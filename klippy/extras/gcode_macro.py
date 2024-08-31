@@ -108,6 +108,7 @@ class TemplateWrapperJinja:
     def run_gcode_from_command(self, context=None):
         self.gcode.run_script_from_command(self.render(context))
 
+
 class TemplateWrapperPython:
     def __init__(self, printer, env, name, script):
         self.printer = printer
@@ -205,7 +206,7 @@ class TemplateWrapperPython:
             try:
                 ret = func()
                 completion.complete((False, ret))
-            except e:
+            except Exception as e:
                 completion.complete((True, e))
 
         t = threading.Thread(target=run, daemon=True)
@@ -257,6 +258,7 @@ class TemplateVariableWrapperPython:
         for name, obj in self.__dict__["__macro"].variables:
             yield name
 
+
 class Template:
     def __init__(self, printer, env, name, script) -> None:
         self.name = name
@@ -295,7 +297,6 @@ class PrinterGCodeMacro:
             script = config.get(option, default)
         script = script.strip()
         return Template(self.printer, self.env, name, script)
-
 
     def _action_emergency_stop(self, msg="action_emergency_stop"):
         self.printer.invoke_shutdown("Shutdown due to %s" % (msg,))
