@@ -4,6 +4,7 @@ import logging
 class BedRemovalDetector:
     def __init__(self, config):
         self.printer = config.get_printer()
+        # TODO
         # self.threshold_temp = config.getfloat('threshold_temp', -20.0)
         # self.bed_heater = self.printer.lookup_object('heater_bed')
         # # self.toolhead = self.printer.lookup_object('toolhead')
