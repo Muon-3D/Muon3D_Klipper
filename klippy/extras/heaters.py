@@ -1,4 +1,4 @@
-# Tracking of PWM controlled heaters and their temperature control
+    # Tracking of PWM controlled heaters and their temperature control
 #
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
