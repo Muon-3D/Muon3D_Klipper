@@ -9,8 +9,9 @@ class BedRemovalDetector:
         # self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode = self.printer.lookup_object('gcode')
         self.bed_removed = False
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.gcode.respond_info("INIT COMPLETE")
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        
 
     def handle_ready(self):
         reactor = self.printer.get_reactor()
