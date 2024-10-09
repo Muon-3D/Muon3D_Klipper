@@ -6,7 +6,7 @@ class BedRemovalDetector:
         self.printer = config.get_printer()
         self.threshold_temp = config.getfloat('threshold_temp', -20.0)
         self.bed_heater = self.printer.lookup_object('heater_bed')
-        self.toolhead = self.printer.lookup_object('toolhead')
+        # self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode = self.printer.lookup_object('gcode')
         self.bed_removed = False
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -28,7 +28,7 @@ class BedRemovalDetector:
     def handle_bed_removal(self):
         self.bed_removed = True
         self.bed_heater.set_temp(0.0)
-        self.toolhead.pause()
+        # self.toolhead.pause()
         self.gcode.respond_info("Bed removed. Print paused.")
         # Additional code to notify UI can be added here
 
