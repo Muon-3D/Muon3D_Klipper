@@ -4,12 +4,12 @@ import logging
 class BedRemovalDetector:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.threshold_temp = config.getfloat('threshold_temp', -20.0)
-        self.bed_heater = self.printer.lookup_object('heater_bed')
-        # self.toolhead = self.printer.lookup_object('toolhead')
+        self.threshold_temp = config.getfloat('threshold_temp', -15.0)
+        self.bed = self.printer.lookup_object('heater_bed')
+        self.bed_heater = self.bed.heater
+        self.bed_check_interval = config.getfloat('interval', 0.1)
         self.gcode = self.printer.lookup_object('gcode')
         self.bed_removed = False
-        self.gcode.respond_info("INIT COMPLETE")
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
         
 
@@ -25,13 +25,12 @@ class BedRemovalDetector:
         else:
             if self.bed_removed:
                 self.handle_bed_reconnection()
-        return eventtime + 1.0  # Check every second
+        return eventtime + self.bed_check_interval
 
     def handle_bed_removal(self):
         self.bed_removed = True
-        #self.bed_heater.set_temp(0.0)
+        self.bed_heater.set_temp(0.0)
         self.gcode.respond_info("Bed removed. Print paused.")
-        # self.toolhead.pause()
         # Additional code to notify UI can be added here
 
     def handle_bed_reconnection(self):
