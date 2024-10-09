@@ -8,6 +8,7 @@ class BedRemovalDetector:
         self.bed_heater = self.printer.lookup_object('heater_bed')
         # self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode = self.printer.lookup_object('gcode')
+        self.gcode.respond_info("STARTING")
         self.bed_removed = False
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
