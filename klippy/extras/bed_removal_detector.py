@@ -28,7 +28,7 @@ class BedRemovalDetector:
 
     def handle_bed_removal(self):
         self.bed_removed = True
-        self.bed_heater.set_temp(0.0)
+        #self.bed_heater.set_temp(0.0)
         self.gcode.respond_info("Bed removed. Print paused.")
         # self.toolhead.pause()
         # Additional code to notify UI can be added here
