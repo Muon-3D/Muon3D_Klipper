@@ -28,12 +28,14 @@ class BedRemovalDetector:
     def handle_bed_removal(self):
         self.bed_removed = True
         self.bed_heater.set_temp(0.0)
-        # self.toolhead.pause()
+        logging.info("Bed removed")
         self.gcode.respond_info("Bed removed. Print paused.")
+        # self.toolhead.pause()
         # Additional code to notify UI can be added here
 
     def handle_bed_reconnection(self):
         self.bed_removed = False
+        logging.info("Bed removed")
         self.gcode.respond_info("Bed reconnected. You may resume printing.")
         # Additional code to update UI can be added here
 
