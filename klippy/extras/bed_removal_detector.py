@@ -4,11 +4,11 @@ import logging
 class BedRemovalDetector:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.threshold_temp = config.getfloat('threshold_temp', -20.0)
-        self.bed_heater = self.printer.lookup_object('heater_bed')
-        # self.toolhead = self.printer.lookup_object('toolhead')
-        self.gcode = self.printer.lookup_object('gcode')
-        self.gcode.respond_info("STARTING")
+        # self.threshold_temp = config.getfloat('threshold_temp', -20.0)
+        # self.bed_heater = self.printer.lookup_object('heater_bed')
+        # # self.toolhead = self.printer.lookup_object('toolhead')
+        # self.gcode = self.printer.lookup_object('gcode')
+        # self.gcode.respond_info("STARTING")
         # self.bed_removed = False
         # self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
