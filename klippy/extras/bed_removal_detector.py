@@ -38,6 +38,11 @@ class BedRemovalDetector:
         self.gcode.respond_info("Bed reconnected. You may resume printing.")
         # Additional code to update UI can be added here
 
+    def get_status(self, eventtime):
+        return {
+            'bedRemoved': self.bed_removed
+        }
+
     # def cmd_START_PRINT(self, gcmd):
     #     if self.bed_removed:
     #         raise self.printer.command_error("Cannot start print: Bed is removed.")
