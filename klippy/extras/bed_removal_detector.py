@@ -9,7 +9,6 @@ class BedRemovalDetector:
         self.bed_heater = self.bed.heater
         self.bed_check_interval = config.getfloat('interval', 0.1)
         self.gcode = self.printer.lookup_object('gcode')
-        self.idle_timeout = self.printer.lookup_object("idle_timeout")
         self.bed_removed = False
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
         
@@ -34,7 +33,8 @@ class BedRemovalDetector:
         self.gcode.respond_info("Bed Removed")
 
         # eventtime = self.reactor.monotonic()
-        is_printing = self.idle_timeout.get_status(eventtime)["state"] == "Printing"
+        idle_timeout = self.printer.lookup_object("idle_timeout")
+        is_printing = idle_timeout.get_status(eventtime)["state"] == "Printing"
         if is_printing:
             self.gcode.run_script("PAUSE")
         # Additional code to notify UI can be added here
