@@ -48,8 +48,11 @@ class Muon3D_Probe:
     def handle_connect(self):
         # Ensure the control pin is configured properly
         self.control_pin.setup_max_duration(0.)  # Ensure no max duration
-        # Ensure the probe is retracted on startup
-        self.retract_probe()
+
+        self.sync_mcu_print_time()
+        self.next_cmd_time += 0.200
+    
+        self.raise_probe()
 
 
 
