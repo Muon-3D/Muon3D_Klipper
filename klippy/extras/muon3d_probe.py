@@ -3,6 +3,8 @@ from . import probe
 
 class Muon3D_Probe:
     def __init__(self, config):
+        self.next_cmd_time = 0.0
+
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         ppins = self.printer.lookup_object('pins')
@@ -51,6 +53,21 @@ class Muon3D_Probe:
 
 
 
+    def sync_mcu_print_time(self):
+        curtime = self.reactor.monotonic()
+        mcu = self.control_pin.get_mcu()
+        est_time = mcu.estimated_print_time(curtime)
+        self.next_cmd_time = max(self.next_cmd_time, est_time + 0.100)  # Schedule at least 100ms in the future
+
+    def sync_print_time(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        if self.next_cmd_time > print_time:
+            toolhead.dwell(self.next_cmd_time - print_time)
+        else:
+            self.next_cmd_time = print_time
+
+
     def get_probe_params(self, gcmd=None):
         return self.probe_session.get_probe_params(gcmd)
     def get_offsets(self):
@@ -64,16 +81,23 @@ class Muon3D_Probe:
 
 
     def set_control_pin(self, value):
-        print_time = self.reactor.monotonic()
-        self.control_pin.set_digital(print_time, value)
+        self.sync_mcu_print_time()
+        self.control_pin.set_digital(self.next_cmd_time, value)
+        self.next_cmd_time += self.pin_move_time
+
 
     def deploy_probe(self):
         self.set_control_pin(1)
-        self.reactor.pause(self.pin_move_time)
+        self.sync_print_time()
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.dwell(self.pin_move_time)
 
     def retract_probe(self):
         self.set_control_pin(0)
-        self.reactor.pause(self.pin_move_time)
+        self.sync_print_time()
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.dwell(self.pin_move_time)
+
 
     # def toggle_probe(self):
     #     # Toggle the probe deployment state
