@@ -96,4 +96,6 @@ class Muon3D_Probe:
         self.toggle_probe()
 
 def load_config(config):
-    return Muon3D_Probe(config)
+    m3dp = Muon3D_Probe(config)
+    config.get_printer().add_object('probe', m3dp)
+    return m3dp
