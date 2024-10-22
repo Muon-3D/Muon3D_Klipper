@@ -90,16 +90,16 @@ class Muon3D_Probe:
 
 
     def deploy_probe(self):
-        self.sync_print_time()
+        # self.sync_print_time()
         self.set_control_pin(1)
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.dwell(self.pin_move_time)
+        # toolhead = self.printer.lookup_object('toolhead')
+        # toolhead.dwell(self.pin_move_time)
 
     def retract_probe(self):
-        self.sync_print_time()
+        # self.sync_print_time()
         self.set_control_pin(0)
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.dwell(self.pin_move_time)
+        # toolhead = self.printer.lookup_object('toolhead')
+        # toolhead.dwell(self.pin_move_time)
 
 
     # def toggle_probe(self):
