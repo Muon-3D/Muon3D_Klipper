@@ -52,7 +52,7 @@ class Muon3D_Probe:
         self.sync_mcu_print_time()
         self.next_cmd_time += 0.200
     
-        self.raise_probe()
+        self.retract_probe()
 
 
 
