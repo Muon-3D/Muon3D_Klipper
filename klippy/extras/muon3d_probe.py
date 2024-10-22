@@ -14,6 +14,9 @@ class Muon3D_Probe:
         self.control_pin = ppins.setup_pin('digital_out', config.get('control_pin'))
         self.sensor_pin = ppins.setup_pin('endstop', config.get('sensor_pin'))
 
+        # Assign sensor_pin to mcu_endstop for clarity
+        self.mcu_endstop = self.sensor_pin
+
         # Set initial state
         self.probing = False
         self.gcode = self.printer.lookup_object('gcode')
@@ -24,6 +27,13 @@ class Muon3D_Probe:
         self.probe_session = probe.ProbeSessionHelper(config, self)
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
 
+        # Wrappers to expose required methods
+        self.get_mcu = self.mcu_endstop.get_mcu
+        self.add_stepper = self.mcu_endstop.add_stepper
+        self.get_steppers = self.mcu_endstop.get_steppers
+        self.home_wait = self.mcu_endstop.home_wait
+        self.query_endstop = self.mcu_endstop.query_endstop
+
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
@@ -31,6 +41,7 @@ class Muon3D_Probe:
         self.gcode.register_command("PROBE_DEPLOY", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
         self.gcode.register_command("PROBE_RETRACT", self.cmd_PROBE_RETRACT, desc="Retract the probe")
         self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
+
 
     def handle_connect(self):
         # Ensure the control pin is configured properly
