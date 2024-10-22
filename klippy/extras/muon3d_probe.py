@@ -15,24 +15,26 @@ class Muon3D_Probe:
         self.sensor_pin = ppins.setup_pin('endstop', config.get('sensor_pin'))
 
         # Set initial state
-        self.control_pin.setup_max_duration(0.)  # Ensure no max duration
         self.probing = False
         self.gcode = self.printer.lookup_object('gcode')
 
-        # Probe offsets and session helpers
+        # Initialize ProbeCommandHelper and ProbeSessionHelper
+        self.cmd_helper = probe.ProbeCommandHelper(
+            config, self, self.sensor_pin.query_endstop)
+        self.probe_session = probe.ProbeSessionHelper(config, self)
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
-        self.probe_helper = probe.ProbeHelper(self.printer)
 
+
+        # Register G-Code commands using cmd_helper
+        self.cmd_helper.register_commands()
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
-        # Register G-Code commands
+        # Register Debug G-Code commands
         self.gcode.register_command("PROBE_DEPLOY", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
         self.gcode.register_command("PROBE_RETRACT", self.cmd_PROBE_RETRACT, desc="Retract the probe")
         self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
-        self.gcode.register_command("PROBE", self.cmd_PROBE, desc="Perform a probe at the current position")
-        self.gcode.register_command("QUERY_PROBE", self.cmd_QUERY_PROBE, desc="Query the probe's status")
 
     def handle_connect(self):
         # Ensure the control pin is configured properly
@@ -47,6 +49,12 @@ class Muon3D_Probe:
         # Return the XY offsets of the probe relative to the nozzle
         return self.probe_offsets.get_offsets()
 
+    def get_probe_params(self, gcmd=None):
+        return self.probe_session.get_probe_params(gcmd)
+
+    def start_probe_session(self, gcmd):
+        self.probe_session.start_probe_session(gcmd)
+
     def set_control_pin(self, value):
         print_time = self.reactor.monotonic()
         self.control_pin.set_digital(print_time, value)
@@ -56,7 +64,6 @@ class Muon3D_Probe:
         self.reactor.pause(self.pin_move_time)
 
     def retract_probe(self):
-        
         self.set_control_pin(0)
         self.reactor.pause(self.pin_move_time)
 
@@ -68,50 +75,33 @@ class Muon3D_Probe:
         msg = "Probe deployed" if new_state else "Probe retracted"
         self.gcode.respond_info(msg)
 
-    def run_probe(self, gcmd):
-        # Start probing sequence
+    def probe_prepare(self, hmove):
         self.deploy_probe()
-        try:
-            # Perform probing move
-            hmove = self.printer.lookup_object('homing')
-            pos = self.probe_helper.get_probe_position(gcmd)
-            speed = self.probe_helper.get_probe_speed(gcmd)
-            hmove.probing_move(self.sensor_pin, pos, speed)
-        finally:
-            if self.stow_on_each_sample:
-                self.retract_probe()
+        self.reactor.pause(self.pin_move_time)
 
-    def cmd_PROBE(self, gcmd):
-        # Handle the PROBE command
-        self.run_probe(gcmd)
-
-    def cmd_QUERY_PROBE(self, gcmd):
-        # Handle the QUERY_PROBE command
-        triggered = self.sensor_pin.query_endstop()
-        msg = "probe: %s" % ("TRIGGERED" if triggered else "open")
-        self.gcode.respond_info(msg)
-
-    def cmd_PROBE_DEPLOY(self, gcmd):
-        # Handle the PROBE_DEPLOY command
-        self.deploy_probe()
-        self.gcode.respond_info("Probe deployed")
-
-    def cmd_PROBE_RETRACT(self, gcmd):
-        # Handle the PROBE_RETRACT command
-        self.retract_probe()
-        self.gcode.respond_info("Probe retracted")
-
-    def cmd_PROBE_TOGGLE(self, gcmd):
-        # Handle the PROBE_TOGGLE command
-        self.toggle_probe()
+    def probe_finish(self, hmove):
+        if self.stow_on_each_sample:
+            self.retract_probe()
+        self.reactor.pause(self.pin_move_time)
 
     def get_status(self, eventtime):
-        # Return the status of the probe
         return {
             'position_endstop': self.position_endstop,
             'is_triggered': self.sensor_pin.query_endstop(),
             'probe_deployed': bool(self.control_pin.get_commanded_value()),
         }
+
+    # Debug G-Code commands
+    def cmd_PROBE_DEPLOY(self, gcmd):
+        self.deploy_probe()
+        self.gcode.respond_info("Probe deployed")
+
+    def cmd_PROBE_RETRACT(self, gcmd):
+        self.retract_probe()
+        self.gcode.respond_info("Probe retracted")
+
+    def cmd_PROBE_TOGGLE(self, gcmd):
+        self.toggle_probe()
 
 def load_config(config):
     return Muon3D_Probe(config)
