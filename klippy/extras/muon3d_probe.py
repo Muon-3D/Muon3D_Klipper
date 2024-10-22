@@ -40,7 +40,7 @@ class Muon3D_Probe:
         # Register Debug G-Code commands
         self.gcode.register_command("PROBE_DEPLOY", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
         self.gcode.register_command("PROBE_RETRACT", self.cmd_PROBE_RETRACT, desc="Retract the probe")
-        self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
+        # self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
 
 
     def handle_connect(self):
@@ -75,13 +75,13 @@ class Muon3D_Probe:
         self.set_control_pin(0)
         self.reactor.pause(self.pin_move_time)
 
-    def toggle_probe(self):
-        # Toggle the probe deployment state
-        current_state = self.control_pin.get_commanded_value()
-        new_state = 0 if current_state else 1
-        self.set_control_pin(new_state)
-        msg = "Probe deployed" if new_state else "Probe retracted"
-        self.gcode.respond_info(msg)
+    # def toggle_probe(self):
+    #     # Toggle the probe deployment state
+    #     current_state = self.control_pin.get_commanded_value()
+    #     new_state = 0 if current_state else 1
+    #     self.set_control_pin(new_state)
+    #     msg = "Probe deployed" if new_state else "Probe retracted"
+    #     self.gcode.respond_info(msg)
 
     def probe_prepare(self, hmove):
         self.deploy_probe()
