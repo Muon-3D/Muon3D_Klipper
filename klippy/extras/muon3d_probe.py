@@ -23,6 +23,7 @@ class Muon3D_Probe:
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
         self.probe_helper = probe.ProbeHelper(self.printer)
 
+
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
@@ -34,11 +35,10 @@ class Muon3D_Probe:
         self.gcode.register_command("QUERY_PROBE", self.cmd_QUERY_PROBE, desc="Query the probe's status")
 
     def handle_connect(self):
-            # Ensure the control pin is configured properly
+        # Ensure the control pin is configured properly
         self.control_pin.setup_max_duration(0.)  # Ensure no max duration
         # Ensure the probe is retracted on startup
         self.retract_probe()
-
 
     def get_position_endstop(self):
         return self.position_endstop
@@ -57,11 +57,7 @@ class Muon3D_Probe:
 
     def retract_probe(self):
         
-self.set/*************  ✨ Codeium Command ⭐  *************/
-"""
-Retract the probe by setting the control pin to 0 and pausing for the specified pin move time.
-"""
-/******  202950d3-5e5c-465f-91a9-3b02a961694f  *******/_control_pin(0)
+        self.set_control_pin(0)
         self.reactor.pause(self.pin_move_time)
 
     def toggle_probe(self):
