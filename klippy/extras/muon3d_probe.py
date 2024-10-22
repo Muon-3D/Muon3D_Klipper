@@ -1,10 +1,3 @@
-# Simple Probe support
-#
-# This file provides support for a simple bed probe that uses a control pin to deploy/retract
-# and a sense pin to detect when the probe is triggered.
-#
-# Place this file in klippy/extras/simple_probe.py
-
 import logging
 from . import probe
 
@@ -22,14 +15,15 @@ class Muon3D_Probe:
         self.sensor_pin = ppins.setup_pin('endstop', config.get('sensor_pin'))
 
         # Set initial state
-        self.control_pin.set_digital(0)  # Ensure probe is retracted
+        self.control_pin.setup_max_duration(0.)  # Ensure no max duration
+        self.set_control_pin(0)  # Ensure probe is retracted
         self.probing = False
         self.gcode = self.printer.lookup_object('gcode')
 
         # Probe offsets and session helpers
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
         self.probe_helper = probe.ProbeHelper(self.printer)
-        self.raise_probe()
+        self.retract_probe()
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -43,7 +37,7 @@ class Muon3D_Probe:
 
     def handle_connect(self):
         # Ensure the probe is retracted on startup
-        self.raise_probe()
+        self.retract_probe()
 
     def get_position_endstop(self):
         return self.position_endstop
@@ -52,23 +46,25 @@ class Muon3D_Probe:
         # Return the XY offsets of the probe relative to the nozzle
         return self.probe_offsets.get_offsets()
 
+    def set_control_pin(self, value):
+        print_time = self.reactor.monotonic()
+        self.control_pin.set_digital(print_time, value)
+
     def deploy_probe(self):
-        self.control_pin.set_digital(1)
+        self.set_control_pin(1)
         self.reactor.pause(self.pin_move_time)
 
-    def raise_probe(self):
-        self.control_pin.set_digital(0)
+    def retract_probe(self):
+        self.set_control_pin(0)
         self.reactor.pause(self.pin_move_time)
 
     def toggle_probe(self):
         # Toggle the probe deployment state
-        current_state = self.control_pin.get_digital()
-        if current_state:
-            self.raise_probe()
-            self.gcode.respond_info("Probe retracted")
-        else:
-            self.deploy_probe()
-            self.gcode.respond_info("Probe deployed")
+        current_state = self.control_pin.get_commanded_value()
+        new_state = 0 if current_state else 1
+        self.set_control_pin(new_state)
+        msg = "Probe deployed" if new_state else "Probe retracted"
+        self.gcode.respond_info(msg)
 
     def run_probe(self, gcmd):
         # Start probing sequence
@@ -81,7 +77,7 @@ class Muon3D_Probe:
             hmove.probing_move(self.sensor_pin, pos, speed)
         finally:
             if self.stow_on_each_sample:
-                self.raise_probe()
+                self.retract_probe()
 
     def cmd_PROBE(self, gcmd):
         # Handle the PROBE command
@@ -100,7 +96,7 @@ class Muon3D_Probe:
 
     def cmd_PROBE_RETRACT(self, gcmd):
         # Handle the PROBE_RETRACT command
-        self.raise_probe()
+        self.retract_probe()
         self.gcode.respond_info("Probe retracted")
 
     def cmd_PROBE_TOGGLE(self, gcmd):
@@ -112,7 +108,7 @@ class Muon3D_Probe:
         return {
             'position_endstop': self.position_endstop,
             'is_triggered': self.sensor_pin.query_endstop(),
-            'probe_deployed': bool(self.control_pin.get_digital()),
+            'probe_deployed': bool(self.control_pin.get_commanded_value()),
         }
 
 def load_config(config):
