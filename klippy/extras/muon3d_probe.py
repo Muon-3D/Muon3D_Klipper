@@ -24,10 +24,6 @@ class Muon3D_Probe:
         self.probe_session = probe.ProbeSessionHelper(config, self)
         self.probe_offsets = probe.ProbeOffsetsHelper(config)
 
-
-        # Register G-Code commands using cmd_helper
-        self.cmd_helper.register_commands()
-
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
@@ -42,18 +38,19 @@ class Muon3D_Probe:
         # Ensure the probe is retracted on startup
         self.retract_probe()
 
-    def get_position_endstop(self):
-        return self.position_endstop
 
-    def get_probe_position(self):
-        # Return the XY offsets of the probe relative to the nozzle
-        return self.probe_offsets.get_offsets()
 
     def get_probe_params(self, gcmd=None):
         return self.probe_session.get_probe_params(gcmd)
-
+    def get_offsets(self):
+        return self.probe_offsets.get_offsets()
+    def get_status(self, eventtime):
+        return self.cmd_helper.get_status(eventtime)
     def start_probe_session(self, gcmd):
-        self.probe_session.start_probe_session(gcmd)
+        return self.probe_session.start_probe_session(gcmd)
+
+
+
 
     def set_control_pin(self, value):
         print_time = self.reactor.monotonic()
@@ -84,12 +81,7 @@ class Muon3D_Probe:
             self.retract_probe()
         self.reactor.pause(self.pin_move_time)
 
-    def get_status(self, eventtime):
-        return {
-            'position_endstop': self.position_endstop,
-            'is_triggered': self.sensor_pin.query_endstop(),
-            'probe_deployed': bool(self.control_pin.get_commanded_value()),
-        }
+
 
     # Debug G-Code commands
     def cmd_PROBE_DEPLOY(self, gcmd):
