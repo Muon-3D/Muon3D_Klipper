@@ -28,7 +28,7 @@ DECL_ENUMERATION("spi_bus", "spi1c", 6);
 DECL_CONSTANT_STR("BUS_PINS_spi1c", "gpio24,gpio27,gpio26");
 
 DECL_ENUMERATION("spi_bus", "spi0e", 7);
-DECL_CONSTANT_STR("BUS_PINS_spi0d", "gpio20,gpio23,gpio22");
+DECL_CONSTANT_STR("BUS_PINS_spi0e", "gpio20,gpio19,gpio18");
 
 struct spi_info {
     spi_hw_t *spi;
