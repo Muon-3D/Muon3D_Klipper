@@ -40,8 +40,8 @@ class Muon3D_Probe:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         # Register Debug G-Code commands
-        self.gcode.register_command("PROBE_DEPLOY", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
-        self.gcode.register_command("PROBE_RETRACT", self.cmd_PROBE_RETRACT, desc="Retract the probe")
+        self.gcode.register_command("DEPLOY_PROBE", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
+        self.gcode.register_command("RETRACT_PROBE", self.cmd_PROBE_RETRACT, desc="Retract the probe")
         # self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
 
 
@@ -60,7 +60,7 @@ class Muon3D_Probe:
         curtime = self.reactor.monotonic()
         mcu = self.control_pin.get_mcu()
         est_time = mcu.estimated_print_time(curtime)
-        self.next_cmd_time = max(self.next_cmd_time, est_time + 0.100)  # Schedule at least 100ms in the future
+        self.next_cmd_time = est_time + 0.100  # Schedule at least 100ms in the future
 
     def sync_print_time(self):
         toolhead = self.printer.lookup_object('toolhead')
