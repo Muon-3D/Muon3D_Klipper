@@ -47,8 +47,6 @@ class Muon3D_Probe:
 
     def handle_connect(self):
         # Ensure the control pin is configured properly
-        self.control_pin.setup_max_duration(0.)  # Ensure no max duration
-
         self.sync_mcu_print_time()
         self.next_cmd_time += 0.200
     
@@ -86,6 +84,7 @@ class Muon3D_Probe:
 
     def set_control_pin(self, value):
         self.sync_mcu_print_time()
+        self.control_pin.setup_max_duration(0.)  # Ensure no max duration
         self.control_pin.set_digital(self.next_cmd_time, value)
         self.action_end_time = self.next_cmd_time + self.pin_move_time
         self.next_cmd_time = self.action_end_time + 0.100  # Add some buffer
