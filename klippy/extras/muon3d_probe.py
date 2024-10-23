@@ -151,7 +151,7 @@ class Muon3D_Probe:
     def wait_for_trigger(self, eventtime):
         self.finish_home_complete.wait()
         if self.multi == 'OFF':
-            self.raise_probe()
+            self.retract_probe()
     def probe_finish(self, hmove):
         self.wait_trigger_complete.wait()
         # if self.multi == 'OFF':
