@@ -27,6 +27,9 @@ DECL_CONSTANT_STR("BUS_PINS_spi1b", "gpio12,gpio15,gpio14");
 DECL_ENUMERATION("spi_bus", "spi1c", 6);
 DECL_CONSTANT_STR("BUS_PINS_spi1c", "gpio24,gpio27,gpio26");
 
+DECL_ENUMERATION("spi_bus", "spi0e", 7);
+DECL_CONSTANT_STR("BUS_PINS_spi0d", "gpio20,gpio23,gpio22");
+
 struct spi_info {
     spi_hw_t *spi;
     uint8_t miso_pin, mosi_pin, sck_pin;
@@ -42,6 +45,8 @@ static const struct spi_info spi_bus[] = {
     {spi1_hw, 8,  11, 10, RESETS_RESET_SPI1_BITS},
     {spi1_hw, 12, 15, 14, RESETS_RESET_SPI1_BITS},
     {spi1_hw, 24, 27, 26, RESETS_RESET_SPI1_BITS},
+
+    {spi0_hw, 20, 19, 18, RESETS_RESET_SPI0_BITS},
 };
 
 struct spi_config
