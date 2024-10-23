@@ -16,6 +16,9 @@ class Muon3D_Probe:
         self.control_pin = ppins.setup_pin('digital_out', config.get('control_pin'))
         self.sensor_pin = ppins.setup_pin('endstop', config.get('sensor_pin'))
 
+        # multi probes state
+        self.multi = 'OFF'
+
         # Assign sensor_pin to mcu_endstop for clarity
         self.mcu_endstop = self.sensor_pin
 
@@ -115,14 +118,49 @@ class Muon3D_Probe:
     #     msg = "Probe deployed" if new_state else "Probe retracted"
     #     self.gcode.respond_info(msg)
 
-    def probe_prepare(self, hmove):
-        self.deploy_probe()
-        self.reactor.pause(self.pin_move_time)
 
-    def probe_finish(self, hmove):
+    def multi_probe_begin(self):
         if self.stow_on_each_sample:
-            self.retract_probe()
-        self.reactor.pause(self.pin_move_time)
+            return
+        self.multi = 'FIRST'
+    def multi_probe_end(self):
+        if self.stow_on_each_sample:
+            return
+        self.sync_print_time()
+        self.retract_probe()
+
+        self.sync_print_time()
+        self.multi = 'OFF'
+    def probing_move(self, pos, speed):
+        phoming = self.printer.lookup_object('homing')
+        return phoming.probing_move(self, pos, speed)
+    def probe_prepare(self, hmove):
+        if self.multi == 'OFF' or self.multi == 'FIRST':
+            self.deploy_probe()
+            if self.multi == 'FIRST':
+                self.multi = 'ON'
+        self.sync_print_time()
+    def home_start(self, print_time, sample_time, sample_count, rest_time,
+                   triggered=True):
+        self.finish_home_complete = self.mcu_endstop.home_start(
+            print_time, sample_time, sample_count, rest_time, triggered)
+        # Schedule wait_for_trigger callback
+        r = self.printer.get_reactor()
+        self.wait_trigger_complete = r.register_callback(self.wait_for_trigger)
+        return self.finish_home_complete
+    def wait_for_trigger(self, eventtime):
+        self.finish_home_complete.wait()
+        if self.multi == 'OFF':
+            self.raise_probe()
+    def probe_finish(self, hmove):
+        self.wait_trigger_complete.wait()
+        # if self.multi == 'OFF':
+        #     self.verify_raise_probe()
+        self.sync_print_time()
+        if hmove.check_no_movement() is not None:
+            raise self.printer.command_error("Muon3D Probe failed to deploy")
+    def get_position_endstop(self):
+        return self.position_endstop
 
 
 
