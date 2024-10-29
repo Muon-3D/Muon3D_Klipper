@@ -223,7 +223,7 @@ variable_count: 10
 variable_speed: 3
 gcode:
   !for i in range(own_vars.count):
-  !  emit(f"BEACON_PROBE SPEED={own_vars.speed} TOP=5 BOTTOM=0.2")
+  !  emit(f"BEACON_POKE SPEED={own_vars.speed} TOP=5 BOTTOM=-0.3")
 ```
 
 #### Python: Printer objects
