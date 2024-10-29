@@ -199,6 +199,22 @@ gcode:
   !    emit(f"G0 X{coordinate[0]} Y{coordinate[1] + 0.25 * wipe} Z9.7 F12000")
 ```
 
+#### Python: Rawparams
+
+```
+[gcode_macro G4]
+rename_existing: G4.1
+gcode:
+  !if rawparams and "S" in rawparams:
+  !  s = int(rawparams.split("S")[1])
+  !  respond_info(f"Sleeping for {s} seconds")
+  !  emit(f"G4.1 P{s * 1000}")
+  !else:
+  !  p = int(rawparams.split("P")[1])
+  !  respond_info(f"Sleeping for {p/1000} seconds")
+  !  emit(f"G4.1 {rawparams}")
+```
+
 #### Python: Variables
 
 ```
@@ -208,6 +224,17 @@ variable_speed: 3
 gcode:
   !for i in range(own_vars.count):
   !  emit(f"BEACON_PROBE SPEED={own_vars.speed} TOP=5 BOTTOM=0.2")
+```
+
+#### Python: Printer objects
+
+```
+[gcode_macro EXTRUDER_TEMP]
+gcode:
+    !ACTUAL_TEMP = printer["extruder"]["temperature"]
+    !TARGET_TEMP = printer["extruder"]["target"]
+    !
+    !respond_info("Extruder Target: %.1fC, Actual: %.1fC" % (TARGET_TEMP, ACTUAL_TEMP))
 ```
 
 #### Python: Helpers
