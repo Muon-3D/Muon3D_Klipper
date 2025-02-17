@@ -4,6 +4,9 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, glob, re, time, logging, configparser, io
+import pathlib
+from . import mathutil
+
 
 error = configparser.Error
 
@@ -14,6 +17,52 @@ error = configparser.Error
 
 class sentinel:
     pass
+
+
+PYTHON_SCRIPT_PREFIX = "!"
+_INCLUDERE = re.compile(r"!!include (?P<file>.*)")
+
+
+def _fix_include_path(source_file: str, match: re.Match) -> pathlib.Path:
+    new_path = pathlib.Path(source_file).parent.absolute() / match.group("file")
+    if not new_path.is_file():
+        raise error(f"Attempted to include non-existent file {new_path}")
+    return f"!!include {new_path}"
+
+
+class SectionInterpolation(configparser.Interpolation):
+    """
+    variable interpolation replacing ${[section.]option}
+    """
+
+    _KEYCRE = re.compile(
+        r"\$\{(?:(?P<section>[^.:${}]+)[.:])?(?P<option>[^${}]+)\}"
+    )
+
+    def __init__(self, access_tracking):
+        self.access_tracking = access_tracking
+
+    def before_get(self, parser, section, option, value, defaults):
+        if not isinstance(value, str):
+            return value
+        depth = configparser.MAX_INTERPOLATION_DEPTH
+        while depth:
+            depth -= 1
+
+            match = self._KEYCRE.search(value)
+            if not match:
+                break
+
+            sect = match.group("section") or section
+            opt = match.group("option")
+
+            const = parser.get(sect, opt)
+            self.access_tracking.setdefault((sect, opt), const)
+
+            value = value[: match.start()] + const + value[match.end() :]
+
+        return value
+
 
 class ConfigWrapper:
     error = configparser.Error
@@ -59,17 +108,71 @@ class ConfigWrapper:
                              % (option, self.section, below))
         return v
     def get(self, option, default=sentinel, note_valid=True):
-        return self._get_wrapper(self.fileconfig.get, option, default,
-                                 note_valid=note_valid)
-    def getint(self, option, default=sentinel, minval=None, maxval=None,
-               note_valid=True):
-        return self._get_wrapper(self.fileconfig.getint, option, default,
-                                 minval, maxval, note_valid=note_valid)
-    def getfloat(self, option, default=sentinel, minval=None, maxval=None,
-                 above=None, below=None, note_valid=True):
-        return self._get_wrapper(self.fileconfig.getfloat, option, default,
-                                 minval, maxval, above, below,
-                                 note_valid=note_valid)
+        return self._get_wrapper(
+            self.fileconfig.get, option, default, note_valid=note_valid
+        )
+
+    def getscript(self, option, default=sentinel, note_valid=True):
+        value: str = self.get(option, default, note_valid).strip()
+
+        match = _INCLUDERE.search(value)
+        if match:
+            file_path = pathlib.Path(match.group("file"))
+            if file_path.suffix.lower() == ".py":
+                return ("python", file_path.read_text())
+            else:
+                return ("gcode", file_path.read_text())
+
+        elif value.startswith(PYTHON_SCRIPT_PREFIX):
+            return (
+                "python",
+                "\n".join(
+                    line.removeprefix(PYTHON_SCRIPT_PREFIX)
+                    for line in value.splitlines()
+                ),
+            )
+
+        return ("gcode", value)
+
+
+    def getint(
+        self,
+        option,
+        default=sentinel,
+        minval=None,
+        maxval=None,
+        note_valid=True,
+    ):
+        return self._get_wrapper(
+            self.fileconfig.getint,
+            option,
+            default,
+            minval,
+            maxval,
+            note_valid=note_valid,
+        )
+
+    def getfloat(
+        self,
+        option,
+        default=sentinel,
+        minval=None,
+        maxval=None,
+        above=None,
+        below=None,
+        note_valid=True,
+    ):
+        return self._get_wrapper(
+            self.fileconfig.getfloat,
+            option,
+            default,
+            minval,
+            maxval,
+            above,
+            below,
+            note_valid=note_valid,
+        )
+
     def getboolean(self, option, default=sentinel, note_valid=True):
         return self._get_wrapper(self.fileconfig.getboolean, option, default,
                                  note_valid=note_valid)
@@ -204,26 +307,41 @@ class ConfigFileReader:
         if path in visited:
             raise error("Recursive include of config file '%s'" % (filename))
         visited.add(path)
+
         lines = data.split('\n')
-        # Buffer lines between includes and parse as a unit so that overrides
-        # in includes apply linearly as they do within a single file
         buf = []
         for line in lines:
             # Strip trailing comment
             pos = line.find('#')
             if pos >= 0:
                 line = line[:pos]
-            # Process include or buffer line
+
+            # Does this line start a new include?
             mo = configparser.RawConfigParser.SECTCRE.match(line)
             header = mo and mo.group('header')
             if header and header.startswith('include '):
+                # Flush the buffered lines so far
                 self.append_fileconfig(fileconfig, '\n'.join(buf), filename)
-                del buf[:]
+                buf.clear()
+
+                # Recurse into the include
                 include_spec = header[8:].strip()
-                self._resolve_include(filename, include_spec, fileconfig,
-                                      visited)
+                self._resolve_include(filename, include_spec, fileconfig, visited)
+
             else:
+                # Kalico-style fixup of include paths in non-include lines
+                # (if you have _INCLUDERE and _fix_include_path defined)
+                try:
+                    line = _INCLUDERE.sub(
+                        lambda m: _fix_include_path(filename, m), line
+                    )
+                except NameError:
+                    # If you don’t have that helper, just skip it
+                    pass
+
                 buf.append(line)
+
+        # Flush any remaining buffered lines
         self.append_fileconfig(fileconfig, '\n'.join(buf), filename)
         visited.remove(path)
     def build_fileconfig_with_includes(self, data, filename):

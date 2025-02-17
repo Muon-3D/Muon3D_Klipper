@@ -6,8 +6,8 @@
 import traceback, logging, ast, copy, json, threading
 import jinja2, math
 import configfile
+import typing
 
-PYTHON_SCRIPT_PREFIX = "!"
 
 ######################################################################
 # Template handling
@@ -46,7 +46,6 @@ class GetStatusWrapperJinja:
 class GetStatusWrapperPython:
     def __init__(self, printer):
         self.printer = printer
-        self.cache = {}
 
     def __getitem__(self, val):
         sval = str(val).strip()
@@ -70,6 +69,15 @@ class GetStatusWrapperPython:
         for name, obj in self.printer.lookup_objects():
             if self.__contains__(name):
                 yield name
+
+    def get(self, key: str, default: configfile.sentinel):
+        try:
+            return self[key]
+        except KeyError:
+            if default is not configfile.sentinel:
+                return default
+            raise
+
 
 # Wrapper around a Jinja2 template
 class TemplateWrapperJinja:
@@ -121,9 +129,6 @@ class TemplateWrapperPython:
         self.vars = None
 
         try:
-            script = "\n".join(
-                map(lambda l: l.removeprefix("!"), script.split("\n"))
-            )
             self.func = compile(script, name, "exec")
         except SyntaxError as e:
             msg = "Error compiling expression '%s': %s at line %d column %d" % (
@@ -137,6 +142,7 @@ class TemplateWrapperPython:
 
     def run_gcode_from_command(self, context=None):
         helpers = {
+            "TYPE_CHECKING": False,
             "printer": GetStatusWrapperPython(self.printer),
             "emit": self._action_emit,
             "wait_while": self._action_wait_while,
@@ -260,11 +266,11 @@ class TemplateVariableWrapperPython:
 
 
 class Template:
-    def __init__(self, printer, env, name, script) -> None:
+    def __init__(self, printer, env, name, script, script_type="gcode") -> None:
         self.name = name
         self.printer = printer
         self.env = env
-        self.reload(script)
+        self.reload(script_type, script)
 
     def __call__(self, context=None):
         return self.function(context)
@@ -272,9 +278,12 @@ class Template:
     def __getattr__(self, name):
         return getattr(self.function, name)
 
-    def reload(self, script):
-        if script.startswith(PYTHON_SCRIPT_PREFIX):
-            script = script[len(PYTHON_SCRIPT_PREFIX) :]
+    def reload(
+        self,
+        script_type: typing.Literal["python", "gcode"],
+        script: str,
+    ):
+        if script_type == "python":
             self.function = TemplateWrapperPython(
                 self.printer, self.env, self.name, script
             )
@@ -292,11 +301,12 @@ class PrinterGCodeMacro:
     def load_template(self, config, option, default=None):
         name = "%s:%s" % (config.get_name(), option)
         if default is None:
-            script = config.get(option)
+            script_type, script = config.getscript(option)
         else:
-            script = config.get(option, default)
-        script = script.strip()
-        return Template(self.printer, self.env, name, script)
+            script_type, script = config.getscript(option, default)
+        return Template(
+            self.printer, self.env, name, script, script_type=script_type
+        )
 
     def _action_emergency_stop(self, msg="action_emergency_stop"):
         self.printer.invoke_shutdown("Shutdown due to %s" % (msg,))
@@ -337,8 +347,8 @@ class PrinterGCodeMacro:
                 for s in new_config.get_prefix_sections("gcode_macro")
             ]:
                 template = obj.template
-                new_script = new_section.get("gcode").strip()
-                template.reload(new_script)
+                script_type, new_script = new_section.getscript("gcode")
+                template.reload(script_type, new_script)
 
 
 def load_config(config):
