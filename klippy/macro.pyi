@@ -20,7 +20,9 @@ def wait_until(condition: collections.abc.Callable[[], bool]) -> None:
 def wait_moves() -> None:
     "Wait until all moves are completed"
 
-def blocking(function: collections.abc.Callable[[], typing._T]) -> typing._T:
+Result = typing.TypeVar("ReturnT")
+
+def blocking(function: collections.abc.Callable[[], Result]) -> Result:
     "Run a blocking task in a thread, waiting for the result"
 
 def sleep(timeout: float) -> None:
