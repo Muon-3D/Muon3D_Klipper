@@ -209,9 +209,6 @@ gcode: !!include my_macros/clean_nozzle.py
 
 ## my_macros/clean_nozzle.py
 
-if TYPE_CHECKING:
-  from klippy.macro import *
-
 wipe_count = 8
 emit("G90")
 emit("G0 Z15 F300")

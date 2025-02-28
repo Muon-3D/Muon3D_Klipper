@@ -1,5 +1,6 @@
-import typing
+import collections.abc
 import math
+import typing
 
 rawparams: str
 params: dict[str, str]
@@ -10,16 +11,16 @@ printer: dict[str, dict[str, typing.Any]]
 def emit(gcode: str) -> None:
     "Run a G-Code"
 
-def wait_while(condition: typing.Callable[[], bool]) -> None:
+def wait_while(condition: collections.abc.Callable[[], bool]) -> None:
     "Wait while a condition is True"
 
-def wait_until(condition: typing.Callable[[], bool]) -> None:
+def wait_until(condition: collections.abc.Callable[[], bool]) -> None:
     "Wait until a condition is True"
 
 def wait_moves() -> None:
     "Wait until all moves are completed"
 
-def blocking(function: typing.Callable[[], typing._T]) -> typing._T:
+def blocking(function: collections.abc.Callable[[], typing._T]) -> typing._T:
     "Run a blocking task in a thread, waiting for the result"
 
 def sleep(timeout: float) -> None:
@@ -74,5 +75,4 @@ __all__ = (
     "action_raise_error",
     "action_respond_info",
     "math",
-    "TYPE_CHECKING",
 )

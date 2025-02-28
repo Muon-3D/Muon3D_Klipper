@@ -142,7 +142,6 @@ class TemplateWrapperPython:
 
     def run_gcode_from_command(self, context=None):
         helpers = {
-            "TYPE_CHECKING": False,
             "printer": GetStatusWrapperPython(self.printer),
             "emit": self._action_emit,
             "wait_while": self._action_wait_while,
