@@ -1,0 +1,3 @@
+- Detect if toolhead is plugged in, if not, dont flash
+- Do firmware update for skbob
+- Figure out when to have this script run (read fw version? Detect out of date errors? ...), it should not be run every time, see https://github.com/fbeauKmi/update_klipper_and_mcus for more info
