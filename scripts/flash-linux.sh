@@ -16,8 +16,8 @@ fi
 
 # Install new micro-controller code
 echo "Installing micro-controller code to /usr/local/bin/"
-rm -f /usr/local/bin/klipper_mcu
-cp ${out}/klipper.elf /usr/local/bin/klipper_mcu
+rm -f /opt/klipper/bin/klipper_mcu
+install -D ${out}/klipper.elf /opt/klipper/bin/klipper_mcu
 sync
 
 # Restart (if system install script present)
