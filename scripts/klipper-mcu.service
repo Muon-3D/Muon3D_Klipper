@@ -11,7 +11,7 @@ WantedBy=multi-user.target
 
 [Service]
 Type=simple
-Environment=KLIPPER_HOST_MCU_SERIAL=/tmp/klipper_host_mcu
+Environment=KLIPPER_HOST_MCU_SERIAL=/home/printer_data/comms/klipper_host_mcu
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/klipper_mcu -r -I ${KLIPPER_HOST_MCU_SERIAL}
 ExecStop=sh -c 'echo "FORCE_SHUTDOWN" > ${KLIPPER_HOST_MCU_SERIAL}'
