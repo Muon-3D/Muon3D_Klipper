@@ -17,12 +17,8 @@ sudo service klipper stop || { echo "Error: Failed to stop klipper service."; ex
 
 
 # Program device using the main OpenOCD config
-openocd -f "${OPENOCD_MAIN_CONFIG}" -c "program ${MAIN_BIN} 0x10000000 verify reset; exit" || { echo "Error: OCD Flasing the MAIN MCU Failed."; exit 1; }
-openocd -f "${OPENOCD_TOOLHEAD_CONFIG}" -c "program ${MAIN_BIN} 0x10000000 verify reset; exit" || { echo "Error: Flasing the TOOLHEAD MCU Failed"; exit 1; }
-
-#ensure each mcu is runnign properly
-openocd -f "${OPENOCD_MAIN_CONFIG}" -c "init; reset; exit"
-openocd -f "${OPENOCD_TOOLHEAD_CONFIG}" -c "init; reset; exit"
+openocd -f "${OPENOCD_MAIN_CONFIG}" -c "program ${MAIN_BIN} 0x10000000 verify reset; init; reset; exit" || { echo "Error: OCD Flasing the MAIN MCU Failed."; exit 1; }
+openocd -f "${OPENOCD_TOOLHEAD_CONFIG}" -c "program ${MAIN_BIN} 0x10000000 verify reset; init; reset; exit" || { echo "Error: Flasing the TOOLHEAD MCU Failed"; exit 1; }
 
 # Start klipper service
 sudo service klipper start || { echo "Error: Failed to start klipper service."; exit 1; }

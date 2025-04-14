@@ -43,8 +43,8 @@ class Muon3D_Probe:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         # Register Debug G-Code commands
-        self.gcode.register_command("DEPLOY_PROBE", self.cmd_PROBE_DEPLOY, desc="Deploy the probe")
-        self.gcode.register_command("RETRACT_PROBE", self.cmd_PROBE_RETRACT, desc="Retract the probe")
+        self.gcode.register_command("DEPLOY_PROBE", self.cmd_DEPLOY_PROBE, desc="Deploy the probe")
+        self.gcode.register_command("RETRACT_PROBE", self.cmd_RETRACT_PROBE, desc="Retract the probe")
         # self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
 
         self.control_pin.setup_max_duration(0.)  # Ensure no max duration
@@ -165,11 +165,11 @@ class Muon3D_Probe:
 
 
     # Debug G-Code commands
-    def cmd_PROBE_DEPLOY(self, gcmd):
+    def cmd_DEPLOY_PROBE(self, gcmd):
         self.deploy_probe()
         self.gcode.respond_info("Probe deployed")
 
-    def cmd_PROBE_RETRACT(self, gcmd):
+    def cmd_RETRACT_RETRACT(self, gcmd):
         self.retract_probe()
         self.gcode.respond_info("Probe retracted")
 
