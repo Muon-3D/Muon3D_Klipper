@@ -43,4 +43,7 @@ make clean KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make clean' for ${R
 #make menuconfig KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make menuconfig' for ${RPI_CONFIG} failed."; exit 1; }
 make flash KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make flash' for ${RPI_CONFIG} failed."; exit 1; }
 
+make clean KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make clean' for ${RPI_CONFIG} failed."; exit 1; }
+
+
 echo "Flashed RPI Host MCU"
