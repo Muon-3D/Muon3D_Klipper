@@ -13,6 +13,10 @@ WantedBy=multi-user.target
 Type=simple
 User=klipper
 Group=printer_admin
+LimitRTPRIO=99
+LimitRTTIME=infinity
+LimitMEMLOCK=infinity
+
 Environment=KLIPPER_HOST_MCU_SERIAL=/home/printer_admin/comms/klipper_host_mcu
 RemainAfterExit=yes
 ExecStart=/opt/klipper/bin/klipper_mcu -r -I ${KLIPPER_HOST_MCU_SERIAL}
