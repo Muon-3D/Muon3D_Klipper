@@ -4,7 +4,7 @@
 Description=Starts the MCU Linux firmware for klipper on startup
 Documentation=https://www.klipper3d.org/RPi_microcontroller.html
 Before=klipper.service
-ConditionFileIsExecutable=/usr/local/bin/klipper_mcu
+ConditionFileIsExecutable=/opt/klipper/bin/klipper_mcu
 
 [Install]
 WantedBy=multi-user.target
