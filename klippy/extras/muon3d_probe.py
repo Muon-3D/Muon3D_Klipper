@@ -169,7 +169,7 @@ class Muon3D_Probe:
         self.deploy_probe()
         self.gcode.respond_info("Probe deployed")
 
-    def cmd_RETRACT_RETRACT(self, gcmd):
+    def cmd_RETRACT_PROBE(self, gcmd):
         self.retract_probe()
         self.gcode.respond_info("Probe retracted")
 
