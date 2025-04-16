@@ -22,9 +22,6 @@ class Muon3D_Probe:
         # Assign sensor_pin to mcu_endstop for clarity
         self.mcu_endstop = self.sensor_pin
 
-        # Set initial state
-        self.probing = False
-        self.gcode = self.printer.lookup_object('gcode')
 
         # Initialize ProbeCommandHelper and ProbeSessionHelper
         self.cmd_helper = probe.ProbeCommandHelper(
@@ -43,6 +40,7 @@ class Muon3D_Probe:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         # Register Debug G-Code commands
+        self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command("DEPLOY_PROBE", self.cmd_DEPLOY_PROBE, desc="Deploy the probe")
         self.gcode.register_command("RETRACT_PROBE", self.cmd_RETRACT_PROBE, desc="Retract the probe")
         # self.gcode.register_command("PROBE_TOGGLE", self.cmd_PROBE_TOGGLE, desc="Toggle the probe deployment")
