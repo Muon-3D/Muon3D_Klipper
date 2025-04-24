@@ -164,6 +164,7 @@ class Fan:
         """Callback from SocketWorker to update tachometer reading."""
         try:
             self.tach_fan_speed_rpm = float(rpm)
+            logging.info(f"RPM UPDATED: {rpm}")
         except (TypeError, ValueError):
             logging.warning(f"Invalid RPM value from server: {rpm}")
 
