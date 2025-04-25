@@ -182,10 +182,10 @@ class Fan:
         return eventtime + 1.0  # reschedule in 1 second
     
     def _firmware_restart(self, force=False):
-        logging.info(f"Attempting Reset of Muon3D_Fan MCU via swdio/openocd from config file: {self.fan.openocd_config}")
+        logging.info(f"Attempting Reset of Muon3D_Fan MCU via swdio/openocd from config file: {self.openocd_config}")
         cmd = [
             "openocd",
-            "-f", self.fan.openocd_config,
+            "-f", self.openocd_config,
             "-c", "init; reset; exit"
         ] #todo handle a bad openocd config file
 
