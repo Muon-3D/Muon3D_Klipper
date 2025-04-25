@@ -28,9 +28,10 @@ class SocketWorker(threading.Thread):
         self.stop_event        = threading.Event()
         self.connected_event   = threading.Event()
 
-    def register_callback(self, cb):
-        """Register cb(rpm) to be called when an update_rpm message arrives."""
-        self.callbacks.append(cb)
+    def register_callback(self, func_name: str, cb: Callable[..., Any]):
+        """Register cb(*args) for frames where 'function' == func_name."""
+        self.callbacks.setdefault(func_name, []).append(cb)
+        logging.debug("Callback registered for '%s': %s", func_name, cb)
 
     def run(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
