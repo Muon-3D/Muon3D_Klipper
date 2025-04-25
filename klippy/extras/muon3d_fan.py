@@ -7,6 +7,7 @@
 
 import json
 import logging
+import subprocess
 import sys
 import socket
 import threading
@@ -124,16 +125,17 @@ class Fan:
         # Load external FanConfig module
         self.socket_adress        = config.get('socket_adress')
         self.fan_config_adress    = config.get('fan_config_adress')
+        self.openocd_config       = config.get('openocd_config')
         spec = importlib.util.spec_from_file_location("FanConfig", self.fan_config_adress)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         self.FanConfigModule = module.FanConfig
         self.FanConfig       = self.FanConfigModule.from_config(config)
-        cfg_json = self.FanConfig.json()
+        self.cfg_json = self.FanConfig.json()
 
         # Start the socket worker and register RPM callback
-        self.socket_worker = SocketWorker(self.socket_adress, cfg_json)
+        self.socket_worker = SocketWorker(self.socket_adress, self.cfg_json)
         self.socket_worker.register_callback(self._update_rpm)
         self.socket_worker.start()
 
@@ -149,6 +151,8 @@ class Fan:
         self.printer.register_event_handler(
             "gcode:request_restart", self._handle_request_restart
         )
+        self.printer.register_event_handler(
+            "klippy:firmware_restart", self._firmware_restart)
 
     def _handle_ready(self):
         reactor = self.printer.get_reactor()
@@ -159,18 +163,43 @@ class Fan:
         if not self.socket_worker.connected_event.is_set():
             raise error("Fatal: fan comms socket disconnected")
         return eventtime + 1.0  # reschedule in 1 second
+    
+    def _firmware_restart(self, force=False):
+        logging.info(f"Attempting Reset of Muon3D_Fan MCU via swdio/openocd from config file: {self.fan.openocd_config}")
+        cmd = [
+            "openocd",
+            "-f", self.fan.openocd_config,
+            "-c", "init; reset; exit"
+        ] #todo handle a bad openocd config file
+
+        # Run the command, capture stdout/stderr, and decode to text
+        result = subprocess.run(
+            cmd,
+            capture_output=True,   # captures both stdout and stderr
+            text=True,             # returns strings instead of bytes
+            check=True             # raises CalledProcessError on non-zero exit
+        )
+        # Print the outputs
+        logging.info(f"STDOUT: {result.stdout}")
+        logging.info(f"STDERR: {result.stderr}")
+        
+        self._send_fan_config()
 
     def _update_rpm(self, rpm):
         """Callback from SocketWorker to update tachometer reading."""
         try:
             self.tach_fan_speed_rpm = float(rpm)
-            logging.info(f"RPM UPDATED: {rpm}")
+            logging.debug(f"RPM UPDATED: {rpm}")
         except (TypeError, ValueError):
             logging.warning(f"Invalid RPM value from server: {rpm}")
 
     def send_command_to_socket(self, function_name, *args):
         """Queue a function call on the socket thread."""
         self.socket_worker.send(function_name, list(args))
+        logging.debug(f"muon3d_fan: {function_name} ({list(args)})")
+
+    def _send_fan_config(self):
+        self.send_command_to_socket("set_fan_config", self.cfg_json)
 
     def _apply_speed(self, print_time, value):
         self.send_command_to_socket("set_fan_speed", value)
@@ -215,6 +244,8 @@ class muon3d_fan:
 
     def cmd_M107(self, gcmd):
         self.fan.set_speed_from_command(0.0)
+
+
 
 
 def load_config(config):

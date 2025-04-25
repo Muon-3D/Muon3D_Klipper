@@ -3,6 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import subprocess
 import sys, os, zlib, logging, math
 import serialhdl, msgproto, pins, chelper, clocksync
 
@@ -572,11 +573,13 @@ class MCU:
                     or self._serialport.startswith("/tmp/klipper_host_")):
                 self._baud = config.getint('baud', 250000, minval=2400)
         # Restarts
-        restart_methods = [None, 'arduino', 'cheetah', 'command', 'rpi_usb']
+        restart_methods = [None, 'arduino', 'cheetah', 'command', 'rpi_usb', 'swdio']
         self._restart_method = 'command'
         if self._baud:
             self._restart_method = config.getchoice('restart_method',
                                                     restart_methods, None)
+        if self._restart_method == 'swdio':
+            self.openocd_config = config.get('openocd_config')
         self._reset_cmd = self._config_reset_cmd = None
         self._is_mcu_bridge = False
         self._emergency_stop_cmd = None
@@ -944,6 +947,25 @@ class MCU:
         chelper.run_hub_ctrl(0)
         self._reactor.pause(self._reactor.monotonic() + 2.)
         chelper.run_hub_ctrl(1)
+    def _restart_via_swdio(self):
+        logging.info(f"Attempting MCU '{self._name}' reset via swdio/openocd from config file: {self.openocd_config}")
+        cmd = [
+            "openocd",
+            "-f", self.openocd_config,
+            "-c", "init; reset; exit"
+        ] #todo handle a bad openocd config file
+
+        # Run the command, capture stdout/stderr, and decode to text
+        result = subprocess.run(
+            cmd,
+            capture_output=True,   # captures both stdout and stderr
+            text=True,             # returns strings instead of bytes
+            check=True             # raises CalledProcessError on non-zero exit
+        )
+        # Print the outputs
+        logging.info(f"STDOUT: {result.stdout}")
+        logging.info(f"STDERR: {result.stderr}")
+
     def _firmware_restart(self, force=False):
         if self._is_mcu_bridge and not force:
             return
@@ -953,6 +975,8 @@ class MCU:
             self._restart_via_command()
         elif self._restart_method == 'cheetah':
             self._restart_cheetah()
+        elif self._restart_method == 'swdio':
+            self._restart_via_swdio()
         else:
             self._restart_arduino()
     def _firmware_restart_bridge(self):
