@@ -13,6 +13,7 @@ import socket
 import threading
 import queue
 import importlib.util
+from typing import Any, Callable
 
 class error(Exception):
     pass
@@ -23,7 +24,7 @@ class SocketWorker(threading.Thread):
         self.socket_address    = socket_address
         self.initial_config    = initial_config_json
         self.cmd_queue         = queue.Queue()
-        self.callbacks         = []          # RPM update callbacks
+        self.callbacks       : dict[str, list[Callable[..., Any]]] = {}
         self.stop_event        = threading.Event()
         self.connected_event   = threading.Event()
 
@@ -75,33 +76,45 @@ class SocketWorker(threading.Thread):
         payload = (json.dumps(msg) + "\n").encode("utf-8")
         sock.sendall(payload)
 
-    def _recv_loop(self, sock):
-        """Continuously read lines and dispatch update_rpm callbacks."""
+    def _recv_loop(self, sock: socket.socket):
+        """Continuously read lines and dispatch to the right callbacks."""
         buf = b""
         while not self.stop_event.is_set():
             try:
                 data = sock.recv(1024)
             except Exception as e:
-                logging.error("FanSocketWorker: recv error: %s", e)
+                logging.error("recv error: %s", e)
                 break
             if not data:
-                logging.info("FanSocketWorker: server disconnected")
+                logging.info("Server disconnected")
                 break
+
             buf += data
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
+                if not line:
+                    continue
                 try:
                     msg = json.loads(line.decode("utf-8"))
                 except json.JSONDecodeError:
+                    logging.warning("Invalid JSON frame: %r", line)
                     continue
-                if msg.get("function") == "update_rpm":
-                    rpm = msg.get("args", [None])[0]
-                    for cb in self.callbacks:
+
+                func = msg.get("function")
+                args = msg.get("args", [])
+                logging.debug("Received frame: %s %s", func, args)
+
+                cbs = self.callbacks.get(func)
+                if cbs:
+                    for cb in cbs:
                         try:
-                            cb(rpm)
+                            cb(*args)
                         except Exception:
-                            logging.exception("Error in RPM callback")
-        # signal disconnect
+                            logging.exception("Error in callback for '%s'", func)
+                else:
+                    logging.debug("No callbacks registered for '%s'", func)
+
+        # tear down
         self.connected_event.clear()
         self.stop_event.set()
 
@@ -136,7 +149,10 @@ class Fan:
 
         # Start the socket worker and register RPM callback
         self.socket_worker = SocketWorker(self.socket_adress, self.cfg_json)
-        self.socket_worker.register_callback(self._update_rpm)
+
+        self.socket_worker.register_callback("update_rpm", self._recieve_update_rpm)        
+        self.socket_worker.register_callback("error", self._recieve_error)
+
         self.socket_worker.start()
 
         # Fail fast if listener isn’t up
@@ -182,16 +198,19 @@ class Fan:
         # Print the outputs
         logging.info(f"STDOUT: {result.stdout}")
         logging.info(f"STDERR: {result.stderr}")
-        
+
         self._send_fan_config()
 
-    def _update_rpm(self, rpm):
+    def _recieve_update_rpm(self, rpm):
         """Callback from SocketWorker to update tachometer reading."""
         try:
             self.tach_fan_speed_rpm = float(rpm)
             logging.debug(f"RPM UPDATED: {rpm}")
         except (TypeError, ValueError):
-            logging.warning(f"Invalid RPM value from server: {rpm}")
+            logging.warning(f"Invalid RPM value from daemon: {rpm}")
+
+    def _recieve_error(self, error_msg):
+        raise Exception(error_msg)
 
     def send_command_to_socket(self, function_name, *args):
         """Queue a function call on the socket thread."""
