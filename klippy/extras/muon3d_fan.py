@@ -138,8 +138,7 @@ class Fan:
 
         # Load external FanConfig module
         self.socket_adress        = config.get('socket_adress')
-        self.fan_config_adress    = config.get('fan_config_adress')
-        self.openocd_config       = config.get('openocd_config')
+        self.fan_config_adress    = config.get('fan_config_adress', "/opt/fan_sk_daemon/include/FanConfig.py")
         spec = importlib.util.spec_from_file_location("FanConfig", self.fan_config_adress)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -180,27 +179,6 @@ class Fan:
         if not self.socket_worker.connected_event.is_set():
             raise error("Fatal: fan comms socket disconnected")
         return eventtime + 1.0  # reschedule in 1 second
-    
-    def _firmware_restart(self, force=False):
-        logging.info(f"Attempting Reset of Muon3D_Fan MCU via swdio/openocd from config file: {self.openocd_config}")
-        cmd = [
-            "openocd",
-            "-f", self.openocd_config,
-            "-c", "init; reset; exit"
-        ] #todo handle a bad openocd config file
-
-        # Run the command, capture stdout/stderr, and decode to text
-        result = subprocess.run(
-            cmd,
-            capture_output=True,   # captures both stdout and stderr
-            text=True,             # returns strings instead of bytes
-            check=True             # raises CalledProcessError on non-zero exit
-        )
-        # Print the outputs
-        logging.info(f"STDOUT: {result.stdout}")
-        logging.info(f"STDERR: {result.stderr}")
-
-        self._send_fan_config()
 
     def _recieve_update_rpm(self, rpm):
         """Callback from SocketWorker to update tachometer reading."""
@@ -213,25 +191,24 @@ class Fan:
     def _recieve_error(self, error_msg):
         raise Exception(error_msg)
 
+
     def send_command_to_socket(self, function_name, *args):
         """Queue a function call on the socket thread."""
         self.socket_worker.send(function_name, list(args))
         logging.debug(f"muon3d_fan: {function_name} ({list(args)})")
 
+    def _firmware_restart(self, force=False):
+        self.send_command_to_socket("firmware_restart")
+
     def _send_fan_config(self):
         self.send_command_to_socket("set_fan_config", self.cfg_json)
-
-    def _apply_speed(self, print_time, value):
-        self.send_command_to_socket("set_fan_speed", value)
 
     def set_speed(self, value, print_time=None):
         self.send_command_to_socket("set_fan_speed", value)
 
-    def set_speed_from_command(self, value):
-        self.send_command_to_socket("set_fan_speed", value)
-
     def _handle_request_restart(self, print_time):
         self.set_speed(0.0, print_time)
+        #Not fully sure what this request restart thing is and if more code is needed
 
     def get_status(self, eventtime):
         return {
@@ -260,10 +237,10 @@ class muon3d_fan:
 
     def cmd_M106(self, gcmd):
         value = gcmd.get_float('S', 255., minval=0.) / 255.0
-        self.fan.set_speed_from_command(value)
+        self.fan.set_speed(value)
 
     def cmd_M107(self, gcmd):
-        self.fan.set_speed_from_command(0.0)
+        self.fan.set_speed(0.0)
 
 
 
