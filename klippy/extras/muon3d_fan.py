@@ -139,6 +139,7 @@ class Fan:
         # Load external FanConfig module
         self.socket_adress        = config.get('socket_adress')
         self.fan_config_adress    = config.get('fan_config_adress', "/opt/fan_sk_daemon/include/FanConfig.py")
+        self.ignore_firmware_restart = config.getboolean('ignore_firmware_restart', False)
         spec = importlib.util.spec_from_file_location("FanConfig", self.fan_config_adress)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -198,7 +199,10 @@ class Fan:
         logging.debug(f"muon3d_fan: {function_name} ({list(args)})")
 
     def _firmware_restart(self, force=False):
-        self.send_command_to_socket("firmware_restart")
+        if not self.ignore_firmware_restart and not force:
+            self.send_command_to_socket("firmware_restart")
+        else:
+            logging.info("Ignoring firmware restart request")
 
     def _send_fan_config(self):
         self.send_command_to_socket("set_fan_config", self.cfg_json)
@@ -216,6 +220,8 @@ class Fan:
             'rpm':   self.tach_fan_speed_rpm,
         }
 
+#TODO: MAKE KLIPPER NOT START IF IT CANT CONNECT TO THE FAN MCU, IN THE SAME WAY KLIPEPR DOES IT WITH THE REGULAR MCU'S
+#TODO: FEEDBACK ERRORS FROM THE FAN MCU TO KLIPPER? OR JSUT USE ITS BUILT IN TACH?
 
 class FanTachometer:
     def __init__(self, fanobject):
@@ -231,6 +237,7 @@ class muon3d_fan:
         gcode = config.get_printer().lookup_object('gcode')
         gcode.register_command("M106", self.cmd_M106)
         gcode.register_command("M107", self.cmd_M107)
+        gcode.register_command("FAN_RESEND_CONFIG", self.fan_resend_config)
 
     def get_status(self, eventtime):
         return self.fan.get_status(eventtime)
@@ -241,6 +248,11 @@ class muon3d_fan:
 
     def cmd_M107(self, gcmd):
         self.fan.set_speed(0.0)
+
+    def fan_resend_config(self, gcmd):
+        """Resend the fan config to the socket."""
+        self.fan._send_fan_config()
+        gcmd.respond_info("Fan config resent")
 
 
 
