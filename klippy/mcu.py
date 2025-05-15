@@ -952,7 +952,7 @@ class MCU:
         cmd = [
             "openocd",
             "-f", self.openocd_config,
-            "-c", "init; reset; exit"
+            "-c", "init; reset run; exit"
         ] #todo handle a bad openocd config file
 
         # Run the command, capture stdout/stderr, and decode to text
