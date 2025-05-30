@@ -13,8 +13,8 @@ OPENOCD_TOOLHEAD_CONFIG="${SCRIPT_DIR}/openocd.toolhead.config"
 
 
 # Program device using the main OpenOCD config
-openocd -f "${OPENOCD_MAIN_CONFIG}" -c "init; reset; exit" || { echo "Error: OCD Restarting the MAIN MCU Failed."; exit 1; }
-openocd -f "${OPENOCD_TOOLHEAD_CONFIG}" -c "init; reset; exit" || { echo "Error: OCD Restarting the TOOLHEAD MCU Failed"; exit 1; }
+openocd -f "${OPENOCD_MAIN_CONFIG}" -c "init; reset run; exit" || { echo "Error: OCD Restarting the MAIN MCU Failed."; exit 1; }
+openocd -f "${OPENOCD_TOOLHEAD_CONFIG}" -c "init; reset run; exit" || { echo "Error: OCD Restarting the TOOLHEAD MCU Failed"; exit 1; }
 
 
 echo "MCU's Rebooted sucessfully"
