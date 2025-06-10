@@ -35,7 +35,7 @@ class TemperatureFan:
             'target_temp', 40. if self.max_temp > 40. else self.max_temp,
             minval=self.min_temp, maxval=self.max_temp)
         self.target_temp = self.target_temp_conf
-        algos = {'watermark': ControlBangBang, 'pid': ControlPID}
+        algos = {'watermark': ControlBangBang, 'pid': ControlPID, 'linear': ControlLinear}
         algo = config.getchoice('control', algos)
         self.control = algo(self, config)
         self.next_speed_time = 0.
@@ -180,6 +180,36 @@ class ControlPID:
         self.prev_temp_deriv = temp_deriv
         if co == bounded_co:
             self.prev_temp_integ = temp_integ
+
+
+class ControlLinear:
+    def __init__(self, temperature_fan, config):
+        self.temperature_fan = temperature_fan
+        self.MaxSpeedTemp = config.getfloat('max_speed_temp')
+
+    def temperature_callback(self, read_time, temp):
+        current_temp, target_temp = self.temperature_fan.get_temp(read_time)
+
+
+
+        # co = self.Kp*temp_err
+        # bounded_co = max(0., min(self.temperature_fan.get_max_speed(), co))
+        # self.temperature_fan.set_tf_speed(
+        #     read_time, max(self.temperature_fan.get_min_speed(),
+        #                    self.temperature_fan.get_max_speed() - bounded_co))
+        # Store state for next measurement
+
+        if temp < target_temp:
+            self.temperature_fan.set_tf_speed(read_time, 0.)
+        elif temp >= self.MaxSpeedTemp:
+            self.temperature_fan.set_tf_speed(
+                read_time, self.temperature_fan.get_max_speed())
+        else:
+            temp_ratio = (temp - target_temp) / (self.MaxSpeedTemp - target_temp)
+            speed_delta = (self.temperature_fan.get_max_speed() -
+                     self.temperature_fan.get_min_speed())
+            speed = self.temperature_fan.get_min_speed() + temp_ratio * speed_delta
+            self.temperature_fan.set_tf_speed(read_time, speed)
 
 def load_config_prefix(config):
     return TemperatureFan(config)
