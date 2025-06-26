@@ -1,0 +1,27 @@
+[include ${CORE_PRINTER_CONFIG_PATH}]
+[virtual_sdcard]
+path: ${PRINTER_DATA_DIR}/gcodes
+
+
+#TODO ADD OTEHR CLIBRATION BITS SUCH AS PID TUNING ETC ETC
+
+
+
+#*# <---------------------- SAVE_CONFIG ---------------------->
+#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.
+#*#
+#*# [bed_tilt]
+#*# x_adjust = -0.006274
+#*# y_adjust = -0.016393
+#*# z_adjust = 1.409749
+#*#
+#*# [probe]
+#*# z_offset = 1.715
+#*#
+#*# [extruder]
+#*#
+#*# [input_shaper]
+#*# shaper_type_x = mzv
+#*# shaper_freq_x = 52.2
+#*# shaper_type_y = zv
+#*# shaper_freq_y = 77.8
