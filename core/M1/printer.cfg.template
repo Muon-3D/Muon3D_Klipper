@@ -5,8 +5,6 @@ path: ${PRINTER_DATA_DIR}/gcodes
 
 #TODO ADD OTEHR CLIBRATION BITS SUCH AS PID TUNING ETC ETC
 
-
-
 #*# <---------------------- SAVE_CONFIG ---------------------->
 #*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.
 #*#
@@ -19,6 +17,10 @@ path: ${PRINTER_DATA_DIR}/gcodes
 #*# z_offset = 1.715
 #*#
 #*# [extruder]
+#*# control: pid
+#*# pid_Kp=7.989 
+#*# pid_Ki=0.459 
+#*# pid_Kd=34.752
 #*#
 #*# [input_shaper]
 #*# shaper_type_x = mzv
