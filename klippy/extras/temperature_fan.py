@@ -190,15 +190,6 @@ class ControlLinear:
     def temperature_callback(self, read_time, temp):
         current_temp, target_temp = self.temperature_fan.get_temp(read_time)
 
-
-
-        # co = self.Kp*temp_err
-        # bounded_co = max(0., min(self.temperature_fan.get_max_speed(), co))
-        # self.temperature_fan.set_tf_speed(
-        #     read_time, max(self.temperature_fan.get_min_speed(),
-        #                    self.temperature_fan.get_max_speed() - bounded_co))
-        # Store state for next measurement
-
         if temp < target_temp:
             self.temperature_fan.set_tf_speed(read_time, 0.)
         elif temp >= self.MaxSpeedTemp:
