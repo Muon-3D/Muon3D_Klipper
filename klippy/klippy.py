@@ -22,6 +22,9 @@ command to reload the config and restart the host software.
 Printer is halted
 """
 
+class WaitInterruption(gcode.CommandError):
+    pass
+
 class Printer:
     config_error = configfile.error
     command_error = gcode.CommandError
@@ -225,6 +228,18 @@ class Printer:
         if self.run_result is None:
             self.run_result = result
         self.reactor.end()
+    def wait_while(self, condition_cb, error_on_cancel=True, interval=1.0):
+        """
+        Call `condition_cb(eventtime)` repeatedly until it returns False.
+        If `error_on_cancel` is True and we go into shutdown, raise to abort.
+        """
+        eventtime = self.reactor.monotonic()
+        while condition_cb(eventtime):
+            if self.is_shutdown():
+                if error_on_cancel:
+                    raise WaitInterruption("Command interrupted")
+                return
+            eventtime = self.reactor.pause(eventtime + interval)
 
 
 ######################################################################

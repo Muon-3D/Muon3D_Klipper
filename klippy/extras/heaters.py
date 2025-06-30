@@ -5,6 +5,12 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, logging, threading
 
+from .control_mpc import (
+    ControlMPC,
+    FILAMENT_TEMP_SRC_AMBIENT,
+    FILAMENT_TEMP_SRC_FIXED,
+    FILAMENT_TEMP_SRC_SENSOR,
+)
 
 ######################################################################
 # Heater
@@ -19,6 +25,7 @@ MAX_MAINTHREAD_TIME = 5.0
 class Heater:
     def __init__(self, config, sensor):
         self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
         self.name = config.get_name()
         self.short_name = short_name = self.name.split()[-1]
         # Setup sensor
@@ -46,9 +53,10 @@ class Heater:
         self.next_pwm_time = 0.
         self.last_pwm_value = 0.
         # Setup control algorithm sub-class
-        algos = {'watermark': ControlBangBang, 'pid': ControlPID}
-        algo = config.getchoice('control', algos)
-        self.control = algo(self, config)
+        # algos = {'watermark': ControlBangBang, 'pid': ControlPID}
+        # algo = config.getchoice('control', algos)
+        # self.control = algo(self, config)
+        # Setup control algorithm sub-class (add MPC)
         # Setup output heater pin
         heater_pin = config.get('heater_pin')
         ppins = self.printer.lookup_object('pins')
@@ -57,6 +65,73 @@ class Heater:
                                          maxval=self.pwm_delay)
         self.mcu_pwm.setup_cycle_time(pwm_cycle_time)
         self.mcu_pwm.setup_max_duration(MAX_HEAT_TIME)
+
+        ctrl = config.get('control')
+        if ctrl == 'mpc':
+            # Build the MPC “profile” exactly as in the PR
+            profile = {
+                "name": config.get_name(),
+                "control": "mpc",
+                "block_heat_capacity":   config.getfloat('block_heat_capacity', above=0.0, default=None),
+                "ambient_transfer":      config.getfloat('ambient_transfer', minval=0.0, default=None),
+                "target_reach_time":     config.getfloat('target_reach_time', above=0.0, default=2.0),
+                "smoothing":            config.getfloat('smoothing', above=0.0, maxval=1.0, default=0.83),
+                "heater_power":         config.getfloat('heater_power', above=0.0),
+                "sensor_responsiveness": config.getfloat('sensor_responsiveness', above=0.0, default=None),
+                "min_ambient_change":   config.getfloat('min_ambient_change', above=0.0, default=1.0),
+                "steady_state_rate":    config.getfloat('steady_state_rate', above=0.0, default=0.5),
+                "filament_diameter":    config.getfloat('filament_diameter', above=0.0, default=1.75),
+                "filament_density":     config.getfloat('filament_density', above=0.0, default=1.2),
+                "filament_heat_capacity": config.getfloat('filament_heat_capacity', above=0.0, default=0.0),
+                "maximum_retract":      config.getfloat('maximum_retract', above=0.0, default=2.0),
+            }
+            # filament_temperature_source → tuple
+            raw = config.get('filament_temperature_source', 'ambient').lower().strip()
+            if raw == 'sensor':
+                profile['filament_temp_src'] = (FILAMENT_TEMP_SRC_SENSOR,)
+            elif raw == 'ambient':
+                profile['filament_temp_src'] = (FILAMENT_TEMP_SRC_AMBIENT,)
+            else:
+                try:
+                    val = float(raw)
+                except ValueError:
+                    raise config.error(f"Invalid filament_temperature_source '{raw}'")
+                profile['filament_temp_src'] = (FILAMENT_TEMP_SRC_FIXED, val)
+            # ambient_temp_sensor → object or None
+            amb_name = config.get('ambient_temp_sensor', None)
+            if amb_name:
+                amb = self.printer.load_object(config, amb_name, None)
+                if amb is None:
+                    amb = self.printer.lookup_object(amb_name, None)
+                if amb is None:
+                    raise config.error(f"Unknown ambient_temp_sensor '{amb_name}'")
+                profile['ambient_temp_sensor'] = amb
+            else:
+                profile['ambient_temp_sensor'] = None
+            # cooling_fan → fan.set_speed or None
+            fan_name = config.get('cooling_fan', None)
+            if fan_name:
+                fan_obj = self.printer.load_object(config, fan_name, None)
+                if fan_obj is None:
+                    fan_obj = self.printer.lookup_object(fan_name, None)
+                if not hasattr(fan_obj, 'fan') or not hasattr(fan_obj.fan, 'set_speed'):
+                    raise config.error(f"Invalid cooling_fan '{fan_name}'")
+                profile['cooling_fan'] = fan_obj.fan
+                profile['fan_ambient_transfer'] = config.getfloatlist('fan_ambient_transfer', [])
+            else:
+                profile['cooling_fan'] = None
+                profile['fan_ambient_transfer'] = []
+            # Finally instantiate MPC
+            self.control = ControlMPC(profile, self)
+        else:
+            # Legacy modes
+            algos = {
+                'watermark': ControlBangBang,
+                'pid':       ControlPID,
+            }
+            algo = config.getchoice('control', algos)
+            self.control = algo(self, config)
+
         # Load additional modules
         self.printer.load_object(config, "verify_heater %s" % (short_name,))
         self.printer.load_object(config, "pid_calibrate")
@@ -108,7 +183,10 @@ class Heater:
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
         with self.lock:
+            if degrees != 0.0 and hasattr(self.control, "check_valid"):
+                self.control.check_valid()
             self.target_temp = degrees
+            # self.target_temp = degrees
     def get_temp(self, eventtime):
         print_time = self.mcu_pwm.get_mcu().estimated_print_time(eventtime) - 5.
         with self.lock:
@@ -140,13 +218,27 @@ class Heater:
         is_active = target_temp or last_temp > 50.
         return is_active, '%s: target=%.0f temp=%.1f pwm=%.3f' % (
             self.short_name, target_temp, last_temp, last_pwm_value)
+    def is_adc_faulty(self):
+        return (self.last_temp > self.max_temp or
+            self.last_temp < self.min_temp)
     def get_status(self, eventtime):
+        control_stats = None
         with self.lock:
-            target_temp = self.target_temp
-            smoothed_temp = self.smoothed_temp
+            target_temp    = self.target_temp
+            smoothed_temp  = self.smoothed_temp
             last_pwm_value = self.last_pwm_value
-        return {'temperature': round(smoothed_temp, 2), 'target': target_temp,
-                'power': last_pwm_value}
+        # If our controller exposes extra state, grab it
+        if hasattr(self.control, 'get_status'):
+            control_stats = self.control.get_status(eventtime)
+        ret = {
+            'temperature' : round(smoothed_temp, 2),
+            'target'      : target_temp,
+            'power'       : last_pwm_value,
+            'pid_profile' : getattr(self.control, 'get_profile', lambda: {'name': ''})()['name'],
+        }
+        if control_stats is not None:
+            ret['control_stats'] = control_stats
+        return ret
     cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
     def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
