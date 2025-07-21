@@ -5,7 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, glob, re, time, logging, configparser, io
 import pathlib
-from . import mathutil
+import mathutil
 
 
 error = configparser.Error
