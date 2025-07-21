@@ -3,6 +3,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import numpy as np
 from . import fan
 
 KELVIN_TO_CELSIUS = -273.15
@@ -35,7 +36,7 @@ class TemperatureFan:
             'target_temp', 40. if self.max_temp > 40. else self.max_temp,
             minval=self.min_temp, maxval=self.max_temp)
         self.target_temp = self.target_temp_conf
-        algos = {'watermark': ControlBangBang, 'pid': ControlPID, 'linear': ControlLinear}
+        algos = {'watermark': ControlBangBang, 'pid': ControlPID, 'curve': ControlCurve}
         algo = config.getchoice('control', algos)
         self.control = algo(self, config)
         self.next_speed_time = 0.
@@ -182,25 +183,97 @@ class ControlPID:
             self.prev_temp_integ = temp_integ
 
 
-class ControlLinear:
+
+
+class ControlCurve:
     def __init__(self, temperature_fan, config):
         self.temperature_fan = temperature_fan
-        self.MaxSpeedTemp = config.getfloat('max_speed_temp')
+
+        points = list(
+            config.getlists("points", seps=(",", "\n"), parser=float, count=2)
+        )
+        points.sort(key=lambda x: x[0])
+
+        if len(points) < 2:
+            raise temperature_fan.printer.config_error(
+                "At least two points must be defined for curve in "
+                "temperature_fan."
+            )
+        if any(len(point) != 2 for point in points):
+            raise temperature_fan.printer.config_error(
+                "A point must have exactly one temperature and one pwm setting "
+                "value."
+            )
+        if not all(points[i] <= points[i + 1] for i in range(len(points) - 1)):
+            raise temperature_fan.printer.config_error(
+                "The fan curve must be monotonically increasing."
+            )
+
+        temp_values, pwm_values = zip(*points)
+
+        if len(temp_values) > len(set(temp_values)):
+            raise temperature_fan.printer.config_error(
+                "Temperature may not exist twice in curve table."
+            )
+        if temp_values[-1] > temperature_fan.target_temp:
+            raise temperature_fan.printer.config_error(
+                "Temperature in point may not exceed target_temp."
+            )
+        if temp_values[0] < temperature_fan.min_temp:
+            raise temperature_fan.printer.config_error(
+                "Temperature in point may not fall below min_temp."
+            )
+        if pwm_values[-1] > temperature_fan.get_max_speed():
+            raise temperature_fan.printer.config_error(
+                "Speed in point may not exceed max_speed."
+            )
+        if pwm_values[0] < temperature_fan.get_min_speed():
+            raise temperature_fan.printer.config_error(
+                "Speed in point may not fall below min_speed."
+            )
+
+        if points[0][0] > temperature_fan.min_temp:
+            points.insert(0, (temperature_fan.min_temp, points[0][1]))
+        if points[-1][0] < temperature_fan.max_temp:
+            points.append((temperature_fan.max_temp, points[-1][1]))
+
+        self.smooth_readings = config.getint(
+            "smooth_readings", default=None, minval=0
+        )
+        if self.smooth_readings is not None:
+            config.deprecate("smooth_readings")
+
+        self.cooling_hysteresis = config.getfloat("cooling_hysteresis", 0.0)
+        self.heating_hysteresis = config.getfloat("heating_hysteresis", 0.0)
+        self.curve_standard = np.array([*points]).transpose()
+        self.curve_heating = np.copy(self.curve_standard)
+        self.curve_cooling = np.copy(self.curve_standard)
+        self.curve_heating[0, :] += self.heating_hysteresis
+        self.curve_cooling[0, :] -= self.cooling_hysteresis
 
     def temperature_callback(self, read_time, temp):
-        current_temp, target_temp = self.temperature_fan.get_temp(read_time)
+        current_speed = self.temperature_fan.last_speed_value
+        upper_temp = np.interp(
+            current_speed, self.curve_heating[1], self.curve_heating[0]
+        )
+        lower_temp = np.interp(
+            current_speed, self.curve_cooling[1], self.curve_cooling[0]
+        )
 
-        if temp < target_temp:
-            self.temperature_fan.set_tf_speed(read_time, 0.)
-        elif temp >= self.MaxSpeedTemp:
-            self.temperature_fan.set_tf_speed(
-                read_time, self.temperature_fan.get_max_speed())
+        if temp < lower_temp:
+            next_speed = np.interp(
+                temp, self.curve_cooling[0], self.curve_cooling[1]
+            )
+        elif temp > upper_temp:
+            next_speed = np.interp(
+                temp, self.curve_heating[0], self.curve_heating[1]
+            )
         else:
-            temp_ratio = (temp - target_temp) / (self.MaxSpeedTemp - target_temp)
-            speed_delta = (self.temperature_fan.get_max_speed() -
-                     self.temperature_fan.get_min_speed())
-            speed = self.temperature_fan.get_min_speed() + temp_ratio * speed_delta
-            self.temperature_fan.set_tf_speed(read_time, speed)
+            next_speed = current_speed
+
+        self.temperature_fan.set_speed(read_time, next_speed)
+
+
 
 def load_config_prefix(config):
     return TemperatureFan(config)
