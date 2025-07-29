@@ -271,7 +271,7 @@ class ControlCurve:
         else:
             next_speed = current_speed
 
-        self.temperature_fan.set_speed(read_time, next_speed)
+        self.temperature_fan.set_tf_speed(read_time, next_speed)
 
 
 
