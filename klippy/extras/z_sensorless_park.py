@@ -48,8 +48,8 @@ class ZSensorlessPark:
         self.mcu_endstop = pins.setup_pin('endstop', self.virtual_endstop_pin)
 
         # Register command
-        gcode = self.printer.lookup_object('gcode')
-        gcode.register_command('Z_PARK_SENSORLESS', self.cmd_Z_PARK_SENSORLESS,
+        self.gcode = self.printer.lookup_object('gcode')
+        self.gcode.register_command('Z_PARK_SENSORLESS', self.cmd_Z_PARK_SENSORLESS,
                                desc=self.cmd_Z_PARK_SENSORLESS_help)
 
     def _find_tmc_module(self):
@@ -72,7 +72,13 @@ class ZSensorlessPark:
     cmd_Z_PARK_SENSORLESS_help = (
         "Sensorless Z parking using TMC virtual endstop (stall). "
         "Does not set Z homed.\n"
-        "Params: DIR=MAX|MIN SPEED=<mm/s> BACKOFF=<mm> OVERSHOOT=<mm> RETRACT_SPEED=<mm/s>"
+        "Params: DIR=MAX|MIN "
+        "SPEED=<mm/s> "
+        "BACKOFF=<mm> "
+        "OVERSHOOT=<mm> "
+        "RETRACT_SPEED=<mm/s> "
+        "ON_SUCCESS=<gcode|macro> "
+        "ON_FAIL=<gcode|macro>"
     )
 
     def cmd_Z_PARK_SENSORLESS(self, gcmd):
@@ -87,6 +93,10 @@ class ZSensorlessPark:
         retract   = gcmd.get_float('RETRACT', self.retract_default, above=0.)
         retract_speed = gcmd.get_float('RETRACT_SPEED', self.retract_speed_default, above=0.)
         overshoot = gcmd.get_float('OVERSHOOT', self.overshoot_default, minval=0.)
+
+        #soft      = gcmd.get_int('SOFT', 0)               # 1 = don’t raise on fail
+        on_success = gcmd.get('ON_SUCCESS', None)         # name of macro or single gcode
+        on_fail    = gcmd.get('ON_FAIL', None)            # name of macro or single gcode
 
         toolhead = self.printer.lookup_object('toolhead')
         phoming  = self.printer.lookup_object('homing')  # PrinterHoming
@@ -131,15 +141,32 @@ class ZSensorlessPark:
             gcmd.respond_info("Z_PARK_SENSORLESS: stalled toward %s at Z=%.3f, parked at Z=%.3f"
                               % (direction.upper(), pos_after[2], final_z))
 
+            if on_success:
+                self.gcode.run_script(on_success)
+
         except self.printer.command_error as e:
             reason = str(e)
+            msg = None
             if "No trigger" in reason or "after full movement" in reason:
-                raise gcmd.error(
-                    "Z_PARK_SENSORLESS failed: no stall before travel limit. "
-                    "Increase OVERSHOOT, verify DIAG wiring, and ensure a firm stop at Z %s."
-                    % (direction.upper(),)
-                )
-            raise gcmd.error("Z_PARK_SENSORLESS error: %s" % reason)
+                msg = ("Z_PARK_SENSORLESS failed: no stall before travel limit. "
+                       "Increase OVERSHOOT, verify DIAG wiring, and ensure a firm stop at Z %s."
+                       % (direction.upper(),))
+            else:
+                msg = "Z_PARK_SENSORLESS error: %s" % reason
+
+            # run fail-branch if configured
+            if on_fail:
+                try:
+                    self.gcode.run_script(on_fail)
+                except Exception:
+                    pass
+
+            # if soft:
+            #     gcmd.respond_info(msg)   # just report it, don’t raise
+            #     return
+
+            raise gcmd.error(msg)
+    
         finally:
             # Restore 'unhomed' limits if it wasn't homed before
             if not was_homed:
