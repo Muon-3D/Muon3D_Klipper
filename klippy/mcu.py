@@ -694,7 +694,7 @@ class MCU:
             if canbus_uuid:
                 raise error("CAN MCUs can't be non-critical yet!")
         self.non_critical_disconnected = False
-        self._get_status_info["non_critical_disconnected"] = False
+        self._get_status_info["disconnected"] = False
         self._non_critical_reconnect_event_name = (
             f"danger:non_critical_mcu_{self.get_name()}:reconnected"
         )
@@ -788,7 +788,7 @@ class MCU:
 
     def handle_non_critical_disconnect(self):
         self.non_critical_disconnected = True
-        self._get_status_info["non_critical_disconnected"] = True
+        self._get_status_info["disconnected"] = True
         # Stop any clock sync activity if the object supports it
         if hasattr(self._clocksync, "disconnect"):
             try:
@@ -920,7 +920,7 @@ class MCU:
                 self._connect()
                 # only clear the flag after full success
                 self.non_critical_disconnected = False
-                self._get_status_info["non_critical_disconnected"] = False
+                self._get_status_info["disconnected"] = False
             except Exception as e:
                 logging.info("non-critical MCU '%s' connect failed: %s",
                             self._name, e)
@@ -1002,7 +1002,7 @@ class MCU:
                     log=True
                 )
             self.non_critical_disconnected = True
-            self._get_status_info["non_critical_disconnected"] = True
+            self._get_status_info["disconnected"] = True
             return False
         # Otherwise: just proceed with connect/identify, but leave the flag
         # unchanged here. (It will be cleared on full success in recon_mcu().)
