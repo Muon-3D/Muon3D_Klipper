@@ -73,6 +73,13 @@ class CommandQueryWrapper:
         self._cmd_queue = cmd_queue
 
     def _do_send(self, cmds, minclock, reqclock):
+        # If this is a non-critical MCU and it's offline (and not in a reconnect),
+        # fail fast with a clear error instead of retrying.
+        mcu = getattr(self._serial, "mcu", None)
+        if (mcu is not None and getattr(mcu, "is_non_critical", False)
+                and getattr(mcu, "non_critical_disconnected", False)
+                and not getattr(mcu, "_connecting", False)):
+            raise self._error("MCU '%s' is currently disconnected" % (mcu.get_name(),))
         xh = self._xmit_helper(self._serial, self._response, self._oid)
         reqclock = max(minclock, reqclock)
         try:
@@ -786,6 +793,35 @@ class MCU:
                 return 0.
             self.estimated_print_time = dummy_estimated_print_time
 
+    # ----- Non-critical helpers -----
+    def _mark_noncritical_offline(self, log_msg):
+        if not self.non_critical_disconnected:
+            self.gcode.respond_info("mcu: '%s' %s" % (self._name, log_msg), log=True)
+        self.non_critical_disconnected = True
+        self._get_status_info["disconnected"] = True
+        # Make sure TX is quiet and a reconnect attempt is scheduled.
+        self._disconnect()
+        if hasattr(self, "non_critical_recon_timer"):
+            self._reactor.update_timer(self.non_critical_recon_timer, self._reactor.NOW)
+
+    def _non_critical_recon_event(self, eventtime):
+        # Try to come back up in the background; never raise out of the reactor.
+        try:
+            self._connecting = True
+            # Normal identify + connect; if either fails, try again later.
+            if not self._mcu_identify():
+                return eventtime + 2.0
+            self._connect()
+        except Exception:
+            return eventtime + 2.0
+        finally:
+            self._connecting = False
+        # Success: clear flags and stop the timer.
+        self.non_critical_disconnected = False
+        self._get_status_info["disconnected"] = False
+        self.gcode.respond_info("mcu: '%s' reconnected!" % (self._name,), log=True)
+        return self._reactor.NEVER
+
     def handle_non_critical_disconnect(self):
         self.non_critical_disconnected = True
         self._get_status_info["disconnected"] = True
@@ -944,27 +980,55 @@ class MCU:
         self._steppersync = None
 
     def _connect(self):
-        if self.non_critical_disconnected and not self._connecting:
-                self._reactor.update_timer(self.non_critical_recon_timer,
-                                        self._reactor.NOW + self.reconnect_interval)
+        # --- Non-critical short-circuit ---
+        # If this MCU is marked non-critical and currently offline (and we’re not
+        # in an active reconnect attempt), do not block the boot pipeline.
+        if self.is_non_critical and self.non_critical_disconnected and not getattr(self, "_connecting", False):
+            # A reconnect timer should already be scheduled when we marked it offline.
+            return
+
+        # Try to read config state. If anything here fails for a non-critical MCU,
+        # mark it offline and let the background reconnect handle it.
+        try:
+            config_params = self._send_get_config()
+        except Exception as e:
+            if self.is_non_critical:
+                self._mark_noncritical_offline("connect flow failed (%s)" % (e,))
                 return
-        config_params = self._send_get_config()
+            raise
+
         if not config_params['is_config']:
             if self._restart_method == 'rpi_usb':
                 # Only configure mcu after usb power reset
                 self._check_restart("full reset before config")
+
             # Not configured - send config and issue get_config again
             self._send_config(None)
-            config_params = self._send_get_config()
+
+            try:
+                config_params = self._send_get_config()
+            except Exception as e:
+                if self.is_non_critical:
+                    self._mark_noncritical_offline("post-config get_config failed (%s)" % (e,))
+                    return
+                raise
+
             if not config_params['is_config'] and not self.is_fileoutput():
                 raise error("Unable to configure MCU '%s'" % (self._name,))
         else:
+            # Already configured - send init/restart commands
             start_reason = self._printer.get_start_args().get("start_reason")
-            if start_reason == 'firmware_restart':
-                raise error("Failed automated reset of MCU '%s'"
-                            % (self._name,))
-            # Already configured - send init commands
-            self._send_config(config_params['crc'])
+            # Primary MCU must really reset across firmware_restart; non-critical may survive host restart.
+            if start_reason == 'firmware_restart' and not self.is_non_critical:
+                raise error("Failed automated reset of MCU '%s'" % (self._name,))
+            try:
+                self._send_config(config_params['crc'])
+            except Exception as e:
+                if self.is_non_critical:
+                    self._mark_noncritical_offline("_send_config failed (%s)" % (e,))
+                    return
+                raise
+
         # Setup steppersync with the move_count returned by get_config
         move_count = config_params['move_count']
         if move_count < self._reserved_move_slots:
@@ -972,10 +1036,12 @@ class MCU:
         ffi_main, ffi_lib = chelper.get_ffi()
         self._steppersync = ffi_main.gc(
             ffi_lib.steppersync_alloc(self._serial.get_serialqueue(),
-                                      self._stepqueues, len(self._stepqueues),
-                                      move_count-self._reserved_move_slots),
-            ffi_lib.steppersync_free)
+                                    self._stepqueues, len(self._stepqueues),
+                                    move_count - self._reserved_move_slots),
+            ffi_lib.steppersync_free
+        )
         ffi_lib.steppersync_set_time(self._steppersync, 0., self._mcu_freq)
+
         # Log config information
         move_msg = "Configured MCU '%s' (%d moves)" % (self._name, move_count)
         logging.info(move_msg)
@@ -995,26 +1061,27 @@ class MCU:
         return self._serial.check_connect(self._serialport, self._baud, rts)
 
     def _mcu_identify(self):
-        # For non-critical MCUs, only mark as disconnected here if the OS
-        # device is *missing*. Do NOT clear the flag in this function; wait
-        # until a full successful reconnect in recon_mcu().
-        if self.is_non_critical and not self._check_serial_exists():
-            if not self.non_critical_disconnected:
-                self.gcode.respond_info(
-                    f"mcu: '{self._name}' serial missing; staying disconnected",
-                    log=True
-                )
-            self.non_critical_disconnected = True
-            self._get_status_info["disconnected"] = True
+        # --- Non-critical: never block boot here ---
+        # If this is a non-critical MCU and we're not currently in a reconnect
+        # attempt, do not run a blocking identify. Just mark offline and let the
+        # background timer do the heavy lifting.
+        if self.is_non_critical and not getattr(self, "_connecting", False):
+            # If the OS path is missing, mark offline and bail.
+            if not self._check_serial_exists():
+                self._mark_noncritical_offline("serial path missing at boot")
+                return False
+            # Path exists but we still don't want to block the boot pipeline here.
+            # We'll connect in the background quickly after startup.
+            self._mark_noncritical_offline("present but deferring identify to background")
             return False
-        # Otherwise: just proceed with connect/identify, but leave the flag
-        # unchanged here. (It will be cleared on full success in recon_mcu().)
+
+        # --- Normal (or active reconnect) path below ---
         if self.is_fileoutput():
             self._connect_file()
         else:
             resmeth = self._restart_method
             if resmeth == 'rpi_usb' and not os.path.exists(self._serialport):
-                # Try toggling usb power
+                # Try toggling usb power on primary flows only
                 self._check_restart("enable power")
             try:
                 if self._canbus_iface is not None:
@@ -1023,40 +1090,52 @@ class MCU:
                     self._serial.connect_canbus(self._serialport, nodeid,
                                                 self._canbus_iface)
                 elif self._baud:
-                    # Cheetah boards require RTS to be deasserted
-                    # else a reset will trigger the built-in bootloader.
+                    # Cheetah boards require RTS deasserted or they jump bootloader
                     rts = (resmeth != "cheetah")
                     self._serial.connect_uart(self._serialport, self._baud, rts)
                 else:
                     self._serial.connect_pipe(self._serialport)
                 self._clocksync.connect(self._serial)
             except serialhdl.error as e:
+                # If we were reconnecting a non-critical MCU, defer instead of failing boot
+                if self.is_non_critical:
+                    self._mark_noncritical_offline(f"identify failed: {e}")
+                    return False
                 raise error(str(e))
+
         logging.info(self._log_info())
+
+        # Reserve pins from constants
         ppins = self._printer.lookup_object('pins')
         pin_resolver = ppins.get_pin_resolver(self._name)
         for cname, value in self.get_constants().items():
             if cname.startswith("RESERVE_PINS_"):
                 for pin in value.split(','):
                     pin_resolver.reserve_pin(pin, cname[13:])
+
+        # Cache core constants and setup handlers
         self._mcu_freq = self.get_constant_float('CLOCK_FREQ')
         self._stats_sumsq_base = self.get_constant_float('STATS_SUMSQ_BASE')
         self._emergency_stop_cmd = self.lookup_command("emergency_stop")
         self._reset_cmd = self.try_lookup_command("reset")
         self._config_reset_cmd = self.try_lookup_command("config_reset")
         ext_only = self._reset_cmd is None and self._config_reset_cmd is None
+
         msgparser = self._serial.get_msgparser()
         mbaud = msgparser.get_constant('SERIAL_BAUD', None)
         if self._restart_method is None and mbaud is None and not ext_only:
             self._restart_method = 'command'
+
         if msgparser.get_constant('CANBUS_BRIDGE', 0):
             self._is_mcu_bridge = True
             self._printer.register_event_handler("klippy:firmware_restart",
-                                                 self._firmware_restart_bridge)
+                                                self._firmware_restart_bridge)
+
         version, build_versions = msgparser.get_version_info()
         self._get_status_info['mcu_version'] = version
         self._get_status_info['mcu_build_versions'] = build_versions
         self._get_status_info['mcu_constants'] = msgparser.get_constants()
+
         self.register_response(self._handle_shutdown, 'shutdown')
         self.register_response(self._handle_shutdown, 'is_shutdown')
         self.register_response(self._handle_mcu_stats, 'stats')
@@ -1064,6 +1143,9 @@ class MCU:
 
     def _ready(self):
         if self.is_fileoutput():
+            return
+        # If a non-critical MCU is offline at boot, skip frequency sanity check.
+        if self.is_non_critical and self.non_critical_disconnected:
             return
         # Check that reported mcu frequency is in range
         mcu_freq = self._mcu_freq

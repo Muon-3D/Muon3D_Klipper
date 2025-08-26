@@ -328,11 +328,12 @@ class SerialReader:
 
     # ---- Non-critical MCU protection ----
     def _is_noncritical_blocked(self):
+        # If a non-critical MCU is intentionally marked disconnected,
+        # don't send anything unless we're currently in a reconnect attempt.
         if self.mcu is None:
             return False
-        # block only when marked disconnected AND not in a reconnect/identify attempt
         return getattr(self.mcu, "non_critical_disconnected", False) and \
-            not getattr(self.mcu, "_connecting", False)
+               not getattr(self.mcu, "_connecting", False)
 
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
