@@ -844,9 +844,14 @@ class MCUConnectHelper:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
                          self._name, str(e))
             return eventtime + self.reconnect_interval
-        self._printer.send_event(self._non_critical_reconnect_event_name)
-        logging.info("Non-critical MCU '%s' reconnected", self._name)
-        return self._reactor.NEVER
+        try:
+            self._printer.send_event(self._non_critical_reconnect_event_name)
+            logging.info("Non-critical MCU '%s' reconnected", self._name)
+            return self._reactor.NEVER
+        except Exception as e:
+            logging.debug("Non-critical MCU '%s' reconnect event failed: %s",
+                          self._name, str(e))
+            return eventtime + self.reconnect_interval
     def log_info(self):
         msgparser = self._serial.get_msgparser()
         message_count = len(msgparser.get_messages())
