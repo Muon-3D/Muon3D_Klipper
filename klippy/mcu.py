@@ -818,6 +818,12 @@ class MCUConnectHelper:
             or self._mcu.non_critical_disconnected):
             return
         self._mcu.non_critical_disconnected = True
+        # Stop any clock sync activity if the object supports it.
+        if hasattr(self._clocksync, "disconnect"):
+            try:
+                self._clocksync.disconnect()
+            except Exception:
+                pass
         self._serial.disconnect()
         if self.non_critical_recon_timer is not None:
             self._reactor.update_timer(
@@ -911,7 +917,8 @@ class MCUConnectHelper:
                      self._serial.dump_debug())
     def _shutdown(self, force=False):
         if (self._emergency_stop_cmd is None
-            or (self._is_shutdown and not force)):
+            or (self._is_shutdown and not force)
+            or self._mcu.non_critical_disconnected):
             return
         self._emergency_stop_cmd.send()
     def force_local_shutdown(self):
@@ -1266,7 +1273,8 @@ class MCU:
         self._steppersync = None
     def _shutdown(self, force=False):
         if (self._emergency_stop_cmd is None
-            or (self._is_shutdown and not force)):
+            or (self._is_shutdown and not force)
+            or self.non_critical_disconnected):
             return
         self._emergency_stop_cmd.send()
     def _restart_arduino(self):
