@@ -913,8 +913,8 @@ class MCU:
             try:
                 self.reset_to_initial_state()
                 if self.non_critical_disconnected:
-                    self.gcode.respond_info(
-                        f"mcu: '{self._name}' link established (identify ok)", log=True
+                                        logging.debug(
+                        f"mcu: '{self._name}' link established (identify ok)", self._name
                     )
                 # keep _connecting True so _connect() can send config/init
                 self._connect()
