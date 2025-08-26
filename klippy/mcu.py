@@ -694,6 +694,7 @@ class MCU:
             if canbus_uuid:
                 raise error("CAN MCUs can't be non-critical yet!")
         self.non_critical_disconnected = False
+        self._get_status_info["non_critical_disconnected"] = False
         self._non_critical_reconnect_event_name = (
             f"danger:non_critical_mcu_{self.get_name()}:reconnected"
         )
@@ -708,6 +709,7 @@ class MCU:
         self._config_cmds_post_inits = []
         self._init_cmds_post_inits = []
         self._restart_cmds_post_inits = []
+        self._connecting = False
 
         # Register handlers
         printer.load_object(config, "error_mcu")
@@ -786,6 +788,7 @@ class MCU:
 
     def handle_non_critical_disconnect(self):
         self.non_critical_disconnected = True
+        self._get_status_info["non_critical_disconnected"] = True
         # Stop any clock sync activity if the object supports it
         if hasattr(self._clocksync, "disconnect"):
             try:
@@ -897,26 +900,36 @@ class MCU:
         return "\n".join(log_info)
 
     def recon_mcu(self):
-        # Try to (re)identify and reconnect; swallow errors and retry later.
         try:
-            res = self._mcu_identify()
-        except Exception as e:
-            logging.info("non-critical MCU '%s' identify failed: %s",
-                         self._name, e)
-            return False
-        if not res:
-            return False
-        try:
-            self.reset_to_initial_state()
-            self.non_critical_disconnected = False
-            self._connect()
-        except Exception as e:
-            logging.info("non-critical MCU '%s' connect failed: %s",
-                         self._name, e)
-            self.non_critical_disconnected = True
-            return False
-        self._printer.send_event(self._non_critical_reconnect_event_name)
-        return True
+            self._connecting = True  # <-- allow serial traffic while we try
+            try:
+                res = self._mcu_identify()
+            except Exception as e:
+                logging.info("non-critical MCU '%s' identify failed: %s",
+                            self._name, e)
+                return False
+            if not res:
+                return False
+            try:
+                self.reset_to_initial_state()
+                if self.non_critical_disconnected:
+                    self.gcode.respond_info(
+                        f"mcu: '{self._name}' link established (identify ok)", log=True
+                    )
+                # keep _connecting True so _connect() can send config/init
+                self._connect()
+                # only clear the flag after full success
+                self.non_critical_disconnected = False
+                self._get_status_info["non_critical_disconnected"] = False
+            except Exception as e:
+                logging.info("non-critical MCU '%s' connect failed: %s",
+                            self._name, e)
+                self.non_critical_disconnected = True
+                return False
+            self._printer.send_event(self._non_critical_reconnect_event_name)
+            return True
+        finally:
+            self._connecting = False
 
     def reset_to_initial_state(self):
         if self._cached_init_state:
@@ -928,12 +941,10 @@ class MCU:
         self._steppersync = None
 
     def _connect(self):
-        if self.non_critical_disconnected:
-            self._reactor.update_timer(
-                self.non_critical_recon_timer,
-                self._reactor.NOW + self.reconnect_interval,
-            )
-            return
+        if self.non_critical_disconnected and not self._connecting:
+                self._reactor.update_timer(self.non_critical_recon_timer,
+                                        self._reactor.NOW + self.reconnect_interval)
+                return
         config_params = self._send_get_config()
         if not config_params['is_config']:
             if self._restart_method == 'rpi_usb':
@@ -981,14 +992,20 @@ class MCU:
         return self._serial.check_connect(self._serialport, self._baud, rts)
 
     def _mcu_identify(self):
+        # For non-critical MCUs, only mark as disconnected here if the OS
+        # device is *missing*. Do NOT clear the flag in this function; wait
+        # until a full successful reconnect in recon_mcu().
         if self.is_non_critical and not self._check_serial_exists():
+            if not self.non_critical_disconnected:
+                self.gcode.respond_info(
+                    f"mcu: '{self._name}' serial missing; staying disconnected",
+                    log=True
+                )
             self.non_critical_disconnected = True
-            # reflect status for API/status queries
             self._get_status_info["non_critical_disconnected"] = True
             return False
-        else:
-            self.non_critical_disconnected = False
-            self._get_status_info["non_critical_disconnected"] = False
+        # Otherwise: just proceed with connect/identify, but leave the flag
+        # unchanged here. (It will be cleared on full success in recon_mcu().)
         if self.is_fileoutput():
             self._connect_file()
         else:

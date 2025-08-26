@@ -325,29 +325,29 @@ class SerialReader:
                 self.handlers[name, oid] = callback
 
     # ---- Non-critical MCU protection ----
-    def _check_noncritical_disconnected(self):
-        if self.mcu is not None and getattr(self.mcu, "non_critical_disconnected", False):
-            self._error("non-critical MCU is disconnected")
+    def _is_noncritical_blocked(self):
+        if self.mcu is None:
+            return False
+        # block only when marked disconnected AND not in a reconnect/identify attempt
+        return getattr(self.mcu, "non_critical_disconnected", False) and \
+            not getattr(self.mcu, "_connecting", False)
 
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
-        self._check_noncritical_disconnected()
-        if self.serialqueue is None:
+        if self.serialqueue is None or self._is_noncritical_blocked():
             return
-        self.ffi_lib.serialqueue_send(
-            self.serialqueue, cmd_queue, cmd, len(cmd), minclock, reqclock, 0
-        )
+        self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
+                                    cmd, len(cmd), minclock, reqclock, 0)
 
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
-        self._check_noncritical_disconnected()
-        if self.serialqueue is None:
+        if self.serialqueue is None or self._is_noncritical_blocked():
             return
         self.last_notify_id += 1
         nid = self.last_notify_id
         completion = self.reactor.completion()
         self.pending_notifications[nid] = completion
         self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
-                                      cmd, len(cmd), minclock, reqclock, nid)
+                                    cmd, len(cmd), minclock, reqclock, nid)
         params = completion.wait()
         if params is None:
             self._error("Serial connection closed")
