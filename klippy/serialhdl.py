@@ -319,10 +319,12 @@ class SerialReader:
     # Serial response callbacks
     def register_response(self, callback, name, oid=None):
         with self.lock:
+            key = (name, oid)
             if callback is None:
-                del self.handlers[name, oid]
+                # was: del self.handlers[name, oid]
+                self.handlers.pop(key, None)   # <- safe even if already removed/overwritten
             else:
-                self.handlers[name, oid] = callback
+                self.handlers[key] = callback
 
     # ---- Non-critical MCU protection ----
     def _is_noncritical_blocked(self):

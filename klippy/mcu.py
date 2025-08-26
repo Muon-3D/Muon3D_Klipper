@@ -900,6 +900,9 @@ class MCU:
         return "\n".join(log_info)
 
     def recon_mcu(self):
+        # If we’re already in the middle of a connect/identify, don’t start another.
+        if getattr(self, "_connecting", False):
+            return False
         try:
             self._connecting = True  # <-- allow serial traffic while we try
             try:
