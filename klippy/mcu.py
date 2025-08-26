@@ -800,12 +800,19 @@ class MCU:
         self.gcode.respond_info("mcu: '%s' disconnected!" % (self._name,), log=True)
 
     def non_critical_recon_event(self, eventtime):
-        success = self.recon_mcu()
+        # Never let this timer raise; reactor exceptions cause global shutdown.
+        try:
+            success = self.recon_mcu()
+        except Exception as e:
+            logging.debug("non-critical MCU '%s' recon exception: %s",
+                          self._name, e)
+            success = False
         if success:
-            self.gcode.respond_info("mcu: '%s' reconnected!" % (self._name,), log=True)
+            self.gcode.respond_info(
+                f"mcu: '{self._name}' reconnected!", log=True
+            )
             return self._reactor.NEVER
-        else:
-            return eventtime + self.reconnect_interval
+        return eventtime + self.reconnect_interval
 
     def _send_config(self, prev_crc):
         if not self._cached_init_state:
@@ -890,12 +897,24 @@ class MCU:
         return "\n".join(log_info)
 
     def recon_mcu(self):
-        res = self._mcu_identify()
+        # Try to (re)identify and reconnect; swallow errors and retry later.
+        try:
+            res = self._mcu_identify()
+        except Exception as e:
+            logging.info("non-critical MCU '%s' identify failed: %s",
+                         self._name, e)
+            return False
         if not res:
             return False
-        self.reset_to_initial_state()
-        self.non_critical_disconnected = False
-        self._connect()
+        try:
+            self.reset_to_initial_state()
+            self.non_critical_disconnected = False
+            self._connect()
+        except Exception as e:
+            logging.info("non-critical MCU '%s' connect failed: %s",
+                         self._name, e)
+            self.non_critical_disconnected = True
+            return False
         self._printer.send_event(self._non_critical_reconnect_event_name)
         return True
 
