@@ -92,6 +92,13 @@ class CommandQueryWrapper:
             cmd_queue = serial.get_default_command_queue()
         self._cmd_queue = cmd_queue
     def _do_send(self, cmds, minclock, reqclock, retry):
+        # Fail fast on non-critical MCUs that are offline (unless reconnecting).
+        mcu = getattr(self._serial, "mcu", None)
+        if (mcu is not None and getattr(mcu, "is_non_critical", False)
+                and getattr(mcu, "non_critical_disconnected", False)
+                and not getattr(mcu, "_connecting", False)):
+            raise self._error("MCU '%s' is currently disconnected"
+                              % (mcu.get_name(),))
         xh = self._xmit_helper(self._serial, self._response, self._oid)
         reqclock = max(minclock, reqclock)
         try:
