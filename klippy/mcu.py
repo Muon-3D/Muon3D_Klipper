@@ -838,6 +838,8 @@ class MCUConnectHelper:
     def non_critical_recon_event(self, eventtime):
         if not self._check_serial_exists():
             return eventtime + self.reconnect_interval
+        if self._mcu._connecting:
+            return eventtime + self.reconnect_interval
         self._mcu._connecting = True
         try:
             self._mcu._config_helper.reset_to_initial_state()
