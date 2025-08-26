@@ -786,7 +786,12 @@ class MCU:
 
     def handle_non_critical_disconnect(self):
         self.non_critical_disconnected = True
-        self._clocksync.disconnect()
+        # Stop any clock sync activity if the object supports it
+        if hasattr(self._clocksync, "disconnect"):
+            try:
+                self._clocksync.disconnect()
+            except Exception:
+                pass
         self._disconnect()
         self._reactor.update_timer(
             self.non_critical_recon_timer, self._reactor.NOW
@@ -1129,7 +1134,8 @@ class MCU:
 
     def _shutdown(self, force=False):
         if (self._emergency_stop_cmd is None
-            or (self._is_shutdown and not force)):
+            or (self._is_shutdown and not force)
+            or self.non_critical_disconnected):
             return
         self._emergency_stop_cmd.send()
 
