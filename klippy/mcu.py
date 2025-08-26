@@ -750,6 +750,8 @@ class MCUConnectHelper:
         self.is_non_critical = config.getboolean("is_non_critical", False)
         if self.is_non_critical and self._name == "mcu":
             raise config.error("'mcu' section can not be non-critical")
+        if self.is_non_critical and canbus_uuid is not None:
+            raise config.error("CAN MCUs can't be non-critical yet")
         self.reconnect_interval = (
             config.getfloat("reconnect_interval", 2.0) + 0.12
         )
@@ -762,6 +764,7 @@ class MCUConnectHelper:
         )
         self._mcu.is_non_critical = self.is_non_critical
         self._mcu.non_critical_disconnected = False
+        self._mcu._connecting = False
         # Shutdown tracking
         self._emergency_stop_cmd = None
         self._is_shutdown = self._is_timeout = False
@@ -818,6 +821,7 @@ class MCUConnectHelper:
             or self._mcu.non_critical_disconnected):
             return
         self._mcu.non_critical_disconnected = True
+        self._mcu._connecting = False
         # Stop any clock sync activity if the object supports it.
         if hasattr(self._clocksync, "disconnect"):
             try:
@@ -834,16 +838,21 @@ class MCUConnectHelper:
     def non_critical_recon_event(self, eventtime):
         if not self._check_serial_exists():
             return eventtime + self.reconnect_interval
+        self._mcu._connecting = True
         try:
             self._mcu._config_helper.reset_to_initial_state()
             self._mcu_identify()
             if self._mcu.non_critical_disconnected:
                 return eventtime + self.reconnect_interval
             self._mcu._config_helper._connect()
+            self._mcu.non_critical_disconnected = False
         except Exception as e:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
                          self._name, str(e))
+            self._mcu.non_critical_disconnected = True
             return eventtime + self.reconnect_interval
+        finally:
+            self._mcu._connecting = False
         try:
             self._printer.send_event(self._non_critical_reconnect_event_name)
             logging.info("Non-critical MCU '%s' reconnected", self._name)
@@ -903,7 +912,9 @@ class MCUConnectHelper:
                     self._reactor.NOW + self.reconnect_interval,
                 )
             return
-        self._mcu.non_critical_disconnected = False
+        if self.is_non_critical and self._mcu.non_critical_disconnected:
+            if not self._mcu._connecting:
+                return
         if self._mcu.is_fileoutput():
             self._attach_file()
         else:
@@ -1115,7 +1126,7 @@ class MCUConfigHelper:
                     self._name,))
         return config_params
     def _connect(self):
-        if self._mcu.non_critical_disconnected:
+        if self._mcu.non_critical_disconnected and not self._mcu._connecting:
             return
         config_params = self._send_get_config()
         if not config_params['is_config']:
