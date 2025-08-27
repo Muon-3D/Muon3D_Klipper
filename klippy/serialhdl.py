@@ -242,9 +242,7 @@ class SerialReader:
         ### On first boot, sometimes the rp2040 wont respond to serial
         ### SWDIO reset seems to work well to improove reliably
         ### So perform reset everytime before trying to connect over serial
-        ### May be related to:  https://github.com/matthew-humphrey/3DP-Build-Log/blob/main/RP2040-USB-Bug/README.md
-        ###               and:  https://github.com/bigtreetech/SKR-Pico/issues/2
-        if getattr(self.mcu, "_restart_method", None) == 'swdio':
+        if self.mcu._restart_method == 'swdio':
             logging.info("First prime rp2040 with swdioreset")
             try:
                 self.mcu._restart_via_swdio()
@@ -356,6 +354,7 @@ class SerialReader:
 
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
         if self.serialqueue is None or self._is_noncritical_blocked():
+            # Link is down or this MCU is intentionally blocked (non-critical disconnect)
             return
         self.last_notify_id += 1
         nid = self.last_notify_id
@@ -365,6 +364,9 @@ class SerialReader:
                                     cmd, len(cmd), minclock, reqclock, nid)
         params = completion.wait()
         if params is None:
+            # Queue died while waiting. Treat as benign for non-critical MCUs.
+            if getattr(self.mcu, "is_non_critical", False):
+                return None
             self._error("Serial connection closed")
         return params
 
@@ -439,6 +441,15 @@ class SerialRetryCommand:
         retries = 5
         retry_delay = .010
         while 1:
+            # If this is a non-critical MCU and it's offline (and not currently reconnecting),
+            # abort the wait loop immediately. Callers higher up should treat this as a soft failure.
+            if getattr(self.serial, "mcu", None) and \
+               getattr(self.serial.mcu, "is_non_critical", False) and \
+               getattr(self.serial.mcu, "non_critical_disconnected", False) and \
+               not getattr(self.serial.mcu, "_connecting", False):
+                self.serial.register_response(None, self.name, self.oid)
+                raise error("non-critical MCU offline")
+
             for cmd in cmds[:-1]:
                 self.serial.raw_send(cmd, minclock, reqclock, cmd_queue)
             self.serial.raw_send_wait_ack(cmds[-1], minclock, reqclock,

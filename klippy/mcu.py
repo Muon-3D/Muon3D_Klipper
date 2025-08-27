@@ -749,6 +749,12 @@ class MCU:
             self._shutdown_clock = self.clock32_to_clock64(clock)
         self._shutdown_msg = msg = params['static_string_id']
         event_type = params['#name']
+        if self.is_non_critical:
+            # Treat as a soft disconnect; don't take the whole printer down.
+            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)",
+                         self._name, event_type, self._shutdown_msg)
+            self.handle_non_critical_disconnect()
+            return
         self._printer.invoke_async_shutdown(
             "MCU shutdown", {"reason": msg, "mcu": self._name,
                              "event_type": event_type})
