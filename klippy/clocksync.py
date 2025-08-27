@@ -9,10 +9,18 @@ RTT_AGE = .000010 / (60. * 60.)
 DECAY = 1. / 30.
 TRANSMIT_EXTRA = .001
 
+# Tunables for non-critical MCUs
+NONCRIT_GET_CLOCK_PERIOD = 0.4476   # faster polls -> quicker disconnect detect
+NONCRIT_PENDING_LIMIT    = 1      # how many unanswered polls still counts as "active"
+
 class ClockSync:
     def __init__(self, reactor):
         self.reactor = reactor
         self.serial = None
+
+        self.mcu = None
+        self.is_non_critical = False
+
         self.get_clock_timer = reactor.register_timer(self._get_clock_event)
         self.get_clock_cmd = self.cmd_queue = None
         self.queries_pending = 0
@@ -34,6 +42,11 @@ class ClockSync:
 
     def connect(self, serial):
         self.serial = serial
+
+        # Learn whether this MCU is marked non-critical (from SerialReader back-ref)
+        self.mcu = getattr(serial, "mcu", None)
+        self.is_non_critical = bool(getattr(self.mcu, "is_non_critical", False))
+
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
         # Load initial clock and frequency
         params = serial.send_with_response('get_uptime', 'uptime')
@@ -66,7 +79,10 @@ class ClockSync:
         self.queries_pending += 1
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
-        return eventtime + .9839
+        if (self.is_non_critical):
+            return eventtime + NONCRIT_GET_CLOCK_PERIOD
+        else:
+            return eventtime + .9839
     def _handle_clock(self, params):
         self.queries_pending = 0
         # Extend clock to 64bit
@@ -145,7 +161,10 @@ class ClockSync:
         clock_diff -= (clock_diff & 0x80000000) << 1
         return last_clock + clock_diff
     def is_active(self):
-        return self.queries_pending <= 4
+        if (self.is_non_critical):
+            return self.queries_pending <= NONCRIT_PENDING_LIMIT
+        else:
+            return self.queries_pending <= 4
     def dump_debug(self):
         sample_time, clock, freq = self.clock_est
         return ("clocksync state: mcu_freq=%d last_clock=%d"
