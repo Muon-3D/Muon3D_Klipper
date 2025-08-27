@@ -47,6 +47,12 @@ class PrinterNeoPixel:
         self.old_color_data = bytearray([d ^ 1 for d in self.color_data])
         # Register callbacks
         printer.register_event_handler("klippy:connect", self.send_data)
+        # If this MCU is marked non-critical, also push LED state on reconnection
+        if hasattr(self.mcu, "get_non_critical_reconnect_event_name"):
+            printer.register_event_handler(
+                self.mcu.get_non_critical_reconnect_event_name(),
+                self.send_data
+            )
     def build_config(self):
         bmt = self.mcu.seconds_to_clock(BIT_MAX_TIME)
         rmt = self.mcu.seconds_to_clock(RESET_MIN_TIME)

@@ -256,15 +256,25 @@ class MCU_TMC_SPI:
         self.name_to_reg = name_to_reg
         self.fields = fields
         self.tmc_frequency = tmc_frequency
+        # keep a handle to the underlying MCU (used for non-critical guard)
+        self.mcu = self.tmc_spi.spi.get_mcu()
     def get_fields(self):
         return self.fields
+    def _check_connected(self):
+        # If this MCU is marked non-critical and currently disconnected, avoid I/O
+        if getattr(self.mcu, "non_critical_disconnected", False):
+            raise self.printer.command_error(
+                "TMC2130 '%s' cannot communicate because MCU '%s' is non_critical_disconnected!"
+                % (self.name, self.mcu.get_name()))
     def get_register(self, reg_name):
         reg = self.name_to_reg[reg_name]
+        self._check_connected()
         with self.mutex:
             read = self.tmc_spi.reg_read(reg, self.chain_pos)
         return read
     def set_register(self, reg_name, val, print_time=None):
         reg = self.name_to_reg[reg_name]
+        self._check_connected()
         with self.mutex:
             for retry in range(5):
                 v = self.tmc_spi.reg_write(reg, val, self.chain_pos, print_time)

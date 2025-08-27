@@ -196,9 +196,19 @@ class MCU_TMC2660_SPI:
         self.spi = bus.MCU_SPI_from_config(config, 0, default_speed=4000000)
         self.name_to_reg = name_to_reg
         self.fields = fields
+        # keep a handle to the underlying MCU (used for non-critical guard)
+        self.mcu = self.spi.get_mcu()
     def get_fields(self):
         return self.fields
+    def _check_connected(self):
+        # If this MCU is marked non-critical and currently disconnected, avoid I/O
+        if getattr(self.mcu, "non_critical_disconnected", False):
+            raise self.printer.command_error(
+                "TMC2660 cannot communicate because MCU '%s' is non_critical_disconnected!"
+                % (self.mcu.get_name(),)
+            )
     def get_register(self, reg_name):
+        self._check_connected()
         new_rdsel = ReadRegisters.index(reg_name)
         reg = self.name_to_reg["DRVCONF"]
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -214,6 +224,7 @@ class MCU_TMC2660_SPI:
         pr = bytearray(params['response'])
         return (pr[0] << 16) | (pr[1] << 8) | pr[2]
     def set_register(self, reg_name, val, print_time=None):
+        self._check_connected()
         minclock = 0
         if print_time is not None:
             minclock = self.spi.get_mcu().print_time_to_clock(print_time)
