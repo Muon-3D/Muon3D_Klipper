@@ -3,6 +3,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import math
 import os, logging, threading
 
 from .control_mpc import (
@@ -157,6 +158,18 @@ class Heater:
         #              self.last_temp, self.last_temp_time, self.target_temp)
     def temperature_callback(self, read_time, temp):
         with self.lock:
+            # ---- glitch guard: drop clearly bogus samples ----
+            #  a) non-finite or wildly out of bounds
+            if (not math.isfinite(temp)
+                    or temp < self.min_temp - 50.0
+                    or temp > self.max_temp + 200.0):
+                logging.debug("%s: drop out-of-range sample %.1f°C", self.name, temp)
+                return
+            #  b) single-sample jump that can’t be physical
+            if self.last_temp_time and abs(temp - self.last_temp) > 200.0:
+                logging.debug("%s: drop temp jump %.1f→%.1f°C",
+                            self.name, self.last_temp, temp)
+                return
             time_diff = read_time - self.last_temp_time
             self.last_temp = temp
             self.last_temp_time = read_time
