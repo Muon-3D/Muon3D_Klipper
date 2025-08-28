@@ -723,6 +723,7 @@ class MCUConnectHelper:
         self._mcu = mcu
         self._clocksync = clocksync
         self._printer = printer = config.get_printer()
+        self.gcode = printer.lookup_object("gcode")
         self._reactor = printer.get_reactor()
         self._name = name = mcu.get_name()
         # Serial port
@@ -769,6 +770,8 @@ class MCUConnectHelper:
         self._non_critical_disconnect_event_name = (
             "danger:non_critical_mcu_%s:disconnected" % (self._name,)
         )
+        self.non_crit_connect_macro = config.get('connect_macro', None)
+        self.non_crit_disconnect_macro = config.get('disconnect_macro', None)
         self._mcu.is_non_critical = self.is_non_critical
         self._mcu.non_critical_disconnected = False
         self._mcu._connecting = False
@@ -780,6 +783,16 @@ class MCUConnectHelper:
             self.non_critical_recon_timer = self._reactor.register_timer(
                 self.non_critical_recon_event
             )
+            if self.non_crit_connect_macro:
+                printer.register_event_handler(
+                    self._non_critical_reconnect_event_name,
+                    self.on_non_critical_connect_event,
+                )
+            if self.non_crit_disconnect_macro:
+                printer.register_event_handler(
+                    self._non_critical_disconnect_event_name,
+                    self.on_non_critical_disconnect_event,
+                )
         # Register handlers
         printer.register_event_handler("klippy:mcu_identify",
                                        self._mcu_identify)
@@ -801,6 +814,28 @@ class MCUConnectHelper:
         return self._non_critical_reconnect_event_name
     def get_non_critical_disconnect_event_name(self):
         return self._non_critical_disconnect_event_name
+    def on_non_critical_connect_event(self):
+        if not self.non_crit_connect_macro:
+            return
+        def _later(eventtime):
+            if self._is_shutdown or self._mcu.non_critical_disconnected:
+                return self._reactor.NEVER
+            try:
+                self.gcode.run_script_from_command(self.non_crit_connect_macro)
+            except Exception as e:
+                logging.info("connect macro failed: %s", e)
+            return self._reactor.NEVER
+        self._reactor.register_timer(_later, self._reactor.monotonic() + 0.25)
+    def on_non_critical_disconnect_event(self):
+        if not self.non_crit_disconnect_macro:
+            return
+        def _later(eventtime):
+            try:
+                self.gcode.run_script_from_command(self.non_crit_disconnect_macro)
+            except Exception as e:
+                logging.info("disconnect macro failed: %s", e)
+            return self._reactor.NEVER
+        self._reactor.register_timer(_later, self._reactor.monotonic() + 0.05)
     def _handle_shutdown(self, params):
         if self._is_shutdown:
             return
