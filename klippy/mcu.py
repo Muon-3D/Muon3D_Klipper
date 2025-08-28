@@ -717,6 +717,16 @@ class MCU:
         self._init_cmds_post_inits = []
         self._restart_cmds_post_inits = []
         self._connecting = False
+        self.non_crit_connect_macro = config.get('connect_macro', None)
+        self.non_crit_disconnect_macro = config.get('disconnect_macro', None)
+        printer.register_event_handler(
+            self._non_critical_reconnect_event_name,
+            self.on_non_critical_connect_event
+        )
+        printer.register_event_handler(
+            self._non_critical_disconnect_event_name,
+            self.on_non_critical_disconnect_event
+        )
 
         # Register handlers
         printer.load_object(config, "error_mcu")
@@ -1195,7 +1205,34 @@ class MCU:
 
     def get_non_critical_disconnect_event_name(self):
         return self._non_critical_disconnect_event_name
+    
+    def on_non_critical_connect_event(self):
+        if not self.non_crit_connect_macro:
+            return
+        def _later(eventtime):
+            # Skip if we’re in shutdown or mid-restart
+            if self._is_shutdown or self.non_critical_disconnected:
+                return self._reactor.NEVER
+            try:
+                self.gcode.run_script_from_command(self.non_crit_connect_macro)
+            except Exception as e:
+                logging.info("connect macro failed: %s", e)
+            return self._reactor.NEVER
+        # run ~250ms later so clocksync/state are up and we’re not in a hot path
+        self._reactor.register_timer(_later, self._reactor.monotonic() + 0.25)
 
+    def on_non_critical_disconnect_event(self):
+        if not self.non_crit_disconnect_macro:
+            return
+        def _later(eventtime):
+            # Safe if printer already in shutdown; macro may be a no-op
+            try:
+                self.gcode.run_script_from_command(self.non_crit_disconnect_macro)
+            except Exception as e:
+                logging.info("disconnect macro failed: %s", e)
+            return self._reactor.NEVER
+        self._reactor.register_timer(_later, self._reactor.monotonic() + 0.05)
+        
     def register_response(self, cb, msg, oid=None):
         self._serial.register_response(cb, msg, oid)
 
