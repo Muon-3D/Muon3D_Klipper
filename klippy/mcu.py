@@ -810,24 +810,6 @@ class MCU:
         if hasattr(self, "non_critical_recon_timer"):
             self._reactor.update_timer(self.non_critical_recon_timer, self._reactor.NOW)
 
-    def _non_critical_recon_event(self, eventtime):
-        # Try to come back up in the background; never raise out of the reactor.
-        try:
-            self._connecting = True
-            # Normal identify + connect; if either fails, try again later.
-            if not self._mcu_identify():
-                return eventtime + 2.0
-            self._connect()
-        except Exception:
-            return eventtime + 2.0
-        finally:
-            self._connecting = False
-        # Success: clear flags and stop the timer.
-        self.non_critical_disconnected = False
-        self._get_status_info["disconnected"] = False
-        self.gcode.respond_info("mcu: '%s' reconnected!" % (self._name,), log=True)
-        return self._reactor.NEVER
-
     def handle_non_critical_disconnect(self):
         self.non_critical_disconnected = True
         self._get_status_info["disconnected"] = True
