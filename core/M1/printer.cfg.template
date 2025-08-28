@@ -21,7 +21,7 @@ path: ${PRINTER_DATA_DIR}/gcodes
 #*# filament_density = 1.20
 #*# filament_heat_capacity = 1.8
 #*# block_heat_capacity = 12.6421
-#*# sensor_responsiveness = 0.44
+#*# sensor_responsiveness = 0.416699
 #*# ambient_transfer = 0.110983
 #*# fan_ambient_transfer = 0.110983, 0.12, 0.125, 0.13, 0.135
 #*#
