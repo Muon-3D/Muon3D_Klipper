@@ -26,10 +26,11 @@ path: ${PRINTER_DATA_DIR}/gcodes
 #*# fan_ambient_transfer = 0.110983, 0.12, 0.125, 0.13, 0.135
 #*#
 #*# [heater_bed]
-#*# block_heat_capacity = 275.631
-#*# sensor_responsiveness = 0.0199149
-#*# ambient_transfer = 1.48369
-#*# fan_ambient_transfer =
+#*# control = mpc
+#*# block_heat_capacity=319.565
+#*# sensor_responsiveness=0.113720
+#*# ambient_transfer=1.19495
+#*# fan_ambient_transfer=1.19495, 1.5, 1.82628
 #*#
 #*# [input_shaper]
 #*# shaper_type_x = mzv
