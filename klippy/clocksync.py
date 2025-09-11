@@ -11,7 +11,7 @@ TRANSMIT_EXTRA = .001
 
 # Tunables for non-critical MCUs
 NONCRIT_GET_CLOCK_PERIOD = 0.4476   # faster polls -> quicker disconnect detect
-NONCRIT_PENDING_LIMIT    = 1      # how many unanswered polls still counts as "active"
+NONCRIT_PENDING_LIMIT    = 2      # how many unanswered polls still counts as "active"
 
 class ClockSync:
     def __init__(self, reactor):
