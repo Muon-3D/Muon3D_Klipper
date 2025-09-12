@@ -46,5 +46,6 @@ make flash KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make flash' for ${R
 make clean KCONFIG_CONFIG="${RPI_CONFIG}" || { echo "Error: 'make clean' for ${RPI_CONFIG} failed."; exit 1; }
 
 #TODO add FORCE_VERSION="build version info" to force version string, allowing us to check if the version is correct, and update it if not. Get build version from an enviroment variobale form the cd/ci pipeline?
+# Mabye use a combined hash of the c files, toolchain and config file? Rather than reflashing every time there is a system update?
 
 echo "Flashed RPI Host MCU"
