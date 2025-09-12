@@ -531,14 +531,19 @@ class HandleVersions:
     def __init__(self):
         self.ctr_dispatch = {}
         self.toolstr = self.version = ""
+        self.force_version = ""
     def update_data_dictionary(self, data):
         data['version'] = self.version
         data['build_versions'] = self.toolstr
         data['app'] = 'Klipper'
         data['license'] = 'GNU GPLv3'
     def generate_code(self, options):
+        self.force_version = getattr(options, "force_version", "") or ""
         cleanbuild, self.toolstr = tool_versions(options.tools)
-        self.version = build_version(options.extra, cleanbuild)
+        if self.force_version:
+            self.version = self.force_version
+        else:
+            self.version = build_version(options.extra, cleanbuild)
         sys.stdout.write("Version: %s\n" % (self.version,))
         return "\n// version: %s\n// build_versions: %s\n" % (
             self.version, self.toolstr)
@@ -604,6 +609,8 @@ def main():
                     help="list of build programs to extract version from")
     opts.add_option("-v", action="store_true", dest="verbose",
                     help="enable debug messages")
+    opts.add_option("", "--force-version", dest="force_version", default=os.environ.get("KLIPPER_FORCE_VERSION",""),
+                    help="override version string entirely")
 
     options, args = opts.parse_args()
     if len(args) != 2:
