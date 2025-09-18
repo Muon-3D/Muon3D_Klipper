@@ -19,8 +19,7 @@ MAIN_BIN="${SCRIPT_DIR}/rp2040.bin"
 cd ${KLIPPER_DIR} || { echo "Error: Failed to change directory to ~/klipper."; exit 1; }
 
 # Build steps for MAIN_CONFIG
-make clean KCONFIG_CONFIG="${MAIN_CONFIG}" || { echo "Error: 'make clean' for ${MAIN_CONFIG} failed."; exit 1; }
-#make menuconfig KCONFIG_CONFIG="${MAIN_CONFIG}" || { echo "Error: 'make menuconfig' for ${MAIN_CONFIG} failed."; exit 1; }
+#make clean KCONFIG_CONFIG="${MAIN_CONFIG}" || { echo "Error: 'make clean' for ${MAIN_CONFIG} failed."; exit 1; }
 
 #Force creation of BIN File
 if ! grep -q "^CONFIG_RPXXXX_HAVE_BOOTLOADER=y$" "${MAIN_CONFIG}"; then
