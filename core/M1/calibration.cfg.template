@@ -1,6 +1,4 @@
 [include ${CORE_PRINTER_CONFIG_PATH}]
-[virtual_sdcard]
-path: ${PRINTER_DATA_DIR}/gcodes
 
 
 #TODO ADD OTEHR CLIBRATION BITS
