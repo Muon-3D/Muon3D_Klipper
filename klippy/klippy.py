@@ -291,6 +291,9 @@ def main():
                     help="file to read for mcu protocol dictionary")
     opts.add_option("--import-test", action="store_true",
                     help="perform an import module test")
+    # OEM split-config: optional path for a seperate writable calibration cfg file
+    opts.add_option("-c", "--calibration-file", dest="calibration_file",
+                    help="path to writable calibration config (autosave target)")
     options, args = opts.parse_args()
     if options.import_test:
         import_test()
@@ -311,6 +314,8 @@ def main():
     if options.debugoutput:
         start_args['debugoutput'] = options.debugoutput
         start_args.update(options.dictionary)
+    if options.calibration_file:
+        start_args['calibration_file'] = options.calibration_file
     bglogger = None
     if options.logfile:
         start_args['log_file'] = options.logfile
