@@ -268,8 +268,13 @@ class ConfigAutoSave:
             if ((not line.startswith("#*#")
                  or (len(line) >= 4 and not line.startswith("#*# ")))
                 and autosave_data):
-                logging.warning("Can't read autosave from config file"
-                                " - modifications after header")
+                if self.printer.get_start_args().get('calibration_file') is not None:
+                    raise error("Calibration autosave block"
+                                    " is formatted incorrectly or corrupted"
+                                    " - please rewind calibration file or revert to defaults and recalibrate")
+                else:
+                    logging.warning("Can't read autosave from config file"
+                                    " - invalid modifications after header")
                 return data, ""
             out.append(line[4:])
         out.append("")
@@ -300,11 +305,41 @@ class ConfigAutoSave:
         return "\n".join(lines)
     def load_main_config(self):
         filename = self.printer.get_start_args()['config_file']
+        calibration_file = self.printer.get_start_args().get('calibration_file')
         cfgrdr = ConfigFileReader()
         data = cfgrdr.read_config_file(filename)
-        regular_data, autosave_data = self._find_autosave_data(data)
+        autosave_data = None #initialise
+        regular_data = None #initialise
+        if calibration_file is not None:
+            try:
+                calib_data = cfgrdr.read_config_file(calibration_file)
+            except Exception:
+                raise error("Calibration file is empty, please revert calibration back to defaults")
+            _, autosave_data = self._find_autosave_data(calib_data)
+            regular_data = data
+        else:
+            regular_data, autosave_data = self._find_autosave_data(data)
         regular_fileconfig = cfgrdr.build_fileconfig_with_includes(
             regular_data, filename)
+        if calibration_file is not None and autosave_data:
+            # Build a temporary fileconfig from the autosave block for checking
+            autosave_fc_check = cfgrdr.build_fileconfig(autosave_data, '*AUTOSAVE-CHECK*')
+
+            conflicts = []
+            for section in autosave_fc_check.sections():
+                for option in autosave_fc_check.options(section):
+                    # If core (regular_fileconfig) defines it, it’s not commented out there
+                    if regular_fileconfig.has_option(section, option):
+                        conflicts.append(f"[{section}] {option}")
+
+            if conflicts:
+                hint = (
+                    "Calibration autosave attempts to override keys that are defined in core.\n"
+                    "Comment these keys out in core:\n  "
+                    + "\n  ".join(conflicts)
+                )
+                # Use Klipper’s command_error type so it shows nicely in the console/UI
+                raise error(hint)
         autosave_data = self._strip_duplicates(autosave_data,
                                                regular_fileconfig)
         self.fileconfig = cfgrdr.build_fileconfig(autosave_data, filename)
@@ -361,7 +396,7 @@ class ConfigAutoSave:
         lines.append("")
         autosave_data = '\n'.join(lines)
         # Read in and validate current config file
-        cfgname = self.printer.get_start_args()['config_file']
+        cfgname = self.printer.get_start_args().get('calibration_file') or self.printer.get_start_args()['config_file']
         try:
             data = cfgrdr.read_config_file(cfgname)
         except error as e:
