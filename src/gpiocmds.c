@@ -13,11 +13,15 @@
 
 struct digital_out_s {
     struct timer timer;
+    struct timer gate_timer;
     uint32_t on_duration, off_duration, end_time;
     struct gpio_out pin;
+    struct gpio_adc gate_pin;
     uint32_t max_duration, cycle_time;
+    uint32_t gate_next_time, gate_check_time;
+    uint16_t gate_threshold;
     struct move_queue_head mq;
-    uint8_t flags;
+    uint8_t flags, gate_enabled;
 };
 
 struct digital_move {
@@ -26,24 +30,64 @@ struct digital_move {
 };
 
 enum {
-    DF_ON=1<<0, DF_TOGGLING=1<<1, DF_CHECK_END=1<<2, DF_DEFAULT_ON=1<<4
+    DF_ON=1<<0, DF_TOGGLING=1<<1, DF_CHECK_END=1<<2,
+    DF_GATED=1<<3, DF_DEFAULT_ON=1<<4
 };
 
 static uint_fast8_t digital_load_event(struct timer *timer);
+
+static void
+digital_set_gate(struct digital_out_s *d, uint8_t gated)
+{
+    irq_disable();
+    uint8_t flags = d->flags;
+    if (gated)
+        flags |= DF_GATED;
+    else
+        flags &= ~DF_GATED;
+    d->flags = flags;
+    irq_enable();
+    if (gated)
+        gpio_out_write(d->pin, 0);
+    else
+        gpio_out_write(d->pin, flags & DF_ON);
+}
+
+static uint_fast8_t
+digital_gate_event(struct timer *timer)
+{
+    struct digital_out_s *d = container_of(timer, struct digital_out_s,
+                                           gate_timer);
+    uint32_t sample_delay = gpio_adc_sample(d->gate_pin);
+    if (sample_delay) {
+        d->gate_timer.waketime += sample_delay;
+        return SF_RESCHEDULE;
+    }
+    uint16_t value = gpio_adc_read(d->gate_pin);
+    uint8_t gated = value > d->gate_threshold;
+    if (gated != !!(d->flags & DF_GATED))
+        digital_set_gate(d, gated);
+    d->gate_next_time += d->gate_check_time;
+    d->gate_timer.waketime = d->gate_next_time;
+    return SF_RESCHEDULE;
+}
 
 // Software PWM toggle event
 static uint_fast8_t
 digital_toggle_event(struct timer *timer)
 {
     struct digital_out_s *d = container_of(timer, struct digital_out_s, timer);
-    gpio_out_toggle_noirq(d->pin);
-    d->flags ^= DF_ON;
+    uint8_t flags = d->flags;
+    if (!(flags & DF_GATED))
+        gpio_out_toggle_noirq(d->pin);
+    flags ^= DF_ON;
+    d->flags = flags;
     uint32_t waketime = d->timer.waketime;
-    if (d->flags & DF_ON)
+    if (flags & DF_ON)
         waketime += d->on_duration;
     else
         waketime += d->off_duration;
-    if (d->flags & DF_CHECK_END && !timer_is_before(waketime, d->end_time)) {
+    if (flags & DF_CHECK_END && !timer_is_before(waketime, d->end_time)) {
         // End of normal pulsing - next event loads new pwm settings
         d->timer.func = digital_load_event;
         waketime = d->end_time;
@@ -58,13 +102,15 @@ digital_load_event(struct timer *timer)
 {
     // Apply next update and remove it from queue
     struct digital_out_s *d = container_of(timer, struct digital_out_s, timer);
+    uint8_t gate_active = d->flags & DF_GATED;
     if (move_queue_empty(&d->mq))
         shutdown("Missed scheduling of next digital out event");
     struct move_node *mn = move_queue_pop(&d->mq);
     struct digital_move *m = container_of(mn, struct digital_move, node);
     uint32_t on_duration = m->on_duration;
     uint8_t flags = on_duration ? DF_ON : 0;
-    gpio_out_write(d->pin, flags);
+    if (!gate_active)
+        gpio_out_write(d->pin, flags);
     move_free(m);
 
     // Calculate next end_time and flags
@@ -91,7 +137,7 @@ digital_load_event(struct timer *timer)
         flags |= DF_CHECK_END;
     }
     d->end_time = end_time;
-    d->flags = flags | (d->flags & DF_DEFAULT_ON);
+    d->flags = flags | (d->flags & (DF_DEFAULT_ON | DF_GATED));
 
     // Schedule next event
     if (!(flags & DF_TOGGLING)) {
@@ -122,11 +168,29 @@ command_config_digital_out(uint32_t *args)
     d->pin = pin;
     d->flags = (args[2] ? DF_ON : 0) | (args[3] ? DF_DEFAULT_ON : 0);
     d->max_duration = args[4];
+    d->gate_enabled = 0;
     move_queue_setup(&d->mq, sizeof(struct digital_move));
 }
 DECL_COMMAND(command_config_digital_out,
              "config_digital_out oid=%c pin=%u value=%c"
              " default_value=%c max_duration=%u");
+
+void
+command_config_digital_out_gate(uint32_t *args)
+{
+    struct digital_out_s *d = oid_lookup(args[0], command_config_digital_out);
+    d->gate_pin = gpio_adc_setup(args[1]);
+    d->gate_threshold = args[2];
+    d->gate_check_time = args[3];
+    d->gate_next_time = args[4];
+    d->gate_timer.func = digital_gate_event;
+    d->gate_timer.waketime = d->gate_next_time;
+    d->gate_enabled = 1;
+    sched_add_timer(&d->gate_timer);
+}
+DECL_COMMAND(command_config_digital_out_gate,
+             "config_digital_out_gate oid=%c pin=%u threshold=%hu"
+             " check_ticks=%u clock=%u");
 
 void
 command_set_digital_out_pwm_cycle(uint32_t *args)
@@ -182,14 +246,15 @@ command_update_digital_out(uint32_t *args)
     if (!move_queue_empty(&d->mq))
         shutdown("update_digital_out not valid with active queue");
     uint8_t value = args[1], flags = d->flags, on_flag = value ? DF_ON : 0;
-    gpio_out_write(d->pin, on_flag);
+    if (!(flags & DF_GATED))
+        gpio_out_write(d->pin, on_flag);
     if (!on_flag != !(flags & DF_DEFAULT_ON) && d->max_duration) {
         d->timer.waketime = d->end_time = timer_read_time() + d->max_duration;
         d->timer.func = digital_load_event;
-        d->flags = (flags & DF_DEFAULT_ON) | on_flag | DF_CHECK_END;
+        d->flags = (flags & (DF_DEFAULT_ON | DF_GATED)) | on_flag | DF_CHECK_END;
         sched_add_timer(&d->timer);
     } else {
-        d->flags = (flags & DF_DEFAULT_ON) | on_flag;
+        d->flags = (flags & (DF_DEFAULT_ON | DF_GATED)) | on_flag;
     }
 }
 DECL_COMMAND(command_update_digital_out, "update_digital_out oid=%c value=%c");
@@ -200,6 +265,11 @@ digital_out_shutdown(void)
     uint8_t i;
     struct digital_out_s *d;
     foreach_oid(i, d, command_config_digital_out) {
+        if (d->gate_enabled) {
+            sched_del_timer(&d->gate_timer);
+            gpio_adc_cancel_sample(d->gate_pin);
+            d->gate_enabled = 0;
+        }
         gpio_out_write(d->pin, d->flags & DF_DEFAULT_ON);
         d->flags = d->flags & DF_DEFAULT_ON ? DF_ON | DF_DEFAULT_ON : 0;
         move_queue_clear(&d->mq);

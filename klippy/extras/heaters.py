@@ -66,6 +66,16 @@ class Heater:
                                          maxval=self.pwm_delay)
         self.mcu_pwm.setup_cycle_time(pwm_cycle_time)
         self.mcu_pwm.setup_max_duration(MAX_HEAT_TIME)
+        gate_adc_pin = config.get('gate_adc_pin', None)
+        if gate_adc_pin is not None:
+            gate_threshold = config.getfloat(
+                'gate_adc_threshold', 0.95, minval=0., maxval=1.)
+            gate_interval = config.getfloat(
+                'gate_adc_interval', 0.001, above=0.)
+            gate_pin_params = ppins.lookup_pin(gate_adc_pin,
+                                               share_type="adc_gate")
+            self.mcu_pwm.setup_gate(gate_pin_params,
+                                    gate_threshold, gate_interval)
 
         ctrl = config.get('control')
         if ctrl == 'mpc':

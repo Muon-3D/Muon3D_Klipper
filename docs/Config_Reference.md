@@ -852,6 +852,17 @@ pid_Kd:
 #   not recommended to set this unless there is an electrical
 #   requirement to switch the heater faster than 10 times a second.
 #   The default is 0.100 seconds.
+#gate_adc_pin:
+#   Optional analog input pin used to gate the heater PWM output. When
+#   configured, the MCU samples this pin at gate_adc_interval and
+#   forces the PWM output off while the sampled value is above
+#   gate_adc_threshold. When the value falls below the threshold, the
+#   PWM output resumes its normal duty cycle.
+#gate_adc_threshold: 0.95
+#   ADC threshold expressed as a fraction of the ADC reference voltage
+#   (0.0 to 1.0). The default is 0.95 (95% of Vref).
+#gate_adc_interval: 0.001
+#   Time in seconds between gate ADC checks. The default is 0.001 (1ms).
 #min_extrude_temp: 170
 #   The minimum temperature (in Celsius) at which extruder move
 #   commands may be issued. The default is 170 Celsius.
