@@ -470,6 +470,9 @@ class MCU_pwm:
         self._last_clock = 0
         self._pwm_max = 0.
         self._set_cmd = None
+        self._gate_pin = None
+        self._gate_threshold = None
+        self._gate_check_time = None
 
     def get_mcu(self):
         return self._mcu
@@ -487,6 +490,14 @@ class MCU_pwm:
             shutdown_value = 1. - shutdown_value
         self._start_value = max(0., min(1., start_value))
         self._shutdown_value = max(0., min(1., shutdown_value))
+
+    def setup_gate(self, pin_params, threshold, check_time):
+        if pin_params['chip'] is not self._mcu:
+            raise pins.error("Gate ADC pin must be on the same MCU")
+        self._gate_pin = pin_params['pin']
+        self._gate_threshold = threshold
+        self._gate_check_time = check_time
+
     def _build_config(self):
         if self._max_duration and self._start_value != self._shutdown_value:
             raise pins.error("Pin with max duration must have start"
@@ -500,6 +511,8 @@ class MCU_pwm:
         if mdur_ticks >= 1<<31:
             raise pins.error("PWM pin max duration too large")
         if self._hardware_pwm:
+            if self._gate_pin is not None:
+                raise pins.error("Gate ADC is only supported on soft PWM pins")
             self._pwm_max = self._mcu.get_constant_float("PWM_MAX")
             self._mcu.request_move_queue_slot()
             self._oid = self._mcu.create_oid()
@@ -531,6 +544,18 @@ class MCU_pwm:
         self._mcu.add_config_cmd(
             "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
             % (self._oid, cycle_ticks))
+        if self._gate_pin is not None:
+            gate_ticks = self._mcu.seconds_to_clock(self._gate_check_time)
+            if gate_ticks <= 0 or gate_ticks >= 1<<31:
+                raise pins.error("Gate ADC check time out of range")
+            mcu_adc_max = self._mcu.get_constant_float("ADC_MAX")
+            gate_threshold = int(self._gate_threshold * mcu_adc_max + 0.5)
+            gate_threshold = max(0, min(0xffff, gate_threshold))
+            self._mcu.add_config_cmd(
+                "config_digital_out_gate oid=%d pin=%s threshold=%d"
+                " check_ticks=%d clock=%d"
+                % (self._oid, self._gate_pin, gate_threshold,
+                   gate_ticks, self._last_clock))
         self._pwm_max = float(cycle_ticks)
         svalue = int(self._start_value * cycle_ticks + 0.5)
         self._mcu.add_config_cmd(
