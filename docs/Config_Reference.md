@@ -1957,6 +1957,12 @@ z_offset:
 #   completes. See docs/Command_Templates.md for G-Code format. Do not
 #   issue any commands here that move the toolhead. The default is to
 #   not run any special G-Code commands on deactivation.
+#on_calibrate_gcode:
+#   Optional list of G-Code commands to execute after a successful
+#   PROBE_CALIBRATE ACCEPT. This runs after the probe z_offset update
+#   is staged in the config, so it can be used to issue SAVE_CONFIG
+#   NO_RESTART or other follow-up commands. The default is to run no
+#   additional commands.
 ```
 
 ### [bltouch]
