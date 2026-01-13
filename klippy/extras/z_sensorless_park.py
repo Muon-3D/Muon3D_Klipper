@@ -51,6 +51,8 @@ class ZSensorlessPark:
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command('Z_PARK_SENSORLESS', self.cmd_Z_PARK_SENSORLESS,
                                desc=self.cmd_Z_PARK_SENSORLESS_help)
+        self.gcode.register_command('Z_PROTECTED_MOVE', self.cmd_Z_PROTECTED_MOVE,
+                               desc=self.cmd_Z_PROTECTED_MOVE_help)
 
     def _find_tmc_module(self):
         cand = TRINAMIC_DRIVERS
@@ -79,6 +81,16 @@ class ZSensorlessPark:
         "RETRACT_SPEED=<mm/s> "
         "ON_SUCCESS=<gcode|macro> "
         "ON_FAIL=<gcode|macro>"
+    )
+
+    cmd_Z_PROTECTED_MOVE_help = (
+        "Protected Z move using TMC virtual endstop (stall). "
+        "Stops when stall occurs or DIST is reached. Does not set Z homed.\n"
+        "Params: DIR=MAX|MIN "
+        "DIST=<mm> "
+        "SPEED=<mm/s> "
+        "BACKOFF=<mm> "
+        "BACKOFF_SPEED=<mm/s>"
     )
 
     def cmd_Z_PARK_SENSORLESS(self, gcmd):
@@ -169,6 +181,63 @@ class ZSensorlessPark:
     
         finally:
             # Restore 'unhomed' limits if it wasn't homed before
+            if not was_homed:
+                try:
+                    kin.clear_homing_state("z")
+                except Exception:
+                    pass
+
+    def cmd_Z_PROTECTED_MOVE(self, gcmd):
+        direction = gcmd.get('DIR', self.dir_default).lower()
+        if direction not in ('max', 'min'):
+            raise gcmd.error("DIR must be MAX or MIN")
+        to_max = (direction == 'max')
+        sign = 1.0 if to_max else -1.0
+
+        dist = gcmd.get_float('DIST', None, above=0.)
+        if dist is None:
+            raise gcmd.error("DIST is required")
+        speed = gcmd.get_float('SPEED', self.speed_default, above=0.)
+        backoff = gcmd.get_float('BACKOFF', 0.0, minval=0.)
+        backoff_speed = gcmd.get_float('BACKOFF_SPEED', speed, above=0.)
+
+        toolhead = self.printer.lookup_object('toolhead')
+        phoming = self.printer.lookup_object('homing')
+        kin = toolhead.get_kinematics()
+
+        # Ensure Z steppers are associated with this endstop
+        self._attach_z_steppers(kin)
+
+        # Record whether Z was homed
+        ks = kin.get_status(self.printer.get_reactor().monotonic())
+        was_homed = 'z' in ks.get('homed_axes', '')
+
+        cur = toolhead.get_position()
+        target_z = cur[2] + sign * dist
+        toolhead.set_position([cur[0], cur[1], cur[2], cur[3]], homing_axes="z")
+
+        try:
+            endpos = [cur[0], cur[1], target_z, cur[3]]
+            endstops = [(self.mcu_endstop, "z_protected")]
+            phoming.manual_home(toolhead, endstops, endpos,
+                                speed, triggered=True, check_triggered=False)
+
+            pos_after = toolhead.get_position()
+            stalled = abs(pos_after[2] - target_z) > 0.001
+            if stalled and backoff > 0.0:
+                final_z = pos_after[2] - sign * backoff
+                toolhead.manual_move([None, None, final_z], backoff_speed)
+
+            if stalled:
+                gcmd.respond_info(
+                    "Z_PROTECTED_MOVE: stalled toward %s at Z=%.3f"
+                    % (direction.upper(), pos_after[2]))
+            else:
+                gcmd.respond_info(
+                    "Z_PROTECTED_MOVE: reached target Z=%.3f"
+                    % (pos_after[2],))
+
+        finally:
             if not was_homed:
                 try:
                     kin.clear_homing_state("z")
