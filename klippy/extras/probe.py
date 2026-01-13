@@ -41,6 +41,9 @@ class ProbeCommandHelper:
         self.probe = probe
         self.query_endstop = query_endstop
         self.name = config.get_name()
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.on_calibrate_gcode = gcode_macro.load_template(
+            config, 'on_calibrate_gcode', '')
         gcode = self.printer.lookup_object('gcode')
         # QUERY_PROBE command
         self.last_state = False
@@ -91,6 +94,9 @@ class ProbeCommandHelper:
             "with the above and restart the printer." % (self.name, z_offset))
         configfile = self.printer.lookup_object('configfile')
         configfile.set(self.name, 'z_offset', "%.3f" % (z_offset,))
+        script = self.on_calibrate_gcode.render()
+        if script.strip():
+            gcode.run_script(script)
     cmd_PROBE_CALIBRATE_help = "Calibrate the probe's z_offset"
     def cmd_PROBE_CALIBRATE(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)
