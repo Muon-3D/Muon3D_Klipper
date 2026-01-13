@@ -46,18 +46,15 @@ class BedRemovalDetector:
     def handle_bed_removal(self, eventtime):
         self.bed_removed = True
         self.bed_heater.set_temp(0.0)
-        self.gcode.respond_info('Bed Removed')
-
-        idle_timeout = self.printer.lookup_object('idle_timeout')
-        is_printing = idle_timeout.get_status(eventtime).get('state') == 'Printing'
-        if is_printing:
-            self.gcode.run_script('PAUSE')
+        # self.gcode.respond_info('Bed Removed')
+        self.gcode.run_script('BED_REMOVED')
         self.log.info('Bed removal detected, printer paused')
 
     def handle_bed_reconnection(self):
         self.bed_removed = False
-        self.gcode.respond_info('Bed Reattached')
-        self.log.info('Bed reattached, monitoring resumed')
+        #self.gcode.respond_info('Bed Reattached')
+        self.gcode.run_script('BED_ATTACHED')
+        self.log.info('Bed attached, monitoring resumed')
 
     def get_status(self, eventtime):
         return {'bedRemoved': self.bed_removed}
