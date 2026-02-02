@@ -18,6 +18,7 @@ struct ads1220_adc {
     struct timer timer;
     uint32_t rest_ticks;
     struct gpio_in data_ready;
+    uint8_t have_drdy;
     struct spidev_s *spi;
     uint8_t pending_flag, data_count;
     struct sensor_bulk sb;
@@ -29,6 +30,7 @@ enum {
 };
 
 #define BYTES_PER_SAMPLE 4
+#define ADS1220_CMD_RDATA 0x10
 
 static struct task_wake wake_ads1220;
 
@@ -51,10 +53,18 @@ ads1220_event(struct timer *timer)
     if (ads1220->pending_flag) {
         ads1220->sb.possible_overflows++;
         rest_ticks *= 4;
-    } else if (ads1220_is_data_ready(ads1220)) {
-        ads1220->pending_flag = 1;
-        sched_wake_task(&wake_ads1220);
-        rest_ticks *= 8;
+    } else {
+        // Two modes:
+        //  - With DRDY pin: only read when DRDY asserts
+        //  - No DRDY pin: read on a fixed schedule
+        if (!ads1220->have_drdy || ads1220_is_data_ready(ads1220)) {
+            ads1220->pending_flag = 1;
+            sched_wake_task(&wake_ads1220);
+            if (ads1220->have_drdy) {
+                // original behaviour: back off polling once we see DRDY
+                rest_ticks *= 8;
+            }
+        }
     }
     ads1220->timer.waketime += rest_ticks;
     return SF_RESCHEDULE;
@@ -80,15 +90,18 @@ add_sample(struct ads1220_adc *ads1220, uint8_t oid, uint_fast32_t counts)
 void
 ads1220_read_adc(struct ads1220_adc *ads1220, uint8_t oid)
 {
-    uint8_t msg[3] = {0, 0, 0};
+    // Option B uses explicit RDATA reads so we don't need DRDY.
+    // Send RDATA then clock out 3 data bytes.
+    uint8_t msg[4] = { ADS1220_CMD_RDATA, 0, 0, 0 };
     spidev_transfer(ads1220->spi, 1, sizeof(msg), msg);
     ads1220->pending_flag = 0;
     barrier();
 
     // create 24 bit int from bytes
-    uint32_t counts = ((uint32_t)msg[0] << 16)
-                    | ((uint32_t)msg[1] << 8)
-                    | ((uint32_t)msg[2]);
+    // Note: msg[0] is the byte received during command phase; ignore it.
+    uint32_t counts = ((uint32_t)msg[1] << 16)
+                    | ((uint32_t)msg[2] << 8)
+                    | ((uint32_t)msg[3]);
 
     // extend 2's complement 24 bits to 32bits
     if (counts & 0x800000)
@@ -107,9 +120,24 @@ command_config_ads1220(uint32_t *args)
     ads1220->pending_flag = 0;
     ads1220->spi = spidev_oid_lookup(args[1]);
     ads1220->data_ready = gpio_in_setup(args[2], 0);
+    ads1220->have_drdy = 1;
 }
 DECL_COMMAND(command_config_ads1220, "config_ads1220 oid=%c"
     " spi_oid=%c data_ready_pin=%u");
+
+// Create an ads1220 sensor (NO DRDY pin - Option B)
+void
+command_config_ads1220_nodrdy(uint32_t *args)
+{
+    struct ads1220_adc *ads1220 = oid_alloc(args[0]
+                , command_config_ads1220_nodrdy, sizeof(*ads1220));
+    ads1220->timer.func = ads1220_event;
+    ads1220->pending_flag = 0;
+    ads1220->spi = spidev_oid_lookup(args[1]);
+    ads1220->have_drdy = 0;
+}
+DECL_COMMAND(command_config_ads1220_nodrdy, "config_ads1220_nodrdy oid=%c"
+    " spi_oid=%c");
 
 // start/stop capturing ADC data
 void
@@ -140,7 +168,9 @@ command_query_ads1220_status(const uint32_t *args)
     struct ads1220_adc *ads1220 = oid_lookup(oid, command_config_ads1220);
     irq_disable();
     const uint32_t start_t = timer_read_time();
-    uint8_t is_data_ready = ads1220_is_data_ready(ads1220);
+    uint8_t is_data_ready = ads1220->have_drdy
+        ? ads1220_is_data_ready(ads1220)
+        : ads1220->pending_flag;
     irq_enable();
     uint8_t pending_bytes = is_data_ready ? BYTES_PER_SAMPLE : 0;
     sensor_bulk_status(&ads1220->sb, oid, start_t, 0, pending_bytes);
