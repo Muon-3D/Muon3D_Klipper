@@ -613,12 +613,16 @@ class MCURestartHelper:
         self._reactor = printer.get_reactor()
         self._name = mcu.get_name()
         # Restart tracking
-        restart_methods = [None, 'arduino', 'cheetah', 'command', 'rpi_usb']
+        restart_methods = [None, 'arduino', 'cheetah', 'command',
+                           'rpi_usb', 'swdio']
         self._restart_method = 'command'
         serialport, baud = conn_helper.get_serialport()
         if baud:
             self._restart_method = config.getchoice('restart_method',
                                                     restart_methods, None)
+        self._openocd_config = None
+        if self._restart_method == 'swdio':
+            self._openocd_config = config.get('openocd_config')
         self._reset_cmd = self._config_reset_cmd = None
         self._is_mcu_bridge = False
         # Register handlers
@@ -653,6 +657,11 @@ class MCURestartHelper:
         # Cheetah boards require RTS to be deasserted
         # else a reset will trigger the built-in bootloader.
         return (self._restart_method != "cheetah")
+    def prepare_connect(self):
+        if self._restart_method != 'swdio':
+            return
+        logging.info("%sPriming MCU via swdio/openocd", self._name)
+        self._restart_via_swdio()
     def _mcu_identify(self):
         self._reset_cmd = self._mcu.try_lookup_command("reset")
         self._config_reset_cmd = self._mcu.try_lookup_command("config_reset")
@@ -701,6 +710,16 @@ class MCURestartHelper:
         chelper.run_hub_ctrl(0)
         self._reactor.pause(self._reactor.monotonic() + 2.)
         chelper.run_hub_ctrl(1)
+    def _restart_via_swdio(self):
+        logging.info("Attempting MCU '%s' reset via swdio/openocd (%s)",
+                     self._name, self._openocd_config)
+        cmd = ["openocd", "-f", self._openocd_config,
+               "-c", "init; reset run; exit"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if result.stdout:
+            logging.info("openocd stdout: %s", result.stdout.strip())
+        if result.stderr:
+            logging.info("openocd stderr: %s", result.stderr.strip())
     def _firmware_restart(self, force=False):
         if self._is_mcu_bridge and not force:
             return
@@ -712,6 +731,8 @@ class MCURestartHelper:
             self._restart_via_command()
         elif self._restart_method == 'cheetah':
             self._restart_cheetah()
+        elif self._restart_method == 'swdio':
+            self._restart_via_swdio()
         else:
             self._restart_arduino()
     def _firmware_restart_bridge(self):
@@ -744,16 +765,6 @@ class MCUConnectHelper:
             if not (self._serialport.startswith("/dev/rpmsg_")
                     or self._serialport.startswith("/tmp/klipper_host_")):
                 self._baud = config.getint('baud', 250000, minval=2400)
-        # Restarts
-        restart_methods = [None, 'arduino', 'cheetah', 'command', 'rpi_usb', 'swdio']
-        self._restart_method = 'command'
-        if self._baud:
-            self._restart_method = config.getchoice('restart_method',
-                                                    restart_methods, None)
-        if self._restart_method == 'swdio':
-            self.openocd_config = config.get('openocd_config')
-        self._reset_cmd = self._config_reset_cmd = None
-        self._is_mcu_bridge = False
         # Non-critical MCU support
         self.is_non_critical = config.getboolean("is_non_critical", False)
         if self.is_non_critical and self._name == "mcu":
@@ -947,7 +958,9 @@ class MCUConnectHelper:
                                             self._canbus_iface)
             elif self._baud:
                 rts = self._restart_helper.lookup_attach_uart_rts()
-                self._serial.connect_uart(self._serialport, self._baud, rts)
+                self._serial.connect_uart(
+                    self._serialport, self._baud, rts,
+                    connect_prepare_cb=self._restart_helper.prepare_connect)
             else:
                 self._serial.connect_pipe(self._serialport)
             self._clocksync.connect(self._serial)
@@ -1333,110 +1346,6 @@ class MCU:
         return self._clocksync.estimated_print_time(eventtime)
     def clock32_to_clock64(self, clock32):
         return self._clocksync.clock32_to_clock64(clock32)
-    # Restarts
-    def _disconnect(self):
-        self._serial.disconnect()
-        self._steppersync = None
-    def _shutdown(self, force=False):
-        if (self._emergency_stop_cmd is None
-            or (self._is_shutdown and not force)
-            or self.non_critical_disconnected):
-            return
-        self._emergency_stop_cmd.send()
-    def _restart_arduino(self):
-        logging.info("Attempting MCU '%s' reset", self._name)
-        self._disconnect()
-        serialhdl.arduino_reset(self._serialport, self._reactor)
-    def _restart_cheetah(self):
-        logging.info("Attempting MCU '%s' Cheetah-style reset", self._name)
-        self._disconnect()
-        serialhdl.cheetah_reset(self._serialport, self._reactor)
-    def _restart_via_command(self):
-        if ((self._reset_cmd is None and self._config_reset_cmd is None)
-            or not self._clocksync.is_active()):
-            logging.info("Unable to issue reset command on MCU '%s'",
-                         self._name)
-            return
-        if self._reset_cmd is None:
-            # Attempt reset via config_reset command
-            logging.info("Attempting MCU '%s' config_reset command", self._name)
-            self._is_shutdown = True
-            self._shutdown(force=True)
-            self._reactor.pause(self._reactor.monotonic() + 0.015)
-            self._config_reset_cmd.send()
-        else:
-            # Attempt reset via reset command
-            logging.info("Attempting MCU '%s' reset command", self._name)
-            self._reset_cmd.send()
-        self._reactor.pause(self._reactor.monotonic() + 0.015)
-        self._disconnect()
-    def _restart_rpi_usb(self):
-        logging.info("Attempting MCU '%s' reset via rpi usb power", self._name)
-        self._disconnect()
-        chelper.run_hub_ctrl(0)
-        self._reactor.pause(self._reactor.monotonic() + 2.)
-        chelper.run_hub_ctrl(1)
-    def _restart_via_swdio(self):
-        logging.info(f"Attempting MCU '{self._name}' reset via swdio/openocd from config file: {self.openocd_config}")
-        cmd = [
-            "openocd",
-            "-f", self.openocd_config,
-            "-c", "init; reset run; exit"
-        ] #todo handle a bad openocd config file
-
-        # Run the command, capture stdout/stderr, and decode to text
-        result = subprocess.run(
-            cmd,
-            capture_output=True,   # captures both stdout and stderr
-            text=True,             # returns strings instead of bytes
-            check=True             # raises CalledProcessError on non-zero exit
-        )
-        # Print the outputs
-        logging.info(f"STDOUT: {result.stdout}")
-        logging.info(f"STDERR: {result.stderr}")
-
-    def _firmware_restart(self, force=False):
-        if self._is_mcu_bridge and not force:
-            return
-        if self.non_critical_disconnected:
-            return
-        if self._restart_method == 'rpi_usb':
-            self._restart_rpi_usb()
-        elif self._restart_method == 'command':
-            self._restart_via_command()
-        elif self._restart_method == 'cheetah':
-            self._restart_cheetah()
-        elif self._restart_method == 'swdio':
-            self._restart_via_swdio()
-        else:
-            self._restart_arduino()
-    def _firmware_restart_bridge(self):
-        self._firmware_restart(True)
-    # Move queue tracking
-    def register_stepqueue(self, stepqueue):
-        self._stepqueues.append(stepqueue)
-    def request_move_queue_slot(self):
-        self._reserved_move_slots += 1
-    def register_flush_callback(self, callback):
-        self._flush_callbacks.append(callback)
-    def flush_moves(self, print_time, clear_history_time):
-        if self._steppersync is None:
-            return
-        clock = self.print_time_to_clock(print_time)
-        if clock < 0:
-            return
-        for cb in self._flush_callbacks:
-            cb(print_time, clock)
-        clear_history_clock = \
-            max(0, self.print_time_to_clock(clear_history_time))
-        ret = self._ffi_lib.steppersync_flush(self._steppersync, clock,
-                                              clear_history_clock)
-        if ret:
-            raise error("Internal error in MCU '%s' stepcompress"
-                        % (self._name,))
-    def check_active(self, print_time, eventtime):
-        if self._steppersync is None:
-            return
     def calibrate_clock(self, print_time, eventtime):
         offset, freq = self._clocksync.calibrate_clock(print_time, eventtime)
         self._conn_helper.check_timeout(eventtime)

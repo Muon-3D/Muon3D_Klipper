@@ -104,7 +104,7 @@ class HeaterCheck:
         logging.error(msg)
         self.printer.invoke_shutdown(msg + HINT_THERMAL)
         return self.printer.get_reactor().NEVER
-    
+
 
     ### Non Crit MCU Buisness
     def _suspend_checks(self):

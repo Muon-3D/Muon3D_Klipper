@@ -231,7 +231,7 @@ class ADXL345:
             raise self.printer.command_error(
                 f"ADXL: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
-        
+
     def read_reg(self, reg):
         params = self.spi.spi_transfer([reg | REG_MOD_READ, 0x00])
         response = bytearray(params['response'])

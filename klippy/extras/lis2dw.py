@@ -106,7 +106,7 @@ class LIS2DW:
             raise self.printer.command_error(
                 f"LIS2DW: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
-        
+
     def read_reg(self, reg):
         if self.bus_type == SPI_SERIAL_TYPE:
             params = self.bus.spi_transfer([reg | REG_MOD_READ, 0x00])

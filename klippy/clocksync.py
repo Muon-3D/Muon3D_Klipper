@@ -36,9 +36,14 @@ class ClockSync:
         self.prediction_variance = 0.
         self.last_prediction_time = 0.
 
-    # XXX - test to see if this is used or not
-    # def disconnect(self):
-    #     self.reactor.update_timer(self.get_clock_timer, self.reactor.NEVER)
+    def disconnect(self):
+        self.reactor.update_timer(self.get_clock_timer, self.reactor.NEVER)
+        self.queries_pending = 0
+        if self.serial is not None:
+            try:
+                self.serial.register_response(None, 'clock')
+            except Exception:
+                pass
 
     def connect(self, serial):
         self.serial = serial

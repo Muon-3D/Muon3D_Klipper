@@ -183,7 +183,8 @@ class SerialReader:
             ret = self._start_session(serial_dev)
             if ret:
                 break
-    def connect_uart(self, serialport, baud, rts=True):
+    def connect_uart(self, serialport, baud, rts=True,
+                     connect_prepare_cb=None):
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
@@ -191,16 +192,12 @@ class SerialReader:
             # if we're already connected, don't reconnect
             if self.serialqueue is not None:
                 break
-            ### HACK for RP2040
-            ### On first boot, sometimes the rp2040 wont respond to serial
-            ### SWDIO reset seems to work well to improove reliably
-            ### So perform reset everytime before trying to connect over serial
-            if self.mcu is not None and self.mcu._restart_method == 'swdio':
-                logging.info("First prime rp2040 with swdioreset")
+            if connect_prepare_cb is not None:
                 try:
-                    self.mcu._restart_via_swdio()
+                    connect_prepare_cb()
                 except Exception as e:
-                    logging.info("%sSWD reset failed/ignored: %s", self.warn_prefix, e)
+                    logging.info("%sConnection prep failed/ignored: %s",
+                                 self.warn_prefix, e)
             if self.reactor.monotonic() > start_time + 90.0:
                 self._error("Unable to connect")
             try:
