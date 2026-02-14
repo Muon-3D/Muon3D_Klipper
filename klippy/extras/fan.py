@@ -47,6 +47,7 @@ class Fan:
     def get_mcu(self):
         return self.mcu_fan.get_mcu()
     def _apply_speed(self, print_time, value):
+        value = float(value)
         if value < self.off_below:
             value = 0.
         value = max(0., min(self.max_power, value * self.max_power))
@@ -76,7 +77,7 @@ class Fan:
     def get_status(self, eventtime):
         tachometer_status = self.tachometer.get_status(eventtime)
         return {
-            'speed': self.last_req_value,
+            'speed': float(self.last_req_value),
             'rpm': tachometer_status['rpm'],
         }
 

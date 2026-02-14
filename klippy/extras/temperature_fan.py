@@ -48,6 +48,7 @@ class TemperatureFan:
             desc=self.cmd_SET_TEMPERATURE_FAN_TARGET_help)
 
     def set_tf_speed(self, read_time, value):
+        value = float(value)
         if value <= 0.:
             value = 0.
         elif value < self.min_speed:
@@ -74,7 +75,7 @@ class TemperatureFan:
     def get_status(self, eventtime):
         status = self.fan.get_status(eventtime)
         status["temperature"] = round(self.last_temp, 2)
-        status["target"] = self.target_temp
+        status["target"] = float(self.target_temp)
         return status
     cmd_SET_TEMPERATURE_FAN_TARGET_help = \
         "Sets a temperature fan target and fan speed limits"
@@ -253,21 +254,21 @@ class ControlCurve:
 
     def temperature_callback(self, read_time, temp):
         current_speed = self.temperature_fan.last_speed_value
-        upper_temp = np.interp(
+        upper_temp = float(np.interp(
             current_speed, self.curve_heating[1], self.curve_heating[0]
-        )
-        lower_temp = np.interp(
+        ))
+        lower_temp = float(np.interp(
             current_speed, self.curve_cooling[1], self.curve_cooling[0]
-        )
+        ))
 
         if temp < lower_temp:
-            next_speed = np.interp(
+            next_speed = float(np.interp(
                 temp, self.curve_cooling[0], self.curve_cooling[1]
-            )
+            ))
         elif temp > upper_temp:
-            next_speed = np.interp(
+            next_speed = float(np.interp(
                 temp, self.curve_heating[0], self.curve_heating[1]
-            )
+            ))
         else:
             next_speed = current_speed
 
