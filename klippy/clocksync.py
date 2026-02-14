@@ -47,6 +47,16 @@ class ClockSync:
 
     def connect(self, serial):
         self.serial = serial
+        self.queries_pending = 0
+        # Reinitialize estimator state - connect() may be invoked after
+        # a non-critical MCU hot-reconnect on the same ClockSync instance.
+        self.min_half_rtt = 999999999.9
+        self.min_rtt_time = 0.
+        self.time_avg = self.time_variance = 0.
+        self.clock_avg = self.clock_covariance = 0.
+        self.prediction_variance = 0.
+        self.last_prediction_time = 0.
+        self.last_clock = 0
 
         # Learn whether this MCU is marked non-critical (from SerialReader back-ref)
         self.mcu = getattr(serial, "mcu", None)
@@ -72,6 +82,9 @@ class ClockSync:
         self.reactor.update_timer(self.get_clock_timer, self.reactor.NOW)
     def connect_file(self, serial, pace=False):
         self.serial = serial
+        self.queries_pending = 0
+        self.last_prediction_time = 0.
+        self.last_clock = 0
         self.mcu_freq = serial.msgparser.get_constant_float('CLOCK_FREQ')
         self.clock_est = (0., 0., self.mcu_freq)
         freq = 1000000000000.

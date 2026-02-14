@@ -417,6 +417,8 @@ class MCU_digital_out:
         self._start_value = (not not start_value) ^ self._invert
         self._shutdown_value = (not not shutdown_value) ^ self._invert
     def _build_config(self):
+        # Reconnect-safe: any MCU reboot invalidates prior scheduled clocks.
+        self._last_clock = 0
         if self._max_duration and self._start_value != self._shutdown_value:
             raise pins.error("Pin with max duration must have start"
                              " value equal to shutdown value")
@@ -471,6 +473,8 @@ class MCU_pwm:
         self._shutdown_value = max(0., min(1., shutdown_value))
         self._last_value = self._start_value
     def _build_config(self):
+        # Reconnect-safe: any MCU reboot invalidates prior scheduled clocks.
+        self._last_clock = 0
         if self._max_duration and self._start_value != self._shutdown_value:
             raise pins.error("Pin with max duration must have start"
                              " value equal to shutdown value")

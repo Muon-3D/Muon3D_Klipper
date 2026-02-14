@@ -505,11 +505,19 @@ class TMCCommandHelper:
             self.mcu_tmc.set_register(reg_name, val, print_time)
         self.echeck_helper.stop_checks()
     def _handle_stepper_enable(self, print_time, is_enable):
+        if self._is_noncritical_mcu():
+            logging.info("TMC '%s' stepper event: %s at %.6f",
+                         self.stepper_name,
+                         "enable" if is_enable else "disable",
+                         print_time)
         def enable_disable_cb(eventtime):
             try:
                 with self.enable_mutex:
                     if is_enable:
                         self._do_enable(print_time)
+                        if self._is_noncritical_mcu():
+                            logging.info("TMC '%s' enable sequence complete",
+                                         self.stepper_name)
                     else:
                         self._do_disable(print_time)
             except self.printer.command_error as e:
