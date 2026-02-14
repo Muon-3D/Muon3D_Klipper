@@ -317,6 +317,8 @@ class SerialReader:
                                 self.ffi_lib.serialqueue_free_commandqueue)
     # Dumping debug lists
     def dump_debug(self):
+        if self.serialqueue is None:
+            return "Serial debug unavailable: queue disconnected"
         out = []
         out.append("Dumping serial stats: %s" % (
             self.stats(self.reactor.monotonic()),))
@@ -374,6 +376,12 @@ class SerialRetryCommand:
             if getattr(self.serial, "mcu", None) and \
                getattr(self.serial.mcu, "is_non_critical", False) and \
                getattr(self.serial.mcu, "non_critical_disconnected", False) and \
+               not getattr(self.serial.mcu, "_connecting", False):
+                self.serial.register_response(None, self.name, self.oid)
+                raise error("non-critical MCU offline")
+            if getattr(self.serial, "mcu", None) and \
+               getattr(self.serial.mcu, "is_non_critical", False) and \
+               self.serial.serialqueue is None and \
                not getattr(self.serial.mcu, "_connecting", False):
                 self.serial.register_response(None, self.name, self.oid)
                 raise error("non-critical MCU offline")

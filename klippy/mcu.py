@@ -105,6 +105,14 @@ class CommandQueryWrapper:
             return xh.get_response(cmds, self._cmd_queue, minclock, reqclock,
                                    retry)
         except serialhdl.error as e:
+            if (mcu is not None and getattr(mcu, "is_non_critical", False)
+                    and not getattr(mcu, "_connecting", False)):
+                conn_helper = getattr(mcu, "_conn_helper", None)
+                if conn_helper is not None:
+                    try:
+                        conn_helper.handle_non_critical_disconnect()
+                    except Exception:
+                        pass
             raise self._error(str(e))
     def send(self, data=(), minclock=0, reqclock=0, retry=True):
         return self._do_send([self._cmd.encode(data)], minclock, reqclock,
@@ -991,9 +999,13 @@ class MCUConnectHelper:
     def _analyze_shutdown(self, msg, details):
         if self._mcu.is_fileoutput():
             return
+        try:
+            serial_debug = self._serial.dump_debug()
+        except Exception as e:
+            serial_debug = "Serial debug unavailable: %s" % (e,)
         logging.info("MCU '%s' shutdown: %s\n%s\n%s", self._name,
                      self._shutdown_msg, self._clocksync.dump_debug(),
-                     self._serial.dump_debug())
+                     serial_debug)
     def _shutdown(self, force=False):
         if (self._emergency_stop_cmd is None
             or (self._is_shutdown and not force)
