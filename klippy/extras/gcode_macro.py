@@ -134,6 +134,7 @@ class GCodeMacro:
         self.gcode = printer.lookup_object('gcode')
         self.rename_existing = config.get("rename_existing", None)
         self.cmd_desc = config.get("description", "G-Code macro")
+        self.recursion_limit = config.getint("recursion_limit", 1, minval=1)
         if self.rename_existing is not None:
             if (self.gcode.is_traditional_gcode(self.alias)
                 != self.gcode.is_traditional_gcode(self.rename_existing)):
@@ -148,7 +149,7 @@ class GCodeMacro:
         self.gcode.register_mux_command("SET_GCODE_VARIABLE", "MACRO",
                                         name, self.cmd_SET_GCODE_VARIABLE,
                                         desc=self.cmd_SET_GCODE_VARIABLE_help)
-        self.in_script = False
+        self.script_depth = 0
         self.variables = {}
         prefix = 'variable_'
         for option in config.get_prefix_options(prefix):
@@ -187,17 +188,19 @@ class GCodeMacro:
         v[variable] = literal
         self.variables = v
     def cmd(self, gcmd):
-        if self.in_script:
-            raise gcmd.error("Macro %s called recursively" % (self.alias,))
+        if self.recursion_limit and self.script_depth >= self.recursion_limit:
+            raise gcmd.error(
+                "Macro %s recursion limit (%d) reached"
+                % (self.alias, self.recursion_limit))
         kwparams = dict(self.variables)
         kwparams.update(self.template.create_template_context())
         kwparams['params'] = gcmd.get_command_parameters()
         kwparams['rawparams'] = gcmd.get_raw_command_parameters()
-        self.in_script = True
+        self.script_depth += 1
         try:
             self.template.run_gcode_from_command(kwparams)
         finally:
-            self.in_script = False
+            self.script_depth -= 1
 
 def load_config_prefix(config):
     return GCodeMacro(config)

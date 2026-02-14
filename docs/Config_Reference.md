@@ -1581,6 +1581,10 @@ G-Code macros (one may define any number of sections with a
 #description: G-Code macro
 #   This will add a short description used at the HELP command or while
 #   using the auto completion feature. Default "G-Code macro"
+#recursion_limit: 1
+#   Maximum active call depth for this macro. Set to 1 to disable
+#   recursive re-entry (default behavior). Set to a higher number to
+#   allow controlled recursion. Must be at least 1.
 ```
 
 ### [delayed_gcode]
