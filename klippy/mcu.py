@@ -923,7 +923,11 @@ class MCUConnectHelper:
                     self._name
                 )
                 return eventtime + self.reconnect_interval
-            self._mcu._config_helper._connect()
+            # Run identify-time helper setup that may have been skipped during
+            # initial startup deferral.
+            self._mcu._config_helper._mcu_identify()
+            self._mcu._stats_helper._mcu_identify()
+            self._mcu._config_helper._connect(allow_noncritical=True)
             self._mcu.non_critical_disconnected = False
         except Exception as e:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
@@ -1008,6 +1012,19 @@ class MCUConnectHelper:
         except serialhdl.error as e:
             raise error(str(e))
     def _mcu_identify(self):
+        # Never block initial startup on optional/non-critical MCUs.
+        # Defer attach/identify to the background reconnect timer.
+        if self.is_non_critical and not self._mcu._connecting:
+            self._mcu.non_critical_disconnected = True
+            if self.non_critical_recon_timer is not None:
+                self._reactor.update_timer(
+                    self.non_critical_recon_timer, self._reactor.NOW
+                )
+            logging.info(
+                "Non-critical MCU '%s' deferred at startup; reconnecting in background",
+                self._name
+            )
+            return
         if self.is_non_critical and not self._check_serial_exists():
             self._mcu.non_critical_disconnected = True
             if self.non_critical_recon_timer is not None:
@@ -1095,7 +1112,8 @@ class MCUStatsHelper:
         self._mcu_tick_stddev = c * math.sqrt(max(0., diff))
         self._mcu_tick_awake = tick_sum / self._mcu_freq
     def _mcu_identify(self):
-        if self._mcu.non_critical_disconnected:
+        if (self._mcu.non_critical_disconnected
+                and not self._mcu._connecting):
             self._get_status_info['non_critical_disconnected'] = True
             return
         self._mcu_freq = self._mcu.get_constant_float('CLOCK_FREQ')
@@ -1233,7 +1251,11 @@ class MCUConfigHelper:
                 raise error("Can not update MCU '%s' config as it is shutdown" % (
                     self._name,))
         return config_params
-    def _connect(self):
+    def _connect(self, allow_noncritical=False):
+        # Non-critical MCUs are configured via reconnect workflow only.
+        # Skip them during global klippy:connect to avoid startup races.
+        if self._mcu.is_non_critical and not allow_noncritical:
+            return
         if self._mcu.non_critical_disconnected and not self._mcu._connecting:
             return
         config_params = self._send_get_config()
@@ -1266,6 +1288,9 @@ class MCUConfigHelper:
         log_info = self._conn_helper.log_info() + "\n" + move_msg
         self._printer.set_rollover_info(self._name, log_info, log=False)
     def _mcu_identify(self):
+        if (self._mcu.non_critical_disconnected
+                and not self._mcu._connecting):
+            return
         self._mcu_freq = self._mcu.get_constant_float('CLOCK_FREQ')
         ppins = self._printer.lookup_object('pins')
         pin_resolver = ppins.get_pin_resolver(self._name)

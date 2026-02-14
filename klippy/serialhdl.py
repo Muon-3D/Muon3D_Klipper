@@ -75,8 +75,12 @@ class SerialReader:
             try:
                 params = self.send_with_response(msg, 'identify_response')
             except error as e:
-                logging.exception("%sWait for identify_response",
-                                  self.warn_prefix)
+                if str(e) == "non-critical MCU offline":
+                    logging.info("%sWait for identify_response: %s",
+                                 self.warn_prefix, str(e))
+                else:
+                    logging.exception("%sWait for identify_response",
+                                      self.warn_prefix)
                 return None
             if params['offset'] == len(identify_data):
                 msgdata = params['data']
