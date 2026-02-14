@@ -911,7 +911,13 @@ class MCUConnectHelper:
         try:
             self._mcu._config_helper.reset_to_initial_state()
             self._mcu_identify()
-            if self._mcu.non_critical_disconnected:
+            # Keep waiting only if identify did not establish a serial queue yet.
+            # The disconnected flag is expected to be True until reconnect finalizes.
+            if self._serial.get_serialqueue() is None:
+                logging.info(
+                    "Non-critical MCU '%s' reconnect waiting for serial queue",
+                    self._name
+                )
                 return eventtime + self.reconnect_interval
             self._mcu._config_helper._connect()
             self._mcu.non_critical_disconnected = False
@@ -922,14 +928,37 @@ class MCUConnectHelper:
             return eventtime + self.reconnect_interval
         finally:
             self._mcu._connecting = False
-        try:
-            self._printer.send_event(self._non_critical_reconnect_event_name)
-            logging.info("Non-critical MCU '%s' reconnected", self._name)
-            return self._reactor.NEVER
-        except Exception as e:
-            logging.debug("Non-critical MCU '%s' reconnect event failed: %s",
-                          self._name, str(e))
+        handlers = list(
+            self._printer.event_handlers.get(
+                self._non_critical_reconnect_event_name, []
+            )
+        )
+        if handlers:
+            logging.info(
+                "Non-critical MCU '%s' running %d reconnect callback(s)",
+                self._name, len(handlers)
+            )
+        callback_failures = 0
+        for cb in handlers:
+            cb_module = getattr(cb, "__module__", "<unknown>")
+            cb_name = getattr(cb, "__qualname__", repr(cb))
+            try:
+                cb()
+            except Exception:
+                callback_failures += 1
+                logging.exception(
+                    "Non-critical MCU '%s' reconnect callback failed: %s.%s",
+                    self._name, cb_module, cb_name
+                )
+        if callback_failures:
+            logging.error(
+                "Non-critical MCU '%s' reconnect callback failures: %d/%d"
+                " - will retry reconnect",
+                self._name, callback_failures, len(handlers)
+            )
             return eventtime + self.reconnect_interval
+        logging.info("Non-critical MCU '%s' reconnected", self._name)
+        return self._reactor.NEVER
     def log_info(self):
         msgparser = self._serial.get_msgparser()
         message_count = len(msgparser.get_messages())

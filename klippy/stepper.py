@@ -56,6 +56,13 @@ class MCU_stepper:
         self._trapq = ffi_main.NULL
         printer.register_event_handler('klippy:connect',
                                        self._query_mcu_position)
+        if getattr(self._mcu, "is_non_critical", False):
+            printer.register_event_handler(
+                self._mcu.get_non_critical_disconnect_event_name(),
+                self._handle_noncritical_disconnect)
+            printer.register_event_handler(
+                self._mcu.get_non_critical_reconnect_event_name(),
+                self._handle_noncritical_reconnect)
     def get_mcu(self):
         return self._mcu
     def get_name(self, short=False):
@@ -207,6 +214,23 @@ class MCU_stepper:
         data = (self._reset_cmd_tag, self._oid, 0)
         ffi_lib.syncemitter_queue_msg(self._syncemitter, 0, data, len(data))
         self._query_mcu_position()
+    def _handle_noncritical_disconnect(self):
+        # Drop stale per-stepper queue state when its MCU goes away.
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ret = ffi_lib.stepcompress_reset(self._stepqueue, 0)
+        if ret:
+            logging.info("Unable to reset step queue for '%s' on disconnect",
+                         self.get_name())
+    def _handle_noncritical_reconnect(self):
+        if self._mcu.non_critical_disconnected:
+            return
+        try:
+            self._query_mcu_position()
+            logging.info("Synced stepper '%s' after non-critical reconnect",
+                         self.get_name())
+        except Exception as e:
+            logging.info("Unable to sync '%s' after reconnect: %s",
+                         self.get_name(), str(e))
     def _query_mcu_position(self):
         if self._mcu.is_fileoutput() or self._mcu.non_critical_disconnected:
             return
