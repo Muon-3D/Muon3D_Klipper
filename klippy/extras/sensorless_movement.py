@@ -43,10 +43,11 @@ class AxisSensorlessPark:
         self.axis_errors = {}   # axis -> user-visible error string
         self.endstop_cache = {} # virtual_endstop pin -> mcu_endstop
 
-        # Build axis contexts at config time.
-        for axis in AXES:
-            self._build_axis_context(
-                config, axis, require=(axis == self.axis_default))
+        # Build only the default axis context at config time.
+        # Other axes are initialized lazily on first command use to avoid
+        # pin registration conflicts with already-configured homing endstops.
+        self._config = config
+        self._build_axis_context(config, self.axis_default, require=True)
 
         # Generic commands
         self.gcode.register_command(
@@ -128,6 +129,10 @@ class AxisSensorlessPark:
 
     def _require_axis_context(self, axis, gcmd):
         ctx = self.axis_ctx.get(axis)
+        if ctx is None:
+            # Lazy-init non-default axes when explicitly requested.
+            self._build_axis_context(self._config, axis, require=False)
+            ctx = self.axis_ctx.get(axis)
         if ctx is None:
             raise gcmd.error(self.axis_errors.get(
                 axis, "Sensorless axis '%s' is not configured"
