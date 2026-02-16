@@ -357,16 +357,34 @@ class MpcCalibrate:
         ambient_measure_sample_time = gcmd.get_float(
             "AMBIENT_MEASURE_SAMPLE_TIME", 5.0, below=ambient_max_measure_time
         )
+        ambient_settle_rate = gcmd.get_float(
+            "AMBIENT_SETTLE_RATE", 0.01, above=0.0
+        )
         fan_breakpoints = gcmd.get_int("FAN_BREAKPOINTS", 3, minval=2)
         target_temp = gcmd.get_float("TARGET", 200.0, minval=90.0)
         threshold_temp = gcmd.get_float(
             "THRESHOLD", max(50.0, min(100, target_temp - 100.0))
         )
+        stable_cycles_base = gcmd.get_int("STABLE_CYCLES_BASE", 5, minval=1)
+        stable_cycles_fan = gcmd.get_int("STABLE_CYCLES_FAN", 3, minval=1)
+        stable_crossing_hysteresis = gcmd.get_float(
+            "STABLE_CROSSING_HYSTERESIS", 0.015, above=0.0
+        )
+        stable_target_band = gcmd.get_float(
+            "STABLE_TARGET_BAND", 0.1, above=0.0
+        )
+        stable_min_time = gcmd.get_float("STABLE_MIN_TIME", 30.0, minval=0.0)
+        stable_hold_time = gcmd.get_float("STABLE_HOLD_TIME", 30.0, minval=0.0)
+        stable_poll_interval = gcmd.get_float(
+            "STABLE_POLL_INTERVAL", 0.2, above=0.0
+        )
 
         control = TuningControl(self.heater)
         old_control = self.heater.set_control(control)
         try:
-            ambient_temp = self.await_ambient(gcmd, control, threshold_temp)
+            ambient_temp = self.await_ambient(
+                gcmd, control, threshold_temp, ambient_settle_rate
+            )
             samples = self.heatup_test(gcmd, target_temp, control)
             first_res = self.process_first_pass(
                 samples,
@@ -397,6 +415,13 @@ class MpcCalibrate:
                 fan_breakpoints,
                 new_control,
                 first_res,
+                stable_cycles_base,
+                stable_cycles_fan,
+                stable_crossing_hysteresis,
+                stable_target_band,
+                stable_min_time,
+                stable_hold_time,
+                stable_poll_interval,
             )
             second_res = self.process_second_pass(
                 first_res,
@@ -456,7 +481,15 @@ class MpcCalibrate:
             self.heater.set_control(old_control)
             self.heater.alter_target(0.0)
 
-    def wait_stable(self, cycles=5):
+    def wait_stable(
+        self,
+        cycles=5,
+        crossing_hysteresis=0.015,
+        target_band=0.1,
+        min_time=30.0,
+        hold_time=30.0,
+        poll_interval=0.2,
+    ):
         """
         We wait for the extruder to cycle x amount of times above and below the target
         doing this should ensure the temperature is stable enough to give a good result
@@ -467,29 +500,30 @@ class MpcCalibrate:
         above_target = 0
         on_target = 0
         starttime = self.printer.reactor.monotonic()
+        hold_samples = max(1, int(math.ceil(hold_time / poll_interval)))
 
         def process(eventtime):
             nonlocal below_target, above_target, on_target
             temp, target = self.heater.get_temp(eventtime)
-            if below_target and temp > target + 0.015:
+            if below_target and temp > target + crossing_hysteresis:
                 above_target += 1
                 below_target = False
-            elif not below_target and temp < target - 0.015:
+            elif not below_target and temp < target - crossing_hysteresis:
                 below_target = True
             if (
                 above_target >= cycles
-                and (self.printer.reactor.monotonic() - starttime) > 30.0
+                and (self.printer.reactor.monotonic() - starttime) > min_time
             ):
                 return False
-            if above_target > 0 and abs(target - temp) < 0.1:
+            if above_target > 0 and abs(target - temp) < target_band:
                 on_target += 1
             else:
                 on_target = 0
-            if on_target >= 150:  # in case the heating is super consistent
+            if on_target >= hold_samples:  # in case the heating is super consistent
                 return False
             return True
 
-        self.printer.wait_while(process, True, 0.2)
+        self.printer.wait_while(process, True, poll_interval)
 
     def wait_settle(self, max_rate):
         last_temp = None
@@ -511,7 +545,7 @@ class MpcCalibrate:
         self.printer.wait_while(process)
         return samples[-1][1]
 
-    def await_ambient(self, gcmd, control, minimum_temp):
+    def await_ambient(self, gcmd, control, minimum_temp, settle_rate):
         self.heater.alter_target(1.0)  # Turn on fan to increase settling speed
         if self.orig_control.ambient_sensor is not None:
             # If we have an ambient sensor we won't waste time waiting for ambient.
@@ -536,7 +570,7 @@ class MpcCalibrate:
             )[0]
 
         gcmd.respond_info("Waiting for heater to settle at ambient temperature")
-        ambient_temp = self.wait_settle(0.01)
+        ambient_temp = self.wait_settle(settle_rate)
         self.heater.alter_target(0.0)
         return ambient_temp
 
@@ -568,6 +602,13 @@ class MpcCalibrate:
         fan_breakpoints,
         control,
         first_pass_results,
+        stable_cycles_base,
+        stable_cycles_fan,
+        stable_crossing_hysteresis,
+        stable_target_band,
+        stable_min_time,
+        stable_hold_time,
+        stable_poll_interval,
     ):
         target_temp = round(first_pass_results["post_block_temp"])
         self.heater.set_temp(target_temp)
@@ -576,7 +617,14 @@ class MpcCalibrate:
             % (target_temp,)
         )
 
-        self.wait_stable(5)
+        self.wait_stable(
+            stable_cycles_base,
+            stable_crossing_hysteresis,
+            stable_target_band,
+            stable_min_time,
+            stable_hold_time,
+            stable_poll_interval,
+        )
 
         fan = self.orig_control.cooling_fan
 
@@ -594,7 +642,14 @@ class MpcCalibrate:
                     print_time = fan.get_mcu().estimated_print_time(curtime)
                     fan.set_speed(speed, print_time + PIN_MIN_TIME)
                     gcmd.respond_info("Waiting for temperature to stabilize")
-                    self.wait_stable(3)
+                    self.wait_stable(
+                        stable_cycles_fan,
+                        stable_crossing_hysteresis,
+                        stable_target_band,
+                        stable_min_time,
+                        stable_hold_time,
+                        stable_poll_interval,
+                    )
                     gcmd.respond_info(
                         f"Temperature stable, measuring power usage with {speed*100.:.0f}% fan speed"
                     )
