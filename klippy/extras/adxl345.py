@@ -232,8 +232,10 @@ class ADXL345:
                 f"ADXL: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
 
-    def read_reg(self, reg):
-        params = self.spi.spi_transfer([reg | REG_MOD_READ, 0x00])
+    def read_reg(self, reg, minclock=0, reqclock=0):
+        params = self.spi.spi_transfer(
+            [reg | REG_MOD_READ, 0x00],
+            minclock=minclock, reqclock=reqclock)
         response = bytearray(params['response'])
         return response[1]
     def set_reg(self, reg, val, minclock=0):

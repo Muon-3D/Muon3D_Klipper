@@ -43,6 +43,8 @@ class ADXL345TapEndstop:
 
     def home_start(self, print_time, sample_time, sample_count, rest_time,
                    triggered=True):
+        print_time = self._owner._adjust_home_start_print_time(
+            self, print_time)
         return self._mcu_endstop.home_start(
             print_time, sample_time, sample_count, rest_time,
             triggered=triggered)
@@ -187,9 +189,13 @@ class ADXL345Probe:
         self.reactor = self.printer.get_reactor()
         self._tap_enable_pending = False
         self._tap_enable_mode = None
+        self._tap_enable_minclock = 0
         self._tap_enable_timer = self.reactor.register_timer(
             self._handle_tap_enable_timer, self.reactor.NEVER)
         self._active_axis_homing_wrappers = []
+        self._active_axis_homing_arm_delay = 0.
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
         self._in_multi_probe = False
         self._adxl_initialized = False
 
@@ -309,17 +315,53 @@ class ADXL345Probe:
             'tap_dur': tap_dur,
         }
 
-    def _try_clear_tap(self):
+    def _try_clear_tap(self, minclock=0):
         chip = self.adxl345
         tries = 8
         while tries > 0:
-            val = chip.read_reg(REG_INT_SOURCE)
+            val = chip.read_reg(REG_INT_SOURCE, minclock=minclock)
             if not (val & INT_SINGLE_TAP):
                 return True
             tries -= 1
         return False
 
+    def _reset_axis_homing_state(self):
+        self._active_axis_homing_wrappers = []
+        self._active_axis_homing_arm_delay = 0.
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
+
+    def _eventtime_from_print_time(self, print_time):
+        now = self.reactor.monotonic()
+        est_print_time = self._adxl_mcu.estimated_print_time(now)
+        return now + max(0., print_time - est_print_time)
+
+    def _schedule_tap_enable(self, mode, arm_print_time):
+        self._tap_enable_pending = True
+        self._tap_enable_mode = mode
+        self._tap_enable_minclock = self._adxl_mcu.print_time_to_clock(
+            arm_print_time)
+        self.reactor.update_timer(
+            self._tap_enable_timer,
+            self._eventtime_from_print_time(arm_print_time))
+
+    def _adjust_home_start_print_time(self, wrapper, print_time):
+        if self._tap_mode != 'axis_homing':
+            return print_time
+        if wrapper not in self._active_axis_homing_wrappers:
+            return print_time
+        arm_delay = self._active_axis_homing_arm_delay
+        if arm_delay <= 0.:
+            return print_time
+        if not self._active_axis_homing_arm_scheduled:
+            arm_print_time = print_time + arm_delay
+            self._active_axis_homing_arm_print_time = arm_print_time
+            self._active_axis_homing_arm_scheduled = True
+            self._schedule_tap_enable('axis_homing', arm_print_time)
+        return self._active_axis_homing_arm_print_time
+
     def _cancel_tap_enable_timer(self):
+        self._tap_enable_minclock = 0
         if not self._tap_enable_pending:
             return
         self._tap_enable_pending = False
@@ -331,24 +373,26 @@ class ADXL345Probe:
             return self.reactor.NEVER
         self._tap_enable_pending = False
         mode = self._tap_enable_mode
+        minclock = self._tap_enable_minclock
         self._tap_enable_mode = None
+        self._tap_enable_minclock = 0
         if self._tap_mode != mode:
             return self.reactor.NEVER
         chip = self.adxl345
         try:
             # Drop startup motion events that happened during arm delay.
-            chip.read_reg(REG_INT_SOURCE)
-            if not self._try_clear_tap():
+            chip.read_reg(REG_INT_SOURCE, minclock=minclock)
+            if not self._try_clear_tap(minclock=minclock):
                 raise self.printer.command_error(
                     "ADXL345 tap active before delayed arm")
-            chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP)
+            chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=minclock)
         except Exception as e:
             logging.exception("Failed delayed ADXL345 tap arm")
             self.printer.invoke_shutdown(
                 "ADXL345 delayed tap arm failed: %s" % (str(e),))
         return self.reactor.NEVER
 
-    def _start_tap(self, profile, mode, arm_delay=0.):
+    def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
         if self._tap_mode is not None:
             raise self.printer.command_error(
                 "ADXL345 tap detection already active (%s)" % (self._tap_mode,))
@@ -371,12 +415,13 @@ class ADXL345Probe:
                 raise self.printer.command_error(
                     "ADXL345 tap triggered before move, reduce sensitivity.")
             self._cancel_tap_enable_timer()
-            if arm_delay > 0.:
+            if defer_arm:
+                pass
+            elif arm_delay > 0.:
                 self._tap_enable_pending = True
                 self._tap_enable_mode = mode
-                self.reactor.update_timer(
-                    self._tap_enable_timer,
-                    self.reactor.monotonic() + arm_delay)
+                self.reactor.update_timer(self._tap_enable_timer,
+                                          self.reactor.monotonic() + arm_delay)
             else:
                 chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=clock)
         except Exception:
@@ -506,8 +551,11 @@ class ADXL345Probe:
         profile = self._merge_profiles(wrappers)
         arm_delay = max([self.axis_homing_arm_delay.get(w.get_axis(), 0.)
                          for w in wrappers])
-        self._start_tap(profile, 'axis_homing', arm_delay=arm_delay)
         self._active_axis_homing_wrappers = wrappers
+        self._active_axis_homing_arm_delay = arm_delay
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
+        self._start_tap(profile, 'axis_homing', defer_arm=arm_delay > 0.)
 
     def _handle_homing_move_end(self, hmove):
         if not self._active_axis_homing_wrappers:
@@ -518,7 +566,7 @@ class ADXL345Probe:
         try:
             self._stop_tap('axis_homing')
         finally:
-            self._active_axis_homing_wrappers = []
+            self._reset_axis_homing_state()
 
     def _handle_command_error(self):
         if self._tap_mode == 'axis_homing':
@@ -526,7 +574,7 @@ class ADXL345Probe:
                 self._stop_tap('axis_homing')
             except Exception:
                 logging.exception("ADXL345 axis homing cleanup failed")
-            self._active_axis_homing_wrappers = []
+            self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
             try:
                 self._stop_tap('tap_test')
@@ -573,7 +621,7 @@ class ADXL345Probe:
         self._adxl_initialized = False
         self._tap_mode = None
         self._tap_was_measuring = False
-        self._active_axis_homing_wrappers = []
+        self._reset_axis_homing_state()
         if not self._in_multi_probe:
             self._set_fan_disabled(False)
 
