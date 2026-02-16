@@ -76,6 +76,17 @@ class EnableTracking:
     def register_state_callback(self, callback):
         self.callbacks.append(callback)
     def motor_enable(self, print_time):
+        mcu = self.stepper.get_mcu()
+        # When a non-critical MCU is disconnected/reconnecting, defer enable
+        # transitions. This callback can fire from flush_handler while the
+        # serial queue is down; attempting GPIO writes there can otherwise
+        # raise and force a full printer shutdown.
+        if (getattr(mcu, "is_non_critical", False)
+                and (getattr(mcu, "non_critical_disconnected", False)
+                     or getattr(mcu, "_connecting", False))):
+            self.is_enabled = False
+            self.stepper.add_active_callback(self.motor_enable)
+            return
         if not self.is_enabled:
             for cb in self.callbacks:
                 cb(print_time, True)

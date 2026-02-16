@@ -276,10 +276,15 @@ class SerialReader:
                 self.handlers[key] = callback
     # ---- Non-critical MCU protection ----
     def _is_noncritical_blocked(self):
-        # If a non-critical MCU is intentionally marked disconnected,
-        # don't send anything unless we're currently in a reconnect attempt.
+        # Non-critical link is unavailable: suppress host-side sends.
+        # This prevents background callbacks from crashing when reconnect is
+        # in progress but the serial queue has not been established yet.
         if self.mcu is None:
             return False
+        if not getattr(self.mcu, "is_non_critical", False):
+            return False
+        if self.serialqueue is None:
+            return True
         return getattr(self.mcu, "non_critical_disconnected", False) and \
                not getattr(self.mcu, "_connecting", False)
 
