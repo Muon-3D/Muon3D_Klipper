@@ -14,6 +14,8 @@ class LEDHelper:
         self.update_func = update_func
         self.led_count = led_count
         self.need_transmit = False
+        self.output_gamma = config.getfloat('output_gamma', 1., above=0.)
+        self._use_output_transform = abs(self.output_gamma - 1.) > 1e-9
         # Initial color
         red = config.getfloat('initial_RED', 0., minval=0., maxval=1.)
         green = config.getfloat('initial_GREEN', 0., minval=0., maxval=1.)
@@ -35,6 +37,15 @@ class LEDHelper:
                                    desc=self.cmd_SET_LED_TEMPLATE_help)
     def get_status(self, eventtime=None):
         return {'color_data': self.led_state}
+    def get_output_data(self):
+        return self._apply_output_transform(self.led_state)
+    def _apply_output_transform(self, led_state):
+        if not self._use_output_transform:
+            return led_state
+        clamp = (lambda x: 0. if x < 0. else 1. if x > 1. else x)
+        gamma = self.output_gamma
+        return [tuple(clamp(channel) ** gamma for channel in color)
+                for color in led_state]
     def _set_color(self, index, color):
         if index is None:
             new_led_state = [color] * self.led_count
@@ -61,7 +72,7 @@ class LEDHelper:
         if not self.need_transmit:
             return
         # Just avoid any race conditions
-        led_state = self.led_state
+        led_state = self._apply_output_transform(self.led_state)
         self.need_transmit = False
         def reactor_cb(eventtime):
             try:
@@ -128,7 +139,7 @@ class PrinterPWMLED:
         self.last_print_time = 0.
         # Initialize color data
         self.led_helper = LEDHelper(config, self.update_leds, 1)
-        self.prev_color = color = self.led_helper.get_status()['color_data'][0]
+        self.prev_color = color = self.led_helper.get_output_data()[0]
         for idx, mcu_pin in self.pins:
             mcu_pin.setup_start_value(color[idx], 0.)
     def update_leds(self, led_state, print_time):

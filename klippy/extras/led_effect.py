@@ -6,7 +6,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-from math import cos, exp, pi
+from math import cos, exp, pi, ceil
 from random import randint
 
 ANALOG_SAMPLE_TIME  = 0.001
@@ -209,17 +209,16 @@ class ledFrameHandler:
         
         for i in range(3):
             if pos[i] >= self.kin.axes_min[i] and pos[i] <= self.kin.axes_max[i]:
-                self.stepperPositions[i] = int(
-                    ((pos[i] - self.kin.axes_min[i]) / \
-                     (self.kin.axes_max[i] - self.kin.axes_min[i])
-                    * 100)- 1)
+                self.stepperPositions[i] = (
+                    ((pos[i] - self.kin.axes_min[i]) /
+                     (self.kin.axes_max[i] - self.kin.axes_min[i])) * 100.0)
         return eventtime + 0.5
 
     def _pollProgress(self, eventtime):
         status = self.displayStatus.get_status(eventtime)
         p = status.get('progress')
         if p is not None:
-            self.printProgress = int(p * 100)
+            self.printProgress = max(0.0, min(100.0, p * 100.0))
         return eventtime + 1
 
     def _getColorData(self, colors, fade):
@@ -378,6 +377,14 @@ class ledEffect:
         self.buttonPins   = config.getlist('button_pins', None)
         self.stepper      = config.get('stepper', None)
         self.recalculate  = config.get('recalculate', False)
+        self.smoothTransitions = config.getboolean('smooth_transitions', True)
+        self.movingAverageFrames = config.getint(
+            'moving_average_frames', 1, minval=1)
+        movingAverageTime = config.getfloat(
+            'moving_average_time', 0.0, minval=0.0)
+        if movingAverageTime > 0.0:
+            self.movingAverageFrames = max(
+                1, int(ceil(movingAverageTime / self.frameRate)))
         self.endstops     = [x.strip() for x in config.get('endstops','').split(',')]
         self.layerTempl   = self.gcode_macro.load_template(config, 'layers')
         self.configLayers = []
@@ -612,6 +619,9 @@ class ledEffect:
             self.thisFrame       = []
             self.frameCount      = 1
             self.lastAnalog      = 0
+            self.movingAverageFrames = max(1, int(getattr(self.handler,
+                                        'movingAverageFrames', 1)))
+            self._movingAverageHistory = []
 
         def nextFrame(self, eventtime):
             if not self.frameCount:
@@ -669,6 +679,47 @@ class ledEffect:
                     z = [((1-r)*palette[k][m] + r*palette[k+1][m]) for m in range(COLORS)]
                 gradient += z
             return gradient
+
+        def _sample_frames(self, frames, index):
+            if not frames:
+                return [0.0] * COLORS * self.ledCount
+
+            max_index = float(len(frames) - 1)
+            if max_index <= 0.0:
+                return frames[0]
+
+            index = max(0.0, min(max_index, float(index)))
+            if not self.handler.smoothTransitions:
+                return frames[int(index)]
+
+            lower = int(index)
+            upper = min(lower + 1, len(frames) - 1)
+            blend = index - lower
+            if blend <= 0.0:
+                return frames[lower]
+
+            low_frame = frames[lower]
+            high_frame = frames[upper]
+            return [((1.0 - blend) * a) + (blend * b)
+                    for a, b in zip(low_frame, high_frame)]
+
+        def _moving_average(self, value):
+            value = float(value)
+            if self.movingAverageFrames <= 1:
+                return value
+
+            history = self._movingAverageHistory
+            history.append(value)
+            max_len = self.movingAverageFrames
+            if len(history) > max_len:
+                del history[:-max_len]
+            return sum(history) / len(history)
+
+        def _reset_moving_average(self):
+            self._movingAverageHistory = []
+
+        def _sample_value_frames(self, frames, value):
+            return self._sample_frames(frames, self._moving_average(value))
 
     #Individual effects inherit from the LED Effect Base class
     #each effect must support the nextFrame() method either by
@@ -1004,22 +1055,25 @@ class ledEffect:
             if heaterTarget > 0.0 and heaterCurrent > 0.0:
                 if (heaterCurrent >= self.effectRate):
                     if (heaterCurrent <= heaterTarget-2):
-                        s = int(((heaterCurrent - self.effectRate) / (heaterTarget - self.effectRate)) * 200)
-                        s = min(len(self.thisFrame)-1,s)
-                        return self.thisFrame[s]
+                        s = ((heaterCurrent - self.effectRate)
+                             / (heaterTarget - self.effectRate)) * 200.0
+                        return self._sample_value_frames(self.thisFrame, s)
                     elif self.effectCutoff > 0:
+                        self._reset_moving_average()
                         return None
                     else:
-                        return self.thisFrame[-1]
+                        return self._sample_value_frames(
+                            self.thisFrame, len(self.thisFrame) - 1)
                 else:
+                    self._reset_moving_average()
                     return None
 
             elif self.effectRate > 0 and heaterCurrent > 0.0:
                 if heaterCurrent >= self.effectRate and heaterLast > 0:
-                    s = int(((heaterCurrent - self.effectRate) / heaterLast) * 200)
-                    s = min(len(self.thisFrame)-1,s)
-                    return self.thisFrame[s]
+                    s = ((heaterCurrent - self.effectRate) / heaterLast) * 200.0
+                    return self._sample_value_frames(self.thisFrame, s)
 
+            self._reset_moving_average()
             return None
 
     #Responds to heater temperature
@@ -1040,15 +1094,13 @@ class ledEffect:
             
         def nextFrame(self, eventtime):
             if self.effectCutoff == self.effectRate:
-                s = 200 if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0
+                s = 200.0 if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0.0
             else:
-                s = int(((self.frameHandler.heaterCurrent[self.handler.heater] - 
-                            self.effectRate) / 
-                            (self.effectCutoff - self.effectRate)) * 200)
-                
-            s = min(len(self.thisFrame)-1,s)
-            s = max(0,s)
-            return self.thisFrame[s]
+                s = ((self.frameHandler.heaterCurrent[self.handler.heater] -
+                      self.effectRate) /
+                     (self.effectCutoff - self.effectRate)) * 200.0
+
+            return self._sample_value_frames(self.thisFrame, s)
     class layerHeaterGauge(_layerBase):
         def __init__(self,  **kwargs):
             super(ledEffect.layerHeaterGauge, self).__init__(**kwargs)
@@ -1094,16 +1146,13 @@ class ledEffect:
             heaterLast    = self.frameHandler.heaterLast[self.handler.heater]
             
             if heaterTarget > 0.0:
-                p = int(heaterCurrent/heaterTarget * 100.0)
+                p = heaterCurrent / heaterTarget * 100.0
             elif heaterLast > 0.0:
-                p = int(heaterCurrent/heaterLast * 100.0)
+                p = heaterCurrent / heaterLast * 100.0
             else: 
                 p = 0
-            
-            p = min(len(self.thisFrame)-1,p)
-            p = max(0,p)
-            
-            return self.thisFrame[p]
+
+            return self._sample_value_frames(self.thisFrame, p)
 
     class layerTemperatureGauge(_layerBase):
         def __init__(self,  **kwargs):
@@ -1141,18 +1190,13 @@ class ledEffect:
 
         def nextFrame(self, eventtime):
             if self.effectCutoff == self.effectRate:
-                s = len(self.thisFrame) if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0
+                s = float(len(self.thisFrame)-1) if self.frameHandler.heaterCurrent[self.handler.heater] >= self.effectRate else 0.0
             else:
-                s = int(((self.frameHandler.heaterCurrent[self.handler.heater] - 
-                            self.effectRate) / 
-                            (self.effectCutoff - self.effectRate)) * self.steps)
-                
-            s = min(len(self.thisFrame)-1,s)
-            s = max(0,s)
+                s = ((self.frameHandler.heaterCurrent[self.handler.heater] -
+                      self.effectRate) /
+                     (self.effectCutoff - self.effectRate)) * self.steps
 
-
-
-            return self.thisFrame[s]
+            return self._sample_value_frames(self.thisFrame, s)
 
             
     #Responds to analog pin voltage
@@ -1169,14 +1213,14 @@ class ledEffect:
                 self.thisFrame.append(gradient[i] * self.ledCount)
 
         def nextFrame(self, eventtime):
-            v = int(self.handler.analogValue * self.effectRate)
+            v = self.handler.analogValue * self.effectRate
 
             if v > 100: v = 100
 
             if v > self.effectCutoff:
-                return self.thisFrame[v]
+                return self._sample_value_frames(self.thisFrame, v)
             else:
-                return self.thisFrame[0]
+                return self._sample_value_frames(self.thisFrame, 0.0)
 
     #Lights illuminate relative to stepper position
     class layerStepper(_layerBase):
@@ -1223,10 +1267,7 @@ class ledEffect:
             else: axis = 2
 
             p = self.frameHandler.stepperPositions[int(axis)]
-
-            if p < 0 : p=0
-            if p > 100 : p=100
-            return self.thisFrame[int((p - 1) * (p > 0))]
+            return self._sample_value_frames(self.thisFrame, p)
 
     class layerStepperColor(_layerBase):
         def __init__(self,  **kwargs):
@@ -1246,11 +1287,7 @@ class ledEffect:
             else: axis = 2
 
             p = self.frameHandler.stepperPositions[int(axis)]*self.effectRate+self.effectCutoff
-                        
-            if p < 0 : p=0
-            if p > 100 : p=100
-
-            return self.thisFrame[int(p)]
+            return self._sample_value_frames(self.thisFrame, p)
 
     #Shameless port of Fire2012 by Mark Kriegsman
 
@@ -1409,7 +1446,7 @@ class ledEffect:
 
         def nextFrame(self, eventtime):
             p = self.frameHandler.printProgress
-            return self.thisFrame[p] #(p - 1) * (p > 0)]
+            return self._sample_value_frames(self.thisFrame, p) #(p - 1) * (p > 0)]
 
     class layerHoming(_layerBase):
         def __init__(self,  **kwargs):

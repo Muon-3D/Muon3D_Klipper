@@ -21,7 +21,7 @@ class PCA9533:
     def handle_connect(self):
         self.i2c.i2c_write([PCA9533_PWM0, 85])
         self.i2c.i2c_write([PCA9533_PWM1, 170])
-        self.update_leds(self.led_helper.get_status()['color_data'], None)
+        self.update_leds(self.led_helper.get_output_data(), None)
     def update_leds(self, led_state, print_time):
         rmap = [0, 2, 3, 1, 1]
         red, green, blue, white = [rmap[int(v * 4.)] for v in led_state[0]]
