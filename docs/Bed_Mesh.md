@@ -347,7 +347,11 @@ are identified in green.
 No-go regions may be configured when a portion of the bed must not be probed
 directly (for example, a fixed obstruction in the printable area). Unlike
 `faulty_region`, points inside a no-go region are canceled instead of replaced
-with boundary samples.
+with boundary samples by default.
+
+Optionally, points near the edge of a no-go region may be snapped to the
+nearest no-go boundary rather than canceled. This can be useful to avoid
+removing too many samples from sparse grids.
 
 When travel between two calibration points intersects a no-go region, bed mesh
 can raise to a higher Z for that segment by setting `no_go_traverse_z`.
@@ -360,6 +364,7 @@ mesh_min: 35, 6
 mesh_max: 240, 198
 probe_count: 5, 3
 no_go_traverse_z: 8
+no_go_boundary_tolerance: 5
 no_go_region_1_min: 120, 90
 no_go_region_1_max: 150, 120
 ```
@@ -372,8 +377,16 @@ no_go_region_1_max: 150, 120
 
 - `no_go_traverse_z`\
   _Default Value: `horizontal_move_z`_\
-  Travel height used for calibration moves that cross a no-go region.
+  Travel height used for calibration moves that cross a no-go region
+  interior (touching only a no-go boundary does not trigger this hop).
   If this value is less than `horizontal_move_z`, `horizontal_move_z` is used.
+
+- `no_go_boundary_tolerance`\
+  _Default Value: 0 (disabled)_\
+  If greater than zero, a generated point inside a no-go region that is within
+  this distance (in mm) from the nearest no-go boundary is moved to that
+  boundary instead of being canceled. If the snapped point is outside the
+  active mesh bounds it is canceled.
 
 ### Adaptive Meshes
 

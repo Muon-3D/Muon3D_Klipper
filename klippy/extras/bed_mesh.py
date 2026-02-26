@@ -62,6 +62,16 @@ def segment_intersects_region(p0, p1, min_c, max_c, tol=0.0):
             u2 = min(u2, t)
     return u1 <= u2
 
+# return true if line segment p0->p1 intersects the interior of an
+# axis-aligned region. Touching only the boundary is not considered
+# an interior intersection.
+def segment_intersects_region_interior(p0, p1, min_c, max_c, tol=0.0):
+    min_i = (min_c[0] + tol, min_c[1] + tol)
+    max_i = (max_c[0] - tol, max_c[1] - tol)
+    if min_i[0] >= max_i[0] or min_i[1] >= max_i[1]:
+        return False
+    return segment_intersects_region(p0, p1, min_i, max_i, tol=0.0)
+
 # Constrain value between min and max
 def constrain(val, min_val, max_val):
     return min(max_val, max(min_val, val))
@@ -420,6 +430,13 @@ class BedMeshCalibrate:
                 pt = points[i]
                 print_func("%d (%.2f, %.2f), canceled by no-go region"
                            % (i, pt[0], pt[1]))
+        adjusted = self.probe_mgr.get_adjusted_points()
+        if adjusted:
+            print_func("bed_mesh: no-go boundary-adjusted points")
+            for i in sorted(adjusted):
+                opt = adjusted[i]
+                print_func("%d adjusted to (%.2f, %.2f)"
+                           % (i, opt[0], opt[1]))
     def _init_mesh_config(self, config):
         mesh_cfg = self.mesh_config
         orig_cfg = self.orig_config
@@ -915,9 +932,13 @@ class ProbeManager:
         self.faulty_regions = []
         self.no_go_regions = []
         self.canceled_points = set()
+        self.adjusted_points = {}
         self.default_horizontal_move_z = config.getfloat("horizontal_move_z", 5.)
         self.no_go_traverse_z = config.getfloat(
             "no_go_traverse_z", self.default_horizontal_move_z, above=0.
+        )
+        self.no_go_boundary_tolerance = config.getfloat(
+            "no_go_boundary_tolerance", 0., minval=0.
         )
         self.overshoot = self.cfg_overshoot
         self.zero_ref_pos = config.getfloatlist(
@@ -996,14 +1017,55 @@ class ProbeManager:
             for min_c, max_c in self.no_go_regions
         )
 
+    def _get_point_no_go_region(self, coord):
+        for min_c, max_c in self.no_go_regions:
+            if within(coord, min_c, max_c, tol=1e-6):
+                return min_c, max_c
+        return None
+
+    def _snap_no_go_point_to_boundary(self, coord, min_c, max_c):
+        x, y = coord
+        d_left = x - min_c[0]
+        d_right = max_c[0] - x
+        d_bottom = y - min_c[1]
+        d_top = max_c[1] - y
+        candidates = [
+            (d_left, (min_c[0], y)),
+            (d_right, (max_c[0], y)),
+            (d_bottom, (x, min_c[1])),
+            (d_top, (x, max_c[1]))
+        ]
+        candidates.sort(key=lambda item: item[0])
+        return candidates
+
+    def _within_active_mesh_bounds(self, coord, mesh_min, mesh_max,
+                                   radius=None, origin=None):
+        if not within(coord, mesh_min, mesh_max, tol=1e-6):
+            return False
+        if radius is None:
+            return True
+        if origin is None:
+            ox = oy = 0.
+        else:
+            ox, oy = origin
+        dx = coord[0] - ox
+        dy = coord[1] - oy
+        return math.sqrt(dx * dx + dy * dy) <= radius + 1e-6
+
     def is_segment_in_no_go_region(self, start, end):
         if not self.no_go_regions:
             return False
         if isclose(start[0], end[0], abs_tol=1e-6) and \
            isclose(start[1], end[1], abs_tol=1e-6):
-            return self._is_point_in_no_go_region(start)
+            return any(
+                (min_c[0] + 1e-6) < start[0] < (max_c[0] - 1e-6) and
+                (min_c[1] + 1e-6) < start[1] < (max_c[1] - 1e-6)
+                for min_c, max_c in self.no_go_regions
+            )
         return any(
-            segment_intersects_region(start, end, min_c, max_c, tol=1e-6)
+            segment_intersects_region_interior(
+                start, end, min_c, max_c, tol=1e-6
+            )
             for min_c, max_c in self.no_go_regions
         )
 
@@ -1050,6 +1112,9 @@ class ProbeManager:
 
     def get_canceled_points(self):
         return self.canceled_points
+
+    def get_adjusted_points(self):
+        return self.adjusted_points
 
     def generate_points(
         self, mesh_config, mesh_min, mesh_max, radius, origin,
@@ -1106,10 +1171,36 @@ class ProbeManager:
             # Zero Reference position outside of mesh
             self.zref_mode = ZrefMode.PROBE
         self.base_points = points
-        self.canceled_points = set(
-            i for i, coord in enumerate(self.base_points)
-            if self._is_point_in_no_go_region(coord)
-        )
+        if radius is None:
+            mesh_bound_min = (min_x, min_y)
+            mesh_bound_max = (max_x, max_y)
+        else:
+            mesh_bound_min = (origin[0] + min_x, origin[1] + min_y)
+            mesh_bound_max = (origin[0] + max_x, origin[1] + max_y)
+        self.canceled_points.clear()
+        self.adjusted_points.clear()
+        for i, coord in enumerate(self.base_points):
+            region = self._get_point_no_go_region(coord)
+            if region is None:
+                continue
+            if self.no_go_boundary_tolerance > 0.:
+                min_c, max_c = region
+                candidates = self._snap_no_go_point_to_boundary(
+                    coord, min_c, max_c
+                )
+                for depth, adj_coord in candidates:
+                    if depth > self.no_go_boundary_tolerance + 1e-6:
+                        break
+                    if self._within_active_mesh_bounds(
+                        adj_coord, mesh_bound_min, mesh_bound_max,
+                        radius, origin
+                    ):
+                        self.base_points[i] = adj_coord
+                        self.adjusted_points[i] = adj_coord
+                        break
+                if i in self.adjusted_points:
+                    continue
+            self.canceled_points.add(i)
         self.substitutes.clear()
         if self.zref_mode == ZrefMode.PROBE and \
            self._is_point_in_no_go_region(self.zero_ref_pos):

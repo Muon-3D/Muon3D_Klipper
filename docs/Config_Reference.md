@@ -1169,6 +1169,23 @@ Visual Examples:
 #   Optional points that define a faulty region.  See docs/Bed_Mesh.md
 #   for details on faulty regions.  Up to 99 faulty regions may be added.
 #   By default no faulty regions are set.
+#no_go_region_1_min:
+#no_go_region_1_max:
+#   Optional points that define a no-go region. Any generated probe point
+#   within a no-go region will be canceled (not substituted). During
+#   calibration travel, moves that cross a no-go region may be traversed
+#   at a higher Z. Up to 99 no-go regions may be added. By default no
+#   no-go regions are set.
+#no_go_traverse_z:
+#   Optional Z height (in mm) used when traveling across no-go region
+#   interiors during bed_mesh calibration. Touching only a no-go
+#   boundary does not trigger this hop. Defaults to horizontal_move_z.
+#no_go_boundary_tolerance:
+#   Optional distance (in mm). If a generated point falls inside a no-go
+#   region but is within this distance from the nearest no-go boundary,
+#   it will be moved to that boundary instead of being canceled. If the
+#   snapped point is outside active mesh bounds, it is canceled.
+#   The default is 0, which disables boundary snapping.
 #adaptive_margin:
 #   An optional margin (in mm) to be added around the bed area used by
 #   the defined print objects when generating an adaptive mesh.
