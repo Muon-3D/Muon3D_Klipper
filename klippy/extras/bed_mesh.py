@@ -26,6 +26,42 @@ def within(coord, min_c, max_c, tol=0.0):
     return (max_c[0] + tol) >= coord[0] >= (min_c[0] - tol) and \
         (max_c[1] + tol) >= coord[1] >= (min_c[1] - tol)
 
+# return true if two axis-aligned regions overlap
+def regions_overlap(min_a, max_a, min_b, max_b, tol=0.0):
+    return not (
+        max_a[0] < (min_b[0] - tol) or max_b[0] < (min_a[0] - tol) or
+        max_a[1] < (min_b[1] - tol) or max_b[1] < (min_a[1] - tol)
+    )
+
+# return true if line segment p0->p1 intersects axis-aligned region
+def segment_intersects_region(p0, p1, min_c, max_c, tol=0.0):
+    min_c = (min_c[0] - tol, min_c[1] - tol)
+    max_c = (max_c[0] + tol, max_c[1] + tol)
+    if within(p0, min_c, max_c) or within(p1, min_c, max_c):
+        return True
+    x0, y0 = p0
+    x1, y1 = p1
+    dx = x1 - x0
+    dy = y1 - y0
+    p = (-dx, dx, -dy, dy)
+    q = (x0 - min_c[0], max_c[0] - x0, y0 - min_c[1], max_c[1] - y0)
+    u1, u2 = 0., 1.
+    for pi, qi in zip(p, q):
+        if isclose(pi, 0., abs_tol=1e-12):
+            if qi < 0.:
+                return False
+            continue
+        t = qi / pi
+        if pi < 0.:
+            if t > u2:
+                return False
+            u1 = max(u1, t)
+        else:
+            if t < u1:
+                return False
+            u2 = min(u2, t)
+    return u1 <= u2
+
 # Constrain value between min and max
 def constrain(val, min_val, max_val):
     return min(max_val, max(min_val, val))
@@ -377,6 +413,13 @@ class BedMeshCalibrate:
                 pt = points[i]
                 print_func("%d (%.2f, %.2f), substituted points: %s"
                            % (i, pt[0], pt[1], repr(v)))
+        canceled = self.probe_mgr.get_canceled_points()
+        if canceled:
+            print_func("bed_mesh: no-go canceled points")
+            for i in sorted(canceled):
+                pt = points[i]
+                print_func("%d (%.2f, %.2f), canceled by no-go region"
+                           % (i, pt[0], pt[1]))
     def _init_mesh_config(self, config):
         mesh_cfg = self.mesh_config
         orig_cfg = self.orig_config
@@ -673,32 +716,51 @@ class BedMeshCalibrate:
         y_cnt = params['y_count']
 
         substitutes = self.probe_mgr.get_substitutes()
+        canceled = self.probe_mgr.get_canceled_points()
         probed_pts = positions
-        if substitutes:
-            # Replace substituted points with the original generated
-            # point.  Its Z Value is the average probed Z of the
-            # substituted points.
-            corrected_pts = []
-            idx_offset = 0
-            start_idx = 0
-            for i, pts in substitutes.items():
-                fpt = list(base_points[i][:2])
-                # offset the index to account for additional samples
-                idx = i + idx_offset
-                # Add "normal" points
-                corrected_pts.extend(positions[start_idx:idx])
-                avg_z = sum([p[2] for p in positions[idx:idx+len(pts)]]) \
-                    / len(pts)
-                idx_offset += len(pts) - 1
-                start_idx = idx + len(pts)
-                fpt.append(avg_z)
+        corrected_pts = []
+        sampled_idx = 0
+        for i, base_pt in enumerate(base_points):
+            if i in canceled:
+                corrected_pts.append([base_pt[0], base_pt[1], None])
+                continue
+            if i in substitutes:
+                pts = substitutes[i]
+                end_idx = sampled_idx + len(pts)
+                vals = positions[sampled_idx:end_idx]
+                if len(vals) != len(pts):
+                    self._dump_points(probed_pts, corrected_pts)
+                    raise self.gcode.error(
+                        "bed_mesh: invalid substituted point count at index %d"
+                        % (i,)
+                    )
+                avg_z = sum([p[2] for p in vals]) / len(vals)
+                fpt = [base_pt[0], base_pt[1], avg_z]
                 logging.info(
                     "bed_mesh: Replacing value at faulty index %d"
                     " (%.4f, %.4f): avg value = %.6f, avg w/ z_offset = %.6f"
                     % (i, fpt[0], fpt[1], avg_z, avg_z - z_offset))
                 corrected_pts.append(fpt)
-            corrected_pts.extend(positions[start_idx:])
-            positions = corrected_pts
+                sampled_idx = end_idx
+                continue
+            if sampled_idx >= len(positions):
+                self._dump_points(probed_pts, corrected_pts)
+                raise self.gcode.error(
+                    "bed_mesh: invalid position list size while processing "
+                    "generated index: %d" % (i,)
+                )
+            corrected_pts.append(positions[sampled_idx])
+            sampled_idx += 1
+        if sampled_idx != len(positions):
+            self._dump_points(probed_pts, corrected_pts)
+            raise self.gcode.error(
+                "bed_mesh: invalid position list size, generated count: %d, "
+                "probed count: %d"
+                % (len(base_points), len(positions))
+            )
+        if canceled:
+            self._populate_canceled_points(corrected_pts, canceled, z_offset)
+        positions = corrected_pts
 
         # validate length of result
         if len(base_points) != len(positions):
@@ -786,6 +848,41 @@ class BedMeshCalibrate:
         self.gcode.respond_info("Mesh Bed Leveling Complete")
         if self._profile_name is not None:
             self.bedmesh.save_profile(self._profile_name)
+
+    def _estimate_point_z(self, target, src_points):
+        dists = []
+        for src in src_points:
+            dx = target[0] - src[0]
+            dy = target[1] - src[1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < 1e-9:
+                return src[2]
+            dists.append((dist, src[2]))
+        dists.sort(key=lambda item: item[0])
+        near = dists[:4]
+        wsum = sum([1. / d for d, _z in near])
+        if wsum <= 0.:
+            return near[0][1]
+        return sum([(1. / d) * z for d, z in near]) / wsum
+
+    def _populate_canceled_points(self, corrected_pts, canceled, z_offset):
+        valid_pts = [pt for i, pt in enumerate(corrected_pts)
+                     if i not in canceled and pt[2] is not None]
+        if not valid_pts:
+            raise self.gcode.error(
+                "bed_mesh: no valid probe points remain after no-go filtering"
+            )
+        for idx in sorted(canceled):
+            x, y = corrected_pts[idx][:2]
+            z_val = self._estimate_point_z((x, y), valid_pts)
+            corrected_pts[idx][2] = z_val
+            logging.info(
+                "bed_mesh: Replacing value at no-go index %d"
+                " (%.4f, %.4f): estimated value = %.6f, "
+                "estimated w/ z_offset = %.6f"
+                % (idx, x, y, z_val, z_val - z_offset)
+            )
+
     def _dump_points(self, probed_pts, corrected_pts):
         # logs generated points with offset applied, points received
         # from the finalize callback, and the list of corrected points
@@ -802,7 +899,11 @@ class BedMeshCalibrate:
             if i < len(probed_pts):
                 probed_pt = "(%.2f, %.2f, %.4f)" % tuple(probed_pts[i])
             if i < len(corrected_pts):
-                corr_pt = "(%.2f, %.2f, %.4f)" % tuple(corrected_pts[i])
+                cpt = corrected_pts[i]
+                if cpt[2] is None:
+                    corr_pt = "(%.2f, %.2f, None)" % (cpt[0], cpt[1])
+                else:
+                    corr_pt = "(%.2f, %.2f, %.4f)" % tuple(cpt)
             logging.info(
                 "  %-4d| %-17s| %-25s| %s" % (i, gen_pt, probed_pt, corr_pt))
 
@@ -812,6 +913,12 @@ class ProbeManager:
         self.cfg_overshoot = config.getfloat("scan_overshoot", 0, minval=1.)
         self.orig_config = orig_config
         self.faulty_regions = []
+        self.no_go_regions = []
+        self.canceled_points = set()
+        self.default_horizontal_move_z = config.getfloat("horizontal_move_z", 5.)
+        self.no_go_traverse_z = config.getfloat(
+            "no_go_traverse_z", self.default_horizontal_move_z, above=0.
+        )
         self.overshoot = self.cfg_overshoot
         self.zero_ref_pos = config.getfloatlist(
             "zero_reference_position", None, count=2
@@ -822,8 +929,10 @@ class ProbeManager:
         self.is_round = orig_config["radius"] is not None
         self.probe_helper = probe.ProbePointsHelper(config, finalize_cb, [])
         self.probe_helper.use_xy_offsets(True)
+        self.probe_helper.set_travel_callback(self._move_to_next_probe)
         self.rapid_scan_helper = RapidScanHelper(config, self, finalize_cb)
         self._init_faulty_regions(config)
+        self._init_no_go_regions(config)
 
     def _init_faulty_regions(self, config):
         for i in list(range(1, 100, 1)):
@@ -863,6 +972,61 @@ class ProbeManager:
                                j+1, repr([prev_c1, prev_c3])))
             self.faulty_regions.append((c1, c3))
 
+    def _init_no_go_regions(self, config):
+        for i in list(range(1, 100, 1)):
+            start = config.getfloatlist("no_go_region_%d_min" % (i,), None,
+                                        count=2)
+            if start is None:
+                break
+            end = config.getfloatlist("no_go_region_%d_max" % (i,), count=2)
+            c1 = [min([s, e]) for s, e in zip(start, end)]
+            c3 = [max([s, e]) for s, e in zip(start, end)]
+            for j, (prev_c1, prev_c3) in enumerate(self.no_go_regions):
+                if regions_overlap(c1, c3, prev_c1, prev_c3, tol=1e-6):
+                    raise config.error(
+                        "bed_mesh: Added no_go_region_%d %s overlaps "
+                        "existing no_go_region_%d %s"
+                        % (i, repr([c1, c3]), j + 1, repr([prev_c1, prev_c3]))
+                    )
+            self.no_go_regions.append((c1, c3))
+
+    def _is_point_in_no_go_region(self, coord):
+        return any(
+            within(coord, min_c, max_c, tol=1e-6)
+            for min_c, max_c in self.no_go_regions
+        )
+
+    def is_segment_in_no_go_region(self, start, end):
+        if not self.no_go_regions:
+            return False
+        if isclose(start[0], end[0], abs_tol=1e-6) and \
+           isclose(start[1], end[1], abs_tol=1e-6):
+            return self._is_point_in_no_go_region(start)
+        return any(
+            segment_intersects_region(start, end, min_c, max_c, tol=1e-6)
+            for min_c, max_c in self.no_go_regions
+        )
+
+    def get_no_go_traverse_z(self):
+        return self.no_go_traverse_z
+
+    def _move_to_next_probe(self, curpos, nextpos, speed, hmove_z, lift_speed):
+        if not self.no_go_regions:
+            return False
+        traverse_z = max(hmove_z, self.no_go_traverse_z)
+        if traverse_z <= hmove_z + 1e-6:
+            return False
+        start = (curpos[0], curpos[1])
+        end = (nextpos[0], nextpos[1])
+        if not self.is_segment_in_no_go_region(start, end):
+            return False
+        toolhead = self.printer.lookup_object("toolhead")
+        if curpos[2] < traverse_z - 1e-6:
+            toolhead.manual_move([None, None, traverse_z], lift_speed)
+        toolhead.manual_move(nextpos, speed)
+        toolhead.manual_move([None, None, hmove_z], lift_speed)
+        return True
+
     def start_probe(self, gcmd):
         method = gcmd.get("METHOD", "automatic").lower()
         can_scan = False
@@ -883,6 +1047,9 @@ class ProbeManager:
 
     def get_substitutes(self):
         return self.substitutes
+
+    def get_canceled_points(self):
+        return self.canceled_points
 
     def generate_points(
         self, mesh_config, mesh_min, mesh_max, radius, origin,
@@ -939,7 +1106,20 @@ class ProbeManager:
             # Zero Reference position outside of mesh
             self.zref_mode = ZrefMode.PROBE
         self.base_points = points
+        self.canceled_points = set(
+            i for i, coord in enumerate(self.base_points)
+            if self._is_point_in_no_go_region(coord)
+        )
         self.substitutes.clear()
+        if self.zref_mode == ZrefMode.PROBE and \
+           self._is_point_in_no_go_region(self.zero_ref_pos):
+            opt = "zero_reference_position"
+            raise BedMeshError(
+                "bed_mesh: Cannot probe zero reference position at "
+                "(%.2f, %.2f) as it is located within a no-go region."
+                " Check the value for option '%s'"
+                % (self.zero_ref_pos[0], self.zero_ref_pos[1], opt,)
+            )
         # adjust overshoot
         og_min_x = self.orig_config["mesh_min"][0]
         og_max_x = self.orig_config["mesh_max"][0]
@@ -947,6 +1127,13 @@ class ProbeManager:
         self.overshoot = self.cfg_overshoot + math.floor(add_ovs)
         min_pt, max_pt = (min_x, min_y), (max_x, max_y)
         self._process_faulty_regions(min_pt, max_pt, radius)
+        active_points = len(self.base_points) - len(self.canceled_points)
+        if active_points < 3:
+            raise BedMeshError(
+                "bed_mesh: no_go_region options remove too many probe points. "
+                "At least 3 generated points must remain, current: %d"
+                % (active_points,)
+            )
         self.probe_helper.update_probe_points(self.get_std_path(), 3)
 
     def _process_faulty_regions(self, min_pt, max_pt, radius):
@@ -970,6 +1157,8 @@ class ProbeManager:
             if not isclose(coord[1], last_y):
                 is_reversed = not is_reversed
             last_y = coord[1]
+            if i in self.canceled_points:
+                continue
             adj_coords = []
             for min_c, max_c in self.faulty_regions:
                 if within(coord, min_c, max_c, tol=.00001):
@@ -1009,6 +1198,8 @@ class ProbeManager:
     def get_std_path(self):
         path = []
         for idx, pt in enumerate(self.base_points):
+            if idx in self.canceled_points:
+                continue
             if idx in self.substitutes:
                 for sub_pt in self.substitutes[idx]:
                     path.append(sub_pt)
@@ -1019,16 +1210,35 @@ class ProbeManager:
         return path
 
     def iter_rapid_path(self):
+        first_valid_idx = None
+        for i, pt in enumerate(self.base_points):
+            if i not in self.canceled_points:
+                first_valid_idx = i
+                break
+        if first_valid_idx is None:
+            if self.zref_mode == ZrefMode.PROBE:
+                yield self.zero_ref_pos, True
+            return
         ascnd_x = True
-        last_base_pt = last_mv_pt = self.base_points[0]
+        last_base_pt = self.base_points[0]
+        for pt in self.base_points[1:first_valid_idx+1]:
+            dir_change = not isclose(pt[1], last_base_pt[1], abs_tol=1e-6)
+            ascnd_x ^= dir_change
+            last_base_pt = pt
+        last_base_pt = last_mv_pt = self.base_points[first_valid_idx]
         # Generate initial move point
         if self.overshoot:
             overshoot = min(8, self.overshoot)
             last_mv_pt = (last_base_pt[0] - overshoot, last_base_pt[1])
             yield last_mv_pt, False
-        for idx, pt in enumerate(self.base_points):
+        for idx, pt in enumerate(self.base_points[first_valid_idx:],
+                                 start=first_valid_idx):
             # increasing Y indicates direction change
             dir_change = not isclose(pt[1], last_base_pt[1], abs_tol=1e-6)
+            if idx in self.canceled_points:
+                last_base_pt = pt
+                ascnd_x ^= dir_change
+                continue
             if idx in self.substitutes:
                 fp_gen = self._gen_faulty_path(
                     last_mv_pt, idx, ascnd_x, dir_change
@@ -1209,11 +1419,14 @@ class RapidScanHelper:
         gcmd_params["SAMPLE_TIME"] = half_window * 2
         self._raise_tool(gcmd, scan_height)
         probe_session = pprobe.start_probe_session(gcmd)
+        pparams = pprobe.get_probe_params(gcmd)
+        lift_speed = pparams["lift_speed"]
         offsets = pprobe.get_offsets(gcmd)
         initial_move = True
         for pos, is_probe_pt in self.probe_manager.iter_rapid_path():
             pos = self._apply_offsets(pos[:2], offsets)
-            toolhead.manual_move(pos, speed)
+            base_z = scan_height + .5 if initial_move else scan_height
+            self._move_scan_segment(pos, speed, base_z, lift_speed)
             if initial_move:
                 initial_move = False
                 self._move_to_scan_height(gcmd, scan_height)
@@ -1224,6 +1437,21 @@ class RapidScanHelper:
         self.finalize_callback(results)
         probe_session.end_probe_session()
 
+    def _move_scan_segment(self, pos, speed, base_z, lift_speed):
+        toolhead = self.printer.lookup_object("toolhead")
+        cur_pos = toolhead.get_position()
+        start = (cur_pos[0], cur_pos[1])
+        end = (pos[0], pos[1])
+        traverse_z = max(base_z, self.probe_manager.get_no_go_traverse_z())
+        if traverse_z > base_z + 1e-6 and \
+           self.probe_manager.is_segment_in_no_go_region(start, end):
+            if cur_pos[2] < traverse_z - 1e-6:
+                toolhead.manual_move([None, None, traverse_z], lift_speed)
+            toolhead.manual_move(pos, speed)
+            toolhead.manual_move([None, None, base_z], lift_speed)
+            return
+        toolhead.manual_move(pos, speed)
+
     def _raise_tool(self, gcmd, scan_height):
         # If the nozzle is below scan height raise the tool
         toolhead = self.printer.lookup_object("toolhead")
@@ -1233,7 +1461,7 @@ class RapidScanHelper:
             return
         pparams = pprobe.get_probe_params(gcmd)
         lift_speed = pparams["lift_speed"]
-        cur_pos[2] = self.scan_height + .5
+        cur_pos[2] = scan_height + .5
         toolhead.manual_move(cur_pos, lift_speed)
 
     def _move_to_scan_height(self, gcmd, scan_height):

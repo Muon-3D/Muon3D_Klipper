@@ -1,0 +1,7 @@
+# Test case for invalid no-go coverage in bed_mesh
+CONFIG bed_mesh_no_go_invalid.cfg
+DICTIONARY atmega2560.dict
+SHOULD_FAIL
+
+# Probe points are fully canceled by no-go region
+G28

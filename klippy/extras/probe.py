@@ -457,6 +457,7 @@ class ProbePointsHelper:
         self.default_horizontal_move_z = def_move_z
         self.speed = config.getfloat('speed', 50., above=0.)
         self.use_offsets = False
+        self.travel_callback = None
         # Internal probing state
         self.lift_speed = self.speed
         self.probe_offsets = (0., 0., 0.)
@@ -470,6 +471,8 @@ class ProbePointsHelper:
         self.minimum_points(min_points)
     def use_xy_offsets(self, use_offsets):
         self.use_offsets = use_offsets
+    def set_travel_callback(self, travel_callback):
+        self.travel_callback = travel_callback
     def get_lift_speed(self):
         return self.lift_speed
     def _move(self, coord, speed):
@@ -493,6 +496,14 @@ class ProbePointsHelper:
         if self.use_offsets:
             nextpos[0] -= self.probe_offsets[0]
             nextpos[1] -= self.probe_offsets[1]
+        if self.travel_callback is not None:
+            curpos = self.printer.lookup_object('toolhead').get_position()
+            handled = self.travel_callback(
+                curpos, nextpos, self.speed, self.horizontal_move_z,
+                self.lift_speed
+            )
+            if handled:
+                return
         self._move(nextpos, self.speed)
     def start_probe(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)

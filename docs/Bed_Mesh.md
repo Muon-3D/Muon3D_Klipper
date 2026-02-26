@@ -290,7 +290,7 @@ probe_count: 5, 3
   adjustment.  If the coordinate lies outside of the mesh then the coordinate
   will be probed after calibration, with the resulting z-value used as the
   z-offset.  Note that this coordinate must NOT be in a location specified as
-  a `faulty_region` if a probe is necessary.
+  a `faulty_region` or `no_go_region` if a probe is necessary.
 
 ### Faulty Regions
 
@@ -341,6 +341,39 @@ in the sample config above.  The replacement points and their coordinates
 are identified in green.
 
 ![bedmesh_interpolated](img/bedmesh_faulty_regions.svg)
+
+### No-go Regions
+
+No-go regions may be configured when a portion of the bed must not be probed
+directly (for example, a fixed obstruction in the printable area). Unlike
+`faulty_region`, points inside a no-go region are canceled instead of replaced
+with boundary samples.
+
+When travel between two calibration points intersects a no-go region, bed mesh
+can raise to a higher Z for that segment by setting `no_go_traverse_z`.
+
+```
+[bed_mesh]
+speed: 120
+horizontal_move_z: 2
+mesh_min: 35, 6
+mesh_max: 240, 198
+probe_count: 5, 3
+no_go_traverse_z: 8
+no_go_region_1_min: 120, 90
+no_go_region_1_max: 150, 120
+```
+
+- `no_go_region_{1...99}_min`\
+  `no_go_region_{1...99}_max`\
+  _Default Value: None (disabled)_\
+  Defines an axis-aligned no-go region. Generated points inside the region
+  are canceled. No two no-go regions may overlap.
+
+- `no_go_traverse_z`\
+  _Default Value: `horizontal_move_z`_\
+  Travel height used for calibration moves that cross a no-go region.
+  If this value is less than `horizontal_move_z`, `horizontal_move_z` is used.
 
 ### Adaptive Meshes
 
