@@ -189,8 +189,8 @@ command_neopixel_update(uint32_t *args)
         shutdown("Invalid neopixel update command");
     memcpy(&n->data[pos], data, data_len);
 }
-DECL_COMMAND(command_neopixel_update,
-             "neopixel_update oid=%c pos=%hu data=%*s");
+DECL_COMMAND_FLAGS(command_neopixel_update, HF_IN_SHUTDOWN,
+                   "neopixel_update oid=%c pos=%hu data=%*s");
 
 void
 command_neopixel_send(uint32_t *args)
@@ -200,4 +200,5 @@ command_neopixel_send(uint32_t *args)
     int ret = send_data(n);
     sendf("neopixel_result oid=%c success=%c", oid, ret ? 0 : 1);
 }
-DECL_COMMAND(command_neopixel_send, "neopixel_send oid=%c");
+DECL_COMMAND_FLAGS(command_neopixel_send, HF_IN_SHUTDOWN,
+                   "neopixel_send oid=%c");

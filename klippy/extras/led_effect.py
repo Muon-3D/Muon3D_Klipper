@@ -128,7 +128,13 @@ class ledFrameHandler:
         for effect in self.effects:
             if not effect.runOnShutown:
                 for chain in self.ledChains:
-                    chain.led_helper.set_color(None, (0.0, 0.0, 0.0, 0.0))
+                    helper = getattr(chain, 'led_helper', None)
+                    if helper is None:
+                        continue
+                    if hasattr(helper, '_set_color'):
+                        helper._set_color(None, (0.0, 0.0, 0.0, 0.0))
+                    elif hasattr(helper, 'set_color'):
+                        helper.set_color(None, (0.0, 0.0, 0.0, 0.0))
                     self._transmit_chain(chain)
                     
         pass
@@ -259,8 +265,7 @@ class ledFrameHandler:
                     chainsToUpdate.add(chain)
 
         for chain in chainsToUpdate:
-            if not self.shutdown: 
-                self._transmit_chain(chain)
+            self._transmit_chain(chain)
         if self.effects:
             next_eventtime=min(self.effects, key=lambda x: x.nextEventTime)\
                             .nextEventTime
