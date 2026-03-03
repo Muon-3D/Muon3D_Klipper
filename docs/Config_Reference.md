@@ -1196,6 +1196,12 @@ Visual Examples:
 #  specified outside of the mesh.  This value is used to optimize the travel
 #  path when performing a "rapid scan".  The minimum value that may be specified
 #  is 1.  The default is no overshoot.
+#auto_skew: False
+#  If true, and [skew_correction] is enabled, then fit a best-fit plane
+#  to the active mesh and automatically set skew_correction's XZ and YZ
+#  factors from that plane tilt whenever a mesh is activated (for
+#  example, after BED_MESH_CALIBRATE or BED_MESH_PROFILE LOAD).
+#  XY skew is left unchanged.
 ```
 
 ### [bed_tilt]
@@ -1218,6 +1224,11 @@ information.
 #z_adjust: 0
 #   The amount to add to the Z height when the nozzle is nominally at
 #   0, 0. The default is 0.
+#auto_skew: False
+#   If true, and [skew_correction] is enabled, then automatically set
+#   skew_correction's XZ and YZ factors from bed_tilt's x_adjust and
+#   y_adjust values. XY skew is left unchanged. This sync occurs at
+#   startup and after BED_TILT_CALIBRATE updates.
 # The remaining parameters control a BED_TILT_CALIBRATE extended
 # g-code command that may be used to calibrate appropriate x and y
 # adjustment parameters.
@@ -3467,6 +3478,11 @@ the [command reference](G-Codes.md#led) for more information.
 #initial_WHITE: 0.0
 #   Sets the initial LED color. Each value should be between 0.0 and
 #   1.0. The default for each color is 0.
+#output_gamma: 1.0
+#   Apply a gamma exponent to all LED output channels before sending
+#   values to hardware. Values greater than 1.0 typically produce a
+#   more perceptually uniform brightness ramp. The default is 1.0,
+#   which disables the transform.
 ```
 
 ### [neopixel]
@@ -5260,13 +5276,40 @@ sensor_type:
 #counts_per_gram:
 #reference_tare_counts:
 #sensor_orientation:
-#   These parameters must be configured before the probe will operate.
-#   See the [load_cell] section for further details.
+#   These parameters are required for gram-based probing behavior
+#   (`trigger_force` and `safety_model=reference_tare`). See the
+#   [load_cell] section for further details.
 #force_safety_limit: 2000
 #   The safe limit for probing force relative to the reference_tare_counts on
 #   the load_cell. The default is +/-2Kg.
 #trigger_force: 75.0
 #   The force that the probe will trigger at. 75g is the default.
+#trigger_counts:
+#   Optional raw ADC count delta used for triggering, measured from the
+#   per-probe tare value. If set, this overrides both trigger_percent and
+#   trigger_force.
+#trigger_percent:
+#   Optional trigger threshold as a percentage of the span from the per-probe
+#   tare value to reference_max_load_counts. If set, this overrides
+#   trigger_force. This option is only supported with
+#   safety_model=preloaded_max.
+#safety_model: reference_tare
+#   Safety range model. Valid values are:
+#   reference_tare: existing behavior using reference_tare_counts and
+#     force_safety_limit (grams)
+#   preloaded_max: one-sided safety range anchored by reference_max_load_counts.
+#reference_max_load_counts:
+#   Raw ADC value for the stable max-load anchor used by
+#   safety_model=preloaded_max. This can be set manually or captured with
+#   LOAD_CELL_CALIBRATE_MAX.
+#max_load_safety_margin_counts: 0
+#   Optional fixed margin in raw ADC counts to keep away from
+#   reference_max_load_counts when safety_model=preloaded_max. If greater than
+#   zero, this overrides max_load_safety_margin_percent.
+#max_load_safety_margin_percent: 5.0
+#   Margin as a percentage of the span from per-probe tare value to
+#   reference_max_load_counts when safety_model=preloaded_max. Larger values
+#   cause earlier safety trips.
 #drift_filter_cutoff_frequency: 0.8
 #   Enable optional continuous taring while homing & probing to reject drift.
 #   The value is a frequency, in Hz, below which drift will be ignored. This

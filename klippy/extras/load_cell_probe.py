@@ -229,16 +229,38 @@ def check_sensor_errors(results, printer):
 
 
 class LoadCellProbeConfigHelper:
+    SAFETY_MODEL_REFERENCE_TARE = "reference_tare"
+    SAFETY_MODEL_PRELOADED_MAX = "preloaded_max"
+
     def __init__(self, config, load_cell_inst):
         self._printer = config.get_printer()
         self._load_cell = load_cell_inst
         self._sensor = load_cell_inst.get_sensor()
+        self._config_name = config.get_name()
         # Collect 4 x 60hz power cycles of data to average across power noise
         self._tare_time_param = floatParamHelper(config, 'tare_time',
             default=4. / 60., minval=0.01, maxval=1.0)
+        self._safety_model = config.getchoice('safety_model', {
+            self.SAFETY_MODEL_REFERENCE_TARE:
+                self.SAFETY_MODEL_REFERENCE_TARE,
+            self.SAFETY_MODEL_PRELOADED_MAX:
+                self.SAFETY_MODEL_PRELOADED_MAX,
+        }, default=self.SAFETY_MODEL_REFERENCE_TARE)
+        self._reference_max_load_counts = config.getint(
+            'reference_max_load_counts', default=None)
+        self._max_load_safety_margin_counts_param = intParamHelper(config,
+            'max_load_safety_margin_counts', default=0, minval=0,
+            maxval=(1 << 30))
+        self._max_load_safety_margin_percent_param = floatParamHelper(config,
+            'max_load_safety_margin_percent', default=5.0, minval=0.,
+            below=100.0)
         # triggering options
         self._trigger_force_param = intParamHelper(config, 'trigger_force',
             default=75, minval=10, maxval=250)
+        self._trigger_counts_param = intParamHelper(config, 'trigger_counts',
+            default=0, minval=0, maxval=(1 << 30))
+        self._trigger_percent_param = floatParamHelper(config,
+            'trigger_percent', default=None, above=0., maxval=100.0)
         self._force_safety_limit_param = intParamHelper(config,
             'force_safety_limit', minval=100, maxval=5000, default=2000)
 
@@ -247,25 +269,215 @@ class LoadCellProbeConfigHelper:
         sps = self._sensor.get_samples_per_second()
         return max(2, math.ceil(tare_time * sps))
 
+    def get_safety_model(self):
+        return self._safety_model
+
+    def get_reference_max_load_counts(self):
+        return self._reference_max_load_counts
+
+    def set_reference_max_load_counts(self, max_counts):
+        self._reference_max_load_counts = int(max_counts)
+        cfg = self._printer.lookup_object('configfile')
+        cfg.set(self._config_name, 'reference_max_load_counts',
+                "%i" % (self._reference_max_load_counts,))
+
+    def get_max_load_safety_margin_counts(self, tare_counts, gcmd=None):
+        # Keep explicit raw-count override for compatibility and direct control.
+        margin_counts = self._max_load_safety_margin_counts_param.get(gcmd)
+        if margin_counts > 0:
+            return margin_counts
+        # Default behavior uses a percentage of tare->reference_max span.
+        margin_percent = self._max_load_safety_margin_percent_param.get(gcmd)
+        if margin_percent is None or margin_percent <= 0.:
+            return 0
+        ref_max = self._reference_max_load_counts
+        if ref_max is None:
+            return 0
+        span_counts = abs(int(ref_max - tare_counts))
+        return int(span_counts * (margin_percent / 100.0))
+
     def get_trigger_force_grams(self, gcmd=None):
         return self._trigger_force_param.get(gcmd)
+
+    def get_trigger_counts(self, gcmd=None):
+        trigger_counts = self._trigger_counts_param.get(gcmd)
+        return trigger_counts if trigger_counts > 0 else None
+
+    def get_trigger_percent(self, gcmd=None):
+        trigger_percent = self._trigger_percent_param.get(gcmd)
+        if trigger_percent is None:
+            return None
+        return float(trigger_percent)
 
     def get_safety_limit_grams(self, gcmd=None):
         return self._force_safety_limit_param.get(gcmd)
 
-    def get_safety_range(self, gcmd=None):
+    def validate_probe_setup(self, gcmd=None):
+        cmd_err = self._printer.command_error
+        if self._safety_model == self.SAFETY_MODEL_REFERENCE_TARE:
+            if self._load_cell.get_counts_per_gram() is None:
+                raise cmd_err(
+                    "Load cell probe requires counts_per_gram calibration "
+                    "for safety_model=reference_tare")
+            if self._load_cell.get_reference_tare_counts() is None:
+                raise cmd_err(
+                    "Load cell probe requires reference_tare_counts "
+                    "for safety_model=reference_tare")
+        elif self._safety_model == self.SAFETY_MODEL_PRELOADED_MAX:
+            if self._reference_max_load_counts is None:
+                raise cmd_err(
+                    "Load cell probe requires reference_max_load_counts for "
+                    "safety_model=preloaded_max. Set it in config or run "
+                    "LOAD_CELL_CALIBRATE_MAX.")
+        else:
+            raise cmd_err("Unsupported load cell probe safety_model '%s'"
+                          % (self._safety_model,))
+        if (self.get_trigger_counts(gcmd) is None
+                and self.get_trigger_percent(gcmd) is None
+                and self._load_cell.get_counts_per_gram() is None):
+            raise cmd_err(
+                "Load cell probe requires counts_per_gram unless "
+                "TRIGGER_COUNTS/TRIGGER_PERCENT "
+                "(or trigger_counts/trigger_percent) is configured")
+
+    def _get_safety_range_reference_tare(self, gcmd=None):
         counts_per_gram = self._load_cell.get_counts_per_gram()
         # calculate the safety band
         zero = self._load_cell.get_reference_tare_counts()
         safety_counts = int(counts_per_gram * self.get_safety_limit_grams(gcmd))
         safety_min = int(zero - safety_counts)
         safety_max = int(zero + safety_counts)
+        return safety_min, safety_max
+
+    def _get_safety_range_preloaded_max(self, tare_counts, gcmd=None):
+        cmd_err = self._printer.command_error
+        ref_max = self._reference_max_load_counts
+        if ref_max is None:
+            raise cmd_err(
+                "Missing reference_max_load_counts. Run "
+                "LOAD_CELL_CALIBRATE_MAX first.")
+        margin = self.get_max_load_safety_margin_counts(tare_counts, gcmd)
+        sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
+        if tare_counts <= ref_max:
+            # Allow unrestricted drift on the low side and limit travel
+            # toward the calibrated max-load anchor.
+            safety_min = sensor_min + 1
+            safety_max = ref_max - margin
+        else:
+            # Invert direction if tare is above the max-load anchor.
+            safety_min = ref_max + margin
+            safety_max = sensor_max - 1
+        return int(safety_min), int(safety_max)
+
+    def get_safety_range(self, tare_counts, gcmd=None):
+        if self._safety_model == self.SAFETY_MODEL_REFERENCE_TARE:
+            safety_min, safety_max = self._get_safety_range_reference_tare(gcmd)
+        else:
+            safety_min, safety_max = self._get_safety_range_preloaded_max(
+                tare_counts, gcmd)
         # don't allow a safety range outside the sensor's real range
         sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
         if safety_min <= sensor_min or safety_max >= sensor_max:
             cmd_err = self._printer.command_error
-            raise cmd_err("Load cell force_safety_limit exceeds sensor range!")
+            if self._safety_model == self.SAFETY_MODEL_REFERENCE_TARE:
+                raise cmd_err(
+                    "Load cell force_safety_limit exceeds sensor range!")
+            raise cmd_err("Load cell preloaded_max safety range exceeds "
+                          "sensor range!")
+        if safety_min >= safety_max:
+            cmd_err = self._printer.command_error
+            raise cmd_err("Load cell computed an invalid safety range")
+        if tare_counts < safety_min or tare_counts > safety_max:
+            cmd_err = self._printer.command_error
+            raise cmd_err("Load cell tare is outside the computed safety range")
         return safety_min, safety_max
+
+    def _get_max_delta_before_raw_range(self, tare_counts, safety_min, safety_max,
+                                        trigger_type, direction=None):
+        if trigger_type == "gt":
+            # Directed trigger where positive values move toward safety limit.
+            if direction is not None and direction < 0:
+                return tare_counts - safety_min
+            return safety_max - tare_counts
+        # abs_ge triggers in either direction, so use the nearest limit.
+        return min(tare_counts - safety_min, safety_max - tare_counts)
+
+    def get_trigger_setup(self, tare_counts, safety_min, safety_max, gcmd=None):
+        trigger_counts = self.get_trigger_counts(gcmd)
+        if trigger_counts is not None:
+            scale = 1.
+            scale_frac_bits = 0
+            trigger_type = "abs_ge"
+            direction = None
+            if self._safety_model == self.SAFETY_MODEL_PRELOADED_MAX:
+                ref_max = self._reference_max_load_counts
+                direction = 1. if ref_max >= tare_counts else -1.
+                scale = direction
+                trigger_type = "gt"
+            max_delta = self._get_max_delta_before_raw_range(
+                tare_counts, safety_min, safety_max, trigger_type, direction)
+            if trigger_counts >= max_delta:
+                cmd_err = self._printer.command_error
+                raise cmd_err("trigger_counts (%i) is too large for the active "
+                              "safety range (%i available counts)"
+                              % (trigger_counts, max_delta))
+            return {
+                'scale': scale,
+                'scale_frac_bits': scale_frac_bits,
+                'trigger_type': trigger_type,
+                'trigger_value': int(trigger_counts),
+                'trigger_mode': 'counts',
+            }
+        trigger_percent = self.get_trigger_percent(gcmd)
+        if trigger_percent is not None:
+            if self._safety_model != self.SAFETY_MODEL_PRELOADED_MAX:
+                cmd_err = self._printer.command_error
+                raise cmd_err("trigger_percent is only supported with "
+                              "safety_model=preloaded_max")
+            ref_max = self._reference_max_load_counts
+            direction = 1. if ref_max >= tare_counts else -1.
+            span_counts = abs(int(ref_max - tare_counts))
+            if span_counts <= 0:
+                cmd_err = self._printer.command_error
+                raise cmd_err("trigger_percent has zero span between "
+                              "tare_counts and reference_max_load_counts")
+            trigger_counts = max(
+                1, int(round(span_counts * (trigger_percent / 100.0))))
+            max_delta = self._get_max_delta_before_raw_range(
+                tare_counts, safety_min, safety_max, "gt", direction)
+            if trigger_counts >= max_delta:
+                cmd_err = self._printer.command_error
+                raise cmd_err("trigger_percent (%.3f%% -> %i counts) is too "
+                              "large for the active safety range "
+                              "(%i available counts)"
+                              % (trigger_percent, trigger_counts, max_delta))
+            return {
+                'scale': direction,
+                'scale_frac_bits': 0,
+                'trigger_type': "gt",
+                'trigger_value': int(trigger_counts),
+                'trigger_mode': 'percent',
+            }
+        # Fall back to grams-based trigger logic
+        trigger_val = self.get_trigger_force_grams(gcmd)
+        gpc = self.get_grams_per_count() * FRAC_GRAMS_CONV
+        trigger_frac_grams = trigger_val * FRAC_GRAMS_CONV
+        max_delta = self._get_max_delta_before_raw_range(
+            tare_counts, safety_min, safety_max, "abs_ge")
+        counts_per_gram = self._load_cell.get_counts_per_gram()
+        trigger_delta_counts = int(trigger_val * counts_per_gram)
+        if trigger_delta_counts >= max_delta:
+            cmd_err = self._printer.command_error
+            raise cmd_err("trigger_force (%ig) is too large for the active "
+                          "safety range (%i available counts)"
+                          % (trigger_val, max_delta))
+        return {
+            'scale': gpc,
+            'scale_frac_bits': 14,
+            'trigger_type': "abs_ge",
+            'trigger_value': int(trigger_frac_grams),
+            'trigger_mode': 'grams',
+        }
 
     # calculate 1/counts_per_gram
     def get_grams_per_count(self):
@@ -294,6 +506,9 @@ class LoadCellProbingMove:
         probe.LookupZSteppers(config, dispatch.add_stepper)
         # internal state tracking
         self._tare_counts = 0
+        self._safety_min = 0
+        self._safety_max = 0
+        self._trigger_mode = 'grams'
 
     def _start_collector(self):
         toolhead = self._printer.lookup_object('toolhead')
@@ -312,29 +527,37 @@ class LoadCellProbingMove:
         # use collect_min collected samples are not wasted
         results = collector.collect_min(num_samples)
         tare_samples = check_sensor_errors(results, self._printer)
-        tare_counts = np.average(np.array(tare_samples)[:, 2].astype(float))
+        tare_counts = int(round(
+            np.average(np.array(tare_samples)[:, 2].astype(float))))
         # update sos_filter with any gcode parameter changes
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         # update the load cell so it reflects the new tare value
         self._load_cell.tare(tare_counts)
+        self._tare_counts = tare_counts
         # update raw range
-        safety_min, safety_max = self._config_helper.get_safety_range(gcmd)
+        safety_min, safety_max = self._config_helper.get_safety_range(
+            tare_counts, gcmd)
         self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
+        self._safety_min = safety_min
+        self._safety_max = safety_max
+        # choose trigger + scaling model
+        trigger_setup = self._config_helper.get_trigger_setup(
+            tare_counts, safety_min, safety_max, gcmd)
         # update internal tare value
-        gpc = self._config_helper.get_grams_per_count() * FRAC_GRAMS_CONV
         sos_filter = self._mcu_trigger_analog.get_sos_filter()
-        Q17_14_FRAC_BITS = 14
-        sos_filter.set_offset_scale(int(-tare_counts), gpc, Q17_14_FRAC_BITS)
-        # update trigger
-        trigger_val = self._config_helper.get_trigger_force_grams(gcmd)
-        trigger_frac_grams = trigger_val * FRAC_GRAMS_CONV
-        self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
+        sos_filter.set_offset_scale(
+            int(-tare_counts), trigger_setup['scale'],
+            trigger_setup['scale_frac_bits'])
+        self._mcu_trigger_analog.set_trigger(
+            trigger_setup['trigger_type'], trigger_setup['trigger_value'])
+        self._trigger_mode = trigger_setup['trigger_mode']
+        logging.debug(
+            "load_cell_probe: tare=%i raw_range=[%i,%i] trigger_mode=%s",
+            tare_counts, safety_min, safety_max, self._trigger_mode)
 
     # Probe towards z_min until the trigger_analog on the MCU triggers
     def probing_move(self, gcmd):
-        # do not permit probing if the load cell is not calibrated
-        if not self._load_cell.is_calibrated():
-            raise self._printer.command_error("Load Cell not calibrated")
+        self._config_helper.validate_probe_setup(gcmd)
         # tare the sensor just before probing
         self._pause_and_tare(gcmd)
         # get params for the homing move
@@ -351,6 +574,7 @@ class LoadCellProbingMove:
 
     # Wait for the MCU to trigger with no movement
     def probing_test(self, gcmd, timeout):
+        self._config_helper.validate_probe_setup(gcmd)
         self._pause_and_tare(gcmd)
         toolhead = self._printer.lookup_object('toolhead')
         print_time = toolhead.get_last_move_time()
@@ -361,6 +585,9 @@ class LoadCellProbingMove:
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
         return {
             'tare_counts': self._tare_counts,
+            'raw_safety_min': self._safety_min,
+            'raw_safety_max': self._safety_max,
+            'trigger_mode': self._trigger_mode,
             'last_trigger_time': trig_time,
         }
 
@@ -436,9 +663,12 @@ class TapSession:
 
 
 class LoadCellProbeCommands:
-    def __init__(self, config, load_cell_probing_move):
+    def __init__(self, config, load_cell_inst, load_cell_probing_move,
+                 config_helper):
         self._printer = config.get_printer()
+        self._load_cell = load_cell_inst
         self._load_cell_probing_move = load_cell_probing_move
+        self._config_helper = config_helper
         self._register_commands()
 
     def _register_commands(self):
@@ -446,6 +676,9 @@ class LoadCellProbeCommands:
         gcode = self._printer.lookup_object('gcode')
         gcode.register_command("LOAD_CELL_TEST_TAP",
             self.cmd_LOAD_CELL_TEST_TAP, desc=self.cmd_LOAD_CELL_TEST_TAP_help)
+        gcode.register_command("LOAD_CELL_CALIBRATE_MAX",
+            self.cmd_LOAD_CELL_CALIBRATE_MAX,
+            desc=self.cmd_LOAD_CELL_CALIBRATE_MAX_help)
 
     cmd_LOAD_CELL_TEST_TAP_help = "Tap the load cell probe to verify operation"
 
@@ -463,6 +696,23 @@ class LoadCellProbeCommands:
             # give the user some time for their finger to move away
             reactor.pause(reactor.monotonic() + 0.2)
         gcmd.respond_info("Test complete, %s taps detected" % (taps,))
+
+    cmd_LOAD_CELL_CALIBRATE_MAX_help = (
+        "Capture and save the current stable max-load raw ADC value")
+
+    def cmd_LOAD_CELL_CALIBRATE_MAX(self, gcmd):
+        default_samples = self._load_cell.get_sensor().get_samples_per_second()
+        num_samples = gcmd.get_int("SAMPLES", default_samples, minval=2)
+        gcmd.respond_info("Collecting %i samples for max-load calibration..."
+                          % (num_samples,))
+        max_counts = int(round(self._load_cell.avg_counts(num_samples)))
+        self._config_helper.set_reference_max_load_counts(max_counts)
+        max_pct = self._load_cell.counts_to_percent(max_counts)
+        gcmd.respond_info(
+            "reference_max_load_counts: %i (%.2f%%)\n"
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with the above and restart the printer."
+            % (max_counts, max_pct))
 
 
 class LoadCellPrinterProbe:
@@ -483,6 +733,7 @@ class LoadCellPrinterProbe:
         self._load_cell = load_cell.LoadCell(config, sensor)
         # Read all user configuration and build modules
         config_helper = LoadCellProbeConfigHelper(config, self._load_cell)
+        self._config_helper = config_helper
         self._mcu = self._load_cell.get_sensor().get_mcu()
         self._mcu_trigger_analog = trigger_analog.MCU_trigger_analog(sensor)
         cmd_queue = self._mcu_trigger_analog.get_dispatch().get_command_queue()
@@ -497,6 +748,7 @@ class LoadCellPrinterProbe:
         load_cell_probing_move = LoadCellProbingMove(config, self._load_cell,
             self._mcu_trigger_analog, self._param_helper,
             continuous_tare_filter_helper, config_helper)
+        self._load_cell_probing_move = load_cell_probing_move
         self._tapping_move = TappingMove(config, load_cell_probing_move,
             config_helper)
         tap_session = TapSession(config, self._tapping_move,
@@ -504,7 +756,8 @@ class LoadCellPrinterProbe:
         self._probe_session = probe.ProbeSessionHelper(config,
             self._param_helper, tap_session.start_probe_session)
         # printer integration
-        LoadCellProbeCommands(config, load_cell_probing_move)
+        LoadCellProbeCommands(config, self._load_cell, load_cell_probing_move,
+                              config_helper)
         probe.ProbeVirtualEndstopDeprecation(config)
         self._printer.add_object('probe', self)
 
@@ -520,7 +773,13 @@ class LoadCellPrinterProbe:
     def get_status(self, eventtime):
         status = self._cmd_helper.get_status(eventtime)
         status.update(self._load_cell.get_status(eventtime))
+        status.update(self._load_cell_probing_move.get_status(eventtime))
         status.update(self._tapping_move.get_status(eventtime))
+        status.update({
+            'safety_model': self._config_helper.get_safety_model(),
+            'reference_max_load_counts':
+                self._config_helper.get_reference_max_load_counts(),
+        })
         return status
 
 

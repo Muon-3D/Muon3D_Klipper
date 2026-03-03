@@ -142,17 +142,22 @@ excessive force to the toolhead. It's important to understand what they are
 and how they work as you can defeat most of them with poorly chosen config
 values.
 
-#### Calibration Check
-Every time a homing move starts, load_cell_probe checks
-that the load_cell is calibrated. If not it will stop the move with an error:
-`!! Load Cell not calibrated`.
+#### Probe Setup Check
+Every time a homing move starts, load_cell_probe verifies that the active
+trigger and safety model is fully configured. With the default
+`safety_model=reference_tare` this requires a standard load-cell calibration
+(`counts_per_gram` and `reference_tare_counts`). With
+`safety_model=preloaded_max` and `trigger_counts` configured, probing can run
+without gram-based calibration.
 
 #### `counts_per_gram`
-This setting is used to convert raw sensor counts into grams. All the safety
-limits are in gram units for your convenience. If the `counts_per_gram`
-setting is not accurate you can easily exceed the safe force on the toolhead.
-You should never guess this value. Use `LOAD_CELL_CALIBRATE` to find your load
-cells actual `counts_per_gram`.
+This setting is used to convert raw sensor counts into grams. In the default
+`safety_model=reference_tare`, safety and trigger limits are configured in gram
+units for convenience. If the `counts_per_gram` setting is not accurate you can
+easily exceed the safe force on the toolhead. You should never guess this
+value. Use `LOAD_CELL_CALIBRATE` to find your load cells actual
+`counts_per_gram`. This setting is optional if you use
+`trigger_counts` and `safety_model=preloaded_max`.
 
 #### `trigger_force`
 This is the force in grams that triggers the endstop to halt the homing move.
@@ -162,6 +167,16 @@ always some overshoot of this value when the probe collides with the bed,
 so be conservative. e.g. a setting of 100g could result in 350g of peak force
 before the toolhead stops. This overshoot will increase with faster probing
 `speed`, a low ADC sample rate or [multi MCU homing](Multi_MCU_Homing.md).
+
+#### `trigger_counts`
+Optional trigger threshold in raw ADC counts, measured from the per-probe tare.
+If set, this overrides both `trigger_percent` and `trigger_force`.
+
+#### `trigger_percent`
+Optional trigger threshold as a percentage of the span from the per-probe tare
+value to `reference_max_load_counts`. This is intended for
+`safety_model=preloaded_max` and automatically scales as tare drifts. If set,
+this overrides `trigger_force`.
 
 #### `reference_tare_counts`
 This is the baseline tare value that is set by `LOAD_CELL_CALIBRATE`.
@@ -199,6 +214,17 @@ strain gauges are heated their `reference_tare_counts` may be very different
 at ambient temperature vs operating temperature. In this case you may need
 to increase the `force_safety_limit` to allow for thermal changes.
 
+#### `safety_model=preloaded_max`
+For preload-style hardware where zero-force can drift but a max-load position
+is stable, `safety_model=preloaded_max` anchors the safety range to
+`reference_max_load_counts` instead of `reference_tare_counts`.
+Use `LOAD_CELL_CALIBRATE_MAX` while the mechanism is at its known stable
+max-load position to capture this value. Optional
+`max_load_safety_margin_percent` (default `5.0`) adds distance from that
+anchor before a safety trip occurs, as a percentage of the span from tare to
+`reference_max_load_counts`. `max_load_safety_margin_counts` can be used as
+an explicit raw-count override.
+
 #### Load Cell Endstop Watchdog Task
 When homing the load_cell_endstop starts a task on the MCU to trac
 measurements arriving from the sensor. If the sensor fails to send
@@ -223,6 +249,8 @@ A `[load_cell_probe]` is also a `[load_cell]` and G-code commands related to
 cell probe, follow the directions for
 [calibrating the load cell](Load_Cell.md#calibrating-a-load-cell) with
 `CALIBRATE_LOAD_CELL` and checking its operation with `LOAD_CELL_DIAGNOSTIC`.
+If you are using `safety_model=preloaded_max` with `trigger_counts`, you may
+instead calibrate the max-load anchor with `LOAD_CELL_CALIBRATE_MAX`.
 
 ### Verify Probe Operation With LOAD_CELL_TEST_TAP
 

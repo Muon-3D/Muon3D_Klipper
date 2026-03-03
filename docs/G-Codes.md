@@ -222,6 +222,11 @@ adjustment after a tool change.  Note that a ZFADE offset does not apply
 additional z-adjustment directly, it is used to correct the `fade`
 calculation when a `gcode offset` has been applied to the Z axis.
 
+#### BED_MESH_SKEW
+`BED_MESH_SKEW`: Fit a best-fit plane to the active mesh and set
+`[skew_correction]` XZ and YZ skew factors from the resulting tilt.
+XY skew is left unchanged.
+
 ### [bed_screws]
 
 The following commands are available when the
@@ -850,6 +855,8 @@ The following command is available when any of the
 `SET_LED LED=<config_name> RED=<value> GREEN=<value> BLUE=<value>
 WHITE=<value> [INDEX=<index>] [TRANSMIT=0] [SYNC=1]`: This sets the
 LED output. Each color `<value>` must be between 0.0 and 1.0. The
+configured `output_gamma` (if any) is applied before values are sent
+to LED hardware. The
 WHITE option is only valid on RGBW LEDs. If the LED supports multiple
 chips in a daisy-chain then one may specify INDEX to alter the color
 of just the given chip (1 for the first chip, 2 for the second,
@@ -934,6 +941,12 @@ QUERY_ENDSTOPS and QUERY_PROBE for load cell probes.
 - `TIMEOOUT`: the time, in seconds, that the tool waits for each tab before
   aborting.
 
+### LOAD_CELL_CALIBRATE_MAX
+`LOAD_CELL_CALIBRATE_MAX [SAMPLES=<sample_count>]`: Capture the current raw ADC
+count as the `reference_max_load_counts` setting for `[load_cell_probe]`.
+This command is intended for preload-style hardware where the stable max-load
+position is easier to calibrate than a stable zero point.
+
 ### Load Cell Command Extensions
 Commands that perform probes, such as [`PROBE`](#probe),
 [`PROBE_ACCURACY`](#probe_accuracy),
@@ -943,6 +956,12 @@ corresponding settings from the
 [`[load_cell_probe]`](./Config_Reference.md#load_cell_probe) configuration:
 - `FORCE_SAFETY_LIMIT=<grams>`
 - `TRIGGER_FORCE=<grams>`
+- `TRIGGER_COUNTS=<counts>`
+- `TRIGGER_PERCENT=<percent>`
+- `MAX_LOAD_SAFETY_MARGIN_COUNTS=<counts>`
+- `MAX_LOAD_SAFETY_MARGIN_PERCENT=<percent>`
+- `TRIGGER_PERCENT` requires `safety_model=preloaded_max`.
+- `MAX_LOAD_SAFETY_MARGIN_PERCENT` requires `safety_model=preloaded_max`.
 - `DRIFT_FILTER_CUTOFF_FREQUENCY=<frequency_hz>`
 - `DRIFT_FILTER_DELAY=<1|2>`
 - `BUZZ_FILTER_CUTOFF_FREQUENCY=<frequency_hz>`

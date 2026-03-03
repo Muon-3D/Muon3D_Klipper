@@ -327,8 +327,14 @@ The following information is available for each `[load_cell name]`:
 The following information is available for `[load_cell_probe]`:
 - all items from [load_cell](Status_Reference.md#load_cell)
 - all items from [probe](Status_Reference.md#probe)
-- 'endstop_tare_counts': the load cell probe keeps a tare value independent of
-the load cell. This re-set at the start of each probe.
+- 'tare_counts': the load cell probe keeps a tare value independent of
+the load cell. This is re-set at the start of each probe.
+- 'raw_safety_min': lower raw ADC safety limit active during probing
+- 'raw_safety_max': upper raw ADC safety limit active during probing
+- 'trigger_mode': trigger units in use (`grams` or `counts`)
+- 'safety_model': active safety model (`reference_tare` or `preloaded_max`)
+- 'reference_max_load_counts': configured max-load anchor for
+`safety_model=preloaded_max`
 - 'last_trigger_time': timestamp of the last homing trigger
 
 ## manual_probe
