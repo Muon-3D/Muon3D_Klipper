@@ -237,32 +237,37 @@ class ledFrameHandler:
 
     def _getFrames(self, eventtime):
         chainsToUpdate = set()
+        nextStates = {}
 
         frames = [(effect, effect.getFrame(eventtime)) for effect in self.effects]
 
-        #first set all LEDs to 0, that should be updated
+        # first mark all LEDs that should be updated and initialize them to off
         for effect, (frame, update) in frames:
             if update:
                 for i in range(effect.ledCount):
                     chain,index=effect.leds[i]
-                    chain.led_helper.led_state[index] = (0.0, 0.0, 0.0, 0.0)
-                    chainsToUpdate.add(chain)
+                    nextStates[(chain, index)] = [0.0, 0.0, 0.0, 0.0]
 
-        #then sum up all effects for that LEDs
+        # then sum all effects for each LED in local scratch state
         for effect, (frame, update) in frames:
             if update:
                 for i in range(effect.ledCount):
                     chain,index=effect.leds[i]
-                    
-                    current_state=list(chain.led_helper.led_state[index])
+                    current_state=nextStates[(chain, index)]
                     effect_state=self._getColorData(frame[i*COLORS:i*COLORS+COLORS], 
                                                     effect.fadeValue)
 
                     next_state=[min(1.0,a+b) for a,b in \
                                  zip(current_state, effect_state)]
 
-                    chain.led_helper.led_state[index] = tuple(next_state)
-                    chainsToUpdate.add(chain)
+                    nextStates[(chain, index)] = next_state
+
+        # apply only changed LED states to avoid unnecessary transmissions
+        for (chain, index), next_state in nextStates.items():
+            next_tuple = tuple(next_state)
+            if chain.led_helper.led_state[index] != next_tuple:
+                chain.led_helper.led_state[index] = next_tuple
+                chainsToUpdate.add(chain)
 
         for chain in chainsToUpdate:
             self._transmit_chain(chain)
@@ -453,6 +458,8 @@ class ledEffect:
 
         self.ledCount = len(self.leds)
         self.frame = [0.0] * COLORS * self.ledCount
+        self.rawFrame = self.frame[:]
+        self.lastFrame = self.frame[:]
 
         #enumerate all effects from the subclasses of _layerBase...
         self.availableLayers = {str(c).rpartition('.layer')[2]\
@@ -523,6 +530,8 @@ class ledEffect:
                 # Effect has just been disabled. Set colors to 0 and update once.
                 self.nextEventTime = self.handler.reactor.NEVER
                 self.frame = [0.0] * COLORS * self.ledCount
+                self.rawFrame = self.frame[:]
+                self.lastFrame = self.frame[:]
                 update = True
             else:
                 update = False
@@ -531,13 +540,16 @@ class ledEffect:
             if eventtime >= self.nextEventTime:
                 self.nextEventTime = eventtime + self.frameRate
 
-                self.frame = [0.0] * COLORS * self.ledCount
+                self.lastFrame = self.rawFrame[:]
+                rawFrame = [0.0] * COLORS * self.ledCount
                 for layer in self.layers:
                     layerFrame = layer.nextFrame(eventtime)
 
                     if layerFrame:
                         blend = self.blendingModes[layer.blendingMode]
-                        self.frame = [blend(t, b) for t, b in zip(layerFrame, self.frame)]
+                        rawFrame = [blend(t, b)
+                                    for t, b in zip(layerFrame, rawFrame)]
+                self.rawFrame = rawFrame
 
                 if (self.fadeEndTime > eventtime) and (self.fadeTime > 0.0):
                     remainingFade = ((self.fadeEndTime - eventtime) / self.fadeTime)
@@ -545,6 +557,15 @@ class ledEffect:
                     remainingFade = 0.0    
 
                 self.fadeValue = 1.0-remainingFade if self.enabled else remainingFade
+
+            if (self.smoothTransitions and self.frameRate > 0.0
+                and self.nextEventTime < self.handler.reactor.NEVER):
+                progress = 1.0 - ((self.nextEventTime - eventtime) / self.frameRate)
+                progress = min(1.0, max(0.0, progress))
+                self.frame = [((1.0 - progress) * a) + (progress * b)
+                              for a, b in zip(self.lastFrame, self.rawFrame)]
+            else:
+                self.frame = self.rawFrame[:]
 
         return self.frame, update
 
