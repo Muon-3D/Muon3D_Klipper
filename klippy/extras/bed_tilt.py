@@ -15,14 +15,28 @@ class BedTilt:
         self.x_adjust = config.getfloat('x_adjust', 0.)
         self.y_adjust = config.getfloat('y_adjust', 0.)
         self.z_adjust = config.getfloat('z_adjust', 0.)
+        self.auto_skew = config.getboolean('auto_skew', False)
+        if self.auto_skew and not config.has_section('skew_correction'):
+            raise config.error(
+                "bed_tilt: auto_skew requires a [skew_correction] section")
         if config.get('points', None) is not None:
             BedTiltCalibrate(config, self)
         self.toolhead = None
         # Register move transform with g-code class
         gcode_move = self.printer.load_object(config, 'gcode_move')
         gcode_move.set_move_transform(self)
+    def _sync_skew_from_tilt(self):
+        if not self.auto_skew:
+            return
+        skew = self.printer.lookup_object('skew_correction', None)
+        if skew is None:
+            return
+        skew._update_skew(skew.xy_factor, self.x_adjust, self.y_adjust)
+        logging.info("bed_tilt auto_skew: xz=%.6f yz=%.6f",
+                     self.x_adjust, self.y_adjust)
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
+        self._sync_skew_from_tilt()
     def get_position(self):
         pos = self.toolhead.get_position()
         x, y, z = pos[:3]
@@ -42,6 +56,7 @@ class BedTilt:
         configfile.set('bed_tilt', 'x_adjust', "%.6f" % (x_adjust,))
         configfile.set('bed_tilt', 'y_adjust', "%.6f" % (y_adjust,))
         configfile.set('bed_tilt', 'z_adjust', "%.6f" % (z_adjust,))
+        self._sync_skew_from_tilt()
 
 # Helper script to calibrate the bed tilt
 class BedTiltCalibrate:

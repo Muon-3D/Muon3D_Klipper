@@ -765,7 +765,7 @@ class MpcCalibrate:
             sensor_responsiveness = fastest_rate[2] / (
                 fastest_rate[2] * fastest_rate[0]
                 + ambient_temp
-                - fastest_rate[0]
+                - fastest_rate[1]
             )
 
         heat_time = all_samples[-1][0] - all_samples[0][0]

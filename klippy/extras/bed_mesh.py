@@ -149,6 +149,10 @@ class BedMesh:
         self.base_fade_target = config.getfloat('fade_target', None)
         self.fade_target = 0.
         self.tool_offset = 0.
+        self.auto_skew = config.getboolean('auto_skew', False)
+        if self.auto_skew and not config.has_section('skew_correction'):
+            raise config.error(
+                "bed_mesh: auto_skew requires a [skew_correction] section")
         self.gcode = self.printer.lookup_object('gcode')
         self.splitter = MoveSplitter(config, self.gcode)
         # setup persistent storage
@@ -167,6 +171,9 @@ class BedMesh:
         self.gcode.register_command(
             'BED_MESH_OFFSET', self.cmd_BED_MESH_OFFSET,
             desc=self.cmd_BED_MESH_OFFSET_help)
+        self.gcode.register_command(
+            'BED_MESH_SKEW', self.cmd_BED_MESH_SKEW,
+            desc=self.cmd_BED_MESH_SKEW_help)
         # Register dump webhooks
         webhooks = self.printer.lookup_object('webhooks')
         webhooks.register_endpoint(
@@ -180,6 +187,21 @@ class BedMesh:
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         self.bmc.print_generated_points(logging.info, truncate=True)
+    def _sync_skew_from_mesh(self):
+        mesh = self.z_mesh
+        if mesh is None:
+            raise self.gcode.error("bed_mesh: Cannot sync skew, no mesh loaded")
+        try:
+            x_tilt, y_tilt = mesh.calc_plane_tilt()
+        except BedMeshError as e:
+            raise self.gcode.error(str(e))
+        skew = self.printer.lookup_object('skew_correction', None)
+        if skew is None:
+            raise self.gcode.error(
+                "bed_mesh: Cannot sync skew, [skew_correction] is not enabled")
+        skew._update_skew(skew.xy_factor, x_tilt, y_tilt)
+        logging.info("bed_mesh skew sync: xz=%.6f yz=%.6f", x_tilt, y_tilt)
+        return x_tilt, y_tilt
     def set_mesh(self, mesh):
         if mesh is not None and self.fade_end != self.FADE_DISABLE:
             self.log_fade_complete = True
@@ -216,6 +238,8 @@ class BedMesh:
         gcode_move = self.printer.lookup_object('gcode_move')
         gcode_move.reset_last_position()
         self.update_status()
+        if self.auto_skew and mesh is not None:
+            self._sync_skew_from_mesh()
     def get_z_factor(self, z_pos):
         z_pos += self.tool_offset
         if z_pos >= self.fade_end:
@@ -334,6 +358,12 @@ class BedMesh:
             gcode_move.reset_last_position()
         else:
             gcmd.respond_info("No mesh loaded to offset")
+    cmd_BED_MESH_SKEW_help = "Sync skew_correction XZ/YZ from active mesh tilt"
+    def cmd_BED_MESH_SKEW(self, gcmd):
+        x_tilt, y_tilt = self._sync_skew_from_mesh()
+        gcmd.respond_info(
+            "bed_mesh: synced skew from mesh tilt\n"
+            "xz_skew: %.6f yz_skew: %.6f" % (x_tilt, y_tilt))
     def _handle_dump_request(self, web_request):
         eventtime = self.printer.get_reactor().monotonic()
         prb = self.printer.lookup_object("probe", None)
@@ -1771,6 +1801,38 @@ class ZMesh:
             return round(avg_z, 2)
         else:
             return 0.
+    def calc_plane_tilt(self):
+        if self.mesh_matrix is None:
+            raise BedMeshError("bed_mesh: Mesh is not available")
+        points = []
+        for yidx, row in enumerate(self.mesh_matrix):
+            y = self.get_y_coordinate(yidx)
+            for xidx, z in enumerate(row):
+                x = self.get_x_coordinate(xidx)
+                points.append((x, y, z))
+        count = len(points)
+        if count < 3:
+            raise BedMeshError(
+                "bed_mesh: Unable to fit mesh tilt plane from fewer than 3 points")
+        mean_x = sum([p[0] for p in points]) / count
+        mean_y = sum([p[1] for p in points]) / count
+        mean_z = sum([p[2] for p in points]) / count
+        sxx = syy = sxy = sxz = syz = 0.
+        for x, y, z in points:
+            dx = x - mean_x
+            dy = y - mean_y
+            dz = z - mean_z
+            sxx += dx * dx
+            syy += dy * dy
+            sxy += dx * dy
+            sxz += dx * dz
+            syz += dy * dz
+        det = sxx * syy - sxy * sxy
+        if isclose(det, 0., abs_tol=1.0e-12):
+            raise BedMeshError("bed_mesh: Unable to solve mesh tilt plane")
+        x_tilt = (sxz * syy - syz * sxy) / det
+        y_tilt = (syz * sxx - sxz * sxy) / det
+        return x_tilt, y_tilt
     def _get_linear_index(self, coord, axis):
         if axis == 0:
             # X-axis
