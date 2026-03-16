@@ -1,0 +1,14 @@
+# Extruder homing tests
+DICTIONARY atmega2560.dict
+CONFIG extruder_homing.cfg
+
+# Dry-run a stall-style move without requiring a trigger
+EXTRUDER_HOMING_MOVE EXTRUDER=sensorless DISTANCE=7 SPEED=6 SET_POSITION=0 STOP_ON_ENDSTOP=2
+CHECK_EXTRUDER_HOMING_STATUS
+
+# Verify the TMC remains queryable after the move
+DUMP_TMC STEPPER=extruder
+
+# Verify position reporting still works
+GET_POSITION
+M114

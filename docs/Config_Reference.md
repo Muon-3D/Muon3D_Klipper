@@ -2626,6 +2626,49 @@ extruder:
 #   parameters.
 ```
 
+### [extruder_homing]
+
+Bounded extruder moves with endstop or TMC stall detection (one may
+define any number of sections with an "extruder_homing" prefix). This
+feature is intended for manual load / unload style moves outside of
+normal printing. For example, it may be paired with
+`endstop_pin: tmc2130_extruder:virtual_endstop` to stop when a
+stallGuard-capable extruder driver reports a stall.
+
+See the [command reference](G-Codes.md#extruder_homing) for more
+information.
+
+```
+[extruder_homing my_extruder]
+extruder:
+#   The extruder object to move. This should usually name an
+#   `[extruder]` section (for example, `extruder` or `extruder1`), but
+#   an `[extruder_stepper]` object name may also be used. This
+#   parameter must be provided.
+endstop_pin:
+#   Endstop pin to monitor during the move. This may be a physical
+#   endstop input or a TMC virtual endstop such as
+#   `tmc2130_extruder:virtual_endstop`. This parameter must be
+#   provided. When using a TMC virtual endstop, place this section
+#   after the corresponding `[tmc...]` section in the config file.
+#velocity:
+#   The default velocity (in mm/s) for the move. This value will be
+#   used if EXTRUDER_HOMING_MOVE does not specify a SPEED parameter.
+#   The default is 5mm/s.
+#accel:
+#   The default acceleration (in mm/s^2) for the move. An acceleration
+#   of zero will result in no acceleration. This value will be used if
+#   EXTRUDER_HOMING_MOVE does not specify an ACCEL parameter. The
+#   default is zero.
+#min_extrude_temp_override:
+#   Override the normal extruder `min_extrude_temp` safety check for
+#   EXTRUDER_HOMING_MOVE only. If set, the command is allowed once the
+#   heater reaches this temperature even if the main extruder config
+#   requires a higher `min_extrude_temp`. Set this to `0` to allow cold
+#   loading moves with EXTRUDER_HOMING_MOVE. The default is to use the
+#   normal extruder safety check unchanged.
+```
+
 ### [manual_stepper]
 
 Manual steppers (one may define any number of sections with a

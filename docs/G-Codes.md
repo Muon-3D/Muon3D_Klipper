@@ -1045,6 +1045,29 @@ acceleration above the specified limits. The
 velocity change (in mm/s) of the motor during the junction of two
 moves (the default is 1mm/s).
 
+### [extruder_homing]
+
+The following command is available when an
+[extruder_homing config section](Config_Reference.md#extruder_homing)
+is enabled.
+
+#### EXTRUDER_HOMING_MOVE
+`EXTRUDER_HOMING_MOVE EXTRUDER=config_name DISTANCE=<distance>
+[SPEED=<speed>] [ACCEL=<accel>] [STOP_ON_ENDSTOP=[1|2|-1|-2]]
+[SET_POSITION=<pos>]`: This command runs a bounded move on the
+configured extruder stepper. The move will stop early if the endstop
+reports the requested state. Use `STOP_ON_ENDSTOP=1` to stop on a
+triggered endstop and raise an error if it never triggers. Use
+`STOP_ON_ENDSTOP=2` to stop on a triggered endstop but allow the move
+to complete without error if it never triggers. Use `-1` or `-2` to
+stop when the endstop reports "not triggered". The optional
+`SET_POSITION` parameter updates the logical extruder position after
+the move completes, which is useful for homing-style workflows. This
+command always waits for the move to finish before continuing. If the
+corresponding `[extruder_homing]` section sets
+`min_extrude_temp_override`, that lower threshold applies to this
+command only.
+
 ### [mcp4018]
 
 The following command is available when a
