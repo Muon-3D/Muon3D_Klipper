@@ -212,6 +212,10 @@ class MCU_trsync:
             "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u")
         state_tag = state_cmd.get_command_tag()
         ffi_main, ffi_lib = chelper.get_ffi()
+        if self._trdispatch_mcu is not None:
+            # Reconnect rebuilds config callbacks against a new serialqueue
+            # while the owning TriggerDispatch persists across reconnects.
+            ffi_lib.trdispatch_mcu_clear(self._trdispatch_mcu)
         self._trdispatch_mcu = ffi_main.gc(ffi_lib.trdispatch_mcu_alloc(
             self._trdispatch, mcu._serial.get_serialqueue(), # XXX
             self._cmd_queue, self._oid, set_timeout_tag, trigger_tag,
