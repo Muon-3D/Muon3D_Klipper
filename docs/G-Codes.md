@@ -513,6 +513,35 @@ parsed as Python literals). If TEMPLATE is an empty string then this
 command will clear any previous template assigned to the pin (one can
 then use `SET_FAN_SPEED` commands to manage the values directly).
 
+### [power_fan]
+
+The following commands are available when a
+[power_fan config section](Config_Reference.md#power_fan) is enabled.
+
+#### SET_POWER_FAN_CONFIG
+`SET_POWER_FAN_CONFIG FAN=config_name [VOLTAGE=<volts>]
+[FILTER_TIME=<seconds>] [SAMPLE_INTERVAL=<seconds>]
+[MIN_SPEED_DELTA=<speed>]`: Updates runtime configuration for a
+power_fan. If no parameters are provided, the current runtime
+configuration is reported. Changed settings are not retained on
+Klipper reset.
+
+#### SET_POWER_FAN_RESISTIVE_LOAD
+`SET_POWER_FAN_RESISTIVE_LOAD FAN=config_name HEATER=<heater>
+RESISTANCE=<ohms>`: Updates the resistance used for a configured
+resistive heater load. Changed settings are not retained on Klipper
+reset.
+
+#### SET_POWER_FAN_DYNAMIC_LOAD
+`SET_POWER_FAN_DYNAMIC_LOAD FAN=config_name NAME=<name> POWER=<watts>`:
+Adds or updates a runtime dynamic load in watts. Dynamic loads may be
+used by macros or other modules to account for miscellaneous loads not
+represented by heaters or steppers.
+
+#### CLEAR_POWER_FAN_DYNAMIC_LOAD
+`CLEAR_POWER_FAN_DYNAMIC_LOAD FAN=config_name NAME=<name>`: Clears a
+runtime dynamic load.
+
 ### [filament_switch_sensor]
 
 The following command is available when a

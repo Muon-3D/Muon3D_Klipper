@@ -3490,6 +3490,57 @@ with the SET_FAN_SPEED [gcode command](G-Codes.md#fan_generic).
 #   See the "fan" section for a description of the above parameters.
 ```
 
+### [power_fan]
+
+Power controlled fan (one may define any number of sections with a
+"power_fan" prefix). A "power fan" estimates printer power draw from
+configured heater, stepper, fixed, and dynamic loads. The fan speed is
+then selected from a power-to-speed curve.
+
+```
+[power_fan my_power_fan]
+#pin:
+#max_power:
+#shutdown_speed:
+#cycle_time:
+#hardware_pwm:
+#kick_start_time:
+#off_below:
+#tachometer_pin:
+#tachometer_ppr:
+#tachometer_poll_interval:
+#enable_pin:
+#   See the "fan" section for a description of the above parameters.
+system_voltage:
+#   System voltage, in volts, used to estimate resistive heater power.
+#   This parameter must be provided.
+#sample_interval: 0.5
+#   Time, in seconds, between power estimate updates. The default is
+#   0.5 seconds.
+#filter_time: 5.0
+#   Time, in seconds, for the moving average filter applied to the
+#   estimated power before fan speed is selected. Set to 0 to disable
+#   filtering. The default is 5 seconds.
+#min_speed_delta: 0.02
+#   Minimum fan speed change that will trigger a new fan update.
+#   Transitions to or from zero are always applied. The default is 0.02.
+points:
+#   A list of power/speed points. Each line should contain one power
+#   value in watts and one fan speed between 0.0 and 1.0, separated by
+#   a comma. At least two points must be provided. Fan speed is linearly
+#   interpolated between points and clamped outside the configured range.
+#resistive_loads:
+#   A list of heater/resistance entries. Each line should contain the
+#   name of a heater and its resistance in ohms, separated by a comma.
+#   Heater power is estimated as heater_pwm * system_voltage^2 / resistance.
+#stepper_loads:
+#   A list of stepper/power entries. Each line should contain the name
+#   of a stepper and its active power draw in watts, separated by a comma.
+#   The configured power is added when the stepper is enabled.
+#fixed_loads:
+#   A list of name/power entries for fixed always-on loads, in watts.
+```
+
 ## LEDs
 
 ### [led]
