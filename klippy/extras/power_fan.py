@@ -13,8 +13,10 @@ PIN_MIN_TIME = 0.100
 class PowerFan:
     cmd_SET_POWER_FAN_CONFIG_help = "Set power fan runtime configuration"
     cmd_SET_POWER_FAN_RESISTIVE_LOAD_help = "Set a power fan heater load"
+    cmd_SET_POWER_FAN_FAN_LOAD_help = "Set a power fan fan load"
     cmd_SET_POWER_FAN_DYNAMIC_LOAD_help = "Set a power fan dynamic load"
     cmd_CLEAR_POWER_FAN_DYNAMIC_LOAD_help = "Clear a power fan dynamic load"
+    cmd_SET_POWER_FAN_OVERRIDE_help = "Set a power fan speed override"
 
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -38,19 +40,24 @@ class PowerFan:
             config, 'resistive_loads', above=0., default=())
         self.stepper_loads = self._parse_named_float_table(
             config, 'stepper_loads', above=0., default=())
+        self.fan_loads = self._parse_named_float_table(
+            config, 'fan_loads', minval=0., default=())
         self.fixed_loads = dict(self._parse_named_float_table(
             config, 'fixed_loads', minval=0., default=()))
         self.dynamic_loads = {}
 
         self.points = self._parse_points(config)
         self.heaters = {}
+        self.fans = {}
         self.stepper_names = []
         self.samples = collections.deque()
         self.last_speed = 0.
+        self.override_speed = None
         self.instant_power = 0.
         self.filtered_power = 0.
         self.resistive_power = 0.
         self.stepper_power = 0.
+        self.fan_power = 0.
         self.fixed_power = sum(self.fixed_loads.values())
         self.dynamic_power = 0.
 
@@ -62,6 +69,10 @@ class PowerFan:
                                    self.name,
                                    self.cmd_SET_POWER_FAN_RESISTIVE_LOAD,
                                    desc="Set a power fan heater load")
+        gcode.register_mux_command("SET_POWER_FAN_FAN_LOAD", "FAN",
+                                   self.name,
+                                   self.cmd_SET_POWER_FAN_FAN_LOAD,
+                                   desc="Set a power fan fan load")
         gcode.register_mux_command("SET_POWER_FAN_DYNAMIC_LOAD", "FAN",
                                    self.name,
                                    self.cmd_SET_POWER_FAN_DYNAMIC_LOAD,
@@ -70,6 +81,10 @@ class PowerFan:
                                    self.name,
                                    self.cmd_CLEAR_POWER_FAN_DYNAMIC_LOAD,
                                    desc="Clear a power fan dynamic load")
+        gcode.register_mux_command("SET_POWER_FAN_OVERRIDE", "FAN",
+                                   self.name,
+                                   self.cmd_SET_POWER_FAN_OVERRIDE,
+                                   desc=self.cmd_SET_POWER_FAN_OVERRIDE_help)
 
     def _parse_named_float_table(self, config, option, default=None,
                                  minval=None, above=None):
@@ -128,6 +143,17 @@ class PowerFan:
                 'heater': pheaters.lookup_heater(heater_name),
                 'resistance': resistance,
             }
+        self.fans = {}
+        for fan_name, power in self.fan_loads:
+            fan_obj = self.printer.lookup_object(fan_name, None)
+            if fan_obj is None or not hasattr(fan_obj, 'get_status'):
+                raise self.printer.config_error(
+                    "Unknown fan '%s' in [power_fan %s]"
+                    % (fan_name, self.name))
+            self.fans[fan_name] = {
+                'fan': fan_obj,
+                'power': power,
+            }
         all_steppers = self.stepper_enable.get_steppers()
         self.stepper_names = []
         for stepper_name, power in self.stepper_loads:
@@ -173,6 +199,13 @@ class PowerFan:
                 total += powers[stepper_name]
         return total
 
+    def _calc_fan_power(self, eventtime):
+        total = 0.
+        for load in self.fans.values():
+            status = load['fan'].get_status(eventtime)
+            total += status.get('speed', 0.) * load['power']
+        return total
+
     def _record_sample(self, eventtime, power):
         self.samples.append((eventtime, power))
         if self.filter_time <= 0.:
@@ -203,13 +236,17 @@ class PowerFan:
     def callback(self, eventtime):
         self.resistive_power = self._calc_resistive_power(eventtime)
         self.stepper_power = self._calc_stepper_power()
+        self.fan_power = self._calc_fan_power(eventtime)
         self.fixed_power = sum(self.fixed_loads.values())
         self.dynamic_power = sum(self.dynamic_loads.values())
         self.instant_power = (self.resistive_power + self.stepper_power
-                              + self.fixed_power + self.dynamic_power)
+                              + self.fan_power + self.fixed_power
+                              + self.dynamic_power)
         self.filtered_power = self._record_sample(eventtime,
                                                   self.instant_power)
-        speed = self._interp_speed(self.filtered_power)
+        speed = self.override_speed
+        if speed is None:
+            speed = self._interp_speed(self.filtered_power)
         if (abs(speed - self.last_speed) >= self.min_speed_delta
             or (not speed and self.last_speed)
             or (speed and not self.last_speed)):
@@ -224,10 +261,12 @@ class PowerFan:
             'filtered_power': round(self.filtered_power, 3),
             'resistive_power': round(self.resistive_power, 3),
             'stepper_power': round(self.stepper_power, 3),
+            'fan_power': round(self.fan_power, 3),
             'fixed_power': round(self.fixed_power, 3),
             'dynamic_power': round(self.dynamic_power, 3),
             'system_voltage': float(self.system_voltage),
             'filter_time': float(self.filter_time),
+            'override_speed': self.override_speed,
         })
         return status
 
@@ -262,6 +301,13 @@ class PowerFan:
             raise gcmd.error("Unknown resistive load '%s'" % (heater_name,))
         self.heaters[heater_name]['resistance'] = resistance
 
+    def cmd_SET_POWER_FAN_FAN_LOAD(self, gcmd):
+        fan_name = gcmd.get('LOAD_FAN')
+        power = gcmd.get_float('POWER', minval=0.)
+        if fan_name not in self.fans:
+            raise gcmd.error("Unknown fan load '%s'" % (fan_name,))
+        self.fans[fan_name]['power'] = power
+
     def cmd_SET_POWER_FAN_DYNAMIC_LOAD(self, gcmd):
         name = gcmd.get('NAME')
         power = gcmd.get_float('POWER', minval=0.)
@@ -271,6 +317,24 @@ class PowerFan:
         name = gcmd.get('NAME')
         if name in self.dynamic_loads:
             del self.dynamic_loads[name]
+
+    def cmd_SET_POWER_FAN_OVERRIDE(self, gcmd):
+        clear = gcmd.get_int('CLEAR', 0, minval=0, maxval=1)
+        speed = gcmd.get_float('SPEED', None, minval=0., maxval=1.)
+        if clear:
+            if speed is not None:
+                raise gcmd.error(
+                    "SET_POWER_FAN_OVERRIDE cannot specify CLEAR and SPEED")
+            self.override_speed = None
+            return
+        if speed is None:
+            gcmd.respond_info(
+                "power_fan %s: override_speed=%s"
+                % (self.name, self.override_speed))
+            return
+        self.override_speed = speed
+        self.last_speed = speed
+        self.fan.set_speed(speed)
 
 
 def load_config_prefix(config):

@@ -168,11 +168,14 @@ The following additional information is available in
 - `instant_power`: The current estimated power draw, in watts.
 - `filtered_power`: The filtered estimated power draw used to select
   fan speed, in watts.
-- `resistive_power`, `stepper_power`, `fixed_power`, `dynamic_power`:
-  The current estimated power contribution from each load type, in watts.
+- `resistive_power`, `stepper_power`, `fan_power`, `fixed_power`,
+  `dynamic_power`: The current estimated power contribution from each
+  load type, in watts.
 - `system_voltage`: The runtime system voltage used for resistive load
   estimation.
 - `filter_time`: The runtime moving average filter time, in seconds.
+- `override_speed`: The active manual override speed as a float between
+  0.0 and 1.0, or `None` when automatic control is active.
 
 ## filament_switch_sensor
 

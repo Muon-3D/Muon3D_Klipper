@@ -3537,6 +3537,10 @@ points:
 #   A list of stepper/power entries. Each line should contain the name
 #   of a stepper and its active power draw in watts, separated by a comma.
 #   The configured power is added when the stepper is enabled.
+#fan_loads:
+#   A list of fan/power entries. Each line should contain the full name
+#   of a fan object and its power draw in watts at full speed, separated
+#   by a comma. The configured power is scaled by the fan's current speed.
 #fixed_loads:
 #   A list of name/power entries for fixed always-on loads, in watts.
 ```
