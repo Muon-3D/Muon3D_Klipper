@@ -55,9 +55,9 @@ fi
 
 # Probe. `init` tolerates a failed core0 examination and still brings up core1,
 # so this reports the fault rather than dying on it.
-probe="$(timeout 30 openocd -f "$CFG" -c 'init; exit' 2>&1)"
+probe() { timeout 30 openocd -f "$CFG" -c 'init; exit' 2>&1; }
 
-if ! grep -q 'core0.*Examination failed' <<<"$probe"; then
+if ! grep -q 'core0.*Examination failed' <<<"$(probe)"; then
     log "main MCU core0 examined OK, no recovery needed"
     exit 0
 fi
@@ -76,7 +76,20 @@ recover="$(timeout 45 openocd -f "$CFG" \
     -c 'sleep 300' \
     -c 'exit' 2>&1)"
 
-if grep -q 'core0.*Examination succeed' <<<"$recover"; then
+# Judge on a FRESH probe, not on the pulse session's own output.
+#
+# The pulse session examines core0 once, at `init`, while it is still wedged -
+# and then never again, because the reset is the last thing it does. So its log
+# can only ever contain core0's FAILURE, whatever the outcome. Grepping it for
+# 'Examination succeed' made the success branch unreachable: every real recovery
+# reported "core0 did NOT recover".
+#
+# That was not caught when this shipped because the wedge is intermittent and
+# the recovery was verified by watching klipper connect afterwards rather than
+# by reading this script's own log line. It came back on 2026-08-23: the pulse
+# worked, core0 examined fine on the next probe, klipper came up first try, and
+# this still printed the failure message.
+if grep -q 'core0.*Examination succeed' <<<"$(probe)"; then
     log "core0 recovered"
 else
     log "core0 did NOT recover; klipper will report the fault"
