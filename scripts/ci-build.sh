@@ -10,7 +10,6 @@ BUILD_DIR=${PWD}/ci_build
 export PATH=${BUILD_DIR}/pru-elf/bin:${PATH}
 export PATH=${BUILD_DIR}/or1k-elf/bin:${PATH}
 PYTHON=${BUILD_DIR}/python-env/bin/python
-PYTHON2=${BUILD_DIR}/python2-env/bin/python
 
 
 ######################################################################
@@ -74,14 +73,12 @@ start_test klippy "Test klippy import (Python3)"
 $PYTHON klippy/klippy.py --import-test
 finish_test klippy "Test klippy import (Python3)"
 
-start_test klippy "Test klippy import (Python2)"
-$PYTHON2 klippy/klippy.py --import-test
-finish_test klippy "Test klippy import (Python2)"
+# MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
+# image builds klippy into a `python3 -m venv` and klippy carries 36
+# f-strings across 12 files, which Python 2 cannot parse at all. The tests
+# could therefore never pass without deleting working printer code to suit
+# an interpreter the product never runs.
 
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
-
-start_test klippy "Test invoke klippy (Python2)"
-$PYTHON2 scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
-finish_test klippy "Test invoke klippy (Python2)"
