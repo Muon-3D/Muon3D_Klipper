@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SRCDIR = Path(__file__).resolve().parent.parent
@@ -53,17 +55,14 @@ WS_SUFFIXES = (".c", ".h", ".s", ".py", ".sh", ".md", ".cfg", ".txt", ".html",
 WS_NAMES = ("makefile", "kconfig")
 WS_EXCLUDE_PREFIX = ("scripts/kconfig/",)
 
-CR_ERROR = r"Invalid '\r' character"
-
-
 def checkout_normalises_crlf() -> bool:
     """True when git rewrites line endings on checkout.
 
-    On such a checkout (Windows, core.autocrlf=true) every line of a file
-    committed with LF is read back with a trailing CR, so the upstream
-    checker reports a control-character error on all of them. CI checks out
-    LF and sees none of it, so reporting those locally sends people chasing
-    failures that do not exist. The committed bytes are what CI judges.
+    On such a checkout (Windows, core.autocrlf=true) a file committed with LF
+    is read back with a CR on every line. That does not merely add spurious
+    control-character errors -- it also adds one to every line length, so a
+    line of exactly 80 characters is reported as 81. CI checks out LF and sees
+    none of it, so the fix is to check the bytes git would commit.
     """
     setting = git("config", "--get", "core.autocrlf").strip().lower()
     return setting in ("true", "input")
@@ -162,8 +161,27 @@ def main() -> int:
         print("check_whitespace_muon: changed files no longer present")
         return 0
 
-    proc = subprocess.run([sys.executable, str(CHECKER), *existing],
-                          cwd=SRCDIR, capture_output=True, text=True)
+    tmpdir = None
+    targets = existing
+    prefix = ""
+    if checkout_normalises_crlf():
+        # Materialise LF copies so lengths and control characters match what
+        # CI will see, then map the reported paths back.
+        tmpdir = tempfile.mkdtemp(prefix="muon-ws-")
+        for rel in existing:
+            dest = Path(tmpdir) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            data = (SRCDIR / rel).read_bytes().replace(b"\r\n", b"\n")
+            dest.write_bytes(data)
+        targets = [str(Path(tmpdir) / rel) for rel in existing]
+        prefix = tmpdir + os.sep
+
+    try:
+        proc = subprocess.run([sys.executable, str(CHECKER), *targets],
+                              cwd=SRCDIR, capture_output=True, text=True)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     crlf_checkout = checkout_normalises_crlf()
     failures = []
@@ -172,8 +190,8 @@ def main() -> int:
         if not m:
             continue
         path, lineno, msg = m["file"], int(m["line"]), m["msg"]
-        if msg.startswith(CR_ERROR) and crlf_checkout:
-            continue
+        if prefix and path.startswith(prefix):
+            path = path[len(prefix):].replace(os.sep, "/")
         if any(msg.startswith(e) for e in EOF_MESSAGES):
             failures.append(line.strip())
         elif lineno in added.get(path, set()):
