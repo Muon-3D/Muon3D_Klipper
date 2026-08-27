@@ -74,8 +74,16 @@ EOF_MESSAGES = ("No newline at end of file", "Extra newlines at end of file")
 
 
 def git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=SRCDIR, capture_output=True,
-                          text=True).stdout
+    """Run git and return stdout.
+
+    encoding is explicit: the default on Windows is the ANSI code page, and a
+    diff of this tree contains non-ASCII (a degree sign in a heaters.py log
+    string). Decoding that as cp1252 raises inside subprocess's reader thread
+    and hands back None, which fails far away from the cause.
+    """
+    proc = subprocess.run(["git", *args], cwd=SRCDIR, capture_output=True,
+                          encoding="utf-8", errors="replace")
+    return proc.stdout or ""
 
 
 def in_scope(path: str) -> bool:
@@ -178,7 +186,8 @@ def main() -> int:
 
     try:
         proc = subprocess.run([sys.executable, str(CHECKER), *targets],
-                              cwd=SRCDIR, capture_output=True, text=True)
+                              cwd=SRCDIR, capture_output=True,
+                              encoding="utf-8", errors="replace")
     finally:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -192,10 +201,12 @@ def main() -> int:
         path, lineno, msg = m["file"], int(m["line"]), m["msg"]
         if prefix and path.startswith(prefix):
             path = path[len(prefix):].replace(os.sep, "/")
+        # Report the repo-relative path, not the temp copy we actually read.
+        reported = "%s:%d: %s" % (path, lineno, msg)
         if any(msg.startswith(e) for e in EOF_MESSAGES):
-            failures.append(line.strip())
+            failures.append(reported)
         elif lineno in added.get(path, set()):
-            failures.append(line.strip())
+            failures.append(reported)
 
     print(f"check_whitespace_muon: {len(existing)} changed file(s) since "
           f"{base[:12]}, checking only added lines")
