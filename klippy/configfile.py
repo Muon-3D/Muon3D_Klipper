@@ -328,7 +328,7 @@ class ConfigAutoSave:
             conflicts = []
             for section in autosave_fc_check.sections():
                 for option in autosave_fc_check.options(section):
-                    # If core (regular_fileconfig) defines it, it’s not commented out there
+                    # If core (regular_fileconfig) defines it, it's not commented out there
                     if regular_fileconfig.has_option(section, option):
                         conflicts.append(f"[{section}] {option}")
 
@@ -338,7 +338,7 @@ class ConfigAutoSave:
                     "Comment these keys out in core:\n  "
                     + "\n  ".join(conflicts)
                 )
-                # Use Klipper’s command_error type so it shows nicely in the console/UI
+                # Use Klipper's command_error type so it shows nicely in the console/UI
                 raise error(hint)
         autosave_data = self._strip_duplicates(autosave_data,
                                                regular_fileconfig)
