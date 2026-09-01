@@ -28,9 +28,17 @@ class HeaterCheck:
             default_gain_time = 60.
         self.check_gain_time = config.getfloat(
             'check_gain_time', default_gain_time, minval=1.)
+        # KAN-99: how long an outage has to last before the accumulated
+        # error is forgotten. Below this the error is carried across the
+        # gap, decayed in proportion, so a link that keeps dropping cannot
+        # hold the fault off indefinitely. Above it the hot end has had time
+        # to cool and the old error no longer describes the hardware.
+        self.reconnect_decay_time = config.getfloat(
+            'reconnect_decay_time', 120., above=0.)
         self.approaching_target = self.starting_approach = False
         self.last_target = self.goal_temp = self.error = 0.
         self.goal_systime = self.printer.get_reactor().NEVER
+        self.suspended_systime = None
         self.check_timer = None
     def handle_connect(self):
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -107,25 +115,48 @@ class HeaterCheck:
 
 
     ### Non Crit MCU Buisness
+    #
+    # The extruder heater sits on the hot-swappable toolhead MCU, so these
+    # checks have to stand down while that MCU is away. Both handlers used to
+    # zero self.error on the way through (KAN-99). The M1 has a user-operated
+    # umbilical release, so a worn connector produces exactly the pattern that
+    # defeats: every drop reset the accumulator, and a hot end genuinely
+    # failing to heat never reached max_error to trip heater_fault().
+    #
+    # The error is now carried across the outage and decayed by how long it
+    # lasted. A brief flap keeps nearly all of it, so a real fault still
+    # trips; an outage past reconnect_decay_time starts clean, so replugging
+    # a toolhead after a genuine absence does not fault on stale error.
+    #
+    # Deliberately NOT added: a shutdown after N reconnects in a window. Once
+    # the accumulator survives flapping, a failing heater is caught by the
+    # mechanism designed to catch it, and a reconnect counter would only add
+    # a new way to halt a healthy print on a connector fault.
     def _suspend_checks(self):
+        r = self.printer.get_reactor()
         if self.check_timer is not None:
-            r = self.printer.get_reactor()
             r.update_timer(self.check_timer, r.NEVER)
-        # Clear state so we don’t “carry” any error during downtime
         self.approaching_target = self.starting_approach = False
-        self.error = 0.
-        self.goal_systime = self.printer.get_reactor().NEVER
-        logging.info("verify_heater[%s]: suspended (MCU offline)", self.heater_name)
+        self.suspended_systime = r.monotonic()
+        self.goal_systime = r.NEVER
+        logging.info("verify_heater[%s]: suspended (MCU offline), holding"
+                     " error %.1f", self.heater_name, self.error)
 
     def _resume_checks(self):
-        # Reset state and resume the periodic check loop
+        r = self.printer.get_reactor()
+        if self.suspended_systime is not None:
+            outage = max(0., r.monotonic() - self.suspended_systime)
+            self.suspended_systime = None
+            if outage >= self.reconnect_decay_time:
+                self.error = 0.
+            else:
+                self.error *= 1. - (outage / self.reconnect_decay_time)
         self.approaching_target = self.starting_approach = False
-        self.error = 0.
-        self.goal_systime = self.printer.get_reactor().NEVER
+        self.goal_systime = r.NEVER
         if self.check_timer is not None:
-            r = self.printer.get_reactor()
             r.update_timer(self.check_timer, r.NOW)
-        logging.info("verify_heater[%s]: resumed (MCU reconnected)", self.heater_name)
+        logging.info("verify_heater[%s]: resumed (MCU reconnected), error"
+                     " %.1f", self.heater_name, self.error)
 
 def load_config_prefix(config):
     return HeaterCheck(config)

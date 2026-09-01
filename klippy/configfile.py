@@ -144,6 +144,65 @@ class ConfigWrapper:
 # Config file parsing (with include file support)
 ######################################################################
 
+# KAN-108: the calibration overlay is operator-writable and persisted, so
+# these are the things it is never allowed to say. Section prefixes first --
+# matched on the part before any name, so [verify_heater extruder] and
+# [mcu toolhead] are both covered.
+SAFETY_SECTIONS = frozenset([
+    'verify_heater',        # thermal runaway detection
+    'force_move',           # unhomed, unchecked motion
+    'bed_removal_detector', # plate-off detection thresholds
+    'mcu',                  # which board is which, and how it is reset
+])
+# Deliberately NOT listed: temperature_fan, controller_fan, heater_fan.
+# They look like they belong, but temperature_fan supports PID control and
+# PID_CALIBRATE persists its coefficients through this same file -- refusing
+# the section would turn a normal calibration into a printer that will not
+# start. Their dangerous keys are covered by SAFETY_OPTIONS instead.
+
+# Option names refused in any section. These are heater limits and pin
+# assignments -- calibration tunes the control model, never the envelope the
+# model is allowed to operate in.
+SAFETY_OPTIONS = frozenset([
+    'min_temp', 'max_temp', 'max_power', 'min_extrude_temp',
+    'heater_pin', 'sensor_pin', 'sensor_type', 'pwm_cycle_time',
+    'max_error', 'check_gain_time', 'heating_gain', 'hysteresis',
+    'enable_force_move', 'remove_threshold', 'attach_threshold',
+])
+
+def find_calibration_conflicts(autosave_fc, regular_fc):
+    """Return the list of things the calibration overlay may not say.
+
+    Three layers, cheapest first:
+      1. the section exists only to carry a safety property (KAN-108)
+      2. the option name is a safety limit, in whatever section (KAN-108)
+      3. core already declares the option, so setting it here overrides it
+
+    Layer 3 alone was the original guard, and it is only as good as core's
+    declarations: an option core left to a module default was not covered.
+    That is how a [verify_heater extruder] block could disable thermal
+    runaway detection on a shipped printer. Layers 1 and 2 do not depend on
+    core declaring anything.
+
+    Pure so it can be tested without a printer object; see
+    recipes/klipper_moonraker_fluidd/tests/test_calibration_guard.py in
+    MuonOS.
+    """
+    conflicts = []
+    for section in autosave_fc.sections():
+        if section.split()[0] in SAFETY_SECTIONS:
+            conflicts.append(
+                "[%s] (section is not calibration-owned)" % (section,))
+            continue
+        for option in autosave_fc.options(section):
+            if option in SAFETY_OPTIONS:
+                conflicts.append("[%s] %s (safety limit)"
+                                 % (section, option))
+            elif regular_fc.has_option(section, option):
+                # Core defines it, so it is not commented out there.
+                conflicts.append("[%s] %s" % (section, option))
+    return conflicts
+
 class ConfigFileReader:
     def read_config_file(self, filename):
         try:
@@ -325,12 +384,8 @@ class ConfigAutoSave:
             # Build a temporary fileconfig from the autosave block for checking
             autosave_fc_check = cfgrdr.build_fileconfig(autosave_data, '*AUTOSAVE-CHECK*')
 
-            conflicts = []
-            for section in autosave_fc_check.sections():
-                for option in autosave_fc_check.options(section):
-                    # If core (regular_fileconfig) defines it, it’s not commented out there
-                    if regular_fileconfig.has_option(section, option):
-                        conflicts.append(f"[{section}] {option}")
+            conflicts = find_calibration_conflicts(
+                autosave_fc_check, regular_fileconfig)
 
             if conflicts:
                 hint = (
