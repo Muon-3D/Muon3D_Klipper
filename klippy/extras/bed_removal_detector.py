@@ -43,12 +43,37 @@ class BedRemovalDetector:
 
         return eventtime + self.bed_check_interval
 
+    def _is_printing(self):
+        ps = self.printer.lookup_object('print_stats', None)
+        if ps is not None:
+            return ps.get_status(None).get('state') == 'printing'
+        idle = self.printer.lookup_object('idle_timeout', None)
+        if idle is not None:
+            return idle.get_status(None).get('state') == 'Printing'
+        return False
+
+    def _is_paused(self):
+        pr = self.printer.lookup_object('pause_resume', None)
+        return pr is not None and pr.is_paused
+
     def handle_bed_removal(self, eventtime):
         self.bed_removed = True
+        # KAN-79: pause here rather than from the BED_REMOVED macro. The
+        # macro's PAUSE had been commented out while its own prompt told the
+        # user the print was paused, so pulling the plate mid-print left the
+        # toolhead running the file over an open carriage. A safety action
+        # belongs next to the detection, in code, not in a config file that
+        # a calibration overlay or a stray edit can silently neuter.
+        if self._is_printing() and not self._is_paused():
+            try:
+                self.gcode.run_script('PAUSE')
+            except Exception:
+                # Never let a pause failure skip the heater cut below.
+                self.log.exception('Bed removed: PAUSE failed')
         self.bed_heater.set_temp(0.0)
-        # self.gcode.respond_info('Bed Removed')
         self.gcode.run_script('BED_REMOVED')
-        self.log.info('Bed removal detected, printer paused')
+        self.log.info('Bed removal detected (printing=%s, paused=%s)',
+                      self._is_printing(), self._is_paused())
 
     def handle_bed_reconnection(self):
         self.bed_removed = False
