@@ -43,47 +43,12 @@ class BedRemovalDetector:
 
         return eventtime + self.bed_check_interval
 
-    def _is_printing(self, eventtime):
-        # eventtime is mandatory. Both of these subtract it from a stored
-        # start time whenever a print is live (print_stats.py:104/108,
-        # idle_timeout.py:37), so passing None raises TypeError in exactly
-        # the state this exists to detect -- and from a reactor callback
-        # that becomes an unhandled exception that takes klippy down.
-        ps = self.printer.lookup_object('print_stats', None)
-        if ps is not None:
-            return ps.get_status(eventtime).get('state') == 'printing'
-        idle = self.printer.lookup_object('idle_timeout', None)
-        if idle is not None:
-            return idle.get_status(eventtime).get('state') == 'Printing'
-        return False
-
-    def _is_paused(self):
-        pr = self.printer.lookup_object('pause_resume', None)
-        return pr is not None and pr.is_paused
-
     def handle_bed_removal(self, eventtime):
         self.bed_removed = True
-        # KAN-79: pause here rather than from the BED_REMOVED macro. The
-        # macro's PAUSE had been commented out while its own prompt told the
-        # user the print was paused, so pulling the plate mid-print left the
-        # toolhead running the file over an open carriage. A safety action
-        # belongs next to the detection, in code, not in a config file that
-        # a calibration overlay or a stray edit can silently neuter.
-        # Heat off first, unconditionally. Everything below can block: PAUSE
-        # takes the gcode mutex, and if virtual_sdcard is sitting in an
-        # M190 on the bed we just exposed, that wait cannot finish while the
-        # heater holds its target -- the cut would never be reached.
         self.bed_heater.set_temp(0.0)
-        printing = self._is_printing(eventtime)
-        if printing and not self._is_paused():
-            try:
-                self.gcode.run_script('PAUSE')
-            except Exception:
-                # A pause failure must not stop BED_REMOVED prompting.
-                self.log.exception('Bed removed: PAUSE failed')
+        # self.gcode.respond_info('Bed Removed')
         self.gcode.run_script('BED_REMOVED')
-        self.log.info('Bed removal detected (printing=%s, paused=%s)',
-                      printing, self._is_paused())
+        self.log.info('Bed removal detected, printer paused')
 
     def handle_bed_reconnection(self):
         self.bed_removed = False
