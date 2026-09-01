@@ -153,6 +153,19 @@ SAFETY_SECTIONS = frozenset([
     'force_move',           # unhomed, unchecked motion
     'bed_removal_detector', # plate-off detection thresholds
     'mcu',                  # which board is which, and how it is reset
+    # Sections that carry executable G-code, or arm a timer that runs it.
+    # SAVE_CONFIG never writes any of these -- every configfile.set() caller
+    # in klippy/extras writes a calibration result (bed_mesh, pid_calibrate,
+    # control_mpc, load_cell, probe, endstop_phase, delta_calibrate,
+    # bed_tilt, angle, ldc1612, manual_probe, axis_twist_compensation) -- so
+    # refusing them outright costs nothing, and denies the overlay any way to
+    # make the machine run G-code of its choosing.
+    'gcode_macro',          # can shadow or replace any shipped macro
+    'delayed_gcode',        # initial_duration runs it uninvited
+    'gcode_button',         # runs G-code on a pin edge
+    'idle_timeout',         # core declares no such section, so layer 3 is
+                            # blind to it; a long timeout leaves the heaters
+                            # and the motors live on an unattended machine
 ])
 # Deliberately NOT listed: temperature_fan, controller_fan, heater_fan.
 # They look like they belong, but temperature_fan supports PID control and
@@ -170,6 +183,12 @@ SAFETY_OPTIONS = frozenset([
     'enable_force_move', 'remove_threshold', 'attach_threshold',
 ])
 
+def _section_prefix(section):
+    # "verify_heater extruder" -> "verify_heater". Folded, so the check
+    # cannot be dodged by writing [Verify_Heater extruder] instead.
+    parts = section.split()
+    return parts[0].lower() if parts else ''
+
 def find_calibration_conflicts(autosave_fc, regular_fc):
     """Return the list of things the calibration overlay may not say.
 
@@ -184,21 +203,39 @@ def find_calibration_conflicts(autosave_fc, regular_fc):
     runaway detection on a shipped printer. Layers 1 and 2 do not depend on
     core declaring anything.
 
+    All three compare section names case-folded. Without that, an overlay
+    can shadow a core section by changing its capitalisation -- Klipper
+    resolves a gcode_macro by the command name it registers, not by the
+    section's spelling, so [gcode_macro g28] takes over core's
+    [gcode_macro G28] while looking like an unrelated section to layer 3.
+
     Pure so it can be tested without a printer object; see
     recipes/klipper_moonraker_fluidd/tests/test_calibration_guard.py in
     MuonOS.
     """
+    # Case-folded index of what core declares. RawConfigParser lower-cases
+    # option names but preserves section case, so [gcode_macro g28] and
+    # core's [gcode_macro G28] are two distinct sections to has_option()
+    # while being the same G-code command to Klipper. That is how an overlay
+    # could shadow a shipped macro -- rename_existing displaces the original
+    # instead of colliding with it -- and walk straight past layer 3.
+    # Folding the name closes that for every section, not just macros.
+    core_sections = {}
+    for name in regular_fc.sections():
+        core_sections.setdefault(name.lower(), []).append(name)
+
     conflicts = []
     for section in autosave_fc.sections():
-        if section.split()[0] in SAFETY_SECTIONS:
+        if _section_prefix(section) in SAFETY_SECTIONS:
             conflicts.append(
                 "[%s] (section is not calibration-owned)" % (section,))
             continue
+        core_names = core_sections.get(section.lower(), [])
         for option in autosave_fc.options(section):
             if option in SAFETY_OPTIONS:
                 conflicts.append("[%s] %s (safety limit)"
                                  % (section, option))
-            elif regular_fc.has_option(section, option):
+            elif any(regular_fc.has_option(n, option) for n in core_names):
                 # Core defines it, so it is not commented out there.
                 conflicts.append("[%s] %s" % (section, option))
     return conflicts
