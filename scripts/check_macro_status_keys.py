@@ -11,10 +11,13 @@
 # Undefined is falsy -- so `not printer['mcu toolhead'].disconnected` is a
 # constant True and the gate built on it never refuses. That was KAN-287.
 #
-# Reading a missing *object* already fails loudly: `printer['mcu tooolhead']`
-# raises KeyError out of GetStatusWrapper, and `printer.mcu_toolhead.x` raises
-# UndefinedError on the attribute access. Only the key fails silently, which
-# is why this checker keys on names.
+# Reading a missing *object* already fails loudly, though not where you would
+# expect: jinja2 catches the KeyError out of GetStatusWrapper and substitutes
+# Undefined, so `printer['mcu tooolhead']` on its own renders as ''. The error
+# arrives on the *next* access -- `printer['mcu tooolhead'].anything` raises
+# UndefinedError, as does the dotted form. Since a status read is always
+# followed by a key, a wrong object name is loud in practice. Only the key
+# itself fails silently, which is why this checker keys on names.
 #
 # The consequence is a deliberate weakening: it asks "does any module publish
 # this name", not "does this object publish it". A read of the right key on
@@ -64,17 +67,31 @@ PRINTER_REF = re.compile(
 # {% set name = printer['obj'] %} -- an alias, so `name.key` is a status read.
 ALIAS_DEF = re.compile(
     r"""set\s+(?P<name>[A-Za-z_]\w*)\s*=\s*printer"""
-    # `-?%}` as well as `%}`: whitespace control is one keystroke, and an
-    # alias that stops being recognised takes its reads with it -- which is
-    # how the fan.cfg site hid in the first place.
+    # Both whitespace-control forms as well as the plain one. An alias that
+    # stops being recognised takes every read through it with it, and the
+    # difference is one keystroke that changes nothing about what renders.
     r"""(?:\s*\[\s*(?P<aq>['"])(?P<obj_q>[^'"]+)(?P=aq)\s*\]"""
-    r"""|\.(?P<obj_a>[A-Za-z_]\w*))\s*-?%\}""")
+    r"""|\.(?P<obj_a>[A-Za-z_]\w*))\s*[-+]?%\}""")
+
+# Attributes that belong to the mapping or string itself, not to the status
+# report. jinja2 resolves these on the object, so they are not status keys and
+# no module publishes them.
+#
+# `.get` matters most: `printer['mcu toolhead'].get('key', True)` is the
+# defensive idiom for exactly the missing-key problem this checker exists to
+# find, and rejecting it would fail the build on the safest way to write the
+# read.
+NOT_STATUS_KEYS = frozenset((
+    'get', 'keys', 'values', 'items', 'copy', 'update', 'pop', 'setdefault',
+    'lower', 'upper', 'strip', 'split', 'join', 'replace', 'startswith',
+    'endswith', 'format', 'count', 'index',
+))
 
 SECTION = re.compile(r"^\s*\[(?P<name>[^\]]+)\]")
 MACRO_VARIABLE = re.compile(r"^\s*variable_(?P<name>\w+)\s*:")
 # A `#` at the start of a line, or after whitespace -- the two forms
 # configparser treats as starting a comment.
-COMMENT = re.compile(r"(?:^|(?<=\s))#")
+COMMENT = re.compile(r"(?:^|(?<=\s))[#;]")
 
 
 def published_status_keys(klippy_dir):
@@ -284,10 +301,16 @@ def check(klippy_dir, config_dir):
         return ["found only %d published status keys under %s -- the scan is "
                 "not looking where it thinks it is" % (len(published),
                                                        klippy_dir)]
+    scanned = list(_config_files(config_dir))
+    if not scanned:
+        return ["found no .cfg files under %s -- a moved or renamed macro "
+                "tree must fail this check, not pass it" % config_dir]
     macro_variables = declared_macro_variables(config_dir)
 
     failures = []
     for relative, number, obj, key, alias in status_references(config_dir):
+        if key in NOT_STATUS_KEYS:
+            continue
         where = "%s:%d" % (relative, number)
         read = ("%s.%s (alias of printer[%r])" % (alias, key, obj) if alias
                 else "printer[%r].%s" % (obj, key))
