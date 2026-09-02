@@ -41,6 +41,15 @@ finish_test check_whitespace "Check whitespace"
 
 
 ######################################################################
+# Check macro status keys resolve against what klippy publishes
+######################################################################
+
+start_test check_macro_status_keys "Check macro status keys"
+$PYTHON scripts/check_macro_status_keys.py
+finish_test check_macro_status_keys "Check macro status keys"
+
+
+######################################################################
 # Run compile tests for several different MCU types
 ######################################################################
 
