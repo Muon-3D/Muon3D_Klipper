@@ -64,12 +64,17 @@ PRINTER_REF = re.compile(
 # {% set name = printer['obj'] %} -- an alias, so `name.key` is a status read.
 ALIAS_DEF = re.compile(
     r"""set\s+(?P<name>[A-Za-z_]\w*)\s*=\s*printer"""
+    # `-?%}` as well as `%}`: whitespace control is one keystroke, and an
+    # alias that stops being recognised takes its reads with it -- which is
+    # how the fan.cfg site hid in the first place.
     r"""(?:\s*\[\s*(?P<aq>['"])(?P<obj_q>[^'"]+)(?P=aq)\s*\]"""
-    r"""|\.(?P<obj_a>[A-Za-z_]\w*))\s*%\}""")
+    r"""|\.(?P<obj_a>[A-Za-z_]\w*))\s*-?%\}""")
 
 SECTION = re.compile(r"^\s*\[(?P<name>[^\]]+)\]")
 MACRO_VARIABLE = re.compile(r"^\s*variable_(?P<name>\w+)\s*:")
-COMMENT = re.compile(r"^\s*#")
+# A `#` at the start of a line, or after whitespace -- the two forms
+# configparser treats as starting a comment.
+COMMENT = re.compile(r"(?:^|(?<=\s))#")
 
 
 def published_status_keys(klippy_dir):
@@ -106,9 +111,11 @@ def _keys_in_get_status(func):
             # return {'a': ..., 'b': ...}, and .update({...})
             keys |= _dict_literal_keys(node)
         elif isinstance(node, ast.Call):
-            # dict(a=..., b=...). Restricted to the dict builtin: harvesting
-            # every keyword argument in the body would admit names like
-            # `name` or `value` from unrelated calls and mask a real typo.
+            # dict(a=..., b=...). Restricted to the dict builtin so that a
+            # keyword argument to some unrelated call inside get_status cannot
+            # enter the published set. No get_status in the tree currently
+            # passes a keyword to anything, so this narrows what a future one
+            # may do rather than changing what is harvested today.
             if isinstance(node.func, ast.Name) and node.func.id == 'dict':
                 for keyword in node.keywords:
                     if keyword.arg:
@@ -196,12 +203,21 @@ def declared_macro_variables(config_dir):
 
 
 def _mask_comments(text):
-    """Blank out whole-line comments, keeping every byte offset intact."""
+    """Blank out comments, keeping every character offset intact.
+
+    Klipper parses these files with `inline_comment_prefixes=(';', '#')`, so a
+    `#` after whitespace ends the value wherever it appears -- not only at the
+    start of a line. Text after one is not code, and flagging a status key
+    named in it fails the build over a line the printer never reads.
+    """
     out = []
     for line in text.splitlines(keepends=True):
-        if COMMENT.match(line):
-            stripped = line.rstrip('\r\n')
-            out.append(' ' * len(stripped) + line[len(stripped):])
+        body = line.rstrip('\r\n')
+        ending = line[len(body):]
+        comment = COMMENT.search(body)
+        if comment:
+            out.append(body[:comment.start()]
+                       + ' ' * (len(body) - comment.start()) + ending)
         else:
             out.append(line)
     return ''.join(out)
@@ -225,22 +241,33 @@ def status_references(config_dir):
         aliases = {}
         section = None
         for region in JINJA_REGION.finditer(masked):
-            line = bisect.bisect_right(newlines, region.start()) + 1
-            here = bisect.bisect_right(section_lines, line)
+            start = region.start()
+            here = bisect.bisect_right(
+                section_lines, bisect.bisect_right(newlines, start) + 1)
             if here != section:
                 aliases = {}
                 section = here
             body = region.group(0)
+
+            def line_of(offset, _start=start):
+                # Per match, not per region: a region can span lines, and
+                # reporting the opening line sends the reader to the wrong
+                # one on exactly the multi-line reads this scanner exists to
+                # catch.
+                return bisect.bisect_right(newlines, _start + offset) + 1
+
             for match in ALIAS_DEF.finditer(body):
                 aliases[match.group('name')] = (match.group('obj_q')
                                                 or match.group('obj_a'))
             for match in PRINTER_REF.finditer(body):
                 obj = match.group('obj_q') or match.group('obj_a')
                 key = match.group('key_q') or match.group('key_a')
-                references.append((relative, line, obj, key, None))
+                references.append(
+                    (relative, line_of(match.start()), obj, key, None))
             for alias, obj in aliases.items():
-                for key in _alias_keys(body, alias):
-                    references.append((relative, line, obj, key, alias))
+                for offset, key in _alias_keys(body, alias):
+                    references.append(
+                        (relative, line_of(offset), obj, key, alias))
     return references
 
 
@@ -248,7 +275,7 @@ def _alias_keys(text, alias):
     pattern = re.compile(r"\b%s\s*(?:\[\s*(['\"])([^'\"]+)\1\s*\]"
                          r"|\.([A-Za-z_]\w*))" % re.escape(alias))
     for match in pattern.finditer(text):
-        yield match.group(2) or match.group(3)
+        yield match.start(), match.group(2) or match.group(3)
 
 
 def check(klippy_dir, config_dir):
