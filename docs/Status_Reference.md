@@ -155,12 +155,27 @@ The following information is available for extruder_stepper objects (as well as
 
 The following information is available in
 [fan](Config_Reference.md#fan),
-[heater_fan some_name](Config_Reference.md#heater_fan) and
-[controller_fan some_name](Config_Reference.md#controller_fan)
+[heater_fan some_name](Config_Reference.md#heater_fan),
+[controller_fan some_name](Config_Reference.md#controller_fan) and
+[power_fan some_name](Config_Reference.md#power_fan)
 objects:
 - `speed`: The fan speed as a float between 0.0 and 1.0.
 - `rpm`: The measured fan speed in rotations per minute if the fan has
   a tachometer_pin defined.
+
+The following additional information is available in
+[power_fan some_name](Config_Reference.md#power_fan) objects:
+- `instant_power`: The current estimated power draw, in watts.
+- `filtered_power`: The filtered estimated power draw used to select
+  fan speed, in watts.
+- `resistive_power`, `stepper_power`, `fan_power`, `fixed_power`,
+  `dynamic_power`: The current estimated power contribution from each
+  load type, in watts.
+- `system_voltage`: The runtime system voltage used for resistive load
+  estimation.
+- `filter_time`: The runtime moving average filter time, in seconds.
+- `override_speed`: The active manual override speed as a float between
+  0.0 and 1.0, or `None` when automatic control is active.
 
 ## filament_switch_sensor
 
