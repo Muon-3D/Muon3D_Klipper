@@ -41,11 +41,18 @@ class ForceMove:
             ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
         # Register commands
         self._enable_force_move = config.getboolean("enable_force_move", False)
-        if self._enable_force_move:
-            gcode = self.printer.lookup_object('gcode')
-            gcode.register_command('SET_KINEMATIC_POSITION',
-                                   self.cmd_SET_KINEMATIC_POSITION,
-                                   desc=self.cmd_SET_KINEMATIC_POSITION_help)
+        # KAN-60: SET_KINEMATIC_POSITION is registered unconditionally, as it
+        # is upstream. It had been gated on enable_force_move, which coupled
+        # it to FORCE_MOVE and made the flag impossible to turn off: the M1
+        # config calls SET_KINEMATIC_POSITION from every homing path, so
+        # acting on the "disable for production" note in core.cfg would have
+        # removed homing from every printer in the field. Splitting them
+        # leaves enable_force_move governing only the raw unguarded-motion
+        # commands, which is what it is named for.
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command('SET_KINEMATIC_POSITION',
+                               self.cmd_SET_KINEMATIC_POSITION,
+                               desc=self.cmd_SET_KINEMATIC_POSITION_help)
     def register_stepper(self, config, mcu_stepper):
         name = mcu_stepper.get_name()
         self.steppers[name] = mcu_stepper
