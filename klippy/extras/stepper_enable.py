@@ -18,6 +18,12 @@ class StepperEnablePin:
         if did_emit:
             self.mcu_enable.set_digital(print_time, 1)
         self.enable_count += 1
+        if self.mcu_enable is None:
+            # No enable line. setup_enable_pin() uses None as the
+            # sentinel for "stepper is always on" and starts the count
+            # at 9999 so nothing is ever emitted; the diagnostic below
+            # must not dereference it.
+            return
         mcu = self.mcu_enable.get_mcu()
         if getattr(mcu, "is_non_critical", False):
             logging.info("Stepper enable pin set_enable emit=%s count=%d",
@@ -27,6 +33,12 @@ class StepperEnablePin:
         did_emit = not self.enable_count
         if did_emit:
             self.mcu_enable.set_digital(print_time, 0)
+        if self.mcu_enable is None:
+            # No enable line. setup_enable_pin() uses None as the
+            # sentinel for "stepper is always on" and starts the count
+            # at 9999 so nothing is ever emitted; the diagnostic below
+            # must not dereference it.
+            return
         mcu = self.mcu_enable.get_mcu()
         if getattr(mcu, "is_non_critical", False):
             logging.info("Stepper enable pin set_disable emit=%s count=%d",
