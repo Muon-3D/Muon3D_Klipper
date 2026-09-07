@@ -16,7 +16,8 @@ mkdir -p ${BUILD_DIR} ${CACHE_DIR}
 ######################################################################
 
 echo -e "\n\n=============== Install system dependencies\n\n"
-PKGS="virtualenv python2-dev libffi-dev build-essential"
+# MUON: python2-dev dropped along with the Python 2 tests; see ci-build.sh.
+PKGS="virtualenv libffi-dev build-essential"
 PKGS="${PKGS} gcc-avr avr-libc"
 PKGS="${PKGS} libnewlib-arm-none-eabi gcc-arm-none-eabi binutils-arm-none-eabi"
 sudo apt-get update
@@ -62,14 +63,3 @@ cd ${MAIN_DIR}
 virtualenv -p python3 ${BUILD_DIR}/python-env
 ${BUILD_DIR}/python-env/bin/pip install -r ${MAIN_DIR}/scripts/klippy-requirements.txt
 ${BUILD_DIR}/python-env/bin/pip install -r ${MAIN_DIR}/scripts/tests-requirements.txt
-
-
-######################################################################
-# Create python2 virtualenv environment
-######################################################################
-
-echo -e "\n\n=============== Install python2 virtualenv\n\n"
-cd ${MAIN_DIR}
-virtualenv -p python2 ${BUILD_DIR}/python2-env
-${BUILD_DIR}/python2-env/bin/pip install -r ${MAIN_DIR}/scripts/klippy-requirements.txt
-${BUILD_DIR}/python2-env/bin/pip install -r ${MAIN_DIR}/scripts/tests-requirements.txt
