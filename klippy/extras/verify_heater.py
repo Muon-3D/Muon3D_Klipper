@@ -111,7 +111,7 @@ class HeaterCheck:
         if self.check_timer is not None:
             r = self.printer.get_reactor()
             r.update_timer(self.check_timer, r.NEVER)
-        # Clear state so we don’t “carry” any error during downtime
+        # Clear state so we don't "carry" any error during downtime
         self.approaching_target = self.starting_approach = False
         self.error = 0.
         self.goal_systime = self.printer.get_reactor().NEVER
