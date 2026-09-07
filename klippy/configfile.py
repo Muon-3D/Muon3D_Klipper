@@ -430,7 +430,8 @@ class ConfigAutoSave:
                     "Comment these keys out in core:\n  "
                     + "\n  ".join(conflicts)
                 )
-                # Use Klipper’s command_error type so it shows nicely in the console/UI
+                # Use Klipper's command_error type so it shows nicely
+                # in the console/UI
                 raise error(hint)
         autosave_data = self._strip_duplicates(autosave_data,
                                                regular_fileconfig)
