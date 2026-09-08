@@ -917,6 +917,16 @@ class MCUConnectHelper:
             return eventtime + self.reconnect_interval
         self._mcu._connecting = True
         try:
+            # Forget the shutdown _handle_shutdown recorded. It describes the
+            # previous connection, not the device: the MCU is about to be
+            # re-identified and reports its own state in the get_config reply,
+            # which _send_get_config still refuses on. Carrying it across made
+            # that reply unreachable -- _send_get_config consults this latch
+            # first -- so a non-critical MCU that shut down once could never
+            # reconnect, however healthy it came back, and the connect macro
+            # stayed blocked with it. Mirrors the initialisation in __init__.
+            self._is_shutdown = self._is_timeout = False
+            self._shutdown_msg = ""
             self._mcu._config_helper.reset_to_initial_state()
             self._mcu_identify()
             # Keep waiting only if identify did not establish a serial queue yet.
