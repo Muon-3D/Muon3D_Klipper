@@ -31,6 +31,20 @@ finish_test()
 
 
 ######################################################################
+# Check macro status keys resolve against what klippy publishes
+######################################################################
+
+# Ahead of the whitespace check on purpose. This script runs under
+# `set -eu`, and check_whitespace currently fails on this fork over
+# upstream files no branch touches -- so a check placed after it never
+# executes at all. Revisit the order once that check is scoped to the
+# lines a branch adds.
+start_test check_macro_status_keys "Check macro status keys"
+$PYTHON scripts/check_macro_status_keys.py
+finish_test check_macro_status_keys "Check macro status keys"
+
+
+######################################################################
 # Check for whitespace errors
 ######################################################################
 
