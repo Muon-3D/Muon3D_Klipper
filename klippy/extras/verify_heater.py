@@ -32,6 +32,8 @@ class HeaterCheck:
         self.last_target = self.goal_temp = self.error = 0.
         self.goal_systime = self.printer.get_reactor().NEVER
         self.check_timer = None
+        self.suspend_systime = None
+        self.recovery_goal = None
     def handle_connect(self):
         if self.printer.get_start_args().get('debugoutput') is not None:
             # Disable verify_heater if outputting to a debug file
@@ -62,12 +64,27 @@ class HeaterCheck:
             reactor.update_timer(self.check_timer, reactor.NEVER)
     def check_event(self, eventtime):
         temp, target = self.heater.get_temp(eventtime)
+        if self.recovery_goal is not None and temp >= self.recovery_goal:
+            # The heater has climbed heating_gain since the last credit, so it
+            # is working. Clear the error it accrued re-heating what the outage
+            # cost it -- that deviation is the outage's doing, not the
+            # heater's -- and move the bar up, so the credit has to be earned
+            # again for the next stretch of the ramp.
+            #
+            # This deliberately grants progress, not time. Re-arming the
+            # approach state instead would hand out a fresh check_gain_time on
+            # every reconnect, which is the deferral this ticket exists to
+            # remove; a heater that stops climbing stops earning credit here
+            # and its error accumulates to max_error as before.
+            self.error = 0.
+            self.recovery_goal = temp + self.heating_gain
         if temp >= target - self.hysteresis or target <= 0.:
             # Temperature near target - reset checks
             if self.approaching_target and target:
                 logging.info("Heater %s within range of %.3f",
                              self.heater_name, target)
             self.approaching_target = self.starting_approach = False
+            self.recovery_goal = None
             if temp <= target + self.hysteresis:
                 self.error = 0.
             self.last_target = target
@@ -107,25 +124,69 @@ class HeaterCheck:
 
 
     ### Non Crit MCU Buisness
+    #
+    # These pause the check across a non-critical MCU outage; they do not
+    # restart it. The distinction matters on the M1, where the extruder
+    # heater is on the hot-swappable toolhead MCU, behind a connector the
+    # product invites the user to unplug. Both used to clear self.error and
+    # self.goal_systime, so every disconnect/reconnect threw away the
+    # evidence gathered so far, and an intermittent umbilical that flapped
+    # faster than check_gain_time held the thermal-runaway check permanently
+    # disarmed. See KAN-99.
+    #
+    # What makes carrying the error safe is not the zero-target branch in
+    # check_event -- that only clears the error when temp is also within
+    # hysteresis of zero, so a 250 C nozzle keeps it across TOOLHEAD_CONNECT's
+    # M104 S0. It is that the error is cleared by evidence of the heater
+    # working: reaching target, gaining heating_gain during an approach, or
+    # recovery_goal below. A heater that shows none of those is exactly the
+    # one whose history is worth keeping.
     def _suspend_checks(self):
+        r = self.printer.get_reactor()
         if self.check_timer is not None:
-            r = self.printer.get_reactor()
             r.update_timer(self.check_timer, r.NEVER)
-        # Clear state so we don't "carry" any error during downtime
-        self.approaching_target = self.starting_approach = False
-        self.error = 0.
-        self.goal_systime = self.printer.get_reactor().NEVER
-        logging.info("verify_heater[%s]: suspended (MCU offline)", self.heater_name)
+        # The timer stops here, so self.error cannot grow while the MCU is
+        # offline; only observed time is ever charged to a heater. First
+        # suspend wins, so a repeated event cannot shorten the outage the
+        # resume below measures.
+        if self.suspend_systime is None:
+            self.suspend_systime = r.monotonic()
+        logging.info("verify_heater[%s]: suspended (MCU offline)",
+                     self.heater_name)
 
     def _resume_checks(self):
-        # Reset state and resume the periodic check loop
-        self.approaching_target = self.starting_approach = False
-        self.error = 0.
-        self.goal_systime = self.printer.get_reactor().NEVER
+        r = self.printer.get_reactor()
+        if self.printer.is_shutdown():
+            # handle_shutdown disarmed the timer deliberately. Re-arming it
+            # here would let a carried error fault an already-shut-down
+            # printer.
+            self.suspend_systime = None
+            return
+        if self.suspend_systime is not None:
+            # Push the gain deadline out by however long we were blind rather
+            # than clearing it, so an approach that had 5 s left to show
+            # heating_gain still has 5 s left and a reconnect cannot buy a
+            # failing heater a fresh window every time the connector twitches.
+            # Capped at one check_gain_time: a toolhead left unplugged for an
+            # hour must not defer the verdict by an hour.
+            outage = max(0., r.monotonic() - self.suspend_systime)
+            if self.goal_systime != r.NEVER:
+                self.goal_systime += min(outage, self.check_gain_time)
+            self.suspend_systime = None
+        if self.heater is not None:
+            # The heater cooled with its power removed, and re-heating that
+            # back is not a fault -- but check_event has no notion of an
+            # approach unless the target changed, so it would charge the whole
+            # recovery ramp as error and could shut the printer down on
+            # healthy hardware. Record what "visibly recovering" looks like
+            # from here; check_event clears the error once the heater gets
+            # there.
+            temp, _target = self.heater.get_temp(r.monotonic())
+            self.recovery_goal = temp + self.heating_gain
         if self.check_timer is not None:
-            r = self.printer.get_reactor()
             r.update_timer(self.check_timer, r.NOW)
-        logging.info("verify_heater[%s]: resumed (MCU reconnected)", self.heater_name)
+        logging.info("verify_heater[%s]: resumed (MCU reconnected)",
+                     self.heater_name)
 
 def load_config_prefix(config):
     return HeaterCheck(config)
