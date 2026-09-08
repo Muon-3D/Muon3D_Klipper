@@ -246,7 +246,16 @@ class NozzleWipeSmart:
         wipe_threshold = params["wipe_temp"] - params["wipe_temp_tolerance"]
 
         try:
-            self._set_fan(params["fan_pct"])
+            # KAN-224: no fan in HEAT_WAIT. MODE=FULL parks the nozzle above the
+            # brush and waits for start_temp with nothing being wiped, so the
+            # fan's only effect there is on the bed underneath it. Measured at
+            # bed 65 (the highest BED_TEMP_NOZZLE_WIPE allows) the shipped 20%
+            # pulls the bed 4.01 C below target across the wipe. The fan is
+            # started at the HEAT_WAIT -> HEAT_WIPE transition below instead.
+            # NOHEAT (COOL_WIPE) and FAN_ONLY (FAN_COOL) both start by cooling
+            # the nozzle, so they keep the fan from the outset as before.
+            if params["mode"] != "FULL":
+                self._set_fan(params["fan_pct"])
             if params["mode"] == "FULL":
                 self._set_heater(extruder, params["wipe_temp"])
 
@@ -290,6 +299,10 @@ class NozzleWipeSmart:
 
                 if self.phase == "HEAT_WAIT":
                     if temp >= params["start_temp"]:
+                        # KAN-224: fan on here, where wiping actually begins,
+                        # rather than at entry. Before _wipe_cycle so the first
+                        # pass is wiped with the fan already running.
+                        self._set_fan(params["fan_pct"])
                         self._wipe_cycle(params, 1, 1)
                         self.phase = "HEAT_WIPE"
                         gcmd.respond_info("NOZZLE_WIPE_SMART: start wiping")
