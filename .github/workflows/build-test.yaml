@@ -1,6 +1,20 @@
 # Perform continuous integration tests on updates and pull requests
 name: Build test
-on: [push, pull_request]
+# MUON: upstream is `on: [push, pull_request]` with no branch filter on either,
+# so any commit pushed to a branch that also has an open pull request builds
+# twice. Measured over 2026-08-08 to 2026-09-07: 177 runs over 93 distinct
+# commits, 84 of which ran exactly twice. This repository is public, so the
+# minutes are free; the duplicate check rollup is not -- it doubles the red on
+# every open pull request, and there are a lot of them.
+#
+# Filtering `push` to the default branch builds every commit exactly once: on
+# `master` by `push`, everywhere else by `pull_request`. The deliberate cost is
+# that a branch with no open pull request now gets no CI at all, which is the
+# same trade MuonOS's pipeline already makes. KAN-337.
+on:
+  push:
+    branches: [master]
+  pull_request:
 
 jobs:
   build:
