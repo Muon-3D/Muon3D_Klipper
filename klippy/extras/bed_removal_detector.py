@@ -36,7 +36,8 @@ class BedRemovalDetector:
     def handle_ready(self):
         reactor = self.printer.get_reactor()
         reactor.register_timer(self.check_bed_temperature, reactor.NOW)
-        self.log.info('BedRemovalDetector ready, checking every %.2f s', self.bed_check_interval)
+        self.log.info('BedRemovalDetector ready, checking every %.2f s',
+                      self.bed_check_interval)
 
     def check_bed_temperature(self, eventtime):
         raw_temp, _ = self.bed_heater.get_temp(eventtime)
