@@ -5331,9 +5331,17 @@ cs_pin:
 #spi_software_miso_pin:
 #   See the "common SPI settings" section for a description of the
 #   above parameters.
-data_ready_pin:
-#   Pin connected to the ADS1220 data ready line. This parameter must be
-#   provided.
+#data_ready_pin:
+#   Pin connected to the ADS1220 data ready (DRDY) line. It must be on the
+#   same mcu as the SPI bus. If not provided the mcu instead reads the
+#   chip on a fixed timer using the RDATA command, at 5% below the
+#   configured sample_rate so that the chip's +/-2% internal oscillator
+#   can never make a conversion arrive late and be reported twice. The
+#   rate reported to [load_cell] and [load_cell_probe] is this reduced
+#   rate (e.g. 1904 for sample_rate 2000) and a few percent of the
+#   chip's conversions are skipped. Wire DRDY where possible; omitting
+#   it is intended for boards that do not route the pin.
+#   The default is unset (timed RDATA reads).
 #gain: 128
 #   Valid gain values are 128, 64, 32, 16, 8, 4, 2, 1
 #   The default is 128
