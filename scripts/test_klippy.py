@@ -18,12 +18,14 @@ class error(Exception):
     pass
 
 class TestCase:
-    def __init__(self, fname, dictdir, tempdir, verbose, keepfiles):
+    def __init__(self, fname, dictdir, tempdir, verbose, keepfiles,
+                 timeout):
         self.fname = fname
         self.dictdir = dictdir
         self.tempdir = tempdir
         self.verbose = verbose
         self.keepfiles = keepfiles
+        self.timeout = timeout
     def relpath(self, fname, rel='test'):
         if rel == 'dict':
             reldir = self.dictdir
@@ -96,7 +98,13 @@ class TestCase:
             args += ['-d', df]
         if not self.verbose:
             args += ['-l', TEMP_LOG_FILE]
-        res = subprocess.call(args)
+        try:
+            res = subprocess.run(args, timeout=self.timeout).returncode
+        except subprocess.TimeoutExpired:
+            if not self.verbose:
+                self.show_log()
+            raise error("Test timed out after %ds (klippy hung)"
+                        % (self.timeout,))
         is_fail = (should_fail and not res) or (not should_fail and res)
         if is_fail:
             if not self.verbose:
@@ -148,6 +156,8 @@ def main():
                     help="do not remove temporary files")
     opts.add_option("-v", action="store_true", dest="verbose",
                     help="show all output from tests")
+    opts.add_option("--timeout", dest="timeout", type="int", default=600,
+                    help="seconds before a test is killed as hung")
     options, args = opts.parse_args()
     if len(args) < 1:
         opts.error("Incorrect number of arguments")
@@ -156,7 +166,7 @@ def main():
     # Run each test
     for fname in args:
         tc = TestCase(fname, options.dictdir, options.tempdir, options.verbose,
-                      options.keepfiles)
+                      options.keepfiles, options.timeout)
         res = tc.run()
         if res != 'success':
             sys.stderr.write("\n\nTest case %s FAILED (%s)!\n\n" % (fname, res))
