@@ -37,6 +37,26 @@ struct stepper_move {
 
 enum { MF_DIR=1<<0 };
 
+// Experimental bounded, preloaded retract.  No profile allocation is done
+// in the trigger handler and ordinary motion cannot append to this profile.
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+struct retract_segment {
+    uint32_t interval;
+    int16_t add;
+    uint16_t count;
+};
+struct stepper_retract {
+    struct timer start_timer;
+    struct stepper *stepper;
+    struct retract_segment *segments;
+    uint16_t capacity, used, index;
+    uint32_t ticks, steps, start_clock, end_clock, delay_ticks;
+    uint32_t halt_position, cycle;
+    uint8_t state, direction, reason;
+};
+enum { RS_IDLE, RS_ARMED, RS_ACTIVE, RS_DONE, RS_CANCELLED };
+#endif
+
 struct stepper {
     struct timer time;
     uint32_t interval;
@@ -47,6 +67,9 @@ struct stepper {
     uint32_t position;
     struct move_queue_head mq;
     struct trsync_signal stop_signal;
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    struct stepper_retract *retract;
+#endif
     // gcc (pre v6) does better optimization when uint8_t are bitfields
     uint8_t flags : 8;
 };
@@ -62,20 +85,49 @@ enum {
 static uint_fast8_t
 stepper_load_next(struct stepper *s)
 {
-    if (move_queue_empty(&s->mq)) {
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    struct stepper_retract *r = s->retract;
+    uint_fast8_t retracting = r && r->state == RS_ACTIVE;
+    if (retracting ? r->index == r->used : move_queue_empty(&s->mq)) {
         // There is no next move - the queue is empty
+        s->count = 0;
+        if (retracting) {
+            r->end_clock = s->time.waketime;
+            r->state = RS_DONE;
+        }
+        return SF_DONE;
+    }
+#else
+    if (move_queue_empty(&s->mq)) {
         s->count = 0;
         return SF_DONE;
     }
+#endif
 
     // Read next 'struct stepper_move'
-    struct move_node *mn = move_queue_pop(&s->mq);
-    struct stepper_move *m = container_of(mn, struct stepper_move, node);
-    uint32_t move_interval = m->interval;
-    uint_fast16_t move_count = m->count;
-    int_fast16_t move_add = m->add;
-    uint_fast8_t need_dir_change = m->flags & MF_DIR;
-    move_free(m);
+    uint32_t move_interval;
+    uint_fast16_t move_count;
+    int_fast16_t move_add;
+    uint_fast8_t need_dir_change;
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    if (retracting) {
+        struct retract_segment *m = &r->segments[r->index];
+        move_interval = m->interval;
+        move_count = m->count;
+        move_add = m->add;
+        need_dir_change = !r->index && r->direction;
+        r->index++;
+    } else
+#endif
+    {
+        struct move_node *mn = move_queue_pop(&s->mq);
+        struct stepper_move *m = container_of(mn, struct stepper_move, node);
+        move_interval = m->interval;
+        move_count = m->count;
+        move_add = m->add;
+        need_dir_change = m->flags & MF_DIR;
+        move_free(m);
+    }
 
     // Add all steps to s->position (stepper_get_position() can calc mid-move)
     s->position = (need_dir_change ? -s->position : s->position) + move_count;
@@ -273,11 +325,12 @@ command_queue_step(uint32_t *args)
         flags ^= SF_LAST_DIR;
         m->flags |= MF_DIR;
     }
-    if (s->count) {
+    if (flags & SF_NEED_RESET) {
+        // Drop late descent packets even while the autonomous lift is active.
+        move_free(m);
+    } else if (s->count) {
         s->flags = flags;
         move_queue_push(&m->node, &s->mq);
-    } else if (flags & SF_NEED_RESET) {
-        move_free(m);
     } else {
         s->flags = flags;
         move_queue_push(&m->node, &s->mq);
@@ -302,6 +355,8 @@ command_set_next_step_dir(uint32_t *args)
 DECL_COMMAND(command_set_next_step_dir, "set_next_step_dir oid=%c dir=%c");
 
 // Set an absolute time that the next step will be relative to
+static uint32_t stepper_get_position(struct stepper *s);
+
 void
 command_reset_step_clock(uint32_t *args)
 {
@@ -310,6 +365,22 @@ command_reset_step_clock(uint32_t *args)
     irq_disable();
     if (s->count)
         shutdown("Can't reset time when stepper active");
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    if (s->retract && s->retract->state == RS_ACTIVE)
+        shutdown("Can't reset time during retract");
+    if (s->retract && s->retract->state == RS_ARMED)
+        s->retract->state = RS_CANCELLED;
+    if (s->retract && s->retract->state == RS_DONE) {
+        // Restore the direction convention expected by stepcompress_reset().
+        if (timer_is_before(timer_read_time(),
+                            s->retract->end_clock + s->step_pulse_ticks))
+            shutdown("Retract direction hold violation");
+        gpio_out_write(s->dir_pin, 0);
+        s->position = -stepper_get_position(s);
+        s->flags &= ~(SF_LAST_DIR | SF_NEXT_DIR);
+        s->retract->state = RS_IDLE;
+    }
+#endif
     s->next_step_time = s->time.waketime = waketime;
     s->flags &= ~SF_NEED_RESET;
     irq_enable();
@@ -345,18 +416,47 @@ command_stepper_get_position(uint32_t *args)
 }
 DECL_COMMAND(command_stepper_get_position, "stepper_get_position oid=%c");
 
+// Reverse only after the configured direction-hold delay has elapsed.
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+static uint_fast8_t
+stepper_retract_start(struct timer *t)
+{
+    struct stepper_retract *r = container_of(t, struct stepper_retract,
+                                            start_timer);
+    struct stepper *s = r->stepper;
+    r->start_clock = timer_read_time();
+    s->next_step_time = s->time.waketime = r->start_clock;
+    gpio_out_write(s->dir_pin, 0);
+    stepper_load_next(s);
+    sched_add_timer(&s->time);
+    return SF_DONE;
+}
+#endif
+
 // Stop all moves for a given stepper (caller must disable IRQs)
 static void
 stepper_stop(struct trsync_signal *tss, uint8_t reason)
 {
     struct stepper *s = container_of(tss, struct stepper, stop_signal);
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    struct stepper_retract *r = s->retract;
+    uint_fast8_t start_retract = (r && r->state == RS_ARMED
+                                  && reason == r->reason);
+    if (r && (r->state == RS_ARMED || r->state == RS_ACTIVE))
+        r->state = RS_CANCELLED;
+    if (r)
+        sched_del_timer(&r->start_timer);
+#endif
     sched_del_timer(&s->time);
     s->next_step_time = s->time.waketime = 0;
     s->position = -stepper_get_position(s);
     s->count = 0;
     s->flags = ((s->flags & (SF_INVERT_STEP|SF_SINGLE_SCHED|SF_OPTIMIZED_PATH))
                 | SF_NEED_RESET);
-    gpio_out_write(s->dir_pin, 0);
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    if (!start_retract)
+#endif
+        gpio_out_write(s->dir_pin, 0);
     if (!(s->flags & SF_SINGLE_SCHED)
         || (HAVE_AVR_OPTIMIZATION && s->flags & SF_OPTIMIZED_PATH))
         // Must return step pin to "unstep" state
@@ -366,7 +466,116 @@ stepper_stop(struct trsync_signal *tss, uint8_t reason)
         struct stepper_move *m = container_of(mn, struct stepper_move, node);
         move_free(m);
     }
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+    if (start_retract) {
+        r->halt_position = stepper_get_position(s);
+        r->start_timer.waketime = timer_read_time() + r->delay_ticks;
+        r->index = 0;
+        r->state = RS_ACTIVE;
+        sched_add_timer(&r->start_timer);
+    }
+#endif
 }
+
+#if CONFIG_EXPERIMENTAL_LOAD_CELL_RETRACT
+void
+command_config_stepper_retract(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    uint32_t capacity = args[1];
+    if (s->retract || !capacity || capacity > 512)
+        shutdown("Invalid retract capacity");
+    s->retract = alloc_chunk(sizeof(*s->retract));
+    s->retract->stepper = s;
+    s->retract->start_timer.func = stepper_retract_start;
+    s->retract->capacity = capacity;
+    s->retract->segments = alloc_chunk(capacity * sizeof(struct retract_segment));
+}
+DECL_COMMAND(command_config_stepper_retract,
+             "config_stepper_retract oid=%c capacity=%hu");
+
+void
+command_stepper_retract_segment(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    struct stepper_retract *r = s->retract;
+    uint32_t index = args[1], interval = args[2], count = args[3];
+    int16_t add = args[4];
+    if (!r || r->state == RS_ARMED || r->state == RS_ACTIVE
+        || index >= r->capacity || !count || count > 4096)
+        shutdown("Invalid retract segment");
+    if (!index) {
+        r->used = r->ticks = r->steps = 0;
+        r->state = RS_IDLE;
+    }
+    int64_t last = (int64_t)interval + (int64_t)add * (count - 1);
+    uint32_t min_ticks = 2 * s->step_pulse_ticks + timer_from_us(2);
+    uint64_t ticks = ((int64_t)interval + last) * count / 2;
+    if (index != r->used || interval < min_ticks || last < min_ticks
+        || r->steps + count > 4096
+        || ticks + r->ticks > timer_from_us(500000))
+        shutdown("Retract profile exceeds limits");
+    r->segments[index] = (struct retract_segment){ interval, add, count };
+    r->used++;
+    r->ticks += ticks;
+    r->steps += count;
+}
+DECL_COMMAND(command_stepper_retract_segment, "stepper_retract_segment oid=%c"
+             " index=%hu interval=%u count=%hu add=%hi");
+
+void
+command_stepper_retract_arm(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    struct stepper_retract *r = s->retract;
+    uint32_t cycle = args[1], delay = args[2], reason = args[4];
+    irq_disable();
+    if (!r || !r->used || r->state == RS_ARMED || r->state == RS_ACTIVE
+        || !cycle || delay < timer_from_us(1000)
+        || delay > timer_from_us(10000) || args[3] > 1
+        || (reason != 1 && reason != 255) || !s->stop_signal.func)
+        shutdown("Invalid retract arm");
+    r->cycle = cycle;
+    r->delay_ticks = delay;
+    r->direction = args[3];
+    r->reason = reason;
+    r->start_clock = r->end_clock = 0;
+    r->state = RS_ARMED;
+    irq_enable();
+}
+DECL_COMMAND(command_stepper_retract_arm, "stepper_retract_arm oid=%c cycle=%u"
+             " delay=%u dir=%c reason=%c");
+
+void
+command_stepper_retract_query(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    struct stepper_retract *r = s->retract;
+    if (!r)
+        shutdown("Retract not configured");
+    irq_disable();
+    uint8_t state = r->state;
+    uint32_t cycle = r->cycle, start = r->start_clock, end = r->end_clock;
+    uint32_t halt = r->halt_position, pos = stepper_get_position(s);
+    irq_enable();
+    sendf("stepper_retract_state oid=%c cycle=%u state=%c"
+          " start=%u end=%u halt=%i pos=%i", args[0], cycle, state,
+          start, end, halt - POSITION_BIAS, pos - POSITION_BIAS);
+}
+DECL_COMMAND(command_stepper_retract_query, "stepper_retract_query oid=%c");
+
+void
+command_stepper_retract_cancel(uint32_t *args)
+{
+    struct stepper *s = stepper_oid_lookup(args[0]);
+    irq_disable();
+    if (s->retract && (s->retract->state == RS_ARMED
+                       || s->retract->state == RS_ACTIVE))
+        stepper_stop(&s->stop_signal, 0);
+    irq_enable();
+}
+DECL_COMMAND(command_stepper_retract_cancel, "stepper_retract_cancel oid=%c");
+#endif
 
 // Set the stepper to stop on a "trigger event" (used in homing)
 void
