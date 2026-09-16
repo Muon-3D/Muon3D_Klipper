@@ -572,6 +572,10 @@ class LoadCellProbingMove:
         epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
         return epos, collector
 
+    # print_time of the MCU's last probe trigger
+    def get_last_trigger_time(self):
+        return self._mcu_trigger_analog.get_last_trigger_time()
+
     # Wait for the MCU to trigger with no movement
     def probing_test(self, gcmd, timeout):
         self._config_helper.validate_probe_setup(gcmd)
@@ -615,7 +619,18 @@ class TappingMove:
         # collect samples from the tap
         toolhead = self._printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
-        move_end = toolhead.get_last_move_time()
+        # End collection at the MCU's trigger timestamp rather than at
+        # get_last_move_time().  On a drained queue the latter calls
+        # _calc_print_time(), which advances print_time by
+        # BUFFER_TIME_START, and homing.py has already advanced it twice
+        # more after the physical trigger.  Waiting for that timestamp
+        # blocks until the sensor clock catches up to a time the machine
+        # invented -- 0.49 s per tap, measured on an M1.  Every sample
+        # the tap needs precedes the trigger.
+        move_end = self._load_cell_probing_move.get_last_trigger_time()
+        if move_end <= 0.:
+            raise self._printer.command_error(
+                'Load cell probe reported no trigger timestamp')
         results = collector.collect_until(move_end)
         samples = check_sensor_errors(results, self._printer)
         # Analyze the tap data
