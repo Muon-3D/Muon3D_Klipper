@@ -154,7 +154,8 @@ class ProbeTests(unittest.TestCase):
             obj._printer = types.SimpleNamespace(
                 lookup_object=lambda n: toolhead, get_reactor=lambda: reactor)
             obj._mcu = types.SimpleNamespace(estimated_print_time=lambda t: t)
-            obj._load_cell = types.SimpleNamespace(get_collector=lambda: collector)
+            obj._load_cell = types.SimpleNamespace(
+                get_collector=lambda: collector)
             obj._start_collector(True, .04)
             self.assertAlmostEqual(captured[0], expected)
 
@@ -176,9 +177,11 @@ class ProbeTests(unittest.TestCase):
             if results[1]:
                 raise RuntimeError('sensor error')
             return results[0]
-        homing = types.SimpleNamespace(check_probe_first_home=lambda g: first_home)
+        homing = types.SimpleNamespace(
+            check_probe_first_home=lambda g: first_home)
+        objects = dict(toolhead=toolhead, homing=homing)
         printer = types.SimpleNamespace(get_reactor=lambda: reactor,
-            lookup_object=lambda name: dict(toolhead=toolhead, homing=homing)[name],
+            lookup_object=lambda name: objects[name],
             command_error=RuntimeError)
         analysis = lambda samples: types.SimpleNamespace(to_dict=lambda: {})
         cls = load_class('klippy/extras/load_cell_probe.py', 'TappingMove',
@@ -186,7 +189,8 @@ class ProbeTests(unittest.TestCase):
             TapAnalysis=analysis)
         obj = cls.__new__(cls)
         obj._printer = printer
-        obj._config_helper = types.SimpleNamespace(get_low_latency=lambda g: True)
+        obj._config_helper = types.SimpleNamespace(
+            get_low_latency=lambda g: True)
         collector = types.SimpleNamespace(collect_until=collect)
         obj._load_cell_probing_move = types.SimpleNamespace(
             probing_move=lambda g: ([0., 0., 2., 0.], collector),
