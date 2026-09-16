@@ -5540,6 +5540,20 @@ sensor_type:
 #   The rime in seconds used for taring the load_cell before each probe. The
 #   default value is: 4 / 60 = 0.066. This collects samples from 4 cycles of
 #   60Hz mains power to cancel power line noise.
+#low_latency: 0
+#   Experimental collection timing optimization. Set to 1 to avoid reserving
+#   a motion startup buffer for tare sample timestamps and collect only the
+#   ascent window consumed by the contact fit. The default is 0. Override
+#   per command with LOW_LATENCY=0 or LOW_LATENCY=1. Validate repeatability
+#   on the printer before enabling this persistently.
+#settling_time: 0.04
+#   With low_latency=1, wait this many seconds after the later of queued
+#   motion completion and the current MCU time before taking tare samples.
+#   This is additional to tare_time and does not reduce motion scheduling
+#   margins. Increase if the toolhead needs longer to settle after travel.
+#   Override per command with SETTLING_TIME. Ignored with low_latency=0.
+#   PROBE_TIMING=1 on a probe command reports time spent probing, scheduling,
+#   collecting samples, fitting, and publishing, plus the ascent duration.
 #z_offset:
 #speed:
 #samples:

@@ -43,6 +43,10 @@ start_test check_macro_status_keys "Check macro status keys"
 $PYTHON scripts/check_macro_status_keys.py
 finish_test check_macro_status_keys "Check macro status keys"
 
+start_test load_cell_timing "Load cell timing regression tests"
+$PYTHON -m unittest discover -s test -p test_load_cell_timing.py -v
+finish_test load_cell_timing "Load cell timing regression tests"
+
 
 ######################################################################
 # Check for whitespace errors

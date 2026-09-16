@@ -288,6 +288,7 @@ class LoadCellSampleCollector:
         self._overflows = 0
         self._start_errors = 0
         self._start_overflows = 0
+        self._completion = None
 
     def _on_samples(self, msg):
         if not self.is_started:
@@ -303,10 +304,13 @@ class LoadCellSampleCollector:
                 self.is_started = False
         if len(self._samples) >= self.min_count:
             self.is_started = False
+        if not self.is_started and self._completion is not None:
+            self._completion.complete(True)
         return self.is_started
 
     def _finish_collecting(self):
         self.is_started = False
+        self._completion = None
         self.min_time = 0.
         self.max_time = float("inf")
         self.min_count = float("inf")  # In Python 3.5 math.inf is better
@@ -322,6 +326,7 @@ class LoadCellSampleCollector:
 
     def _collect_until(self, timeout):
         self.start_collecting()
+        self._completion = self._reactor.completion()
         while self.is_started:
             now = self._reactor.monotonic()
             if self._mcu.estimated_print_time(now) > timeout:
@@ -333,7 +338,9 @@ class LoadCellSampleCollector:
                                                     overflows))
             if self._mcu.is_fileoutput():
                 break
-            self._reactor.pause(now + RETRY_DELAY)
+            # Wake immediately on the finishing batch; retain the bounded
+            # timeout checks when the sensor stops sending data.
+            self._completion.wait(now + RETRY_DELAY)
         return self._finish_collecting()
 
     # start collecting with no automatic end to collection

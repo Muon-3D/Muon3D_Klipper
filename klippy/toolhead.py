@@ -324,6 +324,11 @@ class ToolHead:
         else:
             self._process_lookahead()
         return self.print_time
+    def get_last_queued_move_time(self):
+        # Schedule pending moves normally, but do not reserve a new startup
+        # buffer when only reading the end of an already scheduled queue.
+        self._process_lookahead()
+        return self.print_time
     def _priming_handler(self, eventtime):
         self.reactor.unregister_timer(self.priming_timer)
         self.priming_timer = None
@@ -392,7 +397,7 @@ class ToolHead:
         last_move = self.lookahead.get_last()
         if last_move is not None:
             last_move.limit_next_junction_speed(speed)
-    def move(self, newpos, speed):
+    def move(self, newpos, speed, timing_callback=None):
         move = Move(self, self.commanded_pos, newpos, speed)
         if not move.move_d:
             return
@@ -402,17 +407,25 @@ class ToolHead:
             if move.axes_d[e_index + 3]:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
+        if timing_callback is not None:
+            def report_timing(end_time):
+                duration = move.accel_t + move.cruise_t + move.decel_t
+                timing_callback(end_time - duration, end_time)
+            move.timing_callbacks.append(report_timing)
         want_flush = self.lookahead.add_move(move)
         if want_flush:
             self._process_lookahead(lazy=True)
         if self.print_time > self.need_check_pause:
             self._check_pause()
-    def manual_move(self, coord, speed):
+    def manual_move(self, coord, speed, timing_callback=None):
         curpos = list(self.commanded_pos)
         for i in range(len(coord)):
             if coord[i] is not None:
                 curpos[i] = coord[i]
-        self.move(curpos, speed)
+        if timing_callback is None:
+            self.move(curpos, speed)
+        else:
+            self.move(curpos, speed, timing_callback=timing_callback)
         self.printer.send_event("toolhead:manual_move")
     def dwell(self, delay):
         self._flush_lookahead()
