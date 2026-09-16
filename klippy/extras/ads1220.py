@@ -85,8 +85,6 @@ class ADS1220:
         if drdy_pin_mcu != self.mcu:
             raise config.error("ADS1220 config error: SPI communication and"
                                " data_ready_pin must be on the same MCU")
-        # Bulk Sensor Setup
-        self.bulk_queue = bulk_sensor.BulkDataQueue(self.mcu, oid=self.oid)
         # Clock tracking
         chip_smooth = self.sps * UPDATE_INTERVAL * 2
         # Measurement conversion
@@ -121,6 +119,13 @@ class ADS1220:
 
     def get_samples_per_second(self):
         return self.sps
+
+    def get_status(self, eventtime):
+        return {
+            'errors': self.last_error_count,
+            'overflows': self.ffreader.get_last_overflows(),
+            'sample_rate': self.get_samples_per_second(),
+        }
 
     def lookup_sensor_error(self, error_code):
         return "Unknown ads1220 error" % (error_code,)
