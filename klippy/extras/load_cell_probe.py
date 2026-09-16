@@ -267,6 +267,10 @@ class LoadCellProbeConfigHelper:
         # Collect 4 x 60hz power cycles of data to average across power noise
         self._tare_time_param = floatParamHelper(config, 'tare_time',
             default=4. / 60., minval=0.01, maxval=1.0)
+        self._low_latency_param = intParamHelper(config, 'low_latency',
+            default=0, minval=0, maxval=1)
+        self._settling_time_param = floatParamHelper(config, 'settling_time',
+            default=0.04, minval=0., maxval=1.)
         self._safety_model = config.getchoice('safety_model', {
             self.SAFETY_MODEL_REFERENCE_TARE:
                 self.SAFETY_MODEL_REFERENCE_TARE,
@@ -295,6 +299,12 @@ class LoadCellProbeConfigHelper:
         tare_time = self._tare_time_param.get(gcmd)
         sps = self._sensor.get_samples_per_second()
         return max(2, math.ceil(tare_time * sps))
+
+    def get_low_latency(self, gcmd=None):
+        return bool(self._low_latency_param.get(gcmd))
+
+    def get_settling_time(self, gcmd=None):
+        return self._settling_time_param.get(gcmd)
 
     def get_safety_model(self):
         return self._safety_model
@@ -537,11 +547,17 @@ class LoadCellProbingMove:
         self._safety_max = 0
         self._trigger_mode = 'grams'
 
-    def _start_collector(self):
+    def _start_collector(self, low_latency=False, settling_time=0.):
         toolhead = self._printer.lookup_object('toolhead')
         # homing uses the toolhead last move time which gets special handling
         # to significantly buffer print_time if the move queue has drained
-        print_time = toolhead.get_last_move_time()
+        if low_latency:
+            print_time = toolhead.get_last_queued_move_time()
+            now = self._printer.get_reactor().monotonic()
+            print_time = max(print_time, self._mcu.estimated_print_time(now))
+            print_time += settling_time
+        else:
+            print_time = toolhead.get_last_move_time()
         collector = self._load_cell.get_collector()
         collector.start_collecting(min_time=print_time)
         return collector
@@ -549,7 +565,9 @@ class LoadCellProbingMove:
     # pauses for the last move to complete and then
     # sets the endstop tare value and range
     def _pause_and_tare(self, gcmd):
-        collector = self._start_collector()
+        collector = self._start_collector(
+            self._config_helper.get_low_latency(gcmd),
+            self._config_helper.get_settling_time(gcmd))
         num_samples = self._config_helper.get_tare_samples(gcmd)
         # use collect_min collected samples are not wasted
         results = collector.collect_min(num_samples)
@@ -594,7 +612,8 @@ class LoadCellProbingMove:
         speed = self._param_helper.get_probe_params(gcmd)['probe_speed']
         phoming = self._printer.lookup_object('homing')
         # start collector after tare samples are consumed
-        collector = self._start_collector()
+        collector = self._start_collector(
+            self._config_helper.get_low_latency(gcmd))
         # do homing move
         epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
         return epos, collector
@@ -637,8 +656,13 @@ class TappingMove:
         self._best_fit = LCBestFit(self._printer)
 
     def run_tap(self, gcmd):
+        reactor = self._printer.get_reactor()
+        started = reactor.monotonic()
+        low_latency = self._config_helper.get_low_latency(gcmd)
+        self._is_last_result_valid = False
         # do the descending move
         epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+        probed = reactor.monotonic()
         # collect samples from the tap
         toolhead = self._printer.lookup_object('toolhead')
         # Homing workaround
@@ -651,7 +675,8 @@ class TappingMove:
         # Lift the toolhead while collecting the samples we will use for
         # the fit. The ascent data shall cover both the contact region
         # (force still applied) and free-air region (no force = tare).
-        ascent_start_time = toolhead.get_last_move_time()
+        if not low_latency:
+            ascent_start_time = toolhead.get_last_move_time()
 
         # load_cell_retract_dist is mapped to sample_retract_dist in
         # LoadCellParameterHelper
@@ -660,16 +685,38 @@ class TappingMove:
         lift_dist = params['load_cell_retract_dist']
         lift_pos = toolhead.get_position()
         lift_pos[2] += lift_dist
-        toolhead.manual_move(lift_pos, params['lift_speed'])
-
-        # Collect samples until the end of the ascent
-        move_end = toolhead.get_last_move_time()
-        results = collector.collect_until(move_end)
+        if low_latency:
+            # Obtain the actual planned interval after lookahead has resolved
+            # acceleration and any required motion restart buffer.
+            interval = []
+            def record_interval(start, end):
+                interval.extend((start, end))
+            toolhead.manual_move(lift_pos, params['lift_speed'],
+                                 timing_callback=record_interval)
+            toolhead.get_last_queued_move_time()
+            if not interval:
+                collector.stop_collecting()
+                raise self._printer.command_error("Load cell ascent is empty")
+            ascent_start_time, move_end = interval
+            # The fit ignores the rest of a long ascent. It may finish while
+            # that movement continues; later moves remain ordered by Klipper.
+            collect_end = min(move_end,
+                ascent_start_time + ASCENT_DATA_WINDOW_SECONDS)
+        else:
+            toolhead.manual_move(lift_pos, params['lift_speed'])
+            move_end = collect_end = toolhead.get_last_move_time()
+        scheduled = reactor.monotonic()
+        results = collector.collect_until(collect_end)
+        collected = reactor.monotonic()
         samples = check_sensor_errors(results, self._printer)
+        if low_latency:
+            # A batch may already contain samples beyond the requested end.
+            samples = [s for s in samples if s[0] <= collect_end]
 
         # Perform fit on the ascent data
         corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
                                             toolhead, epos[2])
+        analyzed = reactor.monotonic()
         # Replace the probe result with the fitted Z position
         epos[2] = corrected_z
 
@@ -677,6 +724,14 @@ class TappingMove:
         ppa = TapAnalysis(samples)
         # broadcast tap event data:
         self._clients.send({'tap': ppa.to_dict()})
+        if gcmd.get_int("PROBE_TIMING", 0, minval=0, maxval=1):
+            gcmd.respond_info(
+                "load_cell timing: low_latency=%d probe=%.4f schedule=%.4f"
+                " collect=%.4f fit=%.4f publish=%.4f ascent=%.4f" % (
+                    low_latency, probed - started, scheduled - probed,
+                    collected - scheduled, analyzed - collected,
+                    reactor.monotonic() - analyzed,
+                    move_end - ascent_start_time))
 
         self._is_last_result_valid = True
         self._last_result = epos[2]
