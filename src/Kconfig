@@ -291,6 +291,15 @@ config CANBUS_FILTER
     default y if CANSERIAL
 
 # Stepper optimizations
+config EXPERIMENTAL_LOAD_CELL_RETRACT
+    bool "Experimental MCU load-cell retract (bench testing only)"
+    depends on HAVE_GPIO
+    default n
+    help
+        Include a bounded, preloaded Z retract triggered by probe contact.
+        This is experimental and requires matching host code. Leave disabled
+        on production machines. It has not been validated on real hardware.
+
 config INLINE_STEPPER_HACK
     # Enables gcc to inline stepper_event() into the main timer irq handler
     bool

@@ -212,6 +212,8 @@ defs_serialqueue = """
 
 defs_trdispatch = """
     void trdispatch_start(struct trdispatch *td, uint32_t dispatch_reason);
+    void trdispatch_set_retract(struct trdispatch *td,
+        struct trdispatch_mcu *sensor, uint32_t reason);
     void trdispatch_stop(struct trdispatch *td);
     struct trdispatch *trdispatch_alloc(void);
     struct trdispatch_mcu *trdispatch_mcu_alloc(struct trdispatch *td

@@ -531,6 +531,12 @@ class LoadCellProbingMove:
         self._z_min_position = probe.lookup_minimum_z(config)
         dispatch = mcu_trigger_analog.get_dispatch()
         probe.LookupZSteppers(config, dispatch.add_stepper)
+        self._automatic_retract = None
+        self.active_retract = None
+        if config.getboolean('experimental_mcu_retract', False):
+            from . import load_cell_retract
+            self._automatic_retract = load_cell_retract.AutomaticRetract(
+                config, mcu_trigger_analog)
         # internal state tracking
         self._tare_counts = 0
         self._safety_min = 0
@@ -585,18 +591,29 @@ class LoadCellProbingMove:
     # Probe towards z_min until the trigger_analog on the MCU triggers
     def probing_move(self, gcmd):
         self._config_helper.validate_probe_setup(gcmd)
+        self.active_retract = None
+        params = self._param_helper.get_probe_params(gcmd)
+        if (self._automatic_retract is not None
+            and gcmd.get_command() == 'BED_MESH_CALIBRATE'):
+            self._automatic_retract.prepare(gcmd, params)
+            self.active_retract = self._automatic_retract
         # tare the sensor just before probing
         self._pause_and_tare(gcmd)
         # get params for the homing move
         toolhead = self._printer.lookup_object('toolhead')
         pos = toolhead.get_position()
         pos[2] = self._z_min_position
-        speed = self._param_helper.get_probe_params(gcmd)['probe_speed']
+        speed = params['probe_speed']
         phoming = self._printer.lookup_object('homing')
         # start collector after tare samples are consumed
         collector = self._start_collector()
         # do homing move
-        epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        endstop = self.active_retract or self._mcu_trigger_analog
+        try:
+            epos = phoming.probing_move(endstop, pos, speed)
+        except Exception:
+            collector.stop_collecting()
+            raise
         return epos, collector
 
     # Wait for the MCU to trigger with no movement
@@ -637,6 +654,7 @@ class TappingMove:
         self._best_fit = LCBestFit(self._printer)
 
     def run_tap(self, gcmd):
+        self._is_last_result_valid = False
         # do the descending move
         epos, collector = self._load_cell_probing_move.probing_move(gcmd)
         # collect samples from the tap
@@ -651,25 +669,24 @@ class TappingMove:
         # Lift the toolhead while collecting the samples we will use for
         # the fit. The ascent data shall cover both the contact region
         # (force still applied) and free-air region (no force = tare).
-        ascent_start_time = toolhead.get_last_move_time()
-
-        # load_cell_retract_dist is mapped to sample_retract_dist in
-        # LoadCellParameterHelper
-        params = \
-            self._load_cell_probing_move._param_helper.get_probe_params(gcmd)
-        lift_dist = params['load_cell_retract_dist']
-        lift_pos = toolhead.get_position()
-        lift_pos[2] += lift_dist
-        toolhead.manual_move(lift_pos, params['lift_speed'])
-
-        # Collect samples until the end of the ascent
-        move_end = toolhead.get_last_move_time()
+        automatic = self._load_cell_probing_move.active_retract
+        if automatic is not None:
+            ascent_start_time = automatic.ascent_start
+            move_end = automatic.ascent_end
+        else:
+            ascent_start_time = toolhead.get_last_move_time()
+            params = self._load_cell_probing_move._param_helper.get_probe_params(
+                gcmd)
+            lift_pos = toolhead.get_position()
+            lift_pos[2] += params['load_cell_retract_dist']
+            toolhead.manual_move(lift_pos, params['lift_speed'])
+            move_end = toolhead.get_last_move_time()
         results = collector.collect_until(move_end)
         samples = check_sensor_errors(results, self._printer)
 
         # Perform fit on the ascent data
         corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
-                                            toolhead, epos[2])
+                                            toolhead, epos[2], automatic)
         # Replace the probe result with the fitted Z position
         epos[2] = corrected_z
 
@@ -689,14 +706,19 @@ class TappingMove:
         }
 
     def _analyze_ascent(self, gcmd, all_samples, ascent_start_time, toolhead,
-                        raw_z):
+                        raw_z, automatic=None):
         # Collect samples actually belonging to the ascent. We use a limited
         # time window to minimise the influence of baseline wandering.
         data = []
+        window_end = ascent_start_time + ASCENT_DATA_WINDOW_SECONDS
+        lookup_z = lambda t: _lookup_z_pos(toolhead, t)
+        if automatic is not None:
+            window_end = min(window_end, automatic.ascent_end)
+            lookup_z = automatic.z_at
         for s in all_samples:
             if s[0] >= ascent_start_time and \
-               s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
-                data.append((s[1], _lookup_z_pos(toolhead, s[0])))
+               s[0] <= window_end:
+                data.append((s[1], lookup_z(s[0])))
 
         if self._load_cell_probing_move._mcu.is_fileoutput():
             # In debugging mode: inject dummy data

@@ -173,6 +173,7 @@ class MCU_trsync:
     REASON_HOST_REQUEST = 2
     REASON_PAST_END_TIME = 3
     REASON_COMMS_TIMEOUT = 4
+    REASON_PROBE_RETRACT = 255
     def __init__(self, mcu, trdispatch):
         self._mcu = mcu
         self._trdispatch = trdispatch
@@ -251,7 +252,9 @@ class MCU_trsync:
             if tc is not None:
                 self._trigger_completion = None
                 reason = params['trigger_reason']
-                is_failure = (reason >= self.REASON_COMMS_TIMEOUT)
+                is_failure = (reason >= self.REASON_COMMS_TIMEOUT
+                              and not (self._automatic_retract
+                                       and reason == self.REASON_PROBE_RETRACT))
                 self._reactor.async_complete(tc, is_failure)
         elif self._home_end_clock is not None:
             clock = self._mcu.clock32_to_clock64(params['clock'])
@@ -260,7 +263,8 @@ class MCU_trsync:
                 self._trsync_trigger_cmd.send([self._oid,
                                                self.REASON_PAST_END_TIME])
     def start(self, print_time, report_offset,
-              trigger_completion, expire_timeout):
+              trigger_completion, expire_timeout, automatic_retract=False):
+        self._automatic_retract = automatic_retract
         self._trigger_completion = trigger_completion
         self._home_end_clock = None
         clock = self._mcu.print_time_to_clock(print_time)
@@ -284,7 +288,7 @@ class MCU_trsync:
                                           reqclock=clock)
     def set_home_end_time(self, home_end_time):
         self._home_end_clock = self._mcu.print_time_to_clock(home_end_time)
-    def stop(self):
+    def stop(self, notify_steppers=True):
         self._response_trsync.unregister()
         self._response_trsync = None
         self._trigger_completion = None
@@ -292,8 +296,9 @@ class MCU_trsync:
             return self.REASON_ENDSTOP_HIT
         params = self._trsync_query_cmd.send([self._oid,
                                               self.REASON_HOST_REQUEST])
-        for s in self._steppers:
-            s.note_homing_end()
+        if notify_steppers:
+            for s in self._steppers:
+                s.note_homing_end()
         return params['trigger_reason']
 
 TRSYNC_TIMEOUT = 0.025
@@ -328,7 +333,13 @@ class TriggerDispatch:
                                      " multi-mcu shared axis")
     def get_steppers(self):
         return [s for trsync in self._trsyncs for s in trsync.get_steppers()]
-    def start(self, print_time):
+    def get_stepper_command_queue(self, stepper):
+        for trsync in self._trsyncs:
+            if stepper in trsync.get_steppers():
+                return trsync.get_command_queue()
+        raise self._mcu.get_printer().config_error("Unknown retract stepper")
+    def start(self, print_time, automatic_retract=False):
+        self._automatic_retract = automatic_retract
         reactor = self._mcu.get_printer().get_reactor()
         self._trigger_completion = reactor.completion()
         expire_timeout = TRSYNC_TIMEOUT
@@ -337,9 +348,13 @@ class TriggerDispatch:
         for i, trsync in enumerate(self._trsyncs):
             report_offset = float(i) / len(self._trsyncs)
             trsync.start(print_time, report_offset,
-                         self._trigger_completion, expire_timeout)
+                         self._trigger_completion, expire_timeout,
+                         automatic_retract)
         etrsync = self._trsyncs[0]
         ffi_main, ffi_lib = chelper.get_ffi()
+        ffi_lib.trdispatch_set_retract(
+            self._trdispatch, etrsync._trdispatch_mcu,
+            etrsync.REASON_PROBE_RETRACT if automatic_retract else 0)
         ffi_lib.trdispatch_start(self._trdispatch, etrsync.REASON_HOST_REQUEST)
         return self._trigger_completion
     def wait_end(self, end_time):
@@ -348,11 +363,13 @@ class TriggerDispatch:
         if self._mcu.is_fileoutput():
             self._trigger_completion.complete(True)
         self._trigger_completion.wait()
-    def stop(self):
+    def stop(self, notify_steppers=True):
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_stop(self._trdispatch)
-        res = [trsync.stop() for trsync in self._trsyncs]
-        err_res = [r for r in res if r >= MCU_trsync.REASON_COMMS_TIMEOUT]
+        res = [trsync.stop(notify_steppers) for trsync in self._trsyncs]
+        err_res = [r for r in res if r >= MCU_trsync.REASON_COMMS_TIMEOUT
+                   and not (self._automatic_retract
+                            and r == MCU_trsync.REASON_PROBE_RETRACT)]
         if err_res:
             return err_res[0]
         return res[0]

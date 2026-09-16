@@ -18,7 +18,8 @@ struct trdispatch {
     struct list_head tdm_list;
 
     pthread_mutex_t lock; // protects variables below
-    uint32_t is_active, can_trigger, dispatch_reason;
+    uint32_t is_active, can_trigger, dispatch_reason, retract_reason;
+    struct trdispatch_mcu *retract_sensor;
 };
 
 struct trdispatch_mcu {
@@ -37,10 +38,10 @@ struct trdispatch_mcu {
 
 // Send: trsync_trigger oid=%c reason=%c
 static void
-send_trsync_trigger(struct trdispatch_mcu *tdm)
+send_trsync_trigger(struct trdispatch_mcu *tdm, uint32_t reason)
 {
     uint32_t msg[3] = {
-        tdm->trigger_msgtag, tdm->trsync_oid, tdm->td->dispatch_reason
+        tdm->trigger_msgtag, tdm->trsync_oid, reason
     };
     struct queue_message *qm = message_alloc_and_encode(msg, ARRAY_SIZE(msg));
     serialqueue_send_one(tdm->sq, tdm->cq, qm);
@@ -81,9 +82,14 @@ handle_trsync_state(struct fastreader *fr, double eventtime
     if (!can_trigger) {
         // mcu reports trigger or timeout - propagate to all mcus
         td->can_trigger = 0;
+        // Only the explicitly selected sensor may authorize a retract.
+        // Timeouts and generic stop requests must retain the normal reason.
+        uint32_t reason = td->dispatch_reason;
+        if (td->retract_reason && tdm == td->retract_sensor && fields[3] == 1)
+            reason = td->retract_reason;
         struct trdispatch_mcu *m;
         list_for_each_entry(m, &td->tdm_list, node) {
-            send_trsync_trigger(m);
+            send_trsync_trigger(m, reason);
         }
         goto done;
     }
@@ -125,6 +131,16 @@ done:
 }
 
 // Begin synchronization
+void __visible
+trdispatch_set_retract(struct trdispatch *td, struct trdispatch_mcu *sensor,
+                      uint32_t reason)
+{
+    pthread_mutex_lock(&td->lock);
+    td->retract_reason = reason;
+    td->retract_sensor = sensor;
+    pthread_mutex_unlock(&td->lock);
+}
+
 void __visible
 trdispatch_start(struct trdispatch *td, uint32_t dispatch_reason)
 {

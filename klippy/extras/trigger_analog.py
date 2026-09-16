@@ -372,10 +372,12 @@ class MCU_trigger_analog:
         return self._dispatch.get_steppers()
 
     def home_start(self, print_time, sample_time, sample_count, rest_time,
-                   triggered=True):
+                   triggered=True, automatic_retract=False, arm_callback=None):
         self._last_trigger_time = 0.
         self._reset_filter()
-        trigger_completion = self._dispatch.start(print_time)
+        trigger_completion = self._dispatch.start(print_time, automatic_retract)
+        if arm_callback is not None:
+            arm_callback()
         clock = self._mcu.print_time_to_clock(print_time)
         sensor_update = 1. / self._sensor.get_samples_per_second()
         sm_ticks = self._mcu.seconds_to_clock(sensor_update)
@@ -384,10 +386,10 @@ class MCU_trigger_analog:
             clock, sm_ticks, self.MONITOR_MAX], reqclock=clock)
         return trigger_completion
 
-    def home_wait(self, home_end_time):
+    def home_wait(self, home_end_time, notify_steppers=True):
         self._dispatch.wait_end(home_end_time)
         # trigger has happened, now to find out why...
-        res = self._dispatch.stop()
+        res = self._dispatch.stop(notify_steppers)
         # clear the homing state so it stops processing samples
         trigger_time = self._clear_home()
         if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
