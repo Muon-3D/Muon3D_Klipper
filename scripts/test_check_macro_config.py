@@ -71,7 +71,8 @@ class CheckTest(unittest.TestCase):
             "[delayed_gcode start]\n"
             "initial_duration: 1\n"
             "gcode:\n"
-            "  {% if printer.idle_timeout.state == 'Idle' %}M117 hi{% endif %}\n"
+            "  {% if printer.idle_timeout.state == 'Idle' %}"
+            "M117 hi{% endif %}\n"
         ), [])
 
     def test_indented_header_fails(self):
