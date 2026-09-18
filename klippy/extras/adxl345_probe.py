@@ -1,6 +1,6 @@
 import logging
 import pins
-from . import probe, adxl345
+from . import probe, adxl345, homing
 
 REG_THRESH_TAP = 0x1D
 REG_DUR = 0x21
@@ -22,12 +22,29 @@ TAP_TEST_SAMPLE_COUNT = 4
 TAP_TEST_REST_TIME = .001
 
 
+class _FileOutputRegs:
+    # Stand-in for the adxl345 register interface when klippy runs in
+    # file-output (regression test) mode and SPI reads return nothing.
+    def __init__(self, mcu):
+        self.mcu = mcu
+
+    def set_reg(self, reg, val, minclock=0):
+        pass
+
+    def read_reg(self, reg, minclock=0, reqclock=0):
+        return 0
+
+    def check_connected(self):
+        pass
+
+
 class ADXL345TapEndstop:
     def __init__(self, owner, axis, mcu_endstop, position_endstop=None):
         self._owner = owner
         self._axis = axis
         self._mcu_endstop = mcu_endstop
         self._position_endstop = position_endstop
+        self.last_trigger_time = 0.
 
     def get_axis(self):
         return self._axis
@@ -50,7 +67,8 @@ class ADXL345TapEndstop:
             triggered=triggered)
 
     def home_wait(self, home_end_time):
-        return self._mcu_endstop.home_wait(home_end_time)
+        self.last_trigger_time = self._mcu_endstop.home_wait(home_end_time)
+        return self.last_trigger_time
 
     def query_endstop(self, print_time):
         return self._mcu_endstop.query_endstop(print_time)
@@ -105,6 +123,8 @@ class ADXL345Probe:
 
         self.adxl345 = self.printer.lookup_object(config.get('chip', 'adxl345'))
         self._adxl_mcu = self.adxl345.mcu
+        if self._adxl_mcu.is_fileoutput():
+            self.adxl345 = _FileOutputRegs(self._adxl_mcu)
         self.probe_pin = config.get('probe_pin')
         self.disable_fans = [f.strip() for f in
                              config.get("disable_fans", "").split(",")
@@ -140,6 +160,12 @@ class ADXL345Probe:
             'z': config.getfloat('z_homing_tap_arm_delay',
                                  default_homing_arm_delay,
                                  minval=0., maxval=1.0),
+        }
+
+        # Optional multi-tap confirmation for X/Y homing (KAN-197).
+        self.tap_confirm = {
+            'x': self._load_confirm_profile(config, 'x'),
+            'y': self._load_confirm_profile(config, 'y'),
         }
 
         if self.enable_z_probe:
@@ -213,6 +239,8 @@ class ADXL345Probe:
         self.printer.register_event_handler(
             'homing:homing_move_end', self._handle_homing_move_end)
         self.printer.register_event_handler(
+            'homing:home_rails_end', self._handle_home_rails_end)
+        self.printer.register_event_handler(
             'gcode:command_error', self._handle_command_error)
 
         if self.enable_z_probe:
@@ -279,6 +307,24 @@ class ADXL345Probe:
             'tap_thresh': tap_thresh,
             'tap_dur': tap_dur,
             'tap_axes_mask': tap_axes_mask,
+        }
+
+    def _load_confirm_profile(self, config, axis):
+        def opt(name, getter, default, **kw):
+            base = getter('tap_confirm_%s' % (name,), default, **kw)
+            return getter('%s_tap_confirm_%s' % (axis, name), base, **kw)
+        return {
+            'samples': opt('samples', config.getint, 1, minval=1),
+            'tolerance': opt('tolerance', config.getfloat, 0.2, above=0.),
+            'retries': opt('retries', config.getint, 2, minval=0),
+            'retract_dist': opt('retract_dist', config.getfloat, 3.,
+                                above=0.),
+            'retract_speed': opt('retract_speed', config.getfloat, None,
+                                 above=0.),
+            'speed': opt('speed', config.getfloat, None, above=0.),
+            'seek_retries': opt('seek_retries', config.getint, 1, minval=0),
+            'max_seek_dist': opt('max_seek_dist', config.getfloat, None,
+                                 above=0.),
         }
 
     def _lookup_axis_position_endstop(self, config, axis):
@@ -567,6 +613,131 @@ class ADXL345Probe:
             self._stop_tap('axis_homing')
         finally:
             self._reset_axis_homing_state()
+
+    def _handle_home_rails_end(self, homing_state, rails):
+        # Confirm an X/Y tap home with further agreeing taps before the
+        # position is trusted (KAN-197).
+        matches = []
+        for rail in rails:
+            for es, name in rail.get_endstops():
+                if es in self._axis_wrappers.values():
+                    matches.append((rail, es))
+        if not matches:
+            return
+        if len(matches) > 1:
+            logging.warning("adxl345_probe: tap confirmation skipped for"
+                            " simultaneous multi-axis home")
+            return
+        rail, wrapper = matches[0]
+        axis = wrapper.get_axis()
+        cfg = self.tap_confirm[axis]
+        if cfg['samples'] <= 1:
+            return
+        self._confirm_axis_home(homing_state, rail, wrapper, cfg)
+
+    def _confirm_axis_home(self, homing_state, rail, wrapper, cfg):
+        toolhead = self.printer.lookup_object('toolhead')
+        cmderr = self.printer.command_error
+        axis = wrapper.get_axis()
+        axis_idx = 'xyz'.index(axis)
+        hi = rail.get_homing_info()
+        direction = 1. if hi.positive_dir else -1.
+        pos_endstop = hi.position_endstop
+        speed = cfg['speed'] or hi.speed
+        retract_speed = cfg['retract_speed'] or hi.retract_speed
+        retract_dist = cfg['retract_dist']
+        arm_delay = self.axis_homing_arm_delay.get(axis, 0.)
+        if retract_dist <= speed * arm_delay:
+            raise cmderr(
+                "adxl345_probe: %s_tap_confirm_retract_dist (%.2fmm) must"
+                " exceed the distance covered during the tap arm delay"
+                " (%.1fmm/s * %.3fs = %.2fmm)"
+                % (axis, retract_dist, speed, arm_delay, speed * arm_delay))
+        range_min, range_max = rail.get_range()
+        seek_budget = cfg['max_seek_dist']
+        if seek_budget is None:
+            seek_budget = range_max - range_min
+        endstops = rail.get_endstops()
+        steppers = wrapper.get_steppers()
+        step_dists = {s.get_name(): s.get_step_dist() for s in steppers}
+
+        # Like HomingMove.check_no_movement(): the debug harness has no
+        # physical stop, so trigger positions never agree there.
+        is_debug = self.printer.get_start_args().get('debuginput') is not None
+
+        def spread_mm(a, b):
+            if is_debug:
+                return 0.
+            return max([abs(a[n] - b[n]) * sd for n, sd in step_dists.items()])
+
+        def run_homing_move(start_dist, move_speed):
+            # Pretend to be start_dist away from the endstop so the move
+            # has room to reach it, then home towards position_endstop.
+            startpos = list(toolhead.get_position())
+            startpos[axis_idx] = pos_endstop - direction * start_dist
+            toolhead.set_position(startpos)
+            homepos = list(startpos)
+            homepos[axis_idx] = pos_endstop
+            hmove = homing.HomingMove(self.printer, endstops)
+            wrapper.last_trigger_time = 0.
+            hmove.homing_move(homepos, move_speed, check_triggered=False)
+            if wrapper.last_trigger_time <= 0.:
+                return None, start_dist
+            trig = {sp.stepper_name: sp.trig_pos
+                    for sp in hmove.stepper_positions}
+            travelled = max([abs(sp.trig_pos - sp.start_pos)
+                             * step_dists[sp.stepper_name]
+                             for sp in hmove.stepper_positions])
+            return trig, travelled
+
+        accepted = [dict(homing_state.trigger_mcu_pos)]
+        retries_left = cfg['retries']
+        seek_left = cfg['seek_retries']
+        while len(accepted) < cfg['samples']:
+            # Back off, then re-approach over twice the retract distance.
+            retractpos = list(toolhead.get_position())
+            retractpos[axis_idx] = pos_endstop - direction * retract_dist
+            toolhead.move(retractpos, retract_speed)
+            trig, travelled = run_homing_move(retract_dist * 2., speed)
+            if trig is None:
+                # Nothing within reach: the previous tap was spurious.
+                # Resume the seek from here within the travel budget.
+                seek_budget -= travelled
+                if seek_left <= 0 or seek_budget <= 0.:
+                    raise cmderr(
+                        "adxl345_probe: %s home tap not confirmed; no"
+                        " contact within %.1fmm of the reported tap"
+                        " and seek retries exhausted"
+                        % (axis, retract_dist))
+                seek_left -= 1
+                seek_dist = seek_budget
+                logging.info("adxl345_probe: %s tap judged spurious,"
+                             " resuming seek for up to %.1fmm",
+                             axis, seek_dist)
+                trig, travelled = run_homing_move(seek_dist, hi.speed)
+                seek_budget -= travelled
+                if trig is None:
+                    raise cmderr(
+                        "adxl345_probe: %s home failed; no tap within"
+                        " %.1fmm of resumed seek" % (axis, seek_dist))
+                accepted = [trig]
+                continue
+            spread = spread_mm(accepted[-1], trig)
+            if spread <= cfg['tolerance']:
+                accepted.append(trig)
+                continue
+            if retries_left <= 0:
+                raise cmderr(
+                    "adxl345_probe: %s home taps disagree by %.3fmm"
+                    " (tolerance %.3fmm) after %d retries"
+                    % (axis, spread, cfg['tolerance'], cfg['retries']))
+            retries_left -= 1
+            logging.info("adxl345_probe: %s taps disagree by %.3fmm,"
+                         " retrying confirmation", axis, spread)
+            accepted = [trig]
+        homing_state.trigger_mcu_pos.update(accepted[-1])
+        logging.info("adxl345_probe: %s home confirmed with %d agreeing"
+                     " taps", axis, len(accepted))
 
     def _handle_command_error(self):
         if self._tap_mode == 'axis_homing':
