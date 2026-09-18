@@ -19,6 +19,14 @@ SDS_CHECK_TIME = 0.001 # step+dir+step filter in stepcompress.c
 
 DRIP_SEGMENT_TIME = 0.050
 DRIP_TIME = 0.100
+# After a drip move ends, how long to hold off the background "relaxed"
+# flush.  That flush advances last_step_gen_time to need_flush_time +
+# BGFLUSH_EXTRA_TIME even though the drip's stepper was halted by its
+# trigger and has nothing left to emit, and every move queued afterwards
+# must then start after that time.  A move queued inside this grace kicks
+# the aggressive flush for itself instead; if none arrives the relaxed flush
+# runs exactly as before, just this much later.
+DRIP_FLUSH_GRACE_TIME = 0.200
 
 class PrinterMotionQueuing:
     def __init__(self, config):
@@ -274,9 +282,20 @@ class PrinterMotionQueuing:
             flush_time = min(flush_time + DRIP_SEGMENT_TIME, end_time)
             self.note_mcu_movequeue_activity(flush_time)
             self._advance_flush_time(flush_time - SDS_CHECK_TIME, flush_time)
-        # Restore background flushing
-        self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self._advance_flush_time(flush_time + self.kin_flush_delay)
+        # Restore background flushing.  Not immediately: see
+        # DRIP_FLUSH_GRACE_TIME.  Kicking is re-enabled so that a move
+        # queued during the grace brings the flush forward itself.
+        aggr_sg_time = self.need_step_gen_time - 2.*self.kin_flush_delay
+        if self.can_pause and self.last_step_gen_time >= aggr_sg_time:
+            # Nothing else is waiting on step generation (a concurrent
+            # manual_stepper / pwm ramp would be): the grace is safe.
+            self.do_kick_flush_timer = True
+            self.reactor.update_timer(
+                self.flush_timer,
+                self.reactor.monotonic() + DRIP_FLUSH_GRACE_TIME)
+        else:
+            self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self.drip_start_times.remove(start_time)
     def check_drip_timing(self):
         if not self.drip_start_times:

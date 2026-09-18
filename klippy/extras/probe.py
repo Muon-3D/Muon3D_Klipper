@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+import math
 import pins
 from . import manual_probe
 
@@ -12,6 +13,34 @@ If the probe did not move far enough to trigger, then
 consider reducing the Z axis minimum position so the probe
 can travel further (the Z minimum position can be negative).
 """
+
+# Lift after the LAST sample of a point as well as between samples.
+# Off by default: it adds a move the stock sequence does not have, and it
+# leaves the toolhead 0.4 mm above the trigger instead of on it, which a
+# bare PROBE command's caller may not expect.
+# On, it means the nozzle never sits on the plate while the host reports,
+# and the caller's own lift-and-travel inherits this move's end time
+# instead of priming from a standstill.
+LIFT_AFTER_LAST_SAMPLE = False
+# Per-command opt-in: LIFTLAST=1 on the probing command.  bed_mesh passes
+# its command's parameters through to the probe session, so
+# BED_MESH_CALIBRATE ... LIFTLAST=1 enables it for that mesh only, and
+# PROBE / PROBE_ACCURACY / PROBE_CALIBRATE keep their stock end position.
+
+
+def _get_float(gcmd, name, default, minval=None):
+    get_float = getattr(gcmd, 'get_float', None)
+    if get_float is None:
+        return default
+    return get_float(name, default, minval=minval)
+
+
+def _get_int(gcmd, name, default):
+    get_int = getattr(gcmd, 'get_int', None)
+    if get_int is None:
+        return default
+    return get_int(name, default)
+
 
 # Calculate the average Z from a set of positions
 def calc_probe_z_average(positions, method='average'):
@@ -365,7 +394,7 @@ class ProbeSessionHelper:
         self.results = []
         self.hw_probe_session = None
         hw_probe_session.end_probe_session()
-    def _probe(self, gcmd):
+    def _probe(self, gcmd, retract=None):
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.printer.get_reactor().monotonic()
         if 'z' not in toolhead.get_status(curtime)['homed_axes']:
@@ -378,6 +407,25 @@ class ProbeSessionHelper:
             if "Timeout during endstop homing" in reason:
                 reason += HINT_TIMEOUT
             raise self.printer.command_error(reason)
+        # The toolhead is stopped against the plate here and the move queue
+        # was drained by the homing move.  Queue the lift before doing any
+        # reporting, so the host talks to its clients while the toolhead is
+        # moving rather than while it sits on the bed -- and so the next
+        # descent can inherit this move's end time instead of priming from a
+        # standstill.
+        if retract is not None:
+            retract_dist, lift_speed, probexy = retract
+            cur_z = toolhead.get_position()[2]
+            lift = list(probexy) + [cur_z + retract_dist]
+            # Use the short-prime move where the toolhead offers it: this lift
+            # follows a drained queue, so on stock it pays BUFFER_TIME_START
+            # standing on the plate.  Falls back to manual_move so an
+            # unpatched toolhead.py still works.
+            _short = getattr(toolhead, 'short_prime_move', None)
+            if _short is not None:
+                _short(lift, lift_speed)
+            else:
+                toolhead.manual_move(lift, lift_speed)
         # Allow axis_twist_compensation to update results
         results = [epos]
         self.printer.send_event("probe:update_results", results)
@@ -396,9 +444,18 @@ class ProbeSessionHelper:
         retries = 0
         positions = []
         sample_count = params['samples']
+        _liftlast = (LIFT_AFTER_LAST_SAMPLE
+                     or bool(_get_int(gcmd, 'LIFTLAST', 0)))
         while len(positions) < sample_count:
-            # Probe position
-            pos = self._probe(gcmd)
+            # Probe position.  Hand _probe the retract so it can start the
+            # lift before it reports, rather than after.
+            if (len(positions) + 1 < sample_count
+                    or _liftlast):
+                retract = (params['sample_retract_dist'],
+                           params['lift_speed'], probexy)
+            else:
+                retract = None
+            pos = self._probe(gcmd, retract=retract)
             positions.append(pos)
             # Check samples tolerance
             z_positions = [p.bed_z for p in positions]
@@ -408,8 +465,13 @@ class ProbeSessionHelper:
                 gcmd.respond_info("Probe samples exceed tolerance. Retrying...")
                 retries += 1
                 positions = []
-            # Retract
-            if len(positions) < sample_count:
+            # Retract.  `retract is None` is exactly the case where _probe
+            # was not handed a lift and so did not queue one: the last sample
+            # of the point.  If a tolerance failure has just reset the sample
+            # list, that last sample still needs its lift before the retry.
+            # Any earlier sample was already lifted by _probe and must not be
+            # lifted twice.
+            if len(positions) < sample_count and retract is None:
                 cur_z = toolhead.get_position()[2]
                 toolhead.manual_move(
                     probexy + [cur_z + params['sample_retract_dist']],
@@ -460,6 +522,15 @@ class ProbePointsHelper:
         self.travel_callback = None
         # Internal probing state
         self.lift_speed = self.speed
+        # ZLEAD=<mm>: on legs between probe points, rise to
+        # horizontal_move_z during the first ZLEAD mm of the travel instead
+        # of before it.  Z leads XY by construction (the two are one
+        # trapezoid, and the kinematics cap the segment at max_z_velocity),
+        # so clearance grows at horizontal_move_z/ZLEAD per mm of travel --
+        # 160 um/mm at the defaults, against ~12 um/mm of measured plate
+        # slope.  Requires LIFTLAST=1 so every leg starts already clear of
+        # the plate.  0 (the default) is the stock lift-then-travel.
+        self.z_lead = 0.
         self.probe_offsets = (0., 0., 0.)
         self.manual_results = []
     def minimum_points(self,n):
@@ -504,6 +575,25 @@ class ProbePointsHelper:
             )
             if handled:
                 return
+        if self.z_lead > 0.:
+            # Z-leads travel (see __init__).  The no-go callback above has
+            # already declined this leg, so nothing on it needs the full
+            # traverse height.
+            curpos = self.printer.lookup_object('toolhead').get_position()
+            hz = self.horizontal_move_z
+            dx = nextpos[0] - curpos[0]
+            dy = nextpos[1] - curpos[1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if curpos[2] >= hz - 1e-6 or dist <= self.z_lead:
+                # already at travel height, or a leg no longer than the
+                # lead: one segment, Z still reaches hz within it
+                self._move([nextpos[0], nextpos[1], hz], self.speed)
+            else:
+                f = self.z_lead / dist
+                self._move([curpos[0] + dx * f, curpos[1] + dy * f, hz],
+                           self.speed)
+                self._move(nextpos, self.speed)
+            return
         self._move(nextpos, self.speed)
     def start_probe(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)
@@ -526,10 +616,18 @@ class ProbePointsHelper:
         if self.horizontal_move_z < self.probe_offsets[2]:
             raise gcmd.error("horizontal_move_z can't be less than"
                              " probe's z_offset")
+        self.z_lead = _get_float(gcmd, 'ZLEAD', 0., minval=0.)
+        if self.z_lead > 0. and not _get_int(gcmd, 'LIFTLAST', 0):
+            raise gcmd.error("ZLEAD requires LIFTLAST=1")
         probe_session = probe.start_probe_session(gcmd)
         probe_num = 0
         while 1:
-            self._raise_tool(not probe_num)
+            if (not self.z_lead or not probe_num
+                    or probe_num >= len(self.probe_points)):
+                # stock: lift to horizontal_move_z before the travel.  With
+                # ZLEAD the lift is folded into the travel by _move_next;
+                # the first point and the end-of-pass lift stay as stock.
+                self._raise_tool(not probe_num)
             if probe_num >= len(self.probe_points):
                 results = probe_session.pull_probed_results()
                 done = self._invoke_callback(results)

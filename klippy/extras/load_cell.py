@@ -271,7 +271,7 @@ class LoadCellGuidedCalibrationHelper:
 # Optionally blocks execution while collecting with reactor.pause()
 # can collect a minimum n samples or collect until a specific print_time
 # samples returned in [[time],[force],[counts]] arrays for easy processing
-RETRY_DELAY = 0.05  # 20Hz
+RETRY_DELAY = 0.005  # 200Hz
 class LoadCellSampleCollector:
     def __init__(self, printer, load_cell):
         self._printer = printer
