@@ -194,6 +194,11 @@ class LookAheadQueue:
 
 BUFFER_TIME_HIGH = 1.0
 BUFFER_TIME_START = 0.250
+# Priming lead for drip (homing/probing) moves.  The drip feeder in
+# motion_queuing.py maintains only DRIP_TIME of lead and sleeps off any
+# surplus, so priming such a move with BUFFER_TIME_START leaves the toolhead
+# standing still for the difference.  Kept equal to motion_queuing.DRIP_TIME.
+DRIP_BUFFER_TIME_START = 0.100
 PRIMING_CMD_TIME = 0.100
 
 # Main code to track events (and their timing) on the printer toolhead
@@ -275,7 +280,12 @@ class ToolHead:
             # Transition from "NeedPrime"/"Priming" state to main state
             self.special_queuing_state = ""
             self.need_check_pause = -1.
-            self._calc_print_time()
+            if getattr(self, 'drip_prime_next', False):
+                # short_prime_move() asked for the drip lead
+                self.drip_prime_next = False
+                self._calc_drip_print_time()
+            else:
+                self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
         with self.reactor.assert_no_pause():
@@ -324,6 +334,48 @@ class ToolHead:
         else:
             self._process_lookahead()
         return self.print_time
+    def _calc_drip_print_time(self):
+        curtime = self.reactor.monotonic()
+        est_print_time = self.mcu.estimated_print_time(curtime)
+        kin_time = self.motion_queuing.calc_step_gen_restart(est_print_time)
+        min_print_time = max(est_print_time + DRIP_BUFFER_TIME_START, kin_time)
+        if min_print_time > self.print_time:
+            self.print_time = min_print_time
+            self.printer.send_event("toolhead:sync_print_time",
+                                    curtime, est_print_time, self.print_time)
+    def get_drip_start_time(self):
+        # As get_last_move_time(), but primes with the lead the drip feeder
+        # actually consumes rather than the lead a buffered print needs.
+        # Never schedules earlier than calc_step_gen_restart().
+        if self.special_queuing_state:
+            self._flush_lookahead()
+            self._calc_drip_print_time()
+        else:
+            self._process_lookahead()
+        return self.print_time
+    def drip_dwell(self, delay):
+        # dwell() with the drip lead instead of BUFFER_TIME_START
+        self._flush_lookahead()
+        next_print_time = self.get_drip_start_time() + max(0., delay)
+        self._advance_move_time(next_print_time)
+        self._check_pause()
+    def short_prime_move(self, coord, speed):
+        # A move that, if the queue has drained, is primed with the drip
+        # lead (DRIP_BUFFER_TIME_START) instead of BUFFER_TIME_START.  The
+        # lead is applied when the lookahead is flushed, not here, so the
+        # ordinary NeedPrime/Priming path -- and its priming timer, which
+        # bounds how long a queued move can wait to be flushed -- stays in
+        # force.  A queue that has not drained ignores the flag: print_time
+        # is already ahead and only ever raised.
+        self.drip_prime_next = True
+        try:
+            self.manual_move(coord, speed)
+        except:
+            self.drip_prime_next = False
+            raise
+        if self.lookahead.is_empty():
+            # nothing queued (zero-length move, or already flushed)
+            self.drip_prime_next = False
     def _priming_handler(self, eventtime):
         self.reactor.unregister_timer(self.priming_timer)
         self.priming_timer = None
@@ -462,7 +514,7 @@ class ToolHead:
             self.commanded_pos[:] = submit_move.end_pos
             self.lookahead.add_move(submit_move)
         moves = self.lookahead.flush()
-        self._calc_print_time()
+        self._calc_drip_print_time()
         start_time = end_time = self.print_time
         for move in moves:
             self.trapq_append(
@@ -480,9 +532,12 @@ class ToolHead:
         move = Move(self, self.commanded_pos, newpos, speed)
         if move.move_d:
             self.kin.check_move(move)
-        # Make sure stepper movement doesn't start before nominal start time
+        # Make sure stepper movement doesn't start before nominal start time.
+        # dwell() would prime print_time BUFFER_TIME_START out via
+        # get_last_move_time(); a drip move only needs the drip lead, which is
+        # the margin drip_update_time feeds the descent at anyway.
         kin_flush_delay = self.motion_queuing.get_kin_flush_delay()
-        self.dwell(kin_flush_delay)
+        self.drip_dwell(kin_flush_delay)
         # Transmit move in "drip" mode
         self._process_lookahead()
         start_time, end_time = self._drip_load_trapq(move)
