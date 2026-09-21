@@ -84,6 +84,9 @@ class ProbeCommandHelper:
                                desc=self.cmd_PROBE_help)
         # PROBE_CALIBRATE command
         self.probe_calibrate_info = None
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.on_calibrate_gcode = gcode_macro.load_template(
+            config, 'on_calibrate_gcode', '')
         if can_set_z_offset:
             gcode.register_command('PROBE_CALIBRATE', self.cmd_PROBE_CALIBRATE,
                                    desc=self.cmd_PROBE_CALIBRATE_help)
@@ -132,6 +135,8 @@ class ProbeCommandHelper:
             "with the above and restart the printer." % (self.name, z_offset))
         configfile = self.printer.lookup_object('configfile')
         configfile.set(self.name, 'z_offset', "%.3f" % (z_offset,))
+        # Must run via run_gcode_from_command as the gcode mutex is held
+        self.on_calibrate_gcode.run_gcode_from_command()
     cmd_PROBE_CALIBRATE_help = "Calibrate the probe's z_offset"
     def cmd_PROBE_CALIBRATE(self, gcmd):
         manual_probe.verify_no_manual_probe(self.printer)
