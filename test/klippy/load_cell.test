@@ -22,3 +22,17 @@ PROBE
 
 # Move again
 G1 Z9
+
+# Multi-sample probe.  The default is samples=1, which never
+# retracts; the M1 runs samples=2 so that samples_tolerance can
+# reject a bad tap, so cover the retract-between-samples path.
+PROBE SAMPLES=3 SAMPLE_RETRACT_DIST=1.5
+
+# Move again
+G1 Z5 X0 Y0
+
+# Multi-sample probe with a tolerance retry budget
+PROBE SAMPLES=2 SAMPLES_TOLERANCE=0.5 SAMPLES_TOLERANCE_RETRIES=2
+
+# Move again
+G1 Z9

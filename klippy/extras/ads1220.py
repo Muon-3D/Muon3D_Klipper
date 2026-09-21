@@ -11,7 +11,7 @@ from . import bulk_sensor, bus
 #
 BYTES_PER_SAMPLE = 4  # samples are 4 byte wide unsigned integers
 MAX_SAMPLES_PER_MESSAGE = bulk_sensor.MAX_BULK_MSG_SIZE // BYTES_PER_SAMPLE
-UPDATE_INTERVAL = 0.10
+UPDATE_INTERVAL = 0.02
 RESET_CMD = 0x06
 START_SYNC_CMD = 0x08
 RREG_CMD = 0x20
@@ -99,7 +99,9 @@ class ADS1220:
         # Bulk Sensor Setup
         self.bulk_queue = bulk_sensor.BulkDataQueue(self.mcu, oid=self.oid)
         # Clock tracking
-        chip_smooth = self.effective_sps * UPDATE_INTERVAL * 2
+        # smoothing window kept at its historical value (sps * 0.10 * 2) so
+        # that changing UPDATE_INTERVAL does not also change clock sync
+        chip_smooth = self.effective_sps * 0.10 * 2
         # Measurement conversion
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
         # Process messages in batches

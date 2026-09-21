@@ -1,0 +1,22 @@
+# Test case for probe on_calibrate_gcode support
+CONFIG probe_calibrate_hook.cfg
+DICTIONARY atmega2560.dict
+
+# Start by homing the printer.
+G28
+G1 F6000
+G1 Z5 X0 Y0
+
+# PROBE_CALIBRATE followed by ABORT must not run the hook
+PROBE_CALIBRATE
+ABORT
+_ASSERT_HOOK_RUNS COUNT=0
+
+# ACCEPT stages the new z_offset and runs the hook
+PROBE_CALIBRATE
+TESTZ Z=-.2
+ACCEPT
+_ASSERT_HOOK_RUNS COUNT=1
+
+# Move again (proves g-code processing continues after the hook)
+G1 Z9

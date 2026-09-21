@@ -186,6 +186,10 @@ while this tool is active. The optional `HORIZONTAL_MOVE_Z` value overrides the
 specified then the objects defined by the Gcode file being printed will be used
 to define the probed area. The optional `ADAPTIVE_MARGIN` value overrides the
 `adaptive_margin` option specified in the config file.
+Muon additions: `ZLEAD=<mm>` (requires `LIFTLAST=1`, see PROBE) folds the
+lift to `horizontal_move_z` into the first `ZLEAD` mm of each travel
+between points instead of lifting first; legs that cross a no-go region
+are unchanged.
 
 #### BED_MESH_OUTPUT
 `BED_MESH_OUTPUT PGP=[<0:1>]`: This command outputs the current probed
@@ -1252,6 +1256,16 @@ Move the nozzle downwards until the probe triggers. If any of the
 optional parameters are provided they override their equivalent
 setting in the [probe config section](Config_Reference.md#probe).
 The optional parameter `METHOD` is probe-specific.
+
+Muon additions, all off unless given and all per-command: `LIFTLAST=1`
+lifts by `SAMPLE_RETRACT_DIST` after the last sample of a point as well
+as between samples, so the nozzle never waits on the plate while the
+host reports. For `[load_cell_probe]`: `TAIL=<seconds>` ends sample
+collection that long after the trigger instead of after a re-primed
+move time; `MCUTARE=1` lets the MCU take the tare on the first sample of
+the descent when the nozzle is known to be clear of the plate (otherwise
+the host tare is used); `SETTLE=<seconds>` queues that much quiet time
+before the descent.
 
 #### QUERY_PROBE
 `QUERY_PROBE`: Report the current status of the probe ("triggered" or

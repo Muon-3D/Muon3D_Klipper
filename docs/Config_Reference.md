@@ -2212,6 +2212,12 @@ z_offset:
 #   completes. See docs/Command_Templates.md for G-Code format. Do not
 #   issue any commands here that move the toolhead. The default is to
 #   not run any special G-Code commands on deactivation.
+#on_calibrate_gcode:
+#   A list of G-Code commands to execute after PROBE_CALIBRATE is
+#   completed with ACCEPT and the new z_offset has been staged for
+#   SAVE_CONFIG. It does not run after ABORT. See
+#   docs/Command_Templates.md for G-Code format. The default is to
+#   not run any special G-Code commands.
 ```
 
 ### [bltouch]
@@ -2323,6 +2329,7 @@ z_offset:
 #activate_gcode:
 #deactivate_gcode:
 #deactivate_on_each_sample:
+#on_calibrate_gcode:
 #   See the "probe" section for more information on the parameters above.
 ```
 
@@ -5454,6 +5461,7 @@ sensor_type:
 #samples_tolerance_retries:
 #activate_gcode:
 #deactivate_gcode:
+#on_calibrate_gcode:
 #   See the "[probe]" section for a description of the above parameters.
 ```
 
