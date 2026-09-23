@@ -97,6 +97,13 @@ start_test klippy "Test klippy import (Python3)"
 $PYTHON klippy/klippy.py --import-test
 finish_test klippy "Test klippy import (Python3)"
 
+# MUON: host-side serialqueue / non-critical MCU reconnect tests (KAN-243).
+# Build c_helper.so through chelper.get_ffi(); no MCU dictionary needed.
+start_test serialqueue "Test serialqueue fd handling and reconnect back-off"
+$PYTHON test/serialqueue/test_fd_leak.py
+$PYTHON test/serialqueue/test_reconnect_backoff.py
+finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
+
 # MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
 # image builds klippy into a `python3 -m venv` and klippy carries 36
 # f-strings across 12 files, which Python 2 cannot parse at all. The tests

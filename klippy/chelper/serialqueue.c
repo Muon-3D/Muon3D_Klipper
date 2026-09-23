@@ -717,8 +717,11 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
     sq->name[sizeof(sq->name)-1] = '\0';
 
     int ret = pipe(sq->transmit_requests.pipe_fds);
-    if (ret)
-        goto fail;
+    if (ret) {
+        report_errno("pipe", ret);
+        free(sq);
+        return NULL;
+    }
 
     // Reactor setup
     sq->pr = pollreactor_alloc(SQPF_NUM, SQPT_NUM, sq);
@@ -781,6 +784,12 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
 
 fail:
     report_errno("init", ret);
+    message_queue_free(&sq->old_sent);
+    message_queue_free(&sq->receiver.old_receive);
+    close(sq->transmit_requests.pipe_fds[0]);
+    close(sq->transmit_requests.pipe_fds[1]);
+    pollreactor_free(sq->pr);
+    free(sq);
     return NULL;
 }
 
@@ -828,6 +837,8 @@ serialqueue_free(struct serialqueue *sq)
     pthread_mutex_unlock(&sq->transmit_requests.lock);
     pthread_mutex_unlock(&sq->lock);
     pollreactor_free(sq->pr);
+    close(sq->transmit_requests.pipe_fds[0]);
+    close(sq->transmit_requests.pipe_fds[1]);
     free(sq);
 }
 
