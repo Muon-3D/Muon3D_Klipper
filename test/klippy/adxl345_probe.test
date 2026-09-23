@@ -1,0 +1,18 @@
+# Test case for adxl345_probe X/Y tap homing with tap confirmation
+CONFIG adxl345_probe.cfg
+DICTIONARY linuxprocess.dict
+
+# Home each tap axis separately, then all together
+G28 X
+G28 Y
+G28 Z
+G28
+
+# Moves after homing
+G1 F6000
+G1 X50 Y50
+G1 X0 Y0
+
+# Re-home a single axis mid-session
+G28 X
+G1 X10

@@ -11,13 +11,18 @@ from . import bulk_sensor, bus
 #
 BYTES_PER_SAMPLE = 4  # samples are 4 byte wide unsigned integers
 MAX_SAMPLES_PER_MESSAGE = bulk_sensor.MAX_BULK_MSG_SIZE // BYTES_PER_SAMPLE
-UPDATE_INTERVAL = 0.10
+UPDATE_INTERVAL = 0.02
 RESET_CMD = 0x06
 START_SYNC_CMD = 0x08
 RREG_CMD = 0x20
 WREG_CMD = 0x40
 NOOP_CMD = 0x0
 RESET_STATE = bytearray([0x0, 0x0, 0x0, 0x0])
+# Without a DRDY line the mcu reads on a fixed timer. The chip's internal
+# oscillator is specified at +/-2%, so reading 5% slower than the nominal
+# conversion rate guarantees a new conversion has completed between reads:
+# every read is a fresh sample and no stale value is ever reported twice.
+NODRDY_READ_RATE_MARGIN = 0.05
 
 # turn bytearrays into pretty hex strings: [0xff, 0x1]
 def hexify(byte_array):
@@ -76,17 +81,25 @@ class ADS1220:
         self.spi = bus.MCU_SPI_from_config(config, 1, default_speed=spi_speed)
         self.mcu = mcu = self.spi.get_mcu()
         self.oid = mcu.create_oid()
-        # Data Ready (DRDY) Pin
-        drdy_pin = config.get('data_ready_pin')
-        ppins = printer.lookup_object('pins')
-        drdy_ppin = ppins.lookup_pin(drdy_pin)
-        self.data_ready_pin = drdy_ppin['pin']
-        drdy_pin_mcu = drdy_ppin['chip']
-        if drdy_pin_mcu != self.mcu:
-            raise config.error("ADS1220 config error: SPI communication and"
-                               " data_ready_pin must be on the same MCU")
+        # Data Ready (DRDY) Pin, optional: without it the mcu polls by RDATA
+        drdy_pin = config.get('data_ready_pin', None)
+        self.has_drdy = drdy_pin is not None
+        self.effective_sps = self.sps
+        if self.has_drdy:
+            ppins = printer.lookup_object('pins')
+            drdy_ppin = ppins.lookup_pin(drdy_pin)
+            self.data_ready_pin = drdy_ppin['pin']
+            drdy_pin_mcu = drdy_ppin['chip']
+            if drdy_pin_mcu != self.mcu:
+                raise config.error("ADS1220 config error: SPI communication"
+                                   " and data_ready_pin must be on the same"
+                                   " MCU")
+        else:
+            self.effective_sps = int(self.sps / (1. + NODRDY_READ_RATE_MARGIN))
         # Clock tracking
-        chip_smooth = self.sps * UPDATE_INTERVAL * 2
+        # smoothing window kept at its historical value (sps * 0.10 * 2) so
+        # that changing UPDATE_INTERVAL does not also change clock sync
+        chip_smooth = self.effective_sps * 0.10 * 2
         # Measurement conversion
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
         # Process messages in batches
@@ -94,9 +107,14 @@ class ADS1220:
             self.printer, self._process_batch, self._start_measurements,
             self._finish_measurements, UPDATE_INTERVAL)
         # Command Configuration
-        mcu.add_config_cmd(
-            "config_ads1220 oid=%d spi_oid=%d data_ready_pin=%s"
-            % (self.oid, self.spi.get_oid(), self.data_ready_pin))
+        if self.has_drdy:
+            mcu.add_config_cmd(
+                "config_ads1220 oid=%d spi_oid=%d data_ready_pin=%s"
+                % (self.oid, self.spi.get_oid(), self.data_ready_pin))
+        else:
+            mcu.add_config_cmd(
+                "config_ads1220_nodrdy oid=%d spi_oid=%d"
+                % (self.oid, self.spi.get_oid()))
         mcu.add_config_cmd("query_ads1220 oid=%d rest_ticks=0"
                            % (self.oid,), on_restart=True)
         mcu.register_config_callback(self._build_config)
@@ -118,7 +136,9 @@ class ADS1220:
         return self.mcu
 
     def get_samples_per_second(self):
-        return self.sps
+        # Without DRDY the delivered rate is the mcu read schedule, which is
+        # deliberately slower than the chip's conversion rate
+        return self.effective_sps
 
     def get_status(self, eventtime):
         return {
@@ -155,7 +175,12 @@ class ADS1220:
         # Start bulk reading
         self.reset_chip()
         self.setup_chip()
-        rest_ticks = self.mcu.seconds_to_clock(1. / (10. * self.sps))
+        if self.has_drdy:
+            # poll DRDY well above the conversion rate
+            rest_ticks = self.mcu.seconds_to_clock(1. / (10. * self.sps))
+        else:
+            # one RDATA read per rest_ticks, each yields one sample
+            rest_ticks = self.mcu.seconds_to_clock(1. / self.effective_sps)
         self.query_ads1220_cmd.send([self.oid, rest_ticks])
         logging.info("ADS1220 starting '%s' measurements", self.name)
         # Initialize clock tracking

@@ -533,6 +533,17 @@ class LoadCellProbingMove:
         probe.LookupZSteppers(config, dispatch.add_stepper)
         # internal state tracking
         self._tare_counts = 0
+        # last known zero, used for the raw-range envelope under MCUTARE
+        self._approx_tare = None
+        # Z at which the last probe actually triggered, or None when no
+        # probe has triggered yet in this session.
+        self._last_trigger_z = None
+        # Any re-anchoring of the Z frame (G28, SET_KINEMATIC_POSITION)
+        # makes the recorded trigger Z meaningless.  homing_move's own
+        # set_position after a tap fires this too, before probing_move
+        # records the new value, so ordinary taps are unaffected.
+        self._printer.register_event_handler("toolhead:set_position",
+                                             self._handle_set_position)
         self._safety_min = 0
         self._safety_max = 0
         self._trigger_mode = 'grams'
@@ -541,7 +552,18 @@ class LoadCellProbingMove:
         toolhead = self._printer.lookup_object('toolhead')
         # homing uses the toolhead last move time which gets special handling
         # to significantly buffer print_time if the move queue has drained
-        print_time = toolhead.get_last_move_time()
+        _est = self._load_cell.sensor.get_mcu().estimated_print_time(
+            self._printer.get_reactor().monotonic())
+        # The collector only needs the print_time the descent will start at.
+        # get_last_move_time() primes BUFFER_TIME_START (0.25 s) out and the
+        # descent then inherits that; the drip lead is what the homing move
+        # uses itself.  Never earlier than now, so a stale print_time cannot
+        # widen the window back into the previous tap.
+        _drip = getattr(toolhead, 'get_drip_start_time', None)
+        if _drip is not None:
+            print_time = max(_drip(), _est)
+        else:
+            print_time = toolhead.get_last_move_time()
         collector = self._load_cell.get_collector()
         collector.start_collecting(min_time=print_time)
         return collector
@@ -561,6 +583,7 @@ class LoadCellProbingMove:
         # update the load cell so it reflects the new tare value
         self._load_cell.tare(tare_counts)
         self._tare_counts = tare_counts
+        self._approx_tare = tare_counts
         # update raw range
         safety_min, safety_max = self._config_helper.get_safety_range(
             tare_counts, gcmd)
@@ -582,13 +605,122 @@ class LoadCellProbingMove:
             "load_cell_probe: tare=%i raw_range=[%i,%i] trigger_mode=%s",
             tare_counts, safety_min, safety_max, self._trigger_mode)
 
+    # Arm the trigger without collecting anything: the MCU takes its own
+    # zero on the first sample of the descent (sos_filter.c auto_offset).
+    # Nothing here waits on print_time, so the move queue does not drain
+    # and the descent does not pay BUFFER_TIME_START.
+    def _mcu_tare(self, gcmd):
+        # The host tare this replaces was also the only pre-descent proof
+        # that samples are still arriving.  A descent with a dead sample
+        # stream has no trigger and no raw-range guard, so wait for one
+        # sample newer than now before arming; the collector raises
+        # "LoadCellSampleCollector timed out!" if none comes.
+        _now = self._load_cell.sensor.get_mcu().estimated_print_time(
+            self._printer.get_reactor().monotonic())
+        _fresh = self._load_cell.get_collector()
+        _fresh.start_collecting(min_time=_now)
+        check_sensor_errors(_fresh.collect_min(1), self._printer)
+        tare_counts = self._approx_tare
+        self._continuous_tare_filter_helper.update_from_command(gcmd)
+        self._load_cell.tare(tare_counts)
+        self._tare_counts = tare_counts
+        # The raw-range guard is computed from the approximate zero but is
+        # checked on the MCU against the RAW sample, before the filter, so
+        # it still bounds force no matter what zero the MCU picks.
+        safety_min, safety_max = self._config_helper.get_safety_range(
+            tare_counts, gcmd)
+        self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
+        self._safety_min = safety_min
+        self._safety_max = safety_max
+        trigger_setup = self._config_helper.get_trigger_setup(
+            tare_counts, safety_min, safety_max, gcmd)
+        sos_filter = self._mcu_trigger_analog.get_sos_filter()
+        # offset=0 is a placeholder the MCU overwrites from its own first
+        # sample. auto_offset also makes reset_filter() re-send this every
+        # time, which it must: the flag is consumed after one sample.
+        sos_filter.set_offset_scale(
+            0, trigger_setup['scale'], trigger_setup['scale_frac_bits'],
+            auto_offset=True)
+        self._mcu_trigger_analog.set_trigger(
+            trigger_setup['trigger_type'], trigger_setup['trigger_value'])
+        self._trigger_mode = trigger_setup['trigger_mode']
+
+    MAX_BASELINE_DRIFT_COUNTS = 100000
+
+    # The MCU's auto_offset zero is RELATIVE: it becomes whatever the load
+    # is when the descent arms.  Taking it while the nozzle is touching
+    # absorbs the contact force into "zero".  Require this much clearance
+    # above the last trigger before trusting it; below that, use the stock
+    # host tare, whose zero is absolute and therefore safe in contact.
+    MIN_TARE_CLEARANCE_MM = 0.2
+
+    # Refresh the approximate zero from the pre-contact part of the tap
+    # that just ran. Those samples are already collected and analysed, so
+    # this costs nothing, and it tracks drift across a mesh.
+    def note_baseline(self, samples):
+        head = samples[:64]
+        if len(head) < 8:
+            return
+        counts = sorted(float(s[2]) for s in head)
+        candidate = int(round(counts[len(counts) // 2]))
+        prev = self._approx_tare
+        # A tap that triggered almost immediately would put contact
+        # samples in this window. A zero dragged toward the contact load
+        # shrinks |ref_max - tare| and so shrinks the trigger threshold.
+        # That fails toward triggering EARLY rather than into the plate,
+        # but it is still wrong. Refuse an implausible jump and keep the
+        # previous zero: it is still good, because the envelope and the
+        # threshold are insensitive to it at this scale. Real thermal
+        # drift across a mesh is orders of magnitude under this bound.
+        if (prev is not None
+                and abs(candidate - prev)
+                > self.MAX_BASELINE_DRIFT_COUNTS):
+            logging.warning('load_cell_probe: rejected implausible'
+                            ' baseline %i (previous %i), keeping previous',
+                            candidate, prev)
+            return
+        self._approx_tare = candidate
+
+    def _handle_set_position(self):
+        self._last_trigger_z = None
+
+    def _nozzle_is_clear(self):
+        # True only when the toolhead is known to be clear of the plate.
+        # Unknown counts as not clear: the caller then takes the stock host
+        # tare, which is slower but valid in contact.
+        if self._last_trigger_z is None:
+            return False
+        try:
+            z = self._printer.lookup_object('toolhead').get_position()[2]
+        except Exception:
+            return False
+        if z < self._last_trigger_z + self.MIN_TARE_CLEARANCE_MM:
+            logging.info('load_cell_probe: z=%.3f is within %.3f mm of the'
+                         ' last trigger at %.3f; using the host tare so the'
+                         ' zero is not taken under load',
+                         z, self.MIN_TARE_CLEARANCE_MM, self._last_trigger_z)
+            return False
+        return True
+
     # Probe towards z_min until the trigger_analog on the MCU triggers
     def probing_move(self, gcmd):
         self._config_helper.validate_probe_setup(gcmd)
         # tare the sensor just before probing
-        self._pause_and_tare(gcmd)
+        _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
+        if _mcutare and self._approx_tare is not None \
+                and self._nozzle_is_clear():
+            self._mcu_tare(gcmd)
+        else:
+            self._pause_and_tare(gcmd)
         # get params for the homing move
         toolhead = self._printer.lookup_object('toolhead')
+        # SETTLE=<seconds>: queued quiet time before the descent, to bound
+        # how much of the travel ring the MCU can bake into its zero.  This
+        # is queue time, not a host block: it does not drain the move
+        # queue and so does not cost a re-prime.
+        _settle = 0. if gcmd is None else gcmd.get_float('SETTLE', 0.)
+        if _settle > 0.:
+            toolhead.dwell(_settle)
         pos = toolhead.get_position()
         pos[2] = self._z_min_position
         speed = self._param_helper.get_probe_params(gcmd)['probe_speed']
@@ -597,6 +729,9 @@ class LoadCellProbingMove:
         collector = self._start_collector()
         # do homing move
         epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        # Where this tap actually stopped.  _nozzle_is_clear() needs it to
+        # decide whether the next descent may take a relative MCU zero.
+        self._last_trigger_z = epos[2]
         return epos, collector
 
     # Wait for the MCU to trigger with no movement
@@ -607,6 +742,9 @@ class LoadCellProbingMove:
         print_time = toolhead.get_last_move_time()
         self._mcu_trigger_analog.home_start(print_time, 0., 0, 0.)
         return self._mcu_trigger_analog.home_wait(print_time + timeout)
+
+    def get_last_trigger_time(self):
+        return self._mcu_trigger_analog.get_last_trigger_time()
 
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
@@ -641,38 +779,68 @@ class TappingMove:
         epos, collector = self._load_cell_probing_move.probing_move(gcmd)
         # collect samples from the tap
         toolhead = self._printer.lookup_object('toolhead')
-        # Homing workaround
-        phoming = self._printer.lookup_object('homing')
-        if phoming.check_probe_first_home(gcmd):
-            curpos = toolhead.get_position()
-            curpos[2] -= epos[2]
-            toolhead.set_position(curpos)
-
-        # Lift the toolhead while collecting the samples we will use for
-        # the fit. The ascent data shall cover both the contact region
-        # (force still applied) and free-air region (no force = tare).
-        ascent_start_time = toolhead.get_last_move_time()
-
-        # load_cell_retract_dist is mapped to sample_retract_dist in
-        # LoadCellParameterHelper
-        params = \
-            self._load_cell_probing_move._param_helper.get_probe_params(gcmd)
-        lift_dist = params['load_cell_retract_dist']
-        lift_pos = toolhead.get_position()
-        lift_pos[2] += lift_dist
-        toolhead.manual_move(lift_pos, params['lift_speed'])
-
-        # Collect samples until the end of the ascent
-        move_end = toolhead.get_last_move_time()
-        results = collector.collect_until(move_end)
-        samples = check_sensor_errors(results, self._printer)
-
-        # Perform fit on the ascent data
-        corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
-                                            toolhead, epos[2])
-        # Replace the probe result with the fitted Z position
-        epos[2] = corrected_z
-
+        # Two collection paths (merge of upstream's ascent fit with #44).
+        # TAIL=<seconds> keeps #44's path: collection ends shortly after the
+        # trigger, so there are no ascent samples and no fit. The M1 mesh
+        # macros pass TAIL, so the M1 keeps its measured behaviour. Without
+        # TAIL, upstream's path collects through the lift and fits Z.
+        _tail = None if gcmd is None else gcmd.get_float('TAIL', None,
+                                                          minval=0.)
+        if _tail is not None:
+            toolhead.flush_step_generation()
+            # TAIL=<seconds>: bound the post-trigger collection by the tap
+            # itself rather than by a re-primed print_time.  The window can
+            # only ever SHORTEN relative to stock (stock's bound is est +
+            # 0.25), never extend.  With TAIL the stock get_last_move_time()
+            # is not called at all: its side effect is to prime print_time
+            # 0.25 s out, which the retract queued next would inherit,
+            # holding the nozzle on the plate.
+            # Tradeoff: check_sensor_errors then inspects a shorter
+            # span, so a sensor error delivered after trig+TAIL is no longer
+            # seen.  The descent, trigger, tare and raw-range guard are all
+            # untouched -- this runs entirely after the probe has stopped.
+            _trig = None
+            if _tail is not None:
+                _trig = self._load_cell_probing_move.get_last_trigger_time()
+            if _tail is not None and _trig:
+                _mcu = self._load_cell_probing_move._load_cell.sensor.get_mcu()
+                _est = _mcu.estimated_print_time(
+                    self._printer.get_reactor().monotonic())
+                move_end = min(_trig + _tail, _est + 0.25)
+            else:
+                move_end = toolhead.get_last_move_time()
+            results = collector.collect_until(move_end)
+            samples = check_sensor_errors(results, self._printer)
+            self._load_cell_probing_move.note_baseline(samples)
+        else:
+            # Homing workaround
+            phoming = self._printer.lookup_object('homing')
+            if phoming.check_probe_first_home(gcmd):
+                curpos = toolhead.get_position()
+                curpos[2] -= epos[2]
+                toolhead.set_position(curpos)
+            # Lift the toolhead while collecting the samples we will use for
+            # the fit. The ascent data shall cover both the contact region
+            # (force still applied) and free-air region (no force = tare).
+            ascent_start_time = toolhead.get_last_move_time()
+            # load_cell_retract_dist is mapped to sample_retract_dist in
+            # LoadCellParameterHelper
+            param_helper = self._load_cell_probing_move._param_helper
+            params = param_helper.get_probe_params(gcmd)
+            lift_dist = params['load_cell_retract_dist']
+            lift_pos = toolhead.get_position()
+            lift_pos[2] += lift_dist
+            toolhead.manual_move(lift_pos, params['lift_speed'])
+            # Collect samples until the end of the ascent
+            move_end = toolhead.get_last_move_time()
+            results = collector.collect_until(move_end)
+            samples = check_sensor_errors(results, self._printer)
+            self._load_cell_probing_move.note_baseline(samples)
+            # Perform fit on the ascent data
+            corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
+                                                toolhead, epos[2])
+            # Replace the probe result with the fitted Z position
+            epos[2] = corrected_z
         # Analyze the tap data
         ppa = TapAnalysis(samples)
         # broadcast tap event data:

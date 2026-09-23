@@ -45,6 +45,16 @@ finish_test check_macro_status_keys "Check macro status keys"
 
 
 ######################################################################
+# Check config headers, duplicate keys and bare template names
+######################################################################
+
+start_test check_macro_config "Check macro config"
+$PYTHON scripts/test_check_macro_config.py
+$PYTHON scripts/check_macro_config.py
+finish_test check_macro_config "Check macro config"
+
+
+######################################################################
 # Check for whitespace errors
 ######################################################################
 
