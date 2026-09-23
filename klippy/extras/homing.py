@@ -86,8 +86,13 @@ class HomingMove:
         self.stepper_positions = [ StepperPosition(s, name)
                                    for es, name in self.endstops
                                    for s in es.get_steppers() ]
-        # Start endstop checking
-        print_time = self.toolhead.get_last_move_time()
+        # Start endstop checking.  Prime with the drip feeder's own lead
+        # where the toolhead offers it; fall back to the generic lead so an
+        # unpatched toolhead.py still works.
+        _drip_prime = getattr(self.toolhead, 'get_drip_start_time', None)
+        if _drip_prime is None:
+            _drip_prime = self.toolhead.get_last_move_time
+        print_time = _drip_prime()
         endstop_triggers = []
         for mcu_endstop, name in self.endstops:
             rest_time = self._calc_endstop_rate(mcu_endstop, movepos, speed)
@@ -96,7 +101,12 @@ class HomingMove:
                                           triggered=triggered)
             endstop_triggers.append(wait)
         all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
-        self.toolhead.dwell(HOMING_START_DELAY)
+        # dwell() primes print_time BUFFER_TIME_START out; the drip-lead
+        # dwell is enough here and is what the drip move itself uses.
+        _dwell = getattr(self.toolhead, 'drip_dwell', None)
+        if _dwell is None:
+            _dwell = self.toolhead.dwell
+        _dwell(HOMING_START_DELAY)
         # Issue move
         error = None
         try:
@@ -105,7 +115,13 @@ class HomingMove:
             error = "Error during homing move: %s" % (str(e),)
         # Wait for endstops to trigger
         trigger_times = {}
-        move_end_print_time = self.toolhead.get_last_move_time()
+        # The end time only has to be at or after the drip's physical end
+        # (get_drip_start_time's floor is above last_step_gen_time, which in
+        # the no-trigger case is past the move's end) and it is also what the
+        # next queued move inherits: get_last_move_time() would prime it
+        # BUFFER_TIME_START (0.25 s) out, leaving the toolhead halted on the
+        # plate for that long after every trigger.
+        move_end_print_time = _drip_prime()
         for mcu_endstop, name in self.endstops:
             try:
                 trigger_time = mcu_endstop.home_wait(move_end_print_time)
