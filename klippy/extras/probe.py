@@ -640,6 +640,12 @@ class ProbePointsHelper:
                     break
                 # Caller wants a "retry" - restart probing
                 probe_num = 0
+            # Muon: a cancelled print stops between points rather than after
+            # the whole mesh, when the mesh was started from an abortable
+            # line (see gcode.run_abortable_script(); the M1's is inside the
+            # ordinary macro _BED_MESH_ENSURE, so it is not).  Cleaned up like
+            # any other probe error, by the gcode:command_error handlers.
+            self.gcode.check_abort()
             self._move_next(probe_num)
             probe_session.run_probe(gcmd)
             probe_num += 1

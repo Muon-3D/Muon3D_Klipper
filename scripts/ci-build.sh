@@ -113,3 +113,10 @@ finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: cancelling a print while PRINT_START runs. Real reactor, gcode and
+# virtual_sdcard, no MCU: the batch-mode .test files above cannot send a
+# webhook from a second greenlet, which is the whole of the case.
+start_test print_cancel "Test cancel during PRINT_START"
+$PYTHON test/print_cancel/test_cancel_during_print_start.py
+finish_test print_cancel "Test cancel during PRINT_START"
