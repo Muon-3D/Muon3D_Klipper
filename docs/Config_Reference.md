@@ -64,6 +64,13 @@ serial:
 #   and USB-probes
 #reconnect_interval: 2.0
 #   if is_non_critical == true, how often to poll for a reconnect
+#reconnect_max_interval: 30.0
+#   if is_non_critical == true, the ceiling for the reconnect poll
+#   back-off. Each connect attempt that opens the serial port but gets
+#   no identify response doubles the wait before the next attempt, up
+#   to this many seconds. The wait resets to reconnect_interval when the
+#   port disappears, on a disconnect, and on a successful connect. Set
+#   to 0 to disable the back-off.
 ```
 
 ### [mcu my_extra_mcu]

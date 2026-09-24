@@ -75,7 +75,8 @@ class SerialReader:
             try:
                 params = self.send_with_response(msg, 'identify_response')
             except error as e:
-                if str(e) == "non-critical MCU offline":
+                if (str(e) == "non-critical MCU offline"
+                        or getattr(self.mcu, "is_non_critical", False)):
                     logging.info("%sWait for identify_response: %s",
                                  self.warn_prefix, str(e))
                 else:
@@ -90,11 +91,15 @@ class SerialReader:
                 identify_data += msgdata
     def _start_session(self, serial_dev, serial_fd_type=b'u', client_id=0):
         self.serial_dev = serial_dev
-        self.serialqueue = self.ffi_main.gc(
-            self.ffi_lib.serialqueue_alloc(serial_dev.fileno(),
-                                           serial_fd_type, client_id,
-                                           self.sq_name),
-            self.ffi_lib.serialqueue_free)
+        sq = self.ffi_lib.serialqueue_alloc(serial_dev.fileno(),
+                                            serial_fd_type, client_id,
+                                            self.sq_name)
+        if sq == self.ffi_main.NULL:
+            logging.error("%sUnable to allocate serialqueue",
+                          self.warn_prefix)
+            self.disconnect()
+            return False
+        self.serialqueue = self.ffi_main.gc(sq, self.ffi_lib.serialqueue_free)
         self.background_thread = threading.Thread(target=self._bg_thread)
         self.background_thread.start()
         # Obtain and load the data dictionary from the firmware
@@ -188,11 +193,15 @@ class SerialReader:
             if ret:
                 break
     def connect_uart(self, serialport, baud, rts=True,
-                     connect_prepare_cb=None):
+                     connect_prepare_cb=None, max_attempts=None):
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
+        attempts = 0
         while 1:
+            if max_attempts is not None and attempts >= max_attempts:
+                self._error("Unable to connect")
+            attempts += 1
             # if we're already connected, don't reconnect
             if self.serialqueue is not None:
                 break
