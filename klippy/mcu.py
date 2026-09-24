@@ -790,6 +790,14 @@ class MCUConnectHelper:
         self.reconnect_interval = (
             config.getfloat("reconnect_interval", 2.0) + 0.12
         )
+        # Back-off ceiling for a non-critical MCU that is present on the bus
+        # but never answers identify (e.g. toolhead board absent or dead).
+        # Each failed attempt doubles the wait up to this value; a
+        # disconnect or a successful connect resets it to reconnect_interval.
+        self.reconnect_max_interval = config.getfloat(
+            "reconnect_max_interval", 30.0, minval=0.0
+        )
+        self._reconnect_delay = self.reconnect_interval
         self.non_critical_recon_timer = None
         self._non_critical_reconnect_event_name = (
             "danger:non_critical_mcu_%s:reconnected" % (self._name,)
@@ -897,6 +905,7 @@ class MCUConnectHelper:
             return
         self._mcu.non_critical_disconnected = True
         self._mcu._connecting = False
+        self._reconnect_delay = self.reconnect_interval
         # Stop any clock sync activity if the object supports it.
         if hasattr(self._clocksync, "disconnect"):
             try:
@@ -910,8 +919,14 @@ class MCUConnectHelper:
             )
         self._printer.send_event(self._non_critical_disconnect_event_name)
         logging.info("Non-critical MCU '%s' disconnected", self._name)
+    def _next_reconnect_delay(self):
+        delay = self._reconnect_delay
+        ceiling = max(self.reconnect_max_interval, self.reconnect_interval)
+        self._reconnect_delay = min(delay * 2., ceiling)
+        return delay
     def non_critical_recon_event(self, eventtime):
         if not self._check_serial_exists():
+            self._reconnect_delay = self.reconnect_interval
             return eventtime + self.reconnect_interval
         if self._mcu._connecting:
             return eventtime + self.reconnect_interval
@@ -936,18 +951,19 @@ class MCUConnectHelper:
                     "Non-critical MCU '%s' reconnect waiting for serial queue",
                     self._name
                 )
-                return eventtime + self.reconnect_interval
+                return eventtime + self._next_reconnect_delay()
             # Run identify-time helper setup that may have been skipped during
             # initial startup deferral.
             self._mcu._config_helper._mcu_identify()
             self._mcu._stats_helper._mcu_identify()
             self._mcu._config_helper._connect(allow_noncritical=True)
             self._mcu.non_critical_disconnected = False
+            self._reconnect_delay = self.reconnect_interval
         except Exception as e:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
                          self._name, str(e))
             self._mcu.non_critical_disconnected = True
-            return eventtime + self.reconnect_interval
+            return eventtime + self._next_reconnect_delay()
         finally:
             self._mcu._connecting = False
         handlers = list(
@@ -1017,9 +1033,15 @@ class MCUConnectHelper:
                                             self._canbus_iface)
             elif self._baud:
                 rts = self._restart_helper.lookup_attach_uart_rts()
+                max_attempts = None
+                if self.is_non_critical and self._mcu._connecting:
+                    # Background reconnect: one attempt per timer tick, the
+                    # timer's back-off owns the retry cadence.
+                    max_attempts = 1
                 self._serial.connect_uart(
                     self._serialport, self._baud, rts,
-                    connect_prepare_cb=self._restart_helper.prepare_connect)
+                    connect_prepare_cb=self._restart_helper.prepare_connect,
+                    max_attempts=max_attempts)
             else:
                 self._serial.connect_pipe(self._serialport)
             self._clocksync.connect(self._serial)
