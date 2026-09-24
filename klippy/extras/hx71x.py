@@ -42,8 +42,6 @@ class HX71xBase:
         # gain/channel choices
         self.gain_channel = int(config.getchoice('gain', gain_options,
                                                  default=default_gain))
-        ## Bulk Sensor Setup
-        self.bulk_queue = bulk_sensor.BulkDataQueue(mcu, oid=self.oid)
         # Clock tracking
         chip_smooth = self.sps * UPDATE_INTERVAL * 2
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
@@ -79,6 +77,13 @@ class HX71xBase:
 
     def get_samples_per_second(self):
         return self.sps
+
+    def get_status(self, eventtime):
+        return {
+            'errors': self.last_error_count,
+            'overflows': self.ffreader.get_last_overflows(),
+            'sample_rate': self.get_samples_per_second(),
+        }
 
     def lookup_sensor_error(self, error_code):
         return "Unknown hx71x error %d" % (error_code,)
