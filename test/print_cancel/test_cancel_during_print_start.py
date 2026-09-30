@@ -29,13 +29,13 @@ sys.path.insert(0, os.path.join(ROOT, 'klippy'))
 # not compile klippy's C helper into the source tree.
 _chelper = types.ModuleType('chelper')
 _chelper.get_ffi = lambda: (None, types.SimpleNamespace(
-    get_monotonic=time.monotonic))
+    get_monotonic=time.monotonic, set_thread_name=lambda name: None))
 sys.modules.setdefault('chelper', _chelper)
 
 import reactor  # noqa: E402
 import gcode  # noqa: E402
 from extras import gcode_macro, heaters, pause_resume  # noqa: E402
-from extras import print_stats, virtual_sdcard  # noqa: E402
+from extras import aio_executor, print_stats, virtual_sdcard  # noqa: E402
 
 M1_PRINT_CFG = os.path.join(ROOT, 'core', 'M1', 'macros', 'print.cfg')
 SENTINEL = object()
@@ -201,6 +201,8 @@ class Harness:
             Config(p, 'gcode_macro'))
         p.objects['print_stats'] = self.print_stats = print_stats.PrintStats(
             Config(p, 'print_stats'))
+        p.objects['aio_executor'] = aio_executor.load_config(
+            Config(p, 'aio_executor'))
         self.sddir = tempfile.mkdtemp(prefix='print_cancel_')
         p.objects['virtual_sdcard'] = self.vsd = virtual_sdcard.VirtualSD(
             Config(p, 'virtual_sdcard', {'path': self.sddir}))
@@ -301,6 +303,7 @@ class Harness:
 
         self.reactor.register_callback(main)
         self.reactor.run()
+        self.printer.send_event('klippy:disconnect')
         self.reactor.finalize()
         shutil.rmtree(self.sddir, ignore_errors=True)
 
