@@ -15,6 +15,8 @@ class PauseResume:
         self.pause_command_sent = False
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
+        self.printer.register_event_handler("virtual_sdcard:reset_file",
+                                            self._handle_reset_file)
         self.gcode.register_command("PAUSE", self.cmd_PAUSE,
                                     desc=self.cmd_PAUSE_help)
         self.gcode.register_command("RESUME", self.cmd_RESUME,
@@ -32,6 +34,12 @@ class PauseResume:
                                    self._handle_resume_request)
     def handle_connect(self):
         self.v_sd = self.printer.lookup_object('virtual_sdcard', None)
+    def _handle_reset_file(self):
+        # Muon (KAN-462): a pause belongs to the file it paused.  Without
+        # this, a pause raised with no print running (a bed pulled at boot)
+        # survives SDCARD_PRINT_FILE, and every PAUSE during the new print
+        # answers "Print already paused" - fan and bed faults included.
+        self.is_paused = self.sd_paused = self.pause_command_sent = False
     def _handle_cancel_request(self, web_request):
         # Muon: run_script() below waits for the gcode mutex, which a
         # PRINT_START in progress holds for minutes.  Stop it first.

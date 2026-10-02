@@ -728,7 +728,12 @@ class LoadCellProbingMove:
         # start collector after tare samples are consumed
         collector = self._start_collector()
         # do homing move
-        epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        try:
+            epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        except Exception:
+            # Stop the unbounded collector when the descent fails.
+            collector.stop_collecting()
+            raise
         # Where this tap actually stopped.  _nozzle_is_clear() needs it to
         # decide whether the next descent may take a relative MCU zero.
         self._last_trigger_z = epos[2]
@@ -777,78 +782,84 @@ class TappingMove:
     def run_tap(self, gcmd):
         # do the descending move
         epos, collector = self._load_cell_probing_move.probing_move(gcmd)
-        # collect samples from the tap
-        toolhead = self._printer.lookup_object('toolhead')
-        # Two collection paths (merge of upstream's ascent fit with #44).
-        # TAIL=<seconds> keeps #44's path: collection ends shortly after the
-        # trigger, so there are no ascent samples and no fit. The M1 mesh
-        # macros pass TAIL, so the M1 keeps its measured behaviour. Without
-        # TAIL, upstream's path collects through the lift and fits Z.
-        _tail = None if gcmd is None else gcmd.get_float('TAIL', None,
-                                                          minval=0.)
-        if _tail is not None:
-            toolhead.flush_step_generation()
-            # TAIL=<seconds>: bound the post-trigger collection by the tap
-            # itself rather than by a re-primed print_time.  The window can
-            # only ever SHORTEN relative to stock (stock's bound is est +
-            # 0.25), never extend.  With TAIL the stock get_last_move_time()
-            # is not called at all: its side effect is to prime print_time
-            # 0.25 s out, which the retract queued next would inherit,
-            # holding the nozzle on the plate.
-            # Tradeoff: check_sensor_errors then inspects a shorter
-            # span, so a sensor error delivered after trig+TAIL is no longer
-            # seen.  The descent, trigger, tare and raw-range guard are all
-            # untouched -- this runs entirely after the probe has stopped.
-            _trig = None
+        try:
+            # collect samples from the tap
+            toolhead = self._printer.lookup_object('toolhead')
+            # Two collection paths (merge of upstream's ascent fit with #44).
+            # TAIL=<seconds> keeps #44's path: collection ends shortly after the
+            # trigger, so there are no ascent samples and no fit. The M1 mesh
+            # macros pass TAIL, so the M1 keeps its measured behaviour. Without
+            # TAIL, upstream's path collects through the lift and fits Z.
+            _tail = None if gcmd is None else gcmd.get_float('TAIL', None,
+                                                              minval=0.)
             if _tail is not None:
-                _trig = self._load_cell_probing_move.get_last_trigger_time()
-            if _tail is not None and _trig:
-                _mcu = self._load_cell_probing_move._load_cell.sensor.get_mcu()
-                _est = _mcu.estimated_print_time(
-                    self._printer.get_reactor().monotonic())
-                move_end = min(_trig + _tail, _est + 0.25)
+                toolhead.flush_step_generation()
+                # TAIL=<seconds>: bound the post-trigger collection by the tap
+                # itself rather than by a re-primed print_time.  The window can
+                # only ever SHORTEN relative to stock (stock's bound is est +
+                # 0.25), never extend.  With TAIL the stock get_last_move_time()
+                # is not called at all: its side effect is to prime print_time
+                # 0.25 s out, which the retract queued next would inherit,
+                # holding the nozzle on the plate.
+                # Tradeoff: check_sensor_errors then inspects a shorter
+                # span, so a sensor error delivered after trig+TAIL is no longer
+                # seen.  The descent, trigger, tare and raw-range guard are all
+                # untouched -- this runs entirely after the probe has stopped.
+                _trig = None
+                if _tail is not None:
+                    _trig = self._load_cell_probing_move.get_last_trigger_time()
+                if _tail is not None and _trig:
+                    _mcu = self._load_cell_probing_move._load_cell.sensor.get_mcu()
+                    _est = _mcu.estimated_print_time(
+                        self._printer.get_reactor().monotonic())
+                    move_end = min(_trig + _tail, _est + 0.25)
+                else:
+                    move_end = toolhead.get_last_move_time()
+                results = collector.collect_until(move_end)
+                samples = check_sensor_errors(results, self._printer)
+                self._load_cell_probing_move.note_baseline(samples)
             else:
+                # Homing workaround
+                phoming = self._printer.lookup_object('homing')
+                if phoming.check_probe_first_home(gcmd):
+                    curpos = toolhead.get_position()
+                    curpos[2] -= epos[2]
+                    toolhead.set_position(curpos)
+                # Lift the toolhead while collecting the samples we will use for
+                # the fit. The ascent data shall cover both the contact region
+                # (force still applied) and free-air region (no force = tare).
+                ascent_start_time = toolhead.get_last_move_time()
+                # load_cell_retract_dist is mapped to sample_retract_dist in
+                # LoadCellParameterHelper
+                param_helper = self._load_cell_probing_move._param_helper
+                params = param_helper.get_probe_params(gcmd)
+                lift_dist = params['load_cell_retract_dist']
+                lift_pos = toolhead.get_position()
+                lift_pos[2] += lift_dist
+                toolhead.manual_move(lift_pos, params['lift_speed'])
+                # Collect samples until the end of the ascent
                 move_end = toolhead.get_last_move_time()
-            results = collector.collect_until(move_end)
-            samples = check_sensor_errors(results, self._printer)
-            self._load_cell_probing_move.note_baseline(samples)
-        else:
-            # Homing workaround
-            phoming = self._printer.lookup_object('homing')
-            if phoming.check_probe_first_home(gcmd):
-                curpos = toolhead.get_position()
-                curpos[2] -= epos[2]
-                toolhead.set_position(curpos)
-            # Lift the toolhead while collecting the samples we will use for
-            # the fit. The ascent data shall cover both the contact region
-            # (force still applied) and free-air region (no force = tare).
-            ascent_start_time = toolhead.get_last_move_time()
-            # load_cell_retract_dist is mapped to sample_retract_dist in
-            # LoadCellParameterHelper
-            param_helper = self._load_cell_probing_move._param_helper
-            params = param_helper.get_probe_params(gcmd)
-            lift_dist = params['load_cell_retract_dist']
-            lift_pos = toolhead.get_position()
-            lift_pos[2] += lift_dist
-            toolhead.manual_move(lift_pos, params['lift_speed'])
-            # Collect samples until the end of the ascent
-            move_end = toolhead.get_last_move_time()
-            results = collector.collect_until(move_end)
-            samples = check_sensor_errors(results, self._printer)
-            self._load_cell_probing_move.note_baseline(samples)
-            # Perform fit on the ascent data
-            corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
-                                                toolhead, epos[2])
-            # Replace the probe result with the fitted Z position
-            epos[2] = corrected_z
-        # Analyze the tap data
-        ppa = TapAnalysis(samples)
-        # broadcast tap event data:
-        self._clients.send({'tap': ppa.to_dict()})
+                results = collector.collect_until(move_end)
+                samples = check_sensor_errors(results, self._printer)
+                self._load_cell_probing_move.note_baseline(samples)
+                # Perform fit on the ascent data
+                corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
+                                                    toolhead, epos[2])
+                # Replace the probe result with the fitted Z position
+                epos[2] = corrected_z
+            # Analyze the tap data
+            ppa = TapAnalysis(samples)
+            # broadcast tap event data:
+            self._clients.send({'tap': ppa.to_dict()})
 
-        self._is_last_result_valid = True
-        self._last_result = epos[2]
-        return epos, self._is_last_result_valid
+            self._is_last_result_valid = True
+            self._last_result = epos[2]
+            return epos, self._is_last_result_valid
+        except Exception:
+            # Collection, ascent history, fitting, or tap analysis may fail.
+            # A failed tap must not keep the load-cell subscription alive.
+            collector.stop_collecting()
+            raise
 
     def get_status(self, eventtime):
         return {

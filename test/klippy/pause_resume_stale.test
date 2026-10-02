@@ -1,0 +1,20 @@
+; A pause must not carry over into the next print (KAN-462)
+DICTIONARY atmega2560.dict
+CONFIG pause_resume_stale.cfg
+
+G28
+
+; Paused with no print running, as a bed pull at boot leaves an M1
+PAUSE
+ASSERT_PAUSED
+
+; Starting a new print must clear it. While it is set, PAUSE answers
+; "Print already paused" and every pause-on-fault path does nothing.
+SDCARD_PRINT_FILE FILENAME=moves.gcode
+ASSERT_NOT_PAUSED
+
+; A pause during the new print must still take effect
+PAUSE
+ASSERT_PAUSED
+RESUME
+ASSERT_NOT_PAUSED
