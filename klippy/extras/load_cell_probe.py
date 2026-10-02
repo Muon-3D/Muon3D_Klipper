@@ -860,11 +860,22 @@ class TappingMove:
                         raw_z):
         # Collect samples actually belonging to the ascent. We use a limited
         # time window to minimise the influence of baseline wandering.
-        data = []
+        window = []
         for s in all_samples:
             if s[0] >= ascent_start_time and \
                s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
-                data.append((s[1], _lookup_z_pos(toolhead, s[0])))
+                window.append(s)
+
+        # Raw-count triggering (including the M1 preloaded-max model) does
+        # not require gram calibration. Use one sensor coordinate for the
+        # entire fit: its contact Z is invariant to an affine force scale.
+        # Never mix grams with counts when calibration changes mid-tap.
+        missing_grams = [s[1] is None for s in window]
+        if any(missing_grams) and not all(missing_grams):
+            raise self._printer.command_error(
+                "Load cell calibration changed during ascent sampling")
+        column = 2 if all(missing_grams) else 1
+        data = [(s[column], _lookup_z_pos(toolhead, s[0])) for s in window]
 
         if self._load_cell_probing_move._mcu.is_fileoutput():
             # In debugging mode: inject dummy data
@@ -879,6 +890,11 @@ class TappingMove:
             raise self._printer.command_error(
                 "Insufficient ascent samples (%d total, need >= %d "
                 "each) for piecewise fit" % (len(data), 2*FIT_MIN_POINTS))
+
+        if any(not isinstance(value, (int, float)) or not math.isfinite(value)
+               for row in data for value in row):
+            raise self._printer.command_error(
+                "Invalid load cell ascent samples for piecewise fit")
 
         # Perform the actual fit
         z_contact, below_count, above_count, depress_slope = \

@@ -120,3 +120,7 @@ finish_test klippy "Test invoke klippy (Python3)"
 start_test print_cancel "Test cancel during PRINT_START"
 $PYTHON test/print_cancel/test_cancel_during_print_start.py
 finish_test print_cancel "Test cancel during PRINT_START"
+
+start_test load_cell_fit "Test raw-count and gram-calibrated ascent fits"
+$PYTHON test/load_cell/test_ascent_fit.py
+finish_test load_cell_fit "Test raw-count and gram-calibrated ascent fits"
