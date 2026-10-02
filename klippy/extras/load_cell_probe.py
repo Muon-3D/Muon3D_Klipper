@@ -701,7 +701,14 @@ class LoadCellProbingMove:
         # start collector after tare samples are consumed
         collector = self._start_collector()
         # do homing move
-        epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        try:
+            epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
+        except Exception:
+            # KAN-463: the collector has no end time and no sample limit, so
+            # a failed descent ("No trigger on probe after full movement")
+            # must stop it here or it collects for the life of klippy.
+            collector.stop_collecting()
+            raise
         # Where this tap actually stopped.  _nozzle_is_clear() needs it to
         # decide whether the next descent may take a relative MCU zero.
         self._last_trigger_z = epos[2]
@@ -750,6 +757,24 @@ class TappingMove:
     def run_tap(self, gcmd):
         # do the descending move
         epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+        try:
+            results = self._collect_tap(gcmd, collector)
+        except Exception:
+            # KAN-463: same leak as a failed descent.  collect_until stops
+            # the collector itself when it times out; nothing before it did.
+            collector.stop_collecting()
+            raise
+        samples = check_sensor_errors(results, self._printer)
+        self._load_cell_probing_move.note_baseline(samples)
+        # Analyze the tap data
+        ppa = TapAnalysis(samples)
+        # broadcast tap event data:
+        self._clients.send({'tap': ppa.to_dict()})
+        self._is_last_result_valid = True
+        self._last_result = epos[2]
+        return epos, self._is_last_result_valid
+
+    def _collect_tap(self, gcmd, collector):
         # collect samples from the tap
         toolhead = self._printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
@@ -775,16 +800,7 @@ class TappingMove:
             move_end = min(_trig + _tail, _est + 0.25)
         else:
             move_end = toolhead.get_last_move_time()
-        results = collector.collect_until(move_end)
-        samples = check_sensor_errors(results, self._printer)
-        self._load_cell_probing_move.note_baseline(samples)
-        # Analyze the tap data
-        ppa = TapAnalysis(samples)
-        # broadcast tap event data:
-        self._clients.send({'tap': ppa.to_dict()})
-        self._is_last_result_valid = True
-        self._last_result = epos[2]
-        return epos, self._is_last_result_valid
+        return collector.collect_until(move_end)
 
     def get_status(self, eventtime):
         return {

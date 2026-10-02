@@ -104,6 +104,11 @@ $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
+# MUON: a failed tap must stop its load cell sample collector (KAN-463).
+start_test load_cell "Test load cell collector is stopped on a failed tap"
+$PYTHON test/load_cell/test_collector_leak.py
+finish_test load_cell "Test load cell collector is stopped on a failed tap"
+
 # MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
 # image builds klippy into a `python3 -m venv` and klippy carries 36
 # f-strings across 12 files, which Python 2 cannot parse at all. The tests
