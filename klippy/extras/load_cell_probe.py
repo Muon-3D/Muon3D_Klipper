@@ -809,7 +809,8 @@ class TappingMove:
                 if _tail is not None:
                     _trig = self._load_cell_probing_move.get_last_trigger_time()
                 if _tail is not None and _trig:
-                    _mcu = self._load_cell_probing_move._load_cell.sensor.get_mcu()
+                    sensor = self._load_cell_probing_move._load_cell.sensor
+                    _mcu = sensor.get_mcu()
                     _est = _mcu.estimated_print_time(
                         self._printer.get_reactor().monotonic())
                     move_end = min(_trig + _tail, _est + 0.25)
@@ -843,8 +844,8 @@ class TappingMove:
                 samples = check_sensor_errors(results, self._printer)
                 self._load_cell_probing_move.note_baseline(samples)
                 # Perform fit on the ascent data
-                corrected_z = self._analyze_ascent(gcmd, samples, ascent_start_time,
-                                                    toolhead, epos[2])
+                corrected_z = self._analyze_ascent(
+                    gcmd, samples, ascent_start_time, toolhead, epos[2])
                 # Replace the probe result with the fitted Z position
                 epos[2] = corrected_z
             # Analyze the tap data
