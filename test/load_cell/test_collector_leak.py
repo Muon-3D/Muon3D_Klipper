@@ -36,6 +36,8 @@ class FakeMcu:
 
 
 class FakeSensor:
+    def get_status(self, eventtime):
+        return {"errors": 0, "overflows": 0}
     def get_mcu(self):
         return FakeMcu()
 
@@ -61,15 +63,22 @@ class FakeToolhead:
 
 
 class FakeHoming:
+    def check_probe_first_home(self, gcmd):
+        raise ProbeFailed("ascent homing history failed")
     def probing_move(self, endstop, pos, speed):
         raise ProbeFailed("No trigger on probe after full movement")
+
+
+class FakeReactor:
+    def monotonic(self):
+        return 0.
 
 
 class FakePrinter:
     def __init__(self, toolhead):
         self.objects = {'toolhead': toolhead, 'homing': FakeHoming()}
     def get_reactor(self):
-        return None
+        return FakeReactor()
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
 
@@ -137,9 +146,36 @@ def test_descent_raises():
     assert_stopped(m.collector, cell)
 
 
+class TailCommand:
+    def get_float(self, name, default=None, **kwargs):
+        assert name == "TAIL"
+        return 0.1
+
+
 def test_raise_between_descent_and_collect():
     cell = FakeLoadCell()
     printer = FakePrinter(FakeToolhead(flush_raises=True))
+    collector = new_collector(printer, cell)
+
+    class Descent:
+        def probing_move(self, gcmd):
+            return [10., 10., 0., 0.], collector
+
+    t = object.__new__(load_cell_probe.TappingMove)
+    t._printer = printer
+    t._load_cell_probing_move = Descent()
+    try:
+        t.run_tap(TailCommand())
+    except ProbeFailed:
+        pass
+    else:
+        raise AssertionError("run_tap was expected to raise")
+    assert_stopped(collector, cell)
+
+
+def test_ascent_failure_stops_collector():
+    cell = FakeLoadCell()
+    printer = FakePrinter(FakeToolhead())
     collector = new_collector(printer, cell)
 
     class Descent:
@@ -154,13 +190,14 @@ def test_raise_between_descent_and_collect():
     except ProbeFailed:
         pass
     else:
-        raise AssertionError("run_tap was expected to raise")
+        raise AssertionError("ascent history was expected to raise")
     assert_stopped(collector, cell)
 
 
 def main():
     failed = 0
-    for test in (test_descent_raises, test_raise_between_descent_and_collect):
+    for test in (test_descent_raises, test_raise_between_descent_and_collect,
+                 test_ascent_failure_stops_collector):
         try:
             test()
             print("ok   %s" % test.__name__)

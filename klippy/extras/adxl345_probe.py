@@ -90,6 +90,14 @@ class ADXL345TapEndstop:
         if self._axis == 'z':
             self._owner.probe_finish(hmove)
 
+
+
+# Upstream homing.home_rails() treats any endstop with get_position_endstop()
+# as a Z probe and refuses to home X or Y with it. Only the Z wrapper is a
+# probe, so only it carries the method. X and Y rails then read
+# position_endstop from their stepper sections, the same value
+# _lookup_axis_position_endstop() used to hand back.
+class ADXL345TapZEndstop(ADXL345TapEndstop):
     def get_position_endstop(self):
         if self._position_endstop is None:
             raise self._owner.printer.command_error(
@@ -191,7 +199,7 @@ class ADXL345Probe:
             mcu = pin_params['chip']
             self._mcu_endstops[axis] = mcu.setup_pin('endstop', pin_params)
 
-        self._z_wrapper = ADXL345TapEndstop(
+        self._z_wrapper = ADXL345TapZEndstop(
             self, 'z', self._mcu_endstops['z'], self.position_endstop)
         self._axis_wrappers = {
             'x': ADXL345TapEndstop(

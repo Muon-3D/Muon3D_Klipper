@@ -28,8 +28,12 @@ class VirtualSD:
         self.must_pause_work = self.cmd_from_sd = False
         self.next_file_position = 0
         self.work_timer = None
+        # Set by request_cancel() until do_cancel() runs, see there
+        self.cancel_pending = False
         # Error handling
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        aio = self.printer.load_object(config, 'aio_executor')
+        self.executor = aio.allocate_executor("virtual_sdcard")
         self.on_error_gcode = gcode_macro.load_template(
             config, 'on_error_gcode', DEFAULT_ERROR_GCODE)
         # Register commands
@@ -46,20 +50,30 @@ class VirtualSD:
             desc=self.cmd_SDCARD_PRINT_FILE_help)
         self.printer.register_event_handler("klippy:analyze_shutdown",
                                             self._handle_analyze_shutdown)
+        self.printer.register_event_handler("gcode:debuginput_exit",
+                                            self._handle_debuginput_exit)
     def _handle_analyze_shutdown(self, msg, details):
-        if self.work_timer is not None:
-            self.must_pause_work = True
+        if self.work_timer is None:
+            return
+        file_position = self.file_position
+        current_file = self.current_file
+        self.must_pause_work = True
+        def log_debug_data(eventtime):
             try:
-                readpos = max(self.file_position - 1024, 0)
-                readcount = self.file_position - readpos
-                self.current_file.seek(readpos)
-                data = self.current_file.read(readcount + 128)
+                readpos = max(file_position - 1024, 0)
+                readcount = file_position - readpos
+                current_file.seek(readpos)
+                data = current_file.read(readcount + 128)
             except:
                 logging.exception("virtual_sdcard shutdown read")
                 return
             logging.info("Virtual sdcard (%d): %s\nUpcoming (%d): %s",
                          readpos, repr(data[:readcount]),
-                         self.file_position, repr(data[readcount:]))
+                         file_position, repr(data[readcount:]))
+        self.reactor.register_callback(log_debug_data)
+    def _handle_debuginput_exit(self):
+        # When in batch debugging mode, wait until sdcard idle before exiting
+        return self.work_timer is None
     def stats(self, eventtime):
         if self.work_timer is None:
             return False, ""
@@ -119,7 +133,24 @@ class VirtualSD:
         self.must_pause_work = False
         self.work_timer = self.reactor.register_timer(
             self.work_handler, self.reactor.NOW)
+    def request_cancel(self):
+        # Called ahead of CANCEL_PRINT by a request that does not hold the
+        # gcode mutex.  Stops the line in flight -- normally a PRINT_START
+        # macro, which holds the mutex for its whole length -- at its next
+        # safe point, so the CANCEL_PRINT queued behind it runs in seconds
+        # rather than after the macro has finished on its own.
+        if self.work_timer is None:
+            return
+        self.cancel_pending = True
+        self.must_pause_work = True
+        if self.gcode.request_abort("Print cancelled"):
+            self.gcode.respond_info(
+                "Cancel requested: stopping the running command at its"
+                " next safe point")
+    def is_cancel_pending(self):
+        return self.cancel_pending
     def do_cancel(self):
+        self.cancel_pending = False
         if self.current_file is not None:
             self.do_pause()
             self.current_file.close()
@@ -134,6 +165,7 @@ class VirtualSD:
             self.do_pause()
             self.current_file.close()
             self.current_file = None
+        self.cancel_pending = False
         self.file_position = self.file_size = 0
         self.print_stats.reset()
         self.printer.send_event("virtual_sdcard:reset_file")
@@ -183,10 +215,13 @@ class VirtualSD:
             if fname not in flist:
                 fname = files_by_lower[fname.lower()]
             fname = os.path.join(self.sdcard_dirname, fname)
-            f = io.open(fname, 'r', newline='')
+            f = self.executor.submit(io.open, fname, 'rb', buffering=0)
+            f = self.executor.wrap_obj(f)
+            f = io.BufferedReader(f)
             f.seek(0, os.SEEK_END)
             fsize = f.tell()
             f.seek(0)
+            f = io.TextIOWrapper(f, newline='')
         except:
             logging.exception("virtual_sdcard file open")
             raise gcmd.error("Unable to open file")
@@ -270,7 +305,13 @@ class VirtualSD:
                 next_file_position = self.file_position + len(line) + 1
             self.next_file_position = next_file_position
             try:
-                self.gcode.run_script(line)
+                self.gcode.run_abortable_script(line)
+            except self.gcode.abort_error:
+                # request_cancel() stopped this line; CANCEL_PRINT is queued
+                # behind it and does the rest.  Not an error, so no
+                # on_error_gcode and no note_error().
+                logging.info("virtual_sdcard: line aborted for cancel")
+                break
             except self.gcode.error as e:
                 error_message = str(e)
                 try:
@@ -299,7 +340,10 @@ class VirtualSD:
         if error_message is not None:
             self.print_stats.note_error(error_message)
         elif self.current_file is not None:
-            self.print_stats.note_pause()
+            # A pending cancel is about to note_cancel(); a "paused" state
+            # in between would flash the pause UI for the length of it.
+            if not self.cancel_pending:
+                self.print_stats.note_pause()
         else:
             self.print_stats.note_complete()
         return self.reactor.NEVER

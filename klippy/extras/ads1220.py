@@ -96,8 +96,6 @@ class ADS1220:
                                    " MCU")
         else:
             self.effective_sps = int(self.sps / (1. + NODRDY_READ_RATE_MARGIN))
-        # Bulk Sensor Setup
-        self.bulk_queue = bulk_sensor.BulkDataQueue(self.mcu, oid=self.oid)
         # Clock tracking
         # smoothing window kept at its historical value (sps * 0.10 * 2) so
         # that changing UPDATE_INTERVAL does not also change clock sync
@@ -141,6 +139,13 @@ class ADS1220:
         # Without DRDY the delivered rate is the mcu read schedule, which is
         # deliberately slower than the chip's conversion rate
         return self.effective_sps
+
+    def get_status(self, eventtime):
+        return {
+            'errors': self.last_error_count,
+            'overflows': self.ffreader.get_last_overflows(),
+            'sample_rate': self.get_samples_per_second(),
+        }
 
     def lookup_sensor_error(self, error_code):
         return "Unknown ads1220 error" % (error_code,)
