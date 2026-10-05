@@ -73,8 +73,9 @@ class TemplateWrapper:
                 self.name, traceback.format_exception_only(type(e), e)[-1])
             logging.exception(msg)
             raise self.gcode.error(msg)
-    def run_gcode_from_command(self, context=None):
-        self.gcode.run_script_from_command(self.render(context))
+    def run_gcode_from_command(self, context=None, abortable=False):
+        self.gcode.run_script_from_command(self.render(context),
+                                           abortable=abortable)
 
 # Main gcode macro template tracking
 class PrinterGCodeMacro:
@@ -135,6 +136,11 @@ class GCodeMacro:
         self.rename_existing = config.get("rename_existing", None)
         self.cmd_desc = config.get("description", "G-Code macro")
         self.recursion_limit = config.getint("recursion_limit", 1, minval=1)
+        # Muon: whether a print cancel may stop this macro between its own
+        # lines, see gcode.run_abortable_script().  Opt-in, because most
+        # macros hold an invariant across lines -- the M1's G28 marks Z
+        # homed at a made-up position and clears it three lines later.
+        self.abortable = config.getboolean("abortable", False)
         if self.rename_existing is not None:
             if (self.gcode.is_traditional_gcode(self.alias)
                 != self.gcode.is_traditional_gcode(self.rename_existing)):
@@ -198,7 +204,8 @@ class GCodeMacro:
         kwparams['rawparams'] = gcmd.get_raw_command_parameters()
         self.script_depth += 1
         try:
-            self.template.run_gcode_from_command(kwparams)
+            self.template.run_gcode_from_command(kwparams,
+                                                 abortable=self.abortable)
         finally:
             self.script_depth -= 1
 
