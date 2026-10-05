@@ -1,0 +1,49 @@
+# PRINT_START publishes its phase and its mesh plan as status
+DICTIONARY atmega2560.dict
+CONFIG print_start_phase.cfg
+
+# Nothing has run yet.
+ASSERT_PHASE NAME=
+
+# A print whose slicer region crosses the no-go notch at the front (x 75 to
+# 125, y 0 to 34): 4 x 4 points on a 30 x 26 mm grid, rows alternating
+# direction. On the y=20 row, x=80 is 5 mm inside the notch's left edge, so
+# it is snapped to x=75, and x=110 is more than 10 mm from every edge, so it
+# is dropped.
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+
+# What a subscriber reading phase saw at each stub PRINT_START called.
+ASSERT_SEEN WANT="wipe:home resonance:home_z dock:resonance save_config:mesh dock:save_config led_printing:bed_settle"
+# Handover was the last mark, and clears it.
+ASSERT_SEQ SEQ=13
+ASSERT_PHASE NAME=
+ASSERT_PHASE_T
+ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
+
+# The same print again: the mesh just probed covers it, so it is reused,
+# nothing is planned, and nothing is probed.
+_TEST_RESET
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_PHASE NAME=
+ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
+
+# No slicer region: the whole configured region at the configured 4 x 3,
+# which the notch sits between the columns of. _BED_MESH_PLAN always probes
+# here.
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA
+ASSERT_MESH_PLAN PROBED_COUNT=12 LAST_PROBED=1 POINTS=10.00,7.00/70.00,7.00/130.00,7.00/190.00,7.00/190.00,88.50/130.00,88.50/70.00,88.50/10.00,88.50/10.00,170.00/70.00,170.00/130.00,170.00/190.00,170.00
+
+# A cancel clears the phase, part way through or not.
+_PRINT_START_MARK PHASE=start
+_PRINT_START_MARK PHASE=home
+ASSERT_PHASE NAME=home
+ASSERT_SEQ SEQ=1
+CANCEL_PRINT
+ASSERT_PHASE NAME=
+
+# So does PRINT_END. CANCEL_PRINT ended with M84, so home first.
+G28
+_PRINT_START_MARK PHASE=start
+ASSERT_PHASE NAME=start
+PRINT_END
+ASSERT_PHASE NAME=
