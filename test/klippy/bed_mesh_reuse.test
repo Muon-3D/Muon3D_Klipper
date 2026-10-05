@@ -1,0 +1,25 @@
+# A repeat print reuses the mesh it probed (KAN-469)
+DICTIONARY atmega2560.dict
+CONFIG bed_mesh_reuse.cfg
+
+G28
+G1 Z10
+
+# The first print since startup always probes. 90.1 mm over three gaps is
+# 30.0333 mm, which bed_mesh floors to 30.03, and 80 mm is 26.666, floored to
+# 26.66, so the mesh ends short of what was asked for on both axes.
+_TEST_MESH MIN=50,20 MAX=140.1,100 COUNT=4,4
+ASSERT_PROBED WANT=1
+ASSERT_MESH_MAX WANT=140.09,99.98
+
+# The same print again. Its region is covered by that mesh to within what
+# the flooring lost, so the mesh is reused. This re-probed before KAN-469.
+G1 Z10
+_TEST_MESH MIN=50,20 MAX=140.1,100 COUNT=4,4
+ASSERT_PROBED WANT=0
+
+# Reaching 0.06 mm past the mesh is more than flooring can lose over the 5
+# gaps PRINT_START allows at most, so that still probes.
+G1 Z10
+_TEST_MESH MIN=50,20 MAX=140.1,100.04 COUNT=4,4
+ASSERT_PROBED WANT=1
