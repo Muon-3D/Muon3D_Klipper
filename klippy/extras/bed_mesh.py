@@ -821,8 +821,10 @@ class BedMeshCalibrate:
         probed_matrix = []
         row = []
         prev_pos = base_points[0]
-        for pos, result in zip(base_points, positions):
-            offset_pos = pos[:2]
+        adjusted = self.probe_mgr.get_adjusted_points()
+        for i, (pos, result) in enumerate(zip(base_points, positions)):
+            # Compare against where the probe was sent, not the grid point
+            offset_pos = adjusted.get(i, pos)[:2]
             if (
                 not isclose(offset_pos[0], result[0], abs_tol=.5) or
                 not isclose(offset_pos[1], result[1], abs_tol=.5)
@@ -1225,7 +1227,10 @@ class ProbeManager:
                         adj_coord, mesh_bound_min, mesh_bound_max,
                         radius, origin
                     ):
-                        self.base_points[i] = adj_coord
+                        # Only the probe moves.  base_points keeps the grid
+                        # position, which is what rows, mesh bounds and the
+                        # zig-zag are derived from; a snap in y would
+                        # otherwise split its row (KAN-468).
                         self.adjusted_points[i] = adj_coord
                         break
                 if i in self.adjusted_points:
@@ -1280,6 +1285,8 @@ class ProbeManager:
             last_y = coord[1]
             if i in self.canceled_points:
                 continue
+            # Where the probe would go, which a no-go snap may have moved
+            coord = self.adjusted_points.get(i, coord)
             adj_coords = []
             for min_c, max_c in self.faulty_regions:
                 if within(coord, min_c, max_c, tol=.00001):
@@ -1325,7 +1332,7 @@ class ProbeManager:
                 for sub_pt in self.substitutes[idx]:
                     path.append(sub_pt)
             else:
-                path.append(pt)
+                path.append(self.adjusted_points.get(idx, pt))
         if self.zref_mode == ZrefMode.PROBE:
             path.append(self.zero_ref_pos)
         return path
@@ -1368,11 +1375,13 @@ class ProbeManager:
                     yield sub_pt, is_smp
                     last_mv_pt = sub_pt
             else:
+                mv_pt = self.adjusted_points.get(idx, pt)
                 if dir_change:
-                    for dpt in self._gen_dir_change(last_mv_pt, pt, ascnd_x):
+                    for dpt in self._gen_dir_change(last_mv_pt, mv_pt,
+                                                    ascnd_x):
                         yield dpt, False
-                yield pt, True
-                last_mv_pt = pt
+                yield mv_pt, True
+                last_mv_pt = mv_pt
             last_base_pt = pt
             ascnd_x ^= dir_change
         if self.zref_mode == ZrefMode.PROBE:
