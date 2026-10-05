@@ -88,9 +88,10 @@ The following information is available in the
   something.
 - `load`: The load cell reading, in raw counts above the guard's slowly
   tracked zero, in the direction the probe presses.
-- `active`: False while printing or paused, homing, probing, wiping, just
-  after a probe trigger, without recent load cell samples, or when disabled
-  with SET_CONTACT_GUARD.
+- `active`: False during a job (a virtual_sdcard print, or commands
+  arriving over the G-code pty), homing, probing, wiping, just after a
+  probe trigger, without recent load cell samples, or when disabled with
+  SET_CONTACT_GUARD.
 - `enabled`: False after `SET_CONTACT_GUARD ENABLE=0`.
 
 ## display_status

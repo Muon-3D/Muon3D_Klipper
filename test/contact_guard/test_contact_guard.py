@@ -50,7 +50,15 @@ class FakeConfig:
 class FakeReactor:
     def __init__(self):
         self.now = 100.
+        self.on_pause = []      # called as the guard waits, like the stream
+        self.pauses = 0
     def monotonic(self):
+        return self.now
+    def pause(self, waketime):
+        self.pauses += 1
+        self.now = max(self.now, waketime)
+        for cb in list(self.on_pause):
+            cb()
         return self.now
 
 
@@ -62,9 +70,22 @@ class FakeGCode:
         self.commands[name] = func
 
 
+class FakeMcu:
+    def is_fileoutput(self):
+        return False
+    def estimated_print_time(self, eventtime):
+        return eventtime - 90.  # reactor 100 s is print_time 10 s
+
+
+class FakeSensor:
+    def get_mcu(self):
+        return FakeMcu()
+
+
 class FakeLoadCell:
     def __init__(self):
         self.clients = []
+        self.sensor = FakeSensor()
     def add_client(self, cb):
         self.clients.append(cb)
 
@@ -92,11 +113,26 @@ class FakeToolhead:
     def __init__(self):
         self.position = [50., 50., 5., 0.]
         self.moves = []
+        self.homed_axes = 'xyz'
+        self.print_time = 0.    # end of the queued motion
+        self.waits = 0
+    def get_kinematics(self):
+        return self
+    def get_status(self, eventtime):
+        return {'homed_axes': self.homed_axes}
+    def wait_moves(self):
+        self.waits += 1
     def get_position(self):
         return list(self.position)
     def move(self, newpos, speed):
         self.moves.append(list(newpos))
         self.position = list(newpos)
+
+
+class FakeGCodeIO:
+    def __init__(self):
+        self.is_processing_data = False
+        self.is_fileinput = False
 
 
 class FakeGCodeMove:
@@ -126,12 +162,14 @@ class FakePrinter:
         self.toolhead = FakeToolhead()
         self.homing_override = Flag('in_script')
         self.nozzle_wipe = Flag('active')
+        self.gcode_io = FakeGCodeIO()
         self.objects = {
             'gcode': self.gcode, 'load_cell_probe': self.probe,
             'print_stats': self.print_stats, 'toolhead': self.toolhead,
             'gcode_move': FakeGCodeMove(self.toolhead),
             'homing_override': self.homing_override,
             'nozzle_wipe_smart': self.nozzle_wipe,
+            'gcode_io': self.gcode_io,
         }
         self.handlers = {}
     def get_reactor(self):
@@ -149,8 +187,9 @@ class FakePrinter:
 
 class Rig:
     """A guard wired to fakes, with a sample clock."""
-    def __init__(self, values=None):
+    def __init__(self, values=None, z=5.):
         self.printer = FakePrinter()
+        self.printer.toolhead.position[2] = z
         self.guard = contact_guard.load_config(
             FakeConfig(self.printer, values))
         self.printer.send_event("klippy:connect")
@@ -362,6 +401,108 @@ def test_homing_reanchors():
     r.feed(0, 0.1)
     check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
           "a homing move re-zeroes on what it read before moving")
+
+
+def test_sync_before_deciding_near_the_plate():
+    # Codex P1: a queued descent then an XY move.  The XY move is checked
+    # as it enters the lookahead, before the descent has run, so the
+    # guard must wait for the motion and the samples that follow it.
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    th = r.printer.toolhead
+    th.print_time = r.t + 0.1        # the descent ends 100 ms from now
+    # The stream, during the wait, shows the nozzle reaching the plate
+    r.printer.reactor.on_pause.append(lambda: r.feed(200000, 0.005))
+    check(r.refused(60, 50, 0.5) == REFUSAL,
+          "XY after a queued descent waits and is refused")
+    check(th.waits == 1, "it waited for the queued moves to execute")
+    check(r.guard.data_time >= th.print_time + 0.02,
+          "and for samples 20 ms past the end of the motion")
+    # Same, but the descent stops clear of the plate
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.toolhead.print_time = r.t + 0.1
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.005))
+    check(r.refused(60, 50, 0.5) is None,
+          "XY after a queued descent that stays clear is allowed")
+
+
+def test_no_stall_away_from_the_plate():
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    check(r.refused(60, 50, 5) is None and r.printer.toolhead.waits == 0
+          and r.printer.reactor.pauses == 0,
+          "XY at Z 5 does not wait (sync_below_z 3)")
+    r = Rig(z=2.9)
+    r.feed(0, 0.5)
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.005))
+    check(r.refused(60, 50, 2.9) is None and r.printer.toolhead.waits == 1,
+          "XY at Z 2.9 waits")
+    r = Rig(z=5.)
+    r.printer.toolhead.homed_axes = 'xy'
+    r.feed(0, 0.5)
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.005))
+    check(r.refused(60, 50, 5) is None and r.printer.toolhead.waits == 1,
+          "XY with Z unhomed waits")
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    check(r.refused(50, 50, 1) is None and r.refused(50, 50, 0.5) is None
+          and r.printer.toolhead.waits == 0, "Z-only moves never wait")
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.print_stats.state = 'printing'
+    check(r.refused(60, 50, 0.5) is None and r.printer.toolhead.waits == 0,
+          "a print is never stalled")
+
+
+def test_sync_gives_up_without_samples():
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.reactor.now = 90. + r.t   # the MCU clock is at the data
+    start = r.printer.reactor.now
+    r.printer.toolhead.print_time = r.t + 0.1
+    check(r.refused(60, 50, 0.5) is None,
+          "no samples after the motion: decides on what it has")
+    waited = r.printer.reactor.now - start
+    # 0.1 s of motion + 0.025 s for on_time and margin + the 0.5 s timeout
+    check(0.6 <= waited < 0.65,
+          "and gives up 0.5 s after the samples were due (waited %.3f s)"
+          % waited)
+
+
+def test_sync_waits_out_the_ring():
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.probe.trigger_time = r.t
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(200000, 0.005))
+    check(r.refused(60, 50, 0.5) == REFUSAL,
+          "XY just after a tap waits out the 0.5 s ring, then decides")
+    check(r.guard.data_time >= r.printer.probe.trigger_time + 0.52,
+          "on samples from after the hold-off")
+
+
+def test_streamed_print():
+    # Codex P2: a print streamed over the G-code pty never sets print_stats
+    r = Rig()
+    r.in_contact()
+    io = r.printer.gcode_io
+    io.is_processing_data = True
+    check(not r.status()['active'], "inactive while pty input is running")
+    check(r.refused(60, 50, 5) is None, "XY allowed in a streamed print")
+    io.is_processing_data = False
+    r.printer.reactor.now += 4.9
+    r.feed(200000, 0.05)
+    check(not r.status()['active'],
+          "still a job 4.9 s after the last pty batch")
+    r.printer.reactor.now += 0.2
+    check(r.status()['contact'], "active again 5 s after the stream stops")
+    r = Rig()
+    r.in_contact()
+    r.printer.gcode_io.is_fileinput = True
+    r.printer.gcode_io.is_processing_data = True
+    check(r.refused(60, 50, 5) == REFUSAL,
+          "batch-mode file input is not a streamed job")
 
 
 def test_requires_load_cell_probe():

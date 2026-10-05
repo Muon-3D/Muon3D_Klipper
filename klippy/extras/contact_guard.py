@@ -22,6 +22,14 @@ ANCHOR_TIME = 0.020
 MOVE_EPSILON = 1e-6
 # Sample times are floats; "20 ms" must include the sample at 20 ms.
 TIME_EPSILON = 1e-6
+# Before deciding a move near the plate, wait for samples this far past the
+# end of the queued motion (plus on_time), and give up this long after the
+# samples should have arrived.
+SYNC_MARGIN = 0.005
+SYNC_TIMEOUT = 0.5
+# Commands arriving over the G-code pty are a streamed job; it is still
+# running this long after the last batch was seen.
+STREAM_JOB_GRACE = 5.0
 # Fixed raw zero for CONTACT_GUARD_SIMULATE (batch mode only).
 SIM_ZERO_COUNTS = -1000000
 
@@ -47,10 +55,17 @@ class ContactGuard:
         # A load that sits outside the band but never becomes contact for
         # this long is drift, not a touch, and the baseline jumps to it.
         self.relock_time = config.getfloat('relock_time', 0.5, above=0.)
+        # Moves are checked as they enter the lookahead queue, before the
+        # moves ahead of them have run.  Starting below this machine Z (or
+        # with Z unhomed) the queued motion could put the nozzle on the
+        # plate, so the guard first waits for it to execute and decides on
+        # what the load cell reads afterwards.
+        self.sync_below_z = config.getfloat('sync_below_z', 3.0)
         self.enabled = True
         # Objects found at connect
         self.probe = self.load_cell = self.print_stats = None
         self.homing_override = self.nozzle_wipe = None
+        self.toolhead = self.gcode_io = None
         self.next_transform = None
         self.last_position = [0., 0., 0., 0.]
         # Host state that makes the guard inactive
@@ -69,8 +84,10 @@ class ContactGuard:
         self.drift_sum = 0.
         self.drift_count = 0
         self.recent = collections.deque()
+        self.stream_systime = None  # last time pty input was seen
         self.sim_time = None
         self.sim_drift = 0.
+        self.sim_plate = None
         # Events
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
@@ -108,6 +125,8 @@ class ContactGuard:
         # The brush wipe drags the nozzle through the brush under load
         self.nozzle_wipe = self.printer.lookup_object('nozzle_wipe_smart',
                                                       None)
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.gcode_io = self.printer.lookup_object('gcode_io', None)
 
     def _handle_ready(self):
         # Registered at ready, after every klippy:connect transform
@@ -128,19 +147,51 @@ class ContactGuard:
         self.last_position = list(newpos)
 
     def _check_move(self, newpos):
-        if not self.contact:
-            return
-        eventtime = self.reactor.monotonic()
-        if not self.is_active(eventtime):
-            return
         last = self.last_position
         moves_xy = (abs(newpos[0] - last[0]) > MOVE_EPSILON
                     or abs(newpos[1] - last[1]) > MOVE_EPSILON)
-        raises_z = newpos[2] > last[2] + MOVE_EPSILON
-        if moves_xy and not raises_z:
+        if not moves_xy or newpos[2] > last[2] + MOVE_EPSILON:
+            return
+        eventtime = self.reactor.monotonic()
+        if not self._may_refuse(eventtime):
+            return
+        if self._contact_possible(last, eventtime):
+            self._sync()
+            eventtime = self.reactor.monotonic()
+        if self.contact and self.is_active(eventtime):
             logging.info("contact_guard: refused move %s -> %s, load %d",
                          last[:3], list(newpos[:3]), self.load)
             raise self.gcode.error(REFUSAL)
+
+    def _contact_possible(self, last, eventtime):
+        kin_status = self.toolhead.get_kinematics().get_status(eventtime)
+        return ('z' not in kin_status['homed_axes']
+                or last[2] < self.sync_below_z)
+
+    def _sync(self):
+        # Let everything queued ahead of this move execute, then wait for
+        # samples long enough past its end for contact to be declared, and
+        # past the ring of a tap that just happened.  This stalls only moves
+        # that start near the plate.
+        self.toolhead.wait_moves()
+        target = max(self.toolhead.print_time, self._holdoff_end())
+        target += self.on_time + SYNC_MARGIN
+        if self.sim_plate is not None:
+            self._sim_plate_until(target)
+            return
+        mcu = self.load_cell.sensor.get_mcu()
+        if mcu.is_fileoutput():
+            # Batch mode: no samples will come and print_time is not clock
+            return
+        now = self.reactor.monotonic()
+        deadline = (now + SYNC_TIMEOUT
+                    + max(0., target - mcu.estimated_print_time(now)))
+        while self.data_time is None or self.data_time < target:
+            if now >= deadline:
+                logging.info("contact_guard: no samples past %.3f, deciding"
+                             " on what it has", target)
+                return
+            now = self.reactor.pause(now + 0.005)
 
     # Inactive states
     def _handle_homing_move_begin(self, hmove):
@@ -174,7 +225,22 @@ class ContactGuard:
         ho = self.homing_override
         return ho is not None and getattr(ho, 'in_script', False)
 
-    def _is_printing(self, eventtime):
+    def _is_streaming(self, eventtime):
+        # A print streamed over the G-code pty (not virtual_sdcard) never
+        # sets print_stats.  Its commands run with is_processing_data set.
+        # Batch mode's input file also runs through GCodeIO; that is not a
+        # job.  Prints sent line by line through the API have no marker.
+        io = self.gcode_io
+        if io is None or getattr(io, 'is_fileinput', False):
+            return False
+        if getattr(io, 'is_processing_data', False):
+            self.stream_systime = eventtime
+        return (self.stream_systime is not None
+                and eventtime - self.stream_systime < STREAM_JOB_GRACE)
+
+    def _job_active(self, eventtime):
+        if self._is_streaming(eventtime):
+            return True
         if self.print_stats is None:
             return False
         state = self.print_stats.get_status(eventtime)['state']
@@ -188,15 +254,19 @@ class ContactGuard:
             return float('-inf')
         return trig + self.holdoff
 
-    def is_active(self, eventtime):
+    # The states in which the guard never refuses
+    def _may_refuse(self, eventtime):
         if not self.enabled or self.probe is None:
+            return False
+        if self._is_homing() or self._job_active(eventtime):
+            return False
+        return not getattr(self.nozzle_wipe, 'active', False)
+
+    def is_active(self, eventtime):
+        if not self._may_refuse(eventtime):
             return False
         if (self.sample_systime is None
                 or eventtime - self.sample_systime > STREAM_TIMEOUT):
-            return False
-        if self._is_homing() or self._is_printing(eventtime):
-            return False
-        if getattr(self.nozzle_wipe, 'active', False):
             return False
         # Judged on sample time, not the clock: the decision can only be as
         # new as the data it rests on.
@@ -317,17 +387,29 @@ class ContactGuard:
     def cmd_CONTACT_GUARD_SIMULATE(self, gcmd):
         # Feed synthetic load cell samples through the same client callback
         # the sensor stream uses.  LOAD is counts in the pressing direction.
+        # PLATE_Z=<z> STIFFNESS=<counts/mm> instead models a plate at that
+        # toolhead Z: samples then follow the executed motion in the trapq,
+        # and are generated whenever the guard waits for them.
+        plate_z = gcmd.get_float('PLATE_Z', None)
+        if plate_z is not None:
+            self.sim_plate = (plate_z, gcmd.get_float('STIFFNESS', above=0.))
+            return
+        if gcmd.get_int('PLATE', 1) == 0:
+            self.sim_plate = None
+            return
         load = gcmd.get_float('LOAD', 0.)
         duration = gcmd.get_float('DURATION', above=0.)
         rate = gcmd.get_float('RATE', 2000., above=0.)
         drift = gcmd.get_float('DRIFT', 0.)
         after_trigger = gcmd.get_float('AFTER_TRIGGER', None)
+        # Samples are never older than the motion already queued, and the
+        # toolhead dwells through them below, so the data can never run
+        # ahead of the motion it would be measuring.
+        move_time = self.toolhead.get_last_move_time()
         if after_trigger is not None:
             start = self.probe.get_last_trigger_time() + after_trigger
-        elif self.sim_time is not None:
-            start = self.sim_time
         else:
-            start = 0.
+            start = max(self.sim_time or 0., move_time)
         sign = self.probe.get_press_direction(SIM_ZERO_COUNTS)
         count = int(round(duration * rate))
         rows = []
@@ -338,10 +420,40 @@ class ContactGuard:
             counts = SIM_ZERO_COUNTS + self.sim_drift + sign * load
             rows.append([t, None, int(round(counts)), None])
         self.sim_time = start + count / rate
+        self._sim_feed(rows, rate)
+        if self.sim_time > move_time:
+            self.toolhead.dwell(self.sim_time - move_time)
+
+    def _sim_feed(self, rows, rate):
         batch = int(rate * .020) or 1
         for i in range(0, len(rows), batch):
             self._handle_batch({'data': rows[i:i + batch], 'errors': 0,
                                 'overflows': 0})
+
+    def _sim_plate_until(self, target, rate=2000.):
+        # The last 0.3 s up to target, from where the trapq says the
+        # toolhead was at each sample time
+        plate_z, stiffness = self.sim_plate
+        motion_report = self.printer.lookup_object('motion_report')
+        dtrapq = motion_report.dtrapqs['toolhead']
+        start = target - 0.3
+        if self.data_time is not None:
+            start = max(start, self.data_time + 1. / rate)
+        # Earlier LOAD samples may already run past target; positions after
+        # the last move are its end position, so continue from there
+        end = max(target, start + 0.1)
+        sign = self.probe.get_press_direction(SIM_ZERO_COUNTS)
+        rows = []
+        for i in range(int((end - start) * rate) + 1):
+            t = start + i / rate
+            pos, velocity = dtrapq.get_trapq_position(t)
+            z = pos[2] if pos is not None else self.toolhead.get_position()[2]
+            load = max(0., plate_z - z) * stiffness
+            counts = SIM_ZERO_COUNTS + self.sim_drift + sign * load
+            rows.append([t, None, int(round(counts)), None])
+        if rows:
+            self.sim_time = rows[-1][0] + 1. / rate
+        self._sim_feed(rows, rate)
 
 
 def load_config(config):

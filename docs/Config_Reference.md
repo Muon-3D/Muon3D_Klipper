@@ -5478,10 +5478,15 @@ Refuse G-code moves that would drag the nozzle across the plate. Between
 probes the guard watches the `[load_cell_probe]` load cell and reports
 contact when the load stays above `threshold_counts`. While it does, a
 G-code move with an X or Y component that does not also raise Z fails with
-"Nozzle is touching the plate: lift Z before moving X or Y". It is inactive
-while a print is printing or paused, during homing, probing and
-NOZZLE_WIPE_SMART, for `holdoff_time` after each probe trigger, and when no
-load cell samples have arrived for 1 second. See the
+"Nozzle is touching the plate: lift Z before moving X or Y". A move that
+starts below `sync_below_z`, or with Z unhomed, first waits for the moves
+queued ahead of it to run and is decided on the load cell readings after
+them. The guard is inactive during a job (a virtual_sdcard print that is
+printing or paused, or commands arriving over the G-code pty, until 5
+seconds after the last), during homing, probing and NOZZLE_WIPE_SMART, for
+`holdoff_time` after each probe trigger, and when no load cell samples have
+arrived for 1 second. A print sent line by line through the API is not
+recognised as a job. See the
 [SET_CONTACT_GUARD](G-Codes.md#set_contact_guard) command.
 
 ```
@@ -5507,6 +5512,11 @@ load cell samples have arrived for 1 second. See the
 #relock_time: 0.5
 #   A load outside the band that does not become contact within this many
 #   seconds is treated as drift, and the zero moves to it.
+#sync_below_z: 3.0
+#   An XY move that starts below this Z (in machine coordinates, before
+#   bed_mesh) waits for the queued moves to execute before it is decided,
+#   so a descent queued just ahead of it is seen. Above it, moves are not
+#   delayed.
 ```
 
 ## Board specific hardware support

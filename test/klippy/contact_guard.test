@@ -72,6 +72,20 @@ CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 G1 X50 Y50 Z5
 
+# Queued motion.  A travel that starts below sync_below_z (3) waits for
+# the moves queued ahead of it and decides on the samples that follow.
+# The simulated plate at toolhead Z 0 loads the cell from the executed Z
+# in the trapq.  contact_guard_queued.test is the case that is refused.
+CONTACT_GUARD_SIMULATE PLATE_Z=0 STIFFNESS=19500000
+# stops 0.5 mm clear: allowed
+DESCEND_THEN_TRAVEL Z=0.5 X=60
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+# touches, lifts to 1 mm, then travels: allowed
+DESCEND_THEN_TRAVEL Z=-0.02 LIFT=1 X=50
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+CONTACT_GUARD_SIMULATE PLATE=0
+G1 X50 Y50 Z5
+
 # Tare drift of 9000 counts/s for 20 s (180000, twice the threshold) is
 # followed by the baseline and never reads as contact
 CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=9000
@@ -93,9 +107,10 @@ PROBE
 # the tap's ring, 0.05-0.45 s after the trigger, is ignored
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.4 AFTER_TRIGGER=0.05
 ASSERT_GUARD ACTIVE=0 CONTACT=0
-# the nozzle may still move away inside the hold-off
+# the nozzle may still lift inside the hold-off (an XY move near the plate
+# would wait it out; see the unit test)
 G91
-G1 X1
+G1 Z1
 G90
 # load that continues past 0.5 s is contact
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
