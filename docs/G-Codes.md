@@ -286,6 +286,18 @@ file and restart the host software. This command is used in
 conjunction with other calibration commands to store the results of
 calibration tests.
 
+### [contact_guard]
+
+The following command is available when a
+[contact_guard config section](Config_Reference.md#contact_guard) is
+enabled.
+
+#### SET_CONTACT_GUARD
+`SET_CONTACT_GUARD [ENABLE=<0|1>]`: Turn the contact guard off or back
+on, for macros that must move X or Y with the nozzle loaded. Without
+parameters it reports whether it is enabled, active and in contact, and the
+current load.
+
 ### [delayed_gcode]
 
 The following command is enabled if a

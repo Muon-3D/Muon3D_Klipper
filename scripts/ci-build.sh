@@ -109,6 +109,11 @@ start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
 finish_test load_cell "Test load cell collector is stopped on a failed tap"
 
+# MUON: contact_guard refusal text, hysteresis timing and inactive states.
+start_test contact_guard "Test contact_guard decisions"
+$PYTHON test/contact_guard/test_contact_guard.py
+finish_test contact_guard "Test contact_guard decisions"
+
 # MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
 # image builds klippy into a `python3 -m venv` and klippy carries 36
 # f-strings across 12 files, which Python 2 cannot parse at all. The tests

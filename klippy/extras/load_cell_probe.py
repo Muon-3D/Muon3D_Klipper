@@ -946,6 +946,24 @@ class LoadCellPrinterProbe:
     def start_probe_session(self, gcmd):
         return self._probe_session.start_probe_session(gcmd)
 
+    # For contact_guard, which watches the same load cell between probes
+    def get_load_cell(self):
+        return self._load_cell
+
+    def get_last_trigger_time(self):
+        return self._load_cell_probing_move.get_last_trigger_time()
+
+    # 1. when pressing on the nozzle raises the raw counts above
+    # zero_counts, -1. when it lowers them
+    def get_press_direction(self, zero_counts):
+        helper = self._config_helper
+        ref_max = helper.get_reference_max_load_counts()
+        if (helper.get_safety_model() == helper.SAFETY_MODEL_PRELOADED_MAX
+                and ref_max is not None):
+            # The direction the probe's own trigger uses
+            return 1. if ref_max >= zero_counts else -1.
+        return self._load_cell.invert
+
     def get_status(self, eventtime):
         status = self._cmd_helper.get_status(eventtime)
         status.update(self._load_cell.get_status(eventtime))

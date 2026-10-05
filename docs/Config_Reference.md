@@ -5472,6 +5472,43 @@ sensor_type:
 #   See the "[probe]" section for a description of the above parameters.
 ```
 
+### [contact_guard]
+
+Refuse G-code moves that would drag the nozzle across the plate. Between
+probes the guard watches the `[load_cell_probe]` load cell and reports
+contact when the load stays above `threshold_counts`. While it does, a
+G-code move with an X or Y component that does not also raise Z fails with
+"Nozzle is touching the plate: lift Z before moving X or Y". It is inactive
+while a print is printing or paused, during homing, probing and
+NOZZLE_WIPE_SMART, for `holdoff_time` after each probe trigger, and when no
+load cell samples have arrived for 1 second. See the
+[SET_CONTACT_GUARD](G-Codes.md#set_contact_guard) command.
+
+```
+[contact_guard]
+#threshold_counts: 90000
+#   Raw load cell counts, in the direction the probe presses, above which
+#   the nozzle is in contact. The default is half the force at which the
+#   Muon M1's probe triggers at 4 mm/s.
+#on_time: 0.020
+#   Seconds the load must stay above threshold_counts before contact is
+#   reported.
+#off_time: 0.050
+#   Seconds the load must stay below half of threshold_counts before
+#   contact is released.
+#holdoff_time: 0.5
+#   Seconds after the probe's last trigger during which the load cell is
+#   ringing and is ignored.
+#baseline_time_constant: 1.0
+#   Time constant, in seconds, with which the zero follows slow drift.
+#baseline_band_counts:
+#   The zero only follows the load while it is within this many counts of
+#   it. The default is a quarter of threshold_counts.
+#relock_time: 0.5
+#   A load outside the band that does not become contact within this many
+#   seconds is treated as drift, and the zero moves to it.
+```
+
 ## Board specific hardware support
 
 ### [sx1509]
