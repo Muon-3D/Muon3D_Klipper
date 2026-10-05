@@ -27,6 +27,12 @@ PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_PHASE NAME=
 ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
 
+# 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
+# three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
+# lands at y=99.98 and not 100.
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,100
+ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.66/110.00,46.66/80.00,46.66/50.00,46.66/50.00,73.32/80.00,73.32/110.00,73.32/140.00,73.32/140.00,99.98/110.00,99.98/80.00,99.98/50.00,99.98
+
 # No slicer region: the whole configured region at the configured 4 x 3,
 # which the notch sits between the columns of. _BED_MESH_PLAN always probes
 # here.
