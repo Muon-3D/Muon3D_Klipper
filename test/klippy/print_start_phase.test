@@ -47,6 +47,20 @@ ASSERT_SEQ SEQ=1
 CANCEL_PRINT
 ASSERT_PHASE NAME=
 
+# A print file that raises part way through PRINT_START ends on that line,
+# and [virtual_sdcard] runs its on_error_gcode, which core.cfg sets to
+# _ON_PRINT_ERROR. Batch mode exits non-zero on any command error, so a
+# failing print cannot be part of a passing test: this runs the hook as
+# on_error_gcode would. It clears the phase and keeps Klipper's default of
+# turning the heaters off.
+M104 S200
+M140 S60
+_PRINT_START_MARK PHASE=start
+_PRINT_START_MARK PHASE=home
+_ON_PRINT_ERROR
+ASSERT_PHASE NAME=
+ASSERT_HEATERS_OFF
+
 # So does PRINT_END. CANCEL_PRINT ended with M84, so home first.
 G28
 _PRINT_START_MARK PHASE=start
