@@ -1353,11 +1353,14 @@ class ProbeManager:
             dir_change = not isclose(pt[1], last_base_pt[1], abs_tol=1e-6)
             ascnd_x ^= dir_change
             last_base_pt = pt
-        last_base_pt = last_mv_pt = self.base_points[first_valid_idx]
+        last_base_pt = self.base_points[first_valid_idx]
+        # The grid point drives row and direction bookkeeping; the lead-in
+        # approaches where the first sample is actually taken.
+        last_mv_pt = self.adjusted_points.get(first_valid_idx, last_base_pt)
         # Generate initial move point
         if self.overshoot:
             overshoot = min(8, self.overshoot)
-            last_mv_pt = (last_base_pt[0] - overshoot, last_base_pt[1])
+            last_mv_pt = (last_mv_pt[0] - overshoot, last_mv_pt[1])
             yield last_mv_pt, False
         for idx, pt in enumerate(self.base_points[first_valid_idx:],
                                  start=first_valid_idx):
