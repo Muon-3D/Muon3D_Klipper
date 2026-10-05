@@ -23,3 +23,15 @@ ASSERT_PROBED WANT=0
 G1 Z10
 _TEST_MESH MIN=50,20 MAX=140.1,100.04 COUNT=4,4
 ASSERT_PROBED WANT=1
+
+# Six points, five gaps: the most PRINT_START asks for. 151.7 mm over five
+# gaps is 30.34 mm, which bed_mesh computes as 30.339999999999996 and floors
+# to 30.33, so the mesh ends at 161.78999999999996: 0.05 mm short, the whole
+# slack, plus float error. The same print again must still reuse it.
+G1 Z10
+_TEST_MESH MIN=10.14,20 MAX=161.84,98 COUNT=6,4
+ASSERT_PROBED WANT=1
+ASSERT_MESH_MAX WANT=161.79,98.00
+G1 Z10
+_TEST_MESH MIN=10.14,20 MAX=161.84,98 COUNT=6,4
+ASSERT_PROBED WANT=0
