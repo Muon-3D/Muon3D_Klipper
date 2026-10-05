@@ -1,0 +1,128 @@
+# contact_guard: contact hysteresis, allowed moves, bed_mesh and skew under
+# the guard, inactive while printing, the post-trigger hold-off.
+# CONTACT_GUARD_SIMULATE feeds load cell samples (2000/s, LOAD in counts in
+# the pressing direction) through the guard's load cell client callback.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+
+G28
+G90
+G1 X50 Y50 Z5 F6000
+
+# No samples yet: nothing to judge contact on, so inactive
+ASSERT_GUARD ACTIVE=0 CONTACT=0
+
+# --- The preamble contact_guard_refuse*.test repeat verbatim ---
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+# --- end of preamble ---
+
+# Contact off needs 50 ms below half the threshold (45000)
+# 60000 is under the threshold but above half of it: still contact
+CONTACT_GUARD_SIMULATE LOAD=60000 DURATION=0.2
+ASSERT_GUARD CONTACT=1
+# 50 ms of samples at 2000/s spans 49.5 ms: not yet
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.05
+ASSERT_GUARD CONTACT=1
+# the sample at 50 ms releases it
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.001
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+
+# Contact on needs 20 ms above the threshold (90000)
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.02
+ASSERT_GUARD CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.001
+ASSERT_GUARD CONTACT=1
+# a dip under the threshold restarts the 20 ms
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
+ASSERT_GUARD CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.015
+CONTACT_GUARD_SIMULATE LOAD=80000 DURATION=0.001
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.015
+ASSERT_GUARD CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.01
+ASSERT_GUARD CONTACT=1
+
+# In contact: Z lifts, XY moves that also raise Z, and E are allowed
+G91
+G1 Z1
+G1 X5 Y5 Z1
+G1 E1
+G90
+ASSERT_POSITION X=55 Y=55 Z=7
+ASSERT_GUARD CONTACT=1
+
+# Z alone may also come down.  With skew active a Z move changes X below
+# skew_correction, so this only passes if the guard sits above it.
+SET_SKEW XZ=142,141,100
+G1 Z6
+SET_SKEW CLEAR=1
+ASSERT_GUARD CONTACT=1
+
+# The same X target the refusal tests use is in range once the guard is off
+SET_CONTACT_GUARD ENABLE=0
+ASSERT_GUARD ACTIVE=0 CONTACT=0
+G1 X60 Y50 Z5
+SET_CONTACT_GUARD ENABLE=1
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+
+# Released: XY moves are allowed again
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X50 Y50 Z5
+
+# Queued motion.  A travel that starts below sync_below_z (3) waits for
+# the moves queued ahead of it and decides on the samples that follow.
+# The simulated plate at toolhead Z 0 loads the cell from the executed Z
+# in the trapq.  contact_guard_queued.test is the case that is refused.
+CONTACT_GUARD_SIMULATE PLATE_Z=0 STIFFNESS=19500000
+# stops 0.5 mm clear: allowed
+DESCEND_THEN_TRAVEL Z=0.5 X=60
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+# touches, lifts to 1 mm, then travels: allowed
+DESCEND_THEN_TRAVEL Z=-0.02 LIFT=1 X=50
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+CONTACT_GUARD_SIMULATE PLATE=0
+G1 X50 Y50 Z5
+
+# Tare drift of 9000 counts/s for 20 s (180000, twice the threshold) is
+# followed by the baseline and never reads as contact
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=9000
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=-9000
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+
+# bed_mesh still applies under the guard
+BED_MESH_PROFILE LOAD=flat_offset
+G1 X60 Y60 Z5
+ASSERT_POSITION X=60 Y=60 Z=5 TOOLHEAD_Z=5.1
+BED_MESH_CLEAR
+G1 X50 Y50 Z5
+
+# Hold-off: the load cell rings after a probe tap.  Leave it clear first,
+# since a probing move re-zeroes the guard on what it read just before.
+G1 X50 Y50 Z5
+PROBE
+# the tap's ring, 0.05-0.45 s after the trigger, is ignored
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.4 AFTER_TRIGGER=0.05
+ASSERT_GUARD ACTIVE=0 CONTACT=0
+# the nozzle may still lift inside the hold-off (an XY move near the plate
+# would wait it out; see the unit test)
+G91
+G1 Z1
+G90
+# load that continues past 0.5 s is contact
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+G91
+G1 Z2
+G90
+
+# Inactive while printing.  In batch mode virtual_sdcard only runs the file
+# once this input is exhausted, so this must stay last.  printing.gcode
+# feeds contact itself (the stream would otherwise have gone stale), checks
+# the guard is inactive, and moves XY.
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+SDCARD_PRINT_FILE FILENAME=printing.gcode

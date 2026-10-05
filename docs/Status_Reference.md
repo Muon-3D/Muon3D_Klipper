@@ -80,6 +80,20 @@ The following information is available in the `configfile` object
   field (both strings). Additional fields may be available depending
   on the type of warning.
 
+## contact_guard
+
+The following information is available in the
+[contact_guard](Config_Reference.md#contact_guard) object:
+- `contact`: True when the guard is active and the nozzle is pressing on
+  something.
+- `load`: The load cell reading, in raw counts above the guard's slowly
+  tracked zero, in the direction the probe presses.
+- `active`: False during a job (a virtual_sdcard print, or commands
+  arriving over the G-code pty), homing, probing, wiping, just after a
+  probe trigger, without recent load cell samples, or when disabled with
+  SET_CONTACT_GUARD.
+- `enabled`: False after `SET_CONTACT_GUARD ENABLE=0`.
+
 ## display_status
 
 The following information is available in the `display_status` object

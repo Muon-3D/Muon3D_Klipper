@@ -109,6 +109,11 @@ start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
 finish_test load_cell "Test load cell collector is stopped on a failed tap"
 
+# MUON: contact_guard refusal text, hysteresis timing and inactive states.
+start_test contact_guard "Test contact_guard decisions"
+$PYTHON test/contact_guard/test_contact_guard.py
+finish_test contact_guard "Test contact_guard decisions"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py

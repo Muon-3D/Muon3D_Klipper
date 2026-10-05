@@ -1,0 +1,12 @@
+# contact_guard refuses an XY move that lowers Z in contact.  Exits with an
+# error.  Same preamble as contact_guard_refuse.test.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+SHOULD_FAIL
+
+G28
+G90
+G1 X50 Y50 Z5 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05
+G1 X60 Y50 Z4

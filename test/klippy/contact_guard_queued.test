@@ -1,0 +1,15 @@
+# contact_guard refuses a travel queued behind a descent onto the plate
+# (Codex P1 on #57).  Exits with an error.  The travel is checked as it
+# enters the lookahead, before the descent has run; the guard must wait for
+# the descent and decide on the samples after it.  contact_guard.test runs
+# the same macro to 0.5 mm and to a touch-and-lift, both allowed.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+SHOULD_FAIL
+
+G28
+G90
+G1 X50 Y50 Z5 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE PLATE_Z=0 STIFFNESS=19500000
+DESCEND_THEN_TRAVEL Z=-0.02 X=60
