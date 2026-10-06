@@ -1191,7 +1191,9 @@ Visual Examples:
 #   Optional distance (in mm). If a generated point falls inside a no-go
 #   region but is within this distance from the nearest no-go boundary,
 #   it will be moved to that boundary instead of being canceled. If the
-#   snapped point is outside active mesh bounds, it is canceled.
+#   snapped point is outside active mesh bounds, it is canceled. Only
+#   the probe is moved: the result is stored at the point's place in the
+#   mesh grid.
 #   The default is 0, which disables boundary snapping.
 #adaptive_margin:
 #   An optional margin (in mm) to be added around the bed area used by

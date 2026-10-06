@@ -1,0 +1,24 @@
+# bed_mesh no-go boundary snapping keeps the mesh on its grid (KAN-468)
+CONFIG bed_mesh_no_go_snap.cfg
+DICTIONARY atmega2560.dict
+
+G28
+G1 Z10
+RESET_PROBE_PATH
+
+# 4 x 3 on a 27 x 26 mm grid. On the y=7 row, x=87 and x=114 are inside the
+# notch and more than 10 mm from any edge still in the mesh, so they are
+# dropped. On the y=33 row they are 1 mm under the notch's top edge, so the
+# probe goes to y=34 instead. Snapping them in y used to split that row in
+# two, and the calibrate failed with "Invalid y-axis table length".
+BED_MESH_CALIBRATE MESH_MIN=60,7 MESH_MAX=141,59 PROBE_COUNT=4,3
+ASSERT_PROBE_PATH PATH=60.00,7.00/141.00,7.00/141.00,33.00/114.00,34.00/87.00,34.00/60.00,33.00/60.00,59.00/87.00,59.00/114.00,59.00/141.00,59.00
+ASSERT_MESH WANT="60.00,7.00 141.00,59.00 4x3"
+
+# A snap in x, which never split a row: on the y=20 row, x=80 goes to the
+# notch's left edge at x=75 and x=110 is dropped.
+G1 Z10
+RESET_PROBE_PATH
+BED_MESH_CALIBRATE MESH_MIN=50,20 MESH_MAX=140,98 PROBE_COUNT=4,4
+ASSERT_PROBE_PATH PATH=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
+ASSERT_MESH WANT="50.00,20.00 140.00,98.00 4x4"

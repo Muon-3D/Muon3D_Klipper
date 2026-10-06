@@ -114,6 +114,11 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
+start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
+$PYTHON test/bed_mesh/test_no_go_snap.py
+finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
+
 # MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
 # image builds klippy into a `python3 -m venv` and klippy carries 36
 # f-strings across 12 files, which Python 2 cannot parse at all. The tests
