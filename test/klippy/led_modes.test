@@ -1,0 +1,27 @@
+# User-selectable LED modes (KAN-480)
+DICTIONARY linuxprocess.dict
+CONFIG led_modes.cfg
+
+# Every mode renders through the parametrized led_effect (or LED_RESUME /
+# STOP_LED_EFFECTS for status/off); an unknown MODE responds, not fails.
+LED_MODE MODE=solid H=30 BRIGHT=80
+LED_MODE MODE=gradient H=30 H2=210 BRIGHT=60
+LED_MODE MODE=rainbow SPEED=90
+LED_MODE MODE=breathe H=120 SPEED=20
+LED_MODE MODE=chase H=0 H2=180 SPEED=60
+LED_MODE MODE=off
+LED_MODE MODE=status
+LED_MODE MODE=bogus
+LED_MODE
+LED_MODE MODE=solid H=420 BRIGHT=200 SPEED=2
+
+# Restore path: muon_led is saved, mode reset, restore re-reads it.
+LED_MODE MODE=rainbow H=200 SPEED=75
+SET_GCODE_VARIABLE MACRO=LED_MODE VARIABLE=mode VALUE="'status'"
+UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE DURATION=0
+
+# LED_READY honours the saved user mode instead of the ready effect.
+LED_MODE MODE=breathe H=90
+LED_READY
+LED_MODE MODE=status
+LED_READY
