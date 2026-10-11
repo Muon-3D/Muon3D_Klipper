@@ -55,6 +55,18 @@ finish_test check_macro_config "Check macro config"
 
 
 ######################################################################
+# Check the M1 automatic filament load is still armed
+######################################################################
+
+# Jack, 2026-10-10: the insert trigger stays armed. It was disarmed
+# once (KAN-232) and the disarm kept coming back on new branches.
+start_test check_m1_armed_hooks "Check M1 armed hooks"
+$PYTHON scripts/test_check_m1_armed_hooks.py
+$PYTHON scripts/check_m1_armed_hooks.py
+finish_test check_m1_armed_hooks "Check M1 armed hooks"
+
+
+######################################################################
 # Check for whitespace errors
 ######################################################################
 
