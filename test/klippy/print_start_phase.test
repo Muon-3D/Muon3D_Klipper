@@ -13,10 +13,9 @@ ASSERT_PHASE NAME=
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 
 # What a subscriber reading phase saw at each stub PRINT_START called.
-# No resonance stub in the list: PRINT_START no longer sweeps.
-ASSERT_SEEN WANT="wipe:home dock:home_z save_config:mesh dock:save_config led_printing:bed_settle"
+ASSERT_SEEN WANT="wipe:home resonance:home_z dock:resonance save_config:mesh dock:save_config led_printing:bed_settle"
 # Handover was the last mark, and clears it.
-ASSERT_SEQ SEQ=12
+ASSERT_SEQ SEQ=13
 ASSERT_PHASE NAME=
 ASSERT_PHASE_T
 ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
