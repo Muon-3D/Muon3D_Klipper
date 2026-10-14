@@ -8,7 +8,8 @@
 from . import homing as homing_mod
 
 TRINAMIC_DRIVERS = [
-    "tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660", "tmc5160"
+    "tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2241", "tmc2660",
+    "tmc5160"
 ]
 AXIS_INDEX = {'x': 0, 'y': 1, 'z': 2}
 AXES = tuple(AXIS_INDEX.keys())
