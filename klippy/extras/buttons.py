@@ -21,6 +21,9 @@ class MCU_buttons:
         self.pin_list = []
         self.callbacks = []
         self.invert = self.last_button = 0
+        # MUON: buttons whose state is carried across a non-critical
+        # reconnect (see _reset_state and build_config)
+        self.resync_mask = 0
         self.ack_cmd = None
         self.ack_count = 0
         if getattr(self.mcu, "is_non_critical", False):
@@ -33,8 +36,12 @@ class MCU_buttons:
     def _reset_state(self):
         # MCU-side counters reset on reconnect - keep host-side counters aligned.
         self.ack_count = 0
-        self.last_button = 0
-    def setup_buttons(self, pins, callback):
+        # MUON: a resync button keeps the state the host last saw. The MCU
+        # starts from that state (build_config), so a change made while the
+        # MCU was unplugged arrives as an edge instead of being lost. Other
+        # buttons restart from "released", as before.
+        self.last_button &= self.resync_mask
+    def setup_buttons(self, pins, callback, resync_on_reconnect=False):
         mask = 0
         shift = len(self.pin_list)
         for pin_params in pins:
@@ -43,6 +50,8 @@ class MCU_buttons:
             mask |= 1 << len(self.pin_list)
             self.pin_list.append((pin_params['pin'], pin_params['pullup']))
         self.callbacks.append((mask, shift, callback))
+        if resync_on_reconnect:
+            self.resync_mask |= mask
     def build_config(self):
         if not self.pin_list:
             return
@@ -59,11 +68,15 @@ class MCU_buttons:
             "buttons_ack oid=%c count=%c", cq=cmd_queue)
         clock = self.mcu.get_query_slot(self.oid)
         rest_ticks = self.mcu.seconds_to_clock(QUERY_TIME)
+        # The MCU reports a pin only once it differs from this starting
+        # raw state. Upstream starts every pin "released" (raw == invert);
+        # a resync button starts from what the host last saw (MUON).
+        start_state = self.invert ^ self.last_button
         self.mcu.add_config_cmd(
             "buttons_query oid=%d clock=%d"
             " rest_ticks=%d retransmit_count=%d invert=%d" % (
                 self.oid, clock, rest_ticks, RETRANSMIT_COUNT,
-                self.invert), is_init=True)
+                start_state), is_init=True)
         self.mcu.register_response(self.handle_buttons_state,
                                    "buttons_state", self.oid)
     def handle_buttons_state(self, params):
@@ -300,9 +313,11 @@ class PrinterButtons:
             self.adc_buttons[pin] = adc_buttons = MCU_ADC_buttons(
                 self.printer, pin, pullup)
         adc_buttons.setup_button(min_val, max_val, callback)
-    def register_debounce_button(self, pin, callback, config):
+    def register_debounce_button(self, pin, callback, config,
+                                 resync_on_reconnect=False):
         debounce = DebounceButton(config, callback)
-        return self.register_buttons([pin], debounce.button_handler)
+        return self.register_buttons([pin], debounce.button_handler,
+                                     resync_on_reconnect)
     def register_debounce_adc_button(self, pin, min_val, max_val, pullup
                                      , callback, config):
         debounce = DebounceButton(config, callback)
@@ -313,7 +328,10 @@ class PrinterButtons:
             if state:
                 callback(eventtime)
         self.register_adc_button(pin, min_val, max_val, pullup, helper)
-    def register_buttons(self, pins, callback):
+    def register_buttons(self, pins, callback, resync_on_reconnect=False):
+        # MUON: returns the MCU the buttons are on, and resync_on_reconnect
+        # carries the button's state across a non-critical MCU reconnect
+        # (MCU_buttons._reset_state).
         # Parse pins
         ppins = self.printer.lookup_object('pins')
         mcu = mcu_name = None
@@ -331,7 +349,9 @@ class PrinterButtons:
             or len(mcu_buttons.pin_list) + len(pin_params_list) > 8):
             self.mcu_buttons[mcu_name] = mcu_buttons = MCU_buttons(
                 self.printer, mcu)
-        mcu_buttons.setup_buttons(pin_params_list, callback)
+        mcu_buttons.setup_buttons(pin_params_list, callback,
+                                  resync_on_reconnect)
+        return mcu
     def register_rotary_encoder(self, pin1, pin2, cw_callback, ccw_callback,
                                 steps_per_detent):
         if steps_per_detent == 2:

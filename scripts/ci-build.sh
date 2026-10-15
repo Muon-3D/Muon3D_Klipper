@@ -116,6 +116,13 @@ $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
+# MUON: a toolhead reconnect must not run steps backwards or load on a
+# filament reading from before the unplug (KAN-558).
+start_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
+$PYTHON test/motion_queuing/test_reconnect_step_time.py
+$PYTHON test/filament_switch/test_reconnect_resync.py
+finish_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
+
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
 start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
