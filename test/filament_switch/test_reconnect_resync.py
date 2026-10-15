@@ -81,6 +81,7 @@ class FakeMcu:
     def __init__(self):
         self.config_cmds = []
         self.ack = FakeCommand()
+        self.query = FakeCommand()
     def register_config_callback(self, cb):
         pass
     def get_non_critical_disconnect_event_name(self):
@@ -94,6 +95,8 @@ class FakeMcu:
     def alloc_command_queue(self):
         return None
     def lookup_command(self, msgformat, cq=None):
+        if msgformat.startswith('buttons_query '):
+            return self.query
         return self.ack
     def get_query_slot(self, oid):
         return 0
@@ -102,6 +105,8 @@ class FakeMcu:
     def register_response(self, cb, name, oid):
         pass
     def query_start_state(self):
+        if self.query.sent:
+            return self.query.sent[-1][-1]
         cmds = [c for c in self.config_cmds if c.startswith("buttons_query")]
         return int(cmds[-1].rsplit("invert=", 1)[1])
 
@@ -150,6 +155,7 @@ class McuSide:
 def test_first_config_starts_released():
     printer, mcu, mb, unlock, filament = make_buttons()
     mb.build_config()
+    printer.send_event(RECONNECT)
     assert mcu.query_start_state() == INVERT, mcu.query_start_state()
 
 
@@ -161,13 +167,13 @@ def test_filament_removed_while_unplugged_arrives_on_reconnect():
     assert filament.states == [1], filament.states
     printer.send_event(DISCONNECT)            # umbilical out
     mb.build_config()                         # umbilical in: config resent
+    printer.send_event(RECONNECT)
     mcu_side = McuSide(mb)                    # the MCU restarted its counter
     # The MCU starts from what the host last saw: filament present.
     assert mcu.query_start_state() == raw_state(0, 1), mcu.query_start_state()
     # The switch now reads empty, which differs from that start, so the
     # MCU reports it, and the host sees the change.
     mcu_side.report(raw_state(0, 0))
-    printer.send_event(RECONNECT)
     assert filament.states == [1, 0], filament.states
     assert unlock.states == [], unlock.states
 
@@ -194,6 +200,7 @@ def test_unlock_button_keeps_upstream_start():
     assert unlock.states == [1], unlock.states
     printer.send_event(DISCONNECT)
     mb.build_config()
+    printer.send_event(RECONNECT)
     assert mcu.query_start_state() == raw_state(0, 0), \
         mcu.query_start_state()
 
@@ -289,7 +296,8 @@ def test_no_insert_action_while_unplugged_or_just_back():
     printer.reactor.now = 0.
     helper._handle_ready()
     printer.reactor.now = 3.
-    printer.send_event(RECONNECT)             # settled at 5.0
+    printer.send_event(RECONNECT)
+    edge(printer, helper, 3.1, False)         # first sample; settled at 5.1
     edge(printer, helper, 6.0, True)
     assert len(inserts(gcode)) == 1, gcode.scripts
     edge(printer, helper, 20.0, False)        # filament pulled out
@@ -297,7 +305,7 @@ def test_no_insert_action_while_unplugged_or_just_back():
     printer.send_event(DISCONNECT)            # umbilical out
     edge(printer, helper, 31.0, True)         # reading on the way out
     printer.reactor.now = 40.
-    printer.send_event(RECONNECT)             # back in, settled at 42.0
+    printer.send_event(RECONNECT)             # still waiting for a sample
     edge(printer, helper, 40.5, False)
     edge(printer, helper, 41.0, True)
     assert len(inserts(gcode)) == 1, gcode.scripts

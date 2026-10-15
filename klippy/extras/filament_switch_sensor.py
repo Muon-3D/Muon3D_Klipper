@@ -6,7 +6,7 @@
 import logging
 
 # MUON: how long to ignore insert/runout edges after the sensor's MCU
-# reconnects. Matches the grace _handle_ready gives at startup.
+# delivers its first debounced sample. Matches the startup grace.
 RECONNECT_SETTLE_TIME = 2.
 
 
@@ -35,6 +35,8 @@ class RunoutHelper:
         # MUON: no insert/runout actions before this time; held at NEVER
         # while the sensor's non-critical MCU is offline (note_sensor_mcu)
         self.settle_until = 0.
+        self.sample_ready = True
+        self.sensor_online = True
         self.filament_present = False
         self.sensor_enabled = True
         # Register commands and event handlers
@@ -54,14 +56,16 @@ class RunoutHelper:
         # is unreadable while that MCU is unplugged, and the first readings
         # after it reconnects describe what changed while it was away, not
         # filament going in or out now. Keep tracking the state, but take
-        # no insert/runout action until the MCU has been back for
-        # RECONNECT_SETTLE_TIME. The reconnect load belongs to the MCU's
+        # no insert/runout action until RECONNECT_SETTLE_TIME after its
+        # first debounced sample. The reconnect load belongs to the MCU's
         # connect macro (TOOLHEAD_CONNECT). insert_gcode stays armed.
         if not getattr(mcu, "is_non_critical", False):
             return
         # A non-critical MCU is always deferred at startup and arrives
         # through the reconnect event, so start out held.
         self.settle_until = self.reactor.NEVER
+        self.sample_ready = False
+        self.sensor_online = False
         self.printer.register_event_handler(
             mcu.get_non_critical_disconnect_event_name(),
             self._handle_mcu_disconnect)
@@ -70,8 +74,11 @@ class RunoutHelper:
             self._handle_mcu_reconnect)
     def _handle_mcu_disconnect(self):
         self.settle_until = self.reactor.NEVER
+        self.sample_ready = False
+        self.sensor_online = False
     def _handle_mcu_reconnect(self):
-        self.settle_until = self.reactor.monotonic() + RECONNECT_SETTLE_TIME
+        self._handle_mcu_disconnect()
+        self.sensor_online = True
     def _runout_event_handler(self, eventtime):
         # Pausing from inside an event requires that the pause portion
         # of pause_resume execute immediately.
@@ -91,6 +98,13 @@ class RunoutHelper:
             logging.exception("Script running error")
         self.min_event_systime = self.reactor.monotonic() + self.event_delay
     def note_filament_present(self, eventtime, is_filament_present):
+        if self.sensor_online and not self.sample_ready:
+            self.sample_ready = True
+            self.settle_until = (self.reactor.monotonic()
+                                 + RECONNECT_SETTLE_TIME)
+            logging.info("Filament Sensor %s: first post-reconnect sample,"
+                         " Time %.3f, present=%s", self.name,
+                         self.reactor.monotonic(), bool(is_filament_present))
         if is_filament_present == self.filament_present:
             return
         self.filament_present = is_filament_present
@@ -125,6 +139,7 @@ class RunoutHelper:
     def get_status(self, eventtime):
         return {
             "filament_detected": bool(self.filament_present),
+            "sample_ready": self.sample_ready,
             "enabled": bool(self.sensor_enabled)}
     cmd_QUERY_FILAMENT_SENSOR_help = "Query the status of the Filament Sensor"
     def cmd_QUERY_FILAMENT_SENSOR(self, gcmd):

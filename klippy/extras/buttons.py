@@ -25,17 +25,27 @@ class MCU_buttons:
         # reconnect (see _reset_state and build_config)
         self.resync_mask = 0
         self.ack_cmd = None
+        self.query_cmd = None
         self.ack_count = 0
+        self.first_report = True
+        self.generation = 0
         if getattr(self.mcu, "is_non_critical", False):
             printer.register_event_handler(
                 self.mcu.get_non_critical_disconnect_event_name(),
                 self._reset_state)
             printer.register_event_handler(
                 self.mcu.get_non_critical_reconnect_event_name(),
-                self._reset_state)
+                self._handle_reconnect)
+    def _handle_reconnect(self):
+        self._reset_state()
+        # Configuration can yield long enough for an init query to report
+        # before reconnect handlers run. Start sampling only after config.
+        self.query_cmd.send(self._query_params())
     def _reset_state(self):
         # MCU-side counters reset on reconnect - keep host-side counters aligned.
         self.ack_count = 0
+        self.first_report = True
+        self.generation += 1
         # MUON: a resync button keeps the state the host last saw. The MCU
         # starts from that state (build_config), so a change made while the
         # MCU was unplugged arrives as an edge instead of being lost. Other
@@ -66,19 +76,24 @@ class MCU_buttons:
         cmd_queue = self.mcu.alloc_command_queue()
         self.ack_cmd = self.mcu.lookup_command(
             "buttons_ack oid=%c count=%c", cq=cmd_queue)
-        clock = self.mcu.get_query_slot(self.oid)
-        rest_ticks = self.mcu.seconds_to_clock(QUERY_TIME)
-        # The MCU reports a pin only once it differs from this starting
-        # raw state. Upstream starts every pin "released" (raw == invert);
-        # a resync button starts from what the host last saw (MUON).
-        start_state = self.invert ^ self.last_button
-        self.mcu.add_config_cmd(
-            "buttons_query oid=%d clock=%d"
-            " rest_ticks=%d retransmit_count=%d invert=%d" % (
-                self.oid, clock, rest_ticks, RETRANSMIT_COUNT,
-                start_state), is_init=True)
+        self.query_cmd = self.mcu.lookup_command(
+            "buttons_query oid=%c clock=%u rest_ticks=%u"
+            " retransmit_count=%c invert=%c", cq=cmd_queue)
+        if not getattr(self.mcu, "is_non_critical", False):
+            self.mcu.add_config_cmd(
+                "buttons_query oid=%d clock=%d rest_ticks=%d"
+                " retransmit_count=%d invert=%d" % tuple(self._query_params()),
+                is_init=True)
         self.mcu.register_response(self.handle_buttons_state,
                                    "buttons_state", self.oid)
+    def _query_params(self):
+        clock = self.mcu.get_query_slot(self.oid)
+        rest_ticks = self.mcu.seconds_to_clock(QUERY_TIME)
+        # Matching firmware always reports the first sample. Retain the
+        # previous start state for debounce: resync pins keep the host's
+        # last state; other buttons start "released" (raw == invert).
+        start_state = self.invert ^ self.last_button
+        return [self.oid, clock, rest_ticks, RETRANSMIT_COUNT, start_state]
     def handle_buttons_state(self, params):
         # Expand the message ack_count from 8-bit
         ack_count = self.ack_count
@@ -99,12 +114,18 @@ class MCU_buttons:
         for button in new_buttons:
             button ^= self.invert
             changed = button ^ self.last_button
+            if self.first_report:
+                # Resync clients need a sample even if the pin is unchanged.
+                changed |= self.resync_mask
+                self.first_report = False
             self.last_button = button
             for mask, shift, callback in self.callbacks:
                 if changed & mask:
                     state = (button & mask) >> shift
                     self.reactor.register_async_callback(
-                        (lambda et, c=callback, bt=btime, s=state: c(bt, s)))
+                        (lambda et, c=callback, bt=btime, s=state,
+                         gen=self.generation:
+                         c(bt, s) if gen == self.generation else None))
 
 
 ######################################################################
@@ -278,6 +299,9 @@ class DebounceButton:
         self.logical_state = None
         self.physical_state = None
         self.latest_eventtime = None
+    def reset(self):
+        self.logical_state = self.physical_state = None
+        self.latest_eventtime = None
     def button_handler(self, eventtime, state):
         self.physical_state = state
         self.latest_eventtime = eventtime
@@ -287,6 +311,8 @@ class DebounceButton:
         trigger_time = eventtime + self.debounce_delay
         self.reactor.register_callback(self._debounce_event, trigger_time)
     def _debounce_event(self, eventtime):
+        if self.latest_eventtime is None:
+            return
         # if there would be no state transition, ignore the event:
         if self.logical_state == self.physical_state:
             return
@@ -316,8 +342,11 @@ class PrinterButtons:
     def register_debounce_button(self, pin, callback, config,
                                  resync_on_reconnect=False):
         debounce = DebounceButton(config, callback)
-        return self.register_buttons([pin], debounce.button_handler,
-                                     resync_on_reconnect)
+        mcu = self.register_buttons([pin], debounce.button_handler,
+                                    resync_on_reconnect)
+        if resync_on_reconnect:
+            mcu.register_config_callback(debounce.reset)
+        return mcu
     def register_debounce_adc_button(self, pin, min_val, max_val, pullup
                                      , callback, config):
         debounce = DebounceButton(config, callback)

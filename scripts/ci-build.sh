@@ -121,6 +121,9 @@ finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 start_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
 $PYTHON test/motion_queuing/test_reconnect_step_time.py
 $PYTHON test/filament_switch/test_reconnect_resync.py
+$PYTHON test/filament_switch/test_first_sample.py
+$PYTHON test/filament_switch/test_mcu_first_report.py
+$PYTHON test/serialqueue/test_unconfigured_commands.py
 finish_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).

@@ -17,6 +17,7 @@ struct buttons {
     uint8_t report_count, reports[8];
     uint8_t ack_count, retransmit_state, retransmit_count;
     uint8_t button_count;
+    uint8_t first_report;
     struct gpio_in pins[0];
 };
 
@@ -39,7 +40,16 @@ buttons_event(struct timer *t)
 
     // Check if any pins have changed since last time
     uint8_t diff = status ^ b->pressed;
-    if (diff) {
+    if (b->first_report) {
+        // Report a complete first reading even when no pin has changed.
+        if (status == b->last_pressed) {
+            b->pressed = status;
+            b->first_report = 0;
+            b->reports[b->report_count++] = status;
+            sched_wake_task(&buttons_wake);
+            b->retransmit_state = BF_PENDING;
+        }
+    } else if (diff) {
         // At least one pin has changed - do button debouncing
         uint8_t debounced = ~(status ^ b->last_pressed);
         if (diff & debounced) {
@@ -103,6 +113,7 @@ command_buttons_query(uint32_t *args)
     b->time.waketime = args[1];
     b->rest_ticks = args[2];
     b->pressed = b->last_pressed = args[4];
+    b->first_report = 1;
     b->ack_count = b->report_count = 0;
     b->retransmit_state = BF_ACKED;
     b->retransmit_count = args[3];
