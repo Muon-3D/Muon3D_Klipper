@@ -153,6 +153,37 @@ class ReconnectTest(unittest.TestCase):
         fixtures.edge(printer, helper, 4., False)
         self.assertEqual(gcode.scripts, ['RUNOUT\nM400'])
 
+    def test_registered_debounce_restarts_for_unchanged_sample(self):
+        printer, _, helper = fixtures.make_runout_helper()
+        mcu = fixtures.FakeMcu()
+
+        class Pins:
+            def lookup_pin(self, pin, **kw):
+                return {'chip': mcu, 'chip_name': 'toolhead', 'pin': pin,
+                        'invert': 0, 'pullup': 0}
+
+        printer.objects.update({'pins': Pins(), 'query_adc': object()})
+        config = fixtures.FakeConfig(printer, {'debounce_delay': .2})
+        registered = buttons.PrinterButtons(config)
+        registered.register_debounce_button(
+            'gpio3', helper.note_filament_present, config,
+            resync_on_reconnect=True)
+        mb = registered.mcu_buttons['toolhead']
+        for reconnect, sample in ((0., 1.55), (10., 11.55)):
+            printer.reactor.now = reconnect
+            printer.send_event(fixtures.DISCONNECT)
+            for cb in mcu.config_callbacks:
+                cb()
+            printer.send_event(fixtures.RECONNECT)
+            self.assertFalse(helper.sample_ready)
+            printer.reactor.now = sample
+            mb.handle_buttons_state({'ack_count': 0, 'state': b'\x01',
+                                     '#receive_time': sample})
+            printer.reactor.now = sample + .2
+            printer.reactor.run_callbacks()
+            self.assertTrue(helper.sample_ready,
+                            'unchanged pin must cross debounce each time')
+
 
 if __name__ == '__main__':
     unittest.main()

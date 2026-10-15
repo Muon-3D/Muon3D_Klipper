@@ -80,10 +80,11 @@ class FakeMcu:
     is_non_critical = True
     def __init__(self):
         self.config_cmds = []
+        self.config_callbacks = []
         self.ack = FakeCommand()
         self.query = FakeCommand()
     def register_config_callback(self, cb):
-        pass
+        self.config_callbacks.append(cb)
     def get_non_critical_disconnect_event_name(self):
         return DISCONNECT
     def get_non_critical_reconnect_event_name(self):
