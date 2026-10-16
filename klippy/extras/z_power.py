@@ -13,9 +13,9 @@
 #
 # Inputs: the Z_PRESENT lever divider (ADC, three bands), plate presence
 # from [bed_removal_detector] (the single owner of that judgement), the
-# eFuse PGOOD (digital) and IMON (ADC, current). Output: the eFuse enable. The bed heater refuses a target
-# unless the path is READY, and a PGOOD drop or a current fault latches the
-# path off until Z_POWER_RESET.
+# eFuse PGOOD (digital) and IMON (ADC, current). Output: the eFuse enable.
+# The bed heater refuses a target unless the path is READY, and a PGOOD drop
+# or a current fault latches the path off until Z_POWER_RESET.
 import logging
 
 POLL_INTERVAL = 0.1
