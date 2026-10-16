@@ -112,9 +112,13 @@ class FanModes:
         if factor is not None:
             gcode = self.printer.lookup_object('gcode')
             gcode.run_script_from_command("M220 S%.0f" % (factor * 100.,))
-        gcmd.respond_info("Print mode: %s (part fan %.0f%% commanded ->"
-                          " %.0f%%)" % (mode, self.commanded * 100.,
-                                        self.map_speed(self.commanded) * 100.))
+        if follow:
+            gcmd.respond_info("Print mode: %s (part fan %.0f%% commanded ->"
+                              " %.0f%%)" % (mode, self.commanded * 100.,
+                                            self.output * 100.))
+        else:
+            gcmd.respond_info("Print mode: %s (part fan left as it is: it"
+                              " was set directly, not by M106)" % (mode,))
         logging.info("fan_modes: mode %s", mode)
     def get_status(self, eventtime):
         return {'mode': self.mode,
