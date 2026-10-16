@@ -35,6 +35,22 @@ INHIBITED = 'inhibited'     # held off by Z_POWER_INHIBIT
 FAULT = 'fault'             # latched until Z_POWER_RESET
 
 
+# What is wrong and what to do about it, as shown to the user
+REASONS = {
+    ABSENT: "the Z column is not connected: fold the Z axis down into"
+            " the base",
+    UNLOCKED: "the Z column is not locked: push the locking lever down",
+    UNKNOWN: "the Z column sensor reading is not recognised (see"
+             " Z_POWER_STATUS)",
+    NO_PLATE: "no bed plate detected: attach the bed plate",
+    POWERING: "bed power is starting up",
+    INHIBITED: "bed power is held off (Z_POWER_INHIBIT ENABLE=0 releases"
+               " it)",
+    FAULT: "bed power fault: %s. Check the bed and its cable, then run"
+           " Z_POWER_RESET",
+}
+
+
 def decide(z_band, plate_present, fault, inhibited):
     """Pure decision: (state before PGOOD confirmation, reason, enable).
 
@@ -44,18 +60,18 @@ def decide(z_band, plate_present, fault, inhibited):
     'powering' into 'ready' once PGOOD confirms.
     """
     if fault:
-        return FAULT, "bed power fault: %s. Check the bed and its cable,"             " then run Z_POWER_RESET" % (fault,), False
+        return FAULT, REASONS[FAULT] % (fault,), False
     if inhibited:
-        return INHIBITED, "bed power is held off (Z_POWER_INHIBIT ENABLE=0"             " releases it)", False
+        return INHIBITED, REASONS[INHIBITED], False
     if z_band == 'absent':
-        return ABSENT, "the Z column is not connected: fold the Z axis"             " down into the base", False
+        return ABSENT, REASONS[ABSENT], False
     if z_band == 'unlocked':
-        return UNLOCKED, "the Z column is not locked: push the locking"             " lever down", False
+        return UNLOCKED, REASONS[UNLOCKED], False
     if z_band != 'locked':
-        return UNKNOWN, "the Z column sensor reading is not recognised"             " (see Z_POWER_STATUS)", False
+        return UNKNOWN, REASONS[UNKNOWN], False
     if not plate_present:
-        return NO_PLATE, "no bed plate detected: attach the bed plate", False
-    return POWERING, "bed power is starting up", True
+        return NO_PLATE, REASONS[NO_PLATE], False
+    return POWERING, REASONS[POWERING], True
 
 
 def classify_band(ratio, bands):
