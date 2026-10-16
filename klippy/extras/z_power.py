@@ -175,6 +175,10 @@ class ZPower:
                                desc=self.cmd_Z_POWER_RESET_help)
         gcode.register_command('Z_POWER_INHIBIT', self.cmd_Z_POWER_INHIBIT,
                                desc=self.cmd_Z_POWER_INHIBIT_help)
+        gcode.register_command('Z_POWER_WAIT', self.cmd_Z_POWER_WAIT,
+                               desc=self.cmd_Z_POWER_WAIT_help)
+        gcode.register_command('Z_POWER_REQUIRE', self.cmd_Z_POWER_REQUIRE,
+                               desc=self.cmd_Z_POWER_REQUIRE_help)
     def _get_range(self, config, option):
         vals = config.getfloatlist(option, count=2)
         lo, hi = vals
@@ -372,6 +376,19 @@ class ZPower:
         self.inhibited = bool(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
         gcmd.respond_info("Z power %s" % ("held off" if self.inhibited
                                           else "released"))
+
+    cmd_Z_POWER_WAIT_help = ("Wait up to TIMEOUT seconds for bed power to come"
+                             " up (never an error)")
+    def cmd_Z_POWER_WAIT(self, gcmd):
+        timeout = gcmd.get_float('TIMEOUT', 2., minval=0., maxval=30.)
+        end = self.reactor.monotonic() + timeout
+        while self.state != READY and self.reactor.monotonic() < end:
+            self.reactor.pause(self.reactor.monotonic() + POLL_INTERVAL)
+    cmd_Z_POWER_REQUIRE_help = "Raise an error unless bed power is on"
+    def cmd_Z_POWER_REQUIRE(self, gcmd):
+        if self.state != READY:
+            raise gcmd.error("%s: %s" % (gcmd.get('MSG', 'Bed power is off'),
+                                         self.reason))
 
 def load_config(config):
     return ZPower(config)
