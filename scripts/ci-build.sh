@@ -137,6 +137,10 @@ finish_test contact_guard "Test contact_guard decisions"
 start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
 $PYTHON test/muon_ads1220/test_muon_ads1220.py
 finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+# MUON: B1 Z/bed power path decisions and fault latching.
+start_test z_power "Test z_power decisions"
+$PYTHON test/z_power/test_z_power.py
+finish_test z_power "Test z_power decisions"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
