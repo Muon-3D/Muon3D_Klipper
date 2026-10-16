@@ -89,6 +89,13 @@ class StubHeater:
         return {'power': self.power}
 
 
+class StubDetector:
+    def __init__(self):
+        self.plate = True
+    def plate_present(self):
+        return self.plate
+
+
 class StubPrinter:
     command_error = CommandError
     def is_shutdown(self):
@@ -126,10 +133,7 @@ class Harness(unittest.TestCase):
         zp.over_since = zp.idle_over_since = None
         zp.heater_name = 'heater_bed'
         zp.heater = StubHeater()
-        zp.plate_absent_below, zp.plate_present_above = -15., -5.
-        zp.plate_max_temp = 150.
-        zp.plate = z_power.Debounce(1)
-        zp.last_plate_time = -1.
+        zp.detector = StubDetector()
         zp.power_good_timeout = 0.5
         zp.powering_since = None
         zp.state, zp.reason = UNKNOWN, "starting"
@@ -149,10 +153,9 @@ class Harness(unittest.TestCase):
         zp.heater.set_temp = guarded
         return zp
 
-    def tick(self, zp, t, ratio=0.1, temp=25.):
+    def tick(self, zp, t, ratio=0.1, plate=True):
         zp.present_ratio = ratio
-        zp.heater.last_temp = temp
-        zp.heater.last_temp_time = t
+        zp.detector.plate = plate
         zp._poll(t)
 
     def test_power_up_needs_pgood(self):
@@ -208,7 +211,7 @@ class Harness(unittest.TestCase):
         zp.power_good = True
         self.tick(zp, 1.1)
         zp.heater.set_temp(60.)
-        self.tick(zp, 1.2, temp=-24.)
+        self.tick(zp, 1.2, plate=False)
         self.assertEqual(zp.state, NO_PLATE)
         self.assertFalse(zp.enabled)
         self.assertEqual(zp.heater.target, 0.)
@@ -273,18 +276,11 @@ class Harness(unittest.TestCase):
         self.assertAlmostEqual(zp.current, 3.75, places=2)
 
 
-    def test_plate_hysteresis(self):
+    def test_unknown_plate_keeps_power_off(self):
         zp = self.make()
-        self.tick(zp, 1.0, temp=25.)
-        self.assertTrue(zp.plate.value)
-        self.tick(zp, 1.1, temp=-10.)          # inside the band: no change
-        self.assertTrue(zp.plate.value)
-        self.tick(zp, 1.2, temp=-24.)
-        self.assertFalse(zp.plate.value)
-        self.tick(zp, 1.3, temp=-10.)          # inside the band: stays absent
-        self.assertFalse(zp.plate.value)
-        self.tick(zp, 1.4, temp=0.)
-        self.assertTrue(zp.plate.value)
+        self.tick(zp, 1.0, plate=None)
+        self.assertEqual(zp.state, NO_PLATE)
+        self.assertFalse(zp.enabled)
 
     def test_reasons_say_what_to_do(self):
         self.assertIn('lever', z_power.decide('unlocked', True, None,
@@ -293,6 +289,62 @@ class Harness(unittest.TestCase):
                                                False)[1])
         self.assertIn('Z_POWER_RESET', z_power.decide('locked', True, 'x',
                                                       False)[1])
+
+
+class TestBedRemovalDetector(unittest.TestCase):
+    """The detector is the single owner of plate presence."""
+    def make(self):
+        from extras import bed_removal_detector as brd
+        import collections
+        d = brd.BedRemovalDetector.__new__(brd.BedRemovalDetector)
+        d.remove_thr, d.attach_thr = -15., -5.
+        d.window = collections.deque(maxlen=2)
+        d.last_sample_time = None
+        d.bed_heater = StubHeater()
+        d.bed_removed = False
+        d.plate_known = False
+        d.restore_target = None
+        d.removals = []
+        d.handle_bed_removal = lambda et: (d.removals.append(et),
+                                           setattr(d, 'bed_removed', True))
+        d.handle_bed_reconnection = lambda: setattr(d, 'bed_removed', False)
+        class PR:
+            is_paused = False
+        d.pause_resume = PR()
+        d.bed_check_interval = 0.1
+        return d
+
+    def feed(self, d, temps):
+        for i, temp in enumerate(temps):
+            d.bed_heater.last_temp = temp
+            d.bed_heater.last_temp_time += 0.3
+            d.check_bed_temperature(float(i))
+
+    def test_unknown_until_measured(self):
+        d = self.make()
+        self.assertIsNone(d.plate_present())
+        self.feed(d, [25.])
+        self.assertIsNone(d.plate_present())    # window not full yet
+        self.feed(d, [25.])
+        self.assertTrue(d.plate_present())
+
+    def test_boot_without_a_plate(self):
+        d = self.make()
+        self.feed(d, [-24., -24.])
+        self.assertFalse(d.plate_present())
+        self.assertEqual(len(d.removals), 1)
+
+    def test_boot_between_thresholds_stays_unknown(self):
+        d = self.make()
+        self.feed(d, [-10., -10.])
+        self.assertIsNone(d.plate_present())
+
+    def test_repeated_polls_of_one_sample_count_once(self):
+        d = self.make()
+        d.bed_heater.last_temp, d.bed_heater.last_temp_time = 25., 1.
+        for et in range(5):
+            d.check_bed_temperature(float(et))
+        self.assertEqual(len(d.window), 1)
 
 
 if __name__ == '__main__':

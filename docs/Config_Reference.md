@@ -4657,8 +4657,11 @@ run_current:
 Muon M1 B1 Z column and bed power path. The 48 V feed to the Z column and
 the removable bed passes through an eFuse whose enable this module drives.
 It switches the feed on only when the Z column is present with its lever
-locked (`present_pin`, a resistor divider read in three bands) and a plate
-reads on the bed thermistor, and off as soon as either stops being true.
+locked (`present_pin`, a resistor divider read in three bands) and
+`[bed_removal_detector]` reports a plate, and off as soon as either stops
+being true. Plate presence is the detector's judgement alone (it is
+unknown, and the feed stays off, until the detector has measured), so a
+`[bed_removal_detector]` section is required.
 The bed heater refuses a target unless the path is `ready`. The eFuse PGOOD
 must rise within `power_good_timeout` of enabling, and a later PGOOD drop,
 a current above `max_current`, or current drawn with the bed heater off
@@ -4702,18 +4705,7 @@ present_locked_range:
 #   Used for the reported power when no [tmc_driver_monitor] supply
 #   reading is available.
 #heater: heater_bed
-#   The heater whose thermistor detects the plate and whose target is
-#   gated.
-#plate_absent_below: -15
-#plate_present_above: -5
-#plate_max_temp: 150
-#plate_samples: 2
-#   The plate is judged on the heater's raw thermistor readings: absent
-#   below plate_absent_below or above plate_max_temp, present above
-#   plate_present_above, unchanged in between. A change needs
-#   plate_samples consecutive readings. The defaults match
-#   bed_removal_detector. An open circuit (no plate) reads about -20 to
-#   -26 C on the M1.
+#   The heater whose target is gated.
 #power_good_timeout: 0.5
 #   Seconds PGOOD has to rise after the enable is set.
 #lost_gcode:
