@@ -5624,6 +5624,15 @@ off from the tare to the end of each tap. The mcu range checks the hotend
 reading itself, and checks the chip's configuration registers on every
 temperature read.
 
+The rate reported to the load cell (1977 for sample_rate 2000, i.e.
+4.096MHz / 2072) is the chip's nominal conversion rate, which is what a
+probe's filters see: temperature reads pause while it is armed. Outside
+probing, `LOAD_CELL_DIAGNOSTIC` measures less: the temperature slices take
+about 1.3% of the samples with a PT1000 (or while detection is failing,
+which leaves the chip in PT1000 mode) and 0.7% with an NTC, and the
+internal oscillator may be up to 2% slow. `MUON_ADC_STATS` reports the
+two separately.
+
 ```
 [muon_ads1220 toolhead]
 cs_pin:

@@ -472,6 +472,27 @@ def test_tap_hold_follows_probe_window():
     hotend.release_tap_hold()
     assert not heater.pwm_holds
 
+######################################################################
+# G-code command names
+######################################################################
+
+def test_command_names_survive_the_gcode_parser():
+    # klippy/gcode.py splits a line at digits, so MUON_ADS1220_STATS was
+    # dispatched as "MUON_ADS" and could never be called (bench, 2026-10-16)
+    import re
+    src = open(os.path.join(KLIPPY, 'extras', 'muon_ads1220.py')).read()
+    names = re.findall(r'register_(?:mux_)?command\(\s*"([^"]+)"', src)
+    assert names, "no commands found"
+    gcode_src = open(os.path.join(KLIPPY, 'gcode.py')).read()
+    pattern = re.search(r"args_r = re\.compile\('([^']+)'\)",
+                        gcode_src).group(1)
+    args_r = re.compile(pattern)
+    for name in names:
+        parts = args_r.split((name + " CHIP=x").upper())
+        cmd = ''.join(parts[:3]).strip()
+        assert cmd == name, "%s is parsed as %r" % (name, cmd)
+
+
 def HOLD_REFUSES(heater):
     return bool(heater.pwm_holds.get(m.HOLD_DETECT))
 

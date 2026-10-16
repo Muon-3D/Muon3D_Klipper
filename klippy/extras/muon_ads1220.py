@@ -320,9 +320,11 @@ class MuonADS1220:
         printer.register_event_handler("load_cell_probe:tap_end",
                                        self._handle_tap_end)
         gcode = printer.lookup_object('gcode')
-        gcode.register_mux_command("MUON_ADS1220_STATS", "CHIP", self.name,
-                                   self.cmd_MUON_ADS1220_STATS,
-                                   desc=self.cmd_MUON_ADS1220_STATS_help)
+        # G-code command names cannot contain digits (the parser splits
+        # the word there), hence ADC rather than ADS1220
+        gcode.register_mux_command("MUON_ADC_STATS", "CHIP", self.name,
+                                   self.cmd_MUON_ADC_STATS,
+                                   desc=self.cmd_MUON_ADC_STATS_help)
 
     def _build_config(self):
         t, tick, stall_convs = self._clock_cfg
@@ -456,17 +458,41 @@ class MuonADS1220:
         return {'data': out, 'errors': 0,
                 'overflows': self.ffreader.get_last_overflows()}
 
-    cmd_MUON_ADS1220_STATS_help = "Report ADS1220 sampling statistics"
-    def cmd_MUON_ADS1220_STATS(self, gcmd):
+    # The chip's real conversion rate, from the host's clock tracking of
+    # the slot stream (one slot per conversion, slices included)
+    def get_measured_rate(self):
+        if not self.batch_bulk.is_started:
+            return None
+        try:
+            inv_freq = self.ffreader.clock_sync.get_time_translation()[2]
+        except ZeroDivisionError:
+            return None
+        return 1. / inv_freq if inv_freq > 0. else None
+
+    cmd_MUON_ADC_STATS_help = "Report the load cell/hotend ADC sampling stats"
+    def cmd_MUON_ADC_STATS(self, gcmd):
+        if self.mcu.is_fileoutput():
+            gcmd.respond_info("ADS1220 %s: no statistics in batch mode"
+                              % (self.name,))
+            return
         params = self.stats_cmd.send([self.oid])
         s = self.last_stats
-        gcmd.respond_info(
-            "ADS1220 %s: new=%s repeat=%s hold=%s filler=%s late=%s"
-            " temp=%d blind=%d overrun=%d stall=%d mode=%s" % (
-                self.name, s.get('new'), s.get('dup'), s.get('hold'),
-                s.get('filler'), s.get('late'), params['temp'],
-                params['blind'], params['overrun'], params['stall'],
-                MODE_NAMES.get(params['mode'], 'off')))
+        msg = ("ADS1220 %s: new=%s repeat=%s hold=%s filler=%s late=%s"
+               " temp=%d blind=%d overrun=%d stall=%d mode=%s" % (
+                   self.name, s.get('new'), s.get('dup'), s.get('hold'),
+                   s.get('filler'), s.get('late'), params['temp'],
+                   params['blind'], params['overrun'], params['stall'],
+                   MODE_NAMES.get(params['mode'], 'off')))
+        rate = self.get_measured_rate()
+        if rate is not None:
+            real = sum(s.get(k, 0) for k in ('new', 'dup', 'hold'))
+            slots = real + s.get('filler', 0)
+            delivered = rate * real / slots if slots else 0.
+            msg += ("\nconversion rate %.1f SPS (oscillator %+.2f%% of"
+                    " %d), delivered %.1f SPS after temperature slices"
+                    % (rate, 100. * (rate / self.sps - 1.), self.sps,
+                       delivered))
+        gcmd.respond_info(msg)
 
 ######################################################################
 # Load cell sensor (sensor_type: muon_ads1220)
