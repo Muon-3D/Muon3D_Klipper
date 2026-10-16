@@ -108,6 +108,9 @@ mads_sampler_init(struct mads_sampler *s, uint32_t conv_ticks
     s->conv_ticks = conv_ticks;
     s->conv_min_ticks = conv_min_ticks;
     s->conv_max_ticks = conv_max_ticks;
+    s->last_read_time = s->last_emit_time = s->last_conv_time = 0;
+    s->first_conv_time = s->dup_deadline = 0;
+    s->last_raw = 0;
     s->have_conv = s->in_segment = 0;
     s->dup_run = 0;
     s->n_new = s->n_dup = s->n_hold = s->n_filler = s->n_late = 0;

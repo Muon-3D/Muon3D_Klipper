@@ -131,7 +131,7 @@ run(const struct scenario *sc, int verbose)
     int32_t latest = 0;
     int latest_idx = -1;
     int32_t value = 1000;
-    double t;
+    double t = 0.;
     int k;
     double max_delay = 0., sum_delay = 0.;
     int n_delay = 0, failures = 0;
