@@ -92,12 +92,10 @@ class CommandQueryWrapper:
             cmd_queue = serial.get_default_command_queue()
         self._cmd_queue = cmd_queue
     def _do_send(self, cmds, minclock, reqclock, retry):
-        # Fail fast on non-critical MCUs that are offline (unless reconnecting).
+        # Fail before allocating a response waiter for an unavailable object.
         mcu = getattr(self._serial, "mcu", None)
-        if (mcu is not None and getattr(mcu, "is_non_critical", False)
-                and getattr(mcu, "non_critical_disconnected", False)
-                and not getattr(mcu, "_connecting", False)):
-            raise self._error("MCU '%s' is currently disconnected"
+        if any(self._serial._is_noncritical_blocked(c) for c in cmds):
+            raise self._error("MCU '%s' is disconnected or unconfigured"
                               % (mcu.get_name(),))
         xh = self._xmit_helper(self._serial, self._response, self._oid)
         reqclock = max(minclock, reqclock)
@@ -904,6 +902,7 @@ class MCUConnectHelper:
             or self._mcu.non_critical_disconnected):
             return
         self._mcu.non_critical_disconnected = True
+        self._mcu._configured = False
         self._mcu._connecting = False
         self._reconnect_delay = self.reconnect_interval
         # Stop any clock sync activity if the object supports it.
@@ -931,6 +930,7 @@ class MCUConnectHelper:
         if self._mcu._connecting:
             return eventtime + self.reconnect_interval
         self._mcu._connecting = True
+        self._mcu._configured = False
         try:
             # Forget the shutdown _handle_shutdown recorded. It describes the
             # previous connection, not the device: the MCU is about to be
@@ -963,6 +963,7 @@ class MCUConnectHelper:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
                          self._name, str(e))
             self._mcu.non_critical_disconnected = True
+            self._mcu._configured = False
             return eventtime + self._next_reconnect_delay()
         finally:
             self._mcu._connecting = False
@@ -1258,13 +1259,13 @@ class MCUConfigHelper:
                 logging.info("Sending MCU '%s' printer configuration...",
                              self._name)
                 for c in local_config_cmds:
-                    self._serial.send(c)
+                    self._serial.send(c, is_config=True)
             else:
                 for c in self._restart_cmds:
-                    self._serial.send(c)
+                    self._serial.send(c, is_config=True)
             # Transmit init messages
             for c in self._init_cmds:
-                self._serial.send(c)
+                self._serial.send(c, is_config=True)
         except msgproto.enumeration_error as e:
             enum_name, enum_value = e.get_enum_params()
             if enum_name == 'pin':
@@ -1323,6 +1324,7 @@ class MCUConfigHelper:
         logging.info(move_msg)
         log_info = self._conn_helper.log_info() + "\n" + move_msg
         self._printer.set_rollover_info(self._name, log_info, log=False)
+        self._mcu._configured = True
     def _mcu_identify(self):
         if (self._mcu.non_critical_disconnected
                 and not self._mcu._connecting):
@@ -1379,6 +1381,7 @@ class MCU:
             self._name = self._name[4:]
         self.is_non_critical = False
         self.non_critical_disconnected = False
+        self._configured = False
         # Low-level connection and helpers
         self._conn_helper = MCUConnectHelper(config, self, clocksync)
         self._serial = self._conn_helper.get_serial()
