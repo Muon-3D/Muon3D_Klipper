@@ -1,0 +1,26 @@
+# Tests for the Muon B1 shared load cell / hotend ADS1220
+DICTIONARY rp2040.dict
+CONFIG muon_ads1220.cfg
+
+# Start by homing the printer
+G28
+G1 F6000
+
+G1 Z5 X50 Y50
+
+# Single probe, then the M1's two-sample probe with a retract between taps
+PROBE
+G1 Z5
+PROBE SAMPLES=2 SAMPLE_RETRACT_DIST=0.4
+
+# A mesh is a long run of taps, each one a probe window
+G1 Z5
+BED_MESH_CALIBRATE
+
+# Detection status is reportable before the hotend is known
+MUON_HOTEND_STATUS HEATER=extruder
+
+# Heating stays refused until the hotend type has been detected
+M104 S0
+
+G1 Z9
