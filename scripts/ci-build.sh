@@ -55,6 +55,15 @@ finish_test check_macro_config "Check macro config"
 
 
 ######################################################################
+# Run the M1 LED state and user-mode macros through klippy's macro code
+######################################################################
+
+start_test m1_led_modes "Test M1 LED macros"
+$PYTHON scripts/test_m1_led_modes.py
+finish_test m1_led_modes "Test M1 LED macros"
+
+
+######################################################################
 # Check the M1 automatic filament load is still armed
 ######################################################################
 
