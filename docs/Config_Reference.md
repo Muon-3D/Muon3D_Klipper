@@ -4652,6 +4652,60 @@ run_current:
 #   sensorless homing.
 ```
 
+### [fan_modes]
+
+Print modes for the part fan. The slicer's commanded fan speed is mapped
+through the selected mode's curve before it reaches the fan, so a strong
+fan can be run at a fraction of what stock filament profiles ask for
+without editing every profile. `SET_PART_FAN SPEED=<0..1>` carries the
+commanded speed (an M106 macro calls it), and `SET_PRINT_MODE MODE=<mode>`
+selects the mode and re-applies the commanded speed under the new curve.
+The status object reports `mode`, `modes`, `commanded_speed` and
+`output_speed`.
+
+```
+[fan_modes]
+#fan: fan
+#   The [fan] section to drive. The default is "fan".
+#modes: normal, quiet, turbo
+#   The available modes. Each needs a <mode>_curve.
+#normal_curve:
+#   Comma separated commanded:output pairs, both 0..1, commanded
+#   increasing from 0 to 1, interpolated linearly. For example
+#   "0:0, 1:0.30" runs the fan at 30% when 100% is commanded.
+#default_mode: normal
+#   The mode at startup.
+#normal_speed_factor:
+#   Optional. When set, selecting the mode also sets the print speed
+#   factor (M220) to this value (1.0 = 100%).
+```
+
+### [tmc_driver_monitor]
+
+Die temperature and supply voltage of TMC2240 and TMC2241 drivers, read from
+their ADC_TEMP and ADC_VSUPPLY_AIN registers once a second whether or not the
+motor is enabled (the driver's own periodic check reads the temperature only
+while the motor is enabled). Adding this section registers the
+`tmc_driver` temperature sensor type, so it must appear before any section
+that uses it. The `tmc_driver_monitor` status object reports each monitored
+driver's `temperature` and `supply_voltage`, plus `max_temperature` and
+`min_supply_voltage` across them.
+
+```
+[tmc_driver_monitor]
+```
+
+A sensor reads one driver, or the hottest of several:
+
+```
+[temperature_sensor driver_x]
+sensor_type: tmc_driver
+sensor_stepper: stepper_x
+#   The stepper whose TMC2240/TMC2241 driver to read. A comma-separated
+#   list reports the hottest of them, for example to drive one fan from
+#   several drivers. This parameter must be provided.
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]
