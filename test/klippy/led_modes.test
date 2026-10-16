@@ -25,3 +25,39 @@ LED_MODE MODE=breathe H=90
 LED_READY
 LED_MODE MODE=status
 LED_READY
+
+# Review findings on #61, the parts with no timer in them. The timed
+# return after LED_COMPLETE is in scripts/test_m1_led_modes.py.
+# A mode chosen mid-print is saved and waits for LED_READY.
+LED_PRINTING
+LED_MODE MODE=solid H=30
+ASSERT_LED_STATE STATE=LED_PRINTING
+ASSERT_LED EFFECT=progress_left ENABLED=1
+ASSERT_LED EFFECT=muon_mode ENABLED=0
+LED_READY
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+ASSERT_LED EFFECT=progress_left ENABLED=0
+
+# LED_READY records READY with a user mode too, so going back to
+# 'status' shows ready, not the info effect from before.
+LED_INFO
+LED_READY
+ASSERT_LED_STATE STATE=LED_READY
+LED_MODE MODE=status
+ASSERT_LED EFFECT=ready ENABLED=1
+ASSERT_LED EFFECT=info ENABLED=0
+
+# The LED timeout covers a user mode: M=0 turns it off.
+LED_MODE MODE=solid H=30
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+LED_TIMEOUT_SET M=0
+ASSERT_LED EFFECT=muon_mode ENABLED=0
+LED_TIMEOUT_SET M=-1
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+
+# The end of a print shows the glow first; a mode change then shows now.
+LED_COMPLETE
+ASSERT_LED EFFECT=complete ENABLED=1
+LED_MODE MODE=status
+ASSERT_LED EFFECT=ready ENABLED=1
+ASSERT_LED EFFECT=complete ENABLED=0
