@@ -4652,6 +4652,32 @@ run_current:
 #   sensorless homing.
 ```
 
+### [tmc_driver_monitor]
+
+Die temperature and supply voltage of TMC2240 and TMC2241 drivers, read from
+their ADC_TEMP and ADC_VSUPPLY_AIN registers once a second whether or not the
+motor is enabled (the driver's own periodic check reads the temperature only
+while the motor is enabled). Adding this section registers the
+`tmc_driver` temperature sensor type, so it must appear before any section
+that uses it. The `tmc_driver_monitor` status object reports each monitored
+driver's `temperature` and `supply_voltage`, plus `max_temperature` and
+`min_supply_voltage` across them.
+
+```
+[tmc_driver_monitor]
+```
+
+A sensor reads one driver, or the hottest of several:
+
+```
+[temperature_sensor driver_x]
+sensor_type: tmc_driver
+sensor_stepper: stepper_x
+#   The stepper whose TMC2240/TMC2241 driver to read. A comma-separated
+#   list reports the hottest of them, for example to drive one fan from
+#   several drivers. This parameter must be provided.
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]
