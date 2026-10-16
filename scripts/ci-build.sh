@@ -132,6 +132,12 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: B1 shared load cell / hotend ADS1220: the mcu's no-DRDY sampling
+# against a modelled chip, hotend detection, range limits, heater hold.
+start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+$PYTHON test/muon_ads1220/test_muon_ads1220.py
+finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
