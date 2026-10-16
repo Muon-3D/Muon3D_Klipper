@@ -192,8 +192,9 @@ class RunoutHelperTest(unittest.TestCase):
 
         helper.note_filament_present(100., True)
 
-        self.assertEqual({'filament_detected': True, 'enabled': False},
-                         helper.get_status(100.))
+        status = helper.get_status(100.)
+        self.assertIs(True, status['filament_detected'])
+        self.assertIs(False, status['enabled'])
         self.assertEqual([], printer.reactor.callbacks)
 
     def test_initialization_grace_blocks_insert(self):
