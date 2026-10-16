@@ -46,6 +46,14 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
 
+# The prompt a hot-end fan fault puts on the panel and in Fluidd.
+FAULT_PROMPT = [
+    'action:prompt_begin Hot-end fan fault',
+    'action:prompt_text Hot-end fan fault - check the fan, then confirm. '
+    'Heating and resume are blocked until you do.',
+    'action:prompt_footer_button Fan checked|HOTEND_FAN_FAULT_CLEAR|warning',
+    'action:prompt_show']
+
 
 class FailingLedEffect:
     """A led_effect that records SET_LED_EFFECT in the timeline, and can
@@ -102,8 +110,12 @@ class M1:
         printer.add_object('stepper_enable', Status(
             {'steppers': {'extruder': True}}))
         printer.add_object('heaters', Status({}))
-        printer.add_object('configfile', Status(
-            {'settings': {'extruder': {'max_temp': 265.0}}}))
+        # PRINT_START reads these while it renders, before its first line.
+        printer.add_object('configfile', Status({'settings': {
+            'extruder': {'max_temp': 265.0},
+            'load_cell_probe': {'z_offset': 0.0},
+            'bed_mesh': {'mesh_min': [10.0, 7.0],
+                         'mesh_max': [190.0, 170.0]}}}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
         printer.add_object('filament_switch_sensor filament_sensor_toolhead',
                            Status({'filament_detected': False}))
@@ -203,6 +215,16 @@ class M1:
         names = self.names()
         led = [i for i, n in enumerate(names) if n in LED_COMMANDS]
         return led[0] if led else None
+
+    def prompt_lines(self):
+        """The action:prompt lines since the last prompt_begin."""
+        lines = [line.split('MSG=', 1)[1].strip('"')
+                 for line in self.timeline
+                 if line.upper().startswith('RESPOND') and 'action:prompt'
+                 in line]
+        begins = [i for i, line in enumerate(lines)
+                  if line.startswith('action:prompt_begin')]
+        return lines[begins[-1]:] if begins else []
 
     def index(self, name):
         names = self.names()
@@ -359,18 +381,19 @@ class ResumeRefusedWithADeadFan(_M1TestCase):
         self.run_failing_script(script)
         self.assertNotIn('M104', self.m1.names())
         self.assertNotIn('RESUME_BASE', self.m1.names())
-        # Nothing ran before the refusal: no LEDs (LED_PRINTING), no bed
-        # reheat, no prompt taken down.
+        # Nothing ran before the refusal but the fault prompt: no LEDs
+        # (LED_PRINTING), no bed reheat.
         self.assertNotIn('SET_LED_EFFECT', self.m1.names())
         self.assertNotIn('M190', self.m1.names())
-        self.assertNotIn('RESPOND', self.m1.names())
+        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
         self.assertEqual(self.m1.extruder['target'], 0.)
         self.assertTrue(self.m1.pause_resume['is_paused'])
 
     def run_failing_script(self, script):
         with self.assertRaises(gcode.CommandError):
             self.m1.run(script)
-        self.assertTrue(any('Resume refused' in r
+        self.assertTrue(any('Resume refused' in r and 'Fan checked' in r
+                            and 'HOTEND_FAN_FAULT_CLEAR' in r
                             for r in self.m1.responses))
         self.m1.responses.clear()
         self.log.records.clear()
@@ -528,6 +551,9 @@ class _FanCheckTestCase(_M1TestCase):
         v = self.m1.macro_vars('HOTEND_FAN_CHECK')
         return v['hotend_stop_count'], v['sensor_bad_count']
 
+    def fault(self):
+        return self.m1.macro_vars('HOTEND_FAN_CHECK')['fault_latched']
+
     def fan_dead(self):
         # Flat out and losing: past over_temp_c (51 C at a 215 C nozzle)
         # and 21 C over its air.
@@ -567,11 +593,14 @@ class SensorLatchHolds(_FanCheckTestCase):
         self.assertEqual(self.counts()[1], 3)
         self.resume_refused()
 
-    def test_clears_when_the_reading_is_plausible_again(self):
+    def test_a_plausible_reading_resets_the_counter_not_the_fault(self):
         self.m1.extruder['temperature'] = 95.
         self.m1.heatsink.update(temperature=40.0, speed=0.3)
         self.check()
         self.assertEqual(self.counts()[1], 0)
+        self.assertEqual(self.fault(), 1)
+        self.resume_refused()
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
         self.m1.timeline.clear()
         self.m1.run('RESUME')
         self.assertIn('M104 S215.0', self.m1.timeline)
@@ -630,22 +659,265 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
                 self.assert_cut()
 
     def test_unlock_release(self):
-        # The press saved 215; the stall happened during the hold.
+        # The press saved 215 and the fault came during the hold. The
+        # release itself no longer reheats while the fault stands, and the
+        # check would cut it if it did.
         self.m1.run('SET_GCODE_VARIABLE MACRO=TOOLHEAD_UMBILICAL_UNLOCK_BUTTON'
                     '_PRESSED VARIABLE=saved_hotend_target VALUE=215.0')
         self.m1.run('SET_GCODE_VARIABLE MACRO=TOOLHEAD_UMBILICAL_UNLOCK_BUTTON'
                     '_PRESSED VARIABLE=changed_hotend_target VALUE=1')
         self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED')
-        self.assertEqual(self.m1.extruder['target'], 215.)
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.assertTrue(any('NOT reheated' in r for r in self.m1.responses))
+        self.m1.responses.clear()
         self.assert_cut()
 
-    def test_heat_is_not_cut_once_the_fault_clears(self):
+    def test_one_normal_reading_does_not_clear_the_fault(self):
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.check(5)
+        self.assertEqual(self.counts()[0], 0)
+        self.assertEqual(self.fault(), 1)
+        self.m1.run('M104 S215')
+        self.assert_cut()
+
+    def test_heat_is_not_cut_once_the_fault_is_cleared(self):
         self.m1.heatsink.update(temperature=40.0, speed=0.3)
         self.check()
-        self.assertEqual(self.counts()[0], 0)
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
         self.m1.run('M104 S215')
         self.check()
         self.assertEqual(self.m1.extruder['target'], 215.)
+
+
+class StickyFanFault(_FanCheckTestCase):
+    """Jack, 17 Oct: a hot-end fan trip latches until someone confirms on
+    the panel (HOTEND_FAN_FAULT_CLEAR, the Fan checked button)."""
+
+    def test_an_over_temperature_trip_latches_and_asks(self):
+        self.fan_dead()
+        self.trip()
+        self.assertEqual(self.fault(), 1)
+        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
+
+    def test_a_sensor_trip_latches_and_asks(self):
+        self.sensor_open()
+        self.trip()
+        self.assertEqual(self.fault(), 1)
+        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
+
+    def test_clear_refused_while_the_heatsink_is_hot(self):
+        self.fan_dead()
+        self.trip()
+        self.refuse_clear('51C or more')
+
+    def test_clear_refused_while_the_sensor_is_open(self):
+        self.sensor_open()
+        self.trip()
+        self.m1.extruder['temperature'] = 95.
+        self.check()
+        self.refuse_clear('not plausible')
+
+    def test_clear_once_checked(self):
+        self.fan_dead()
+        self.trip()
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.check()
+        self.m1.timeline.clear()
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.fault(), 0)
+        self.assertEqual(self.counts(), (0, 0))
+        self.assertIn('RESPOND TYPE=command MSG="action:prompt_end"',
+                      self.m1.timeline)
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertIn('M104 S215.0', self.m1.timeline)
+        # Still dead: the check trips again once the heat is back.
+        self.fan_dead()
+        self.trip()
+        self.assertEqual(self.fault(), 1)
+
+    def test_clear_with_nothing_latched(self):
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.fault(), 0)
+        self.assertTrue(any('No hot-end fan fault' in r
+                            for r in self.m1.responses))
+        self.m1.responses.clear()
+
+    def test_print_start_refused(self):
+        self.fan_dead()
+        self.trip()
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.check()
+        self.m1.run('CANCEL_PRINT')
+        self.m1.print_stats['state'] = 'printing'
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA')
+        self.assertTrue(any('Print refused' in r and 'Fan checked' in r
+                            for r in self.m1.responses))
+        self.assertNotIn('M104', self.m1.names())
+        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+    def refuse_clear(self, why):
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.fault(), 1)
+        self.assertTrue(any(why in r for r in self.m1.responses),
+                        self.m1.responses)
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+
+class UnlockReleaseRestoresOnce(_FanCheckTestCase):
+    """Jack, 17 Oct: the unlock release turns the heater back on, but only
+    once, only while no fan fault stands, and not after a stall, a cancel
+    or a pulled toolhead during the hold."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm_unlock()
+
+    def press(self):
+        self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def release(self):
+        self.m1.timeline.clear()
+        self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED')
+        return [line for line in self.m1.timeline
+                if line.split()[0] in ('M104', 'SET_STEPPER_ENABLE')]
+
+    def test_a_normal_press_and_release(self):
+        self.press()
+        self.assertEqual(self.release(), [
+            'SET_STEPPER_ENABLE STEPPER=extruder ENABLE=1', 'M104 S215.0'])
+        self.assertEqual(self.m1.extruder['target'], 215.)
+
+    def test_p3_a_stall_during_the_hold(self):
+        self.press()
+        self.fan_dead()
+        self.check(3)
+        self.assertEqual(self.fault(), 1)
+        self.assertNotIn('M104 S215.0', self.release())
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def test_p4_a_cancel_during_the_hold(self):
+        self.press()
+        self.m1.run('CANCEL_PRINT')
+        self.assertEqual(self.release(), [])
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def test_p6_a_second_release(self):
+        self.press()
+        self.release()
+        self.m1.run('M104 S0')
+        self.assertEqual(self.release(), [])
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def test_p5_toolhead_pulled_while_held(self):
+        # klippy's own button debouncing (extras/buttons.py), driven the
+        # way the toolhead MCU does: press, the toolhead is pulled while the
+        # button is held, it is reattached, then pressed and released.
+        events = []
+        presses = ButtonSim(events)
+        presses.report(0)
+        self.assertEqual(events, ['PRESS'])
+        self.press()
+        presses.disconnect()
+        self.m1.run('TOOLHEAD_DISCONNECT')
+        presses.reconnect()
+        self.m1.run('TOOLHEAD_CONNECT')
+        self.arm_unlock()
+        self.m1.run('CANCEL_PRINT')
+        self.m1.print_stats['state'] = 'standby'
+        presses.report(0)
+        presses.report(1)
+        # The press after reattach is swallowed; only its release fires.
+        self.assertEqual(events, ['PRESS', 'RELEASE'])
+        self.assertEqual(self.release(), [])
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+
+class ButtonSim:
+    """klippy's MCU_buttons and DebounceButton for one inverted pin, with
+    the non-critical toolhead disconnect and reconnect events."""
+
+    def __init__(self, events):
+        from extras import buttons
+
+        class Reactor:
+            def register_callback(self, callback, waketime):
+                callback(waketime)
+
+            def register_async_callback(self, callback):
+                callback(0.)
+
+        class Printer:
+            def __init__(self):
+                self.handlers = {}
+                self.reactor = Reactor()
+
+            def get_reactor(self):
+                return self.reactor
+
+            def register_event_handler(self, name, callback):
+                self.handlers.setdefault(name, []).append(callback)
+
+            def send(self, name):
+                for callback in self.handlers.get(name, []):
+                    callback()
+
+        class Mcu:
+            is_non_critical = True
+
+            def register_config_callback(self, callback):
+                pass
+
+            def get_non_critical_disconnect_event_name(self):
+                return 'toolhead:disconnect'
+
+            def get_non_critical_reconnect_event_name(self):
+                return 'toolhead:reconnect'
+
+        class Config:
+            def __init__(self, printer):
+                self.printer = printer
+
+            def get_printer(self):
+                return self.printer
+
+            def getfloat(self, name, default, minval=None):
+                return 0.05
+
+        class Ack:
+            def send(self, args):
+                pass
+
+        self.printer = Printer()
+        self.mcu_buttons = buttons.MCU_buttons(self.printer, Mcu())
+        debounce = buttons.DebounceButton(
+            Config(self.printer),
+            lambda t, state: events.append('PRESS' if state else 'RELEASE'))
+        self.mcu_buttons.setup_buttons(
+            [{'pin': 'gpio5', 'invert': 1, 'pullup': 0}],
+            debounce.button_handler)
+        self.mcu_buttons.ack_cmd = Ack()
+        self.mcu_buttons.oid = 0
+        self.time = 0.
+
+    def report(self, raw):
+        self.time += 1.
+        self.mcu_buttons.handle_buttons_state({
+            'ack_count': self.mcu_buttons.ack_count & 0xff,
+            'state': bytes([raw]), '#receive_time': self.time})
+
+    def disconnect(self):
+        self.printer.send('toolhead:disconnect')
+
+    def reconnect(self):
+        self.printer.send('toolhead:reconnect')
 
 
 if __name__ == '__main__':
