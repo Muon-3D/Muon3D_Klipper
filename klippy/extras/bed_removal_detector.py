@@ -7,9 +7,16 @@ class BedRemovalDetector:
         # thresholds
         self.remove_thr = config.getfloat('remove_threshold', -15.0)
         self.attach_thr = config.getfloat('attach_threshold', -5.0)
-        # buffer settings
-        buffer_len = config.getint('buffer_length', 5)
+        # Decide on fresh raw thermistor samples, not on the smoothed
+        # temperature polled every interval. The smoothed value (smooth_time
+        # 1.0) lags a pulled plate by most of a second, and the bed sensor
+        # only reports every 0.3 s, so a window of polls mostly held repeats
+        # of one sample. Two fresh samples is ~0.6 s from pull to decision,
+        # well inside the ~2 s before [verify_heater] would trip on the open
+        # reading. z_power uses the same thresholds to gate the bed feed.
+        buffer_len = config.getint('buffer_length', 2, minval=1)
         self.window = collections.deque(maxlen=buffer_len)
+        self.last_sample_time = None
         # check interval
         self.bed_check_interval = config.getfloat('interval', 0.1)
 
@@ -40,8 +47,10 @@ class BedRemovalDetector:
                       self.bed_check_interval)
 
     def check_bed_temperature(self, eventtime):
-        raw_temp, _ = self.bed_heater.get_temp(eventtime)
-        self.window.append(raw_temp)
+        heater = self.bed_heater
+        if heater.last_temp_time != self.last_sample_time:
+            self.last_sample_time = heater.last_temp_time
+            self.window.append(heater.last_temp)
 
         if (self.restore_target is not None and not self.bed_removed
                 and not self.pause_resume.is_paused):

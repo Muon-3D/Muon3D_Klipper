@@ -4704,12 +4704,16 @@ present_locked_range:
 #heater: heater_bed
 #   The heater whose thermistor detects the plate and whose target is
 #   gated.
-#plate_min_temp: -10
+#plate_absent_below: -15
+#plate_present_above: -5
 #plate_max_temp: 150
 #plate_samples: 2
-#   A plate is present while the heater's raw reading is within this
-#   range for plate_samples consecutive readings. An open circuit (no
-#   plate) reads well below plate_min_temp.
+#   The plate is judged on the heater's raw thermistor readings: absent
+#   below plate_absent_below or above plate_max_temp, present above
+#   plate_present_above, unchanged in between. A change needs
+#   plate_samples consecutive readings. The defaults match
+#   bed_removal_detector. An open circuit (no plate) reads about -20 to
+#   -26 C on the M1.
 #power_good_timeout: 0.5
 #   Seconds PGOOD has to rise after the enable is set.
 #lost_gcode:
