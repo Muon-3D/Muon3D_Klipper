@@ -60,6 +60,8 @@ finish_test check_macro_config "Check macro config"
 
 start_test m1_led_modes "Test M1 LED macros"
 $PYTHON scripts/test_m1_led_modes.py
+# KAN-569: on fault paths the hot end turns off before any LED command.
+$PYTHON scripts/test_m1_heater_before_leds.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
