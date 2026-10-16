@@ -1,0 +1,18 @@
+# Tests for fan_modes print modes
+DICTIONARY atmega2560.dict
+CONFIG fan_modes.cfg
+
+; Commanded speed through the default (normal) curve
+SET_PART_FAN SPEED=1
+SET_PART_FAN SPEED=0.5
+SET_PRINT_MODE
+
+; Switching mode re-applies the commanded speed under the new curve
+SET_PRINT_MODE MODE=quiet
+SET_PRINT_MODE MODE=turbo
+SET_PRINT_MODE MODE=normal
+
+; The raw path is untouched and the off command still works
+M106 S128
+M107
+SET_PART_FAN SPEED=0
