@@ -115,8 +115,12 @@ class ZPower:
             lo, hi = self._get_range(config, 'present_%s_range' % (band,))
             self.bands.append((band, (lo, hi)))
         self.z_band = Debounce(config.getint('present_samples', 3, minval=1))
-        # IMON current (optional)
+        # IMON current (optional). IMON reads a small non-zero value with
+        # the feed off (~0.11 A equivalent on gimlet), so the zero is learnt
+        # while the enable is off and subtracted while it is on.
         self.current = None
+        self.raw_current = None
+        self.current_offset = None
         self.current_scale = (config.getfloat('adc_voltage', 3.3, above=0.)
                               * config.getfloat('current_per_volt', 2.24,
                                                 above=0.))
@@ -200,7 +204,17 @@ class ZPower:
     def _present_callback(self, read_time, read_value):
         self.present_ratio = read_value
     def _current_callback(self, read_time, read_value):
-        self.current = read_value * self.current_scale
+        self.raw_current = read_value * self.current_scale
+    def _update_current(self):
+        raw = self.raw_current
+        if raw is None:
+            return
+        if not self.enabled:
+            if self.current_offset is None:
+                self.current_offset = raw
+            else:
+                self.current_offset += (raw - self.current_offset) * 0.1
+        self.current = max(0., raw - (self.current_offset or 0.))
     # Main loop
     def _plate_present(self):
         heater = self.heater
@@ -255,6 +269,7 @@ class ZPower:
             band = self.z_band.update(classify_band(self.present_ratio,
                                                     self.bands))
         plate = self._plate_present()
+        self._update_current()
         if self.enabled:
             self._check_current(eventtime)
         state, reason, enable = decide(band, plate, self.fault,

@@ -118,6 +118,8 @@ class Harness(unittest.TestCase):
         zp.bands = BANDS
         zp.z_band = z_power.Debounce(1)
         zp.current = None
+        zp.raw_current = None
+        zp.current_offset = None
         zp.max_current, zp.max_current_time = 5.0, 0.5
         zp.idle_current, zp.idle_current_time = 1.0, 2.0
         zp.supply_voltage = 45.
@@ -226,7 +228,7 @@ class Harness(unittest.TestCase):
         self.tick(zp, 1.0)
         zp.power_good = True
         self.tick(zp, 1.1)
-        zp.current = 2.0
+        zp.raw_current = 2.0
         self.tick(zp, 1.2)
         self.tick(zp, 3.3)
         self.assertEqual(zp.state, FAULT)
@@ -238,7 +240,7 @@ class Harness(unittest.TestCase):
         zp.power_good = True
         self.tick(zp, 1.1)
         zp.heater.power = 1.0
-        zp.current = 3.7
+        zp.raw_current = 3.7
         for t in (1.2, 2.0, 3.0, 4.0):
             self.tick(zp, t)
         self.assertEqual(zp.state, READY)
@@ -249,11 +251,25 @@ class Harness(unittest.TestCase):
         zp.power_good = True
         self.tick(zp, 1.1)
         zp.heater.power = 1.0
-        zp.current = 5.8
+        zp.raw_current = 5.8
         self.tick(zp, 1.2)
         self.tick(zp, 1.8)
         self.assertEqual(zp.state, FAULT)
         self.assertIn('overcurrent', zp.fault)
+
+    def test_imon_offset_is_learnt_while_off(self):
+        zp = self.make()
+        zp.raw_current = 0.11
+        for t in (0.1, 0.2, 0.3):
+            self.tick(zp, t, ratio=0.99)        # absent: feed off
+        self.assertAlmostEqual(zp.current, 0., places=3)
+        self.tick(zp, 1.0)                      # locked: feed comes on
+        zp.power_good = True
+        self.tick(zp, 1.1)
+        zp.heater.power = 1.0
+        zp.raw_current = 3.86
+        self.tick(zp, 1.2)
+        self.assertAlmostEqual(zp.current, 3.75, places=2)
 
 
 if __name__ == '__main__':
