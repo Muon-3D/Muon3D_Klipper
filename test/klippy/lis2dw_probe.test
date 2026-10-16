@@ -1,0 +1,25 @@
+# Test case for adxl345_probe X/Y tap homing on a LIS2DW12
+CONFIG lis2dw_probe.cfg
+DICTIONARY linuxprocess.dict
+
+# Home each tap axis separately, then all together
+G28 X
+G28 Y
+G28 Z
+G28
+
+# Moves after homing
+G1 F6000
+G1 X50 Y50
+G1 X0 Y0
+
+# Re-home a single axis mid-session
+G28 X
+G1 X10
+
+# Tap tuning commands used by the B1 threshold sweep
+SET_ACCEL_PROBE AXIS=X TAP_THRESH=17500 TAP_DUR=0.01
+SET_ACCEL_PROBE AXIS=Y TAP_AXES=xy
+SET_ACCEL_PROBE
+G28 X
+G28 Y
