@@ -1762,6 +1762,24 @@ print.
 #### SDCARD_RESET_FILE
 `SDCARD_RESET_FILE`: Unload file and clear SD state.
 
+### [z_power]
+
+The following commands are available when a
+[z_power config section](Config_Reference.md#z_power) is enabled.
+
+#### Z_POWER_STATUS
+`Z_POWER_STATUS`: Report the bed power path state and why, the Z_PRESENT
+ADC ratio and the band it falls in, whether a plate is detected, the
+eFuse enable and PGOOD, and the current and power drawn.
+
+#### Z_POWER_RESET
+`Z_POWER_RESET`: Clear a latched fault. The feed comes back up on its own
+if the Z column, lever and plate allow it.
+
+#### Z_POWER_INHIBIT
+`Z_POWER_INHIBIT [ENABLE=<0|1>]`: Hold the feed off (`ENABLE=1`, the
+default) for service, or release it (`ENABLE=0`).
+
 ### [z_thermal_adjust]
 
 The following commands are available when the
