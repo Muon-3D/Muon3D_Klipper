@@ -28,15 +28,18 @@ LED_READY
 
 # Review findings on #61, the parts with no timer in them. The timed
 # return after LED_COMPLETE is in scripts/test_m1_led_modes.py.
-# A mode chosen mid-print is saved and waits for LED_READY.
+# This config has no print_stats, so no print is running: a mode chosen
+# while a print's effect is left lit shows now (KAN-568). Deferral
+# during a running print is in scripts/test_m1_led_modes.py.
 LED_PRINTING
 LED_MODE MODE=solid H=30
-ASSERT_LED_STATE STATE=LED_PRINTING
-ASSERT_LED EFFECT=progress_left ENABLED=1
-ASSERT_LED EFFECT=muon_mode ENABLED=0
-LED_READY
+ASSERT_LED_STATE STATE=LED_READY
 ASSERT_LED EFFECT=muon_mode ENABLED=1
 ASSERT_LED EFFECT=progress_left ENABLED=0
+LED_INFO
+LED_MODE MODE=solid H=30
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+ASSERT_LED EFFECT=info ENABLED=0
 
 # LED_READY records READY with a user mode too, so going back to
 # 'status' shows ready, not the info effect from before.

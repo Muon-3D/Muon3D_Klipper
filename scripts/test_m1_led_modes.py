@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Behaviour tests for the M1 LED state macros and the user LED mode
-# (KAN-480): core/M1/macros/led.cfg, led_modes.cfg, and the LED call in
-# print.cfg's PRINT_END.
+# (KAN-480, KAN-568): core/M1/macros/led.cfg and led_modes.cfg, and the
+# LED calls in print.cfg (PRINT_END, CANCEL_PRINT, PAUSE, RESUME,
+# _ON_PRINT_ERROR) and filament.cfg (UNLOAD_FILAMENT, the load prompts).
 #
 #   python3 scripts/test_m1_led_modes.py      (or: pytest <this file>)
 #
@@ -11,10 +12,11 @@
 # and SaveVariables. That means Klipper's single-brace Jinja environment,
 # its render-then-run order, macro recursion limits and literal_eval'd
 # variables are the real ones, not a copy. The reactor is a fake whose
-# clock the test moves, so delayed_gcode timers fire on demand. Only the
-# led_effect objects (enabled flag and REPLACE overlap, nothing rendered
-# to a pixel) and the motion and heater commands PRINT_END emits are
-# stubbed.
+# clock the test moves, so delayed_gcode timers fire on demand. Stubbed:
+# the led_effect objects (enabled flag and REPLACE overlap, nothing
+# rendered to a pixel), the motion, heater and prompt commands the macros
+# emit, and the builtins CANCEL_PRINT, PAUSE and RESUME, which the macros
+# rename to *_BASE through GCodeMacro's own rename_existing path.
 import contextlib
 import logging
 import os
@@ -32,13 +34,18 @@ import gcode  # noqa: E402
 from extras import delayed_gcode, gcode_macro, save_variables  # noqa: E402
 
 # The files under test, as core/M1/macros/macros.cfg includes them.
-INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg')
+INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'filament.cfg')
 
-# Commands PRINT_END sends that are not defined by the files above.
-# Recorded, otherwise ignored. Anything else unknown is an error.
+# Commands the macros send that the files above don't define, plus
+# CUT_FILAMENT, which they do but which only moves. Recorded, otherwise
+# ignored. Anything else unknown is an error.
 STUB_COMMANDS = ('SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'M400', 'G92',
                  'G1', 'G0', 'G90', 'G91', 'M107', 'M84', 'TURN_OFF_HEATERS',
-                 'CUT_FILAMENT')
+                 'CUT_FILAMENT', 'M104', 'M83', 'G4', 'M300', 'M117',
+                 'TEMPERATURE_WAIT', 'RESPOND', 'CLEAR_PAUSE')
+
+# What PRINT_END must always reach: heaters, part fan, motors off.
+SHUTDOWN = ('TURN_OFF_HEATERS', 'M107', 'M84')
 
 # The M1 neopixel chains are 40 LEDs each. A bare chain name in a
 # led_effect's leds: covers all of them.
@@ -221,6 +228,9 @@ class FakeLedEffect:
         self.enabled = False
         self.layers = None
         self.params = None
+        # Set by a test to make SET_LED_EFFECT raise, as a broken effect
+        # or template would.
+        self.fail = False
         effects.append(self)
         printer = config.get_printer()
         printer.register_event_handler('klippy:ready', self._handle_ready)
@@ -235,6 +245,8 @@ class FakeLedEffect:
         self.enabled = self.auto_start
 
     def cmd_SET_LED_EFFECT(self, gcmd):
+        if self.fail:
+            raise gcmd.error("led_effect %s: failing on purpose" % self.name)
         if gcmd.get_int('STOP', 0) >= 1:
             self.enabled = False
             return
@@ -257,7 +269,7 @@ class FakeLedEffect:
 class M1Leds:
     """The LED macros loaded into a klippy that has reached ready."""
 
-    def __init__(self, variables_file):
+    def __init__(self, variables_file, includes=INCLUDES):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
         self.gcode = gcode.GCodeDispatch(printer)
@@ -276,15 +288,24 @@ class M1Leds:
             'homed_axes': 'xyz', 'estimated_print_time': 0.}))
         printer.add_object('extruder', Status({
             'can_extrude': True, 'target': 0., 'temperature': 215.}))
+        printer.add_object('heaters', Status({}))
+        self.print_stats = {'state': 'standby'}
+        printer.add_object('print_stats', Status(self.print_stats))
+        self.pause_resume = {'is_paused': False}
+        printer.add_object('pause_resume', Status(self.pause_resume))
 
         self.stubbed = []
         for name in STUB_COMMANDS:
             self.gcode.register_command(name, self._stub)
         self.gcode.register_command('STOP_LED_EFFECTS',
                                     self.cmd_STOP_LED_EFFECTS)
+        # The builtins print.cfg renames on klippy:connect.
+        self.gcode.register_command('CANCEL_PRINT', self._base_cancel)
+        self.gcode.register_command('PAUSE', self._base_pause)
+        self.gcode.register_command('RESUME', self._base_resume)
 
         top = os.path.join(MACROS, '_test_m1_led_modes.cfg')
-        data = ''.join('[include %s]\n' % (name,) for name in INCLUDES)
+        data = ''.join('[include %s]\n' % (name,) for name in includes)
         reader = configfile.ConfigFileReader()
         fileconfig = reader.build_fileconfig_with_includes(data, top)
         self.effects = []
@@ -292,8 +313,7 @@ class M1Leds:
             config = FakeConfig(printer, fileconfig, section)
             kind, _, name = section.partition(' ')
             if kind == 'gcode_macro':
-                if (fileconfig.has_option(section, 'rename_existing')
-                        or name.upper() in STUB_COMMANDS):
+                if name.upper() in STUB_COMMANDS:
                     continue
                 obj = gcode_macro.GCodeMacro(config)
             elif kind == 'delayed_gcode':
@@ -303,11 +323,39 @@ class M1Leds:
             else:
                 continue
             printer.add_object(section, obj)
+        printer.send_event('klippy:connect')
         printer.send_event('klippy:ready')
         self.responses.clear()
 
     def _stub(self, gcmd):
         self.stubbed.append(gcmd.get_commandline())
+
+    def _base_cancel(self, gcmd):
+        self.stubbed.append('CANCEL_PRINT_BASE')
+        self.print_stats['state'] = 'cancelled'
+
+    def _base_pause(self, gcmd):
+        self.stubbed.append('PAUSE_BASE')
+        if not self.pause_resume['is_paused']:
+            self.pause_resume['is_paused'] = True
+            self.print_stats['state'] = 'paused'
+
+    def _base_resume(self, gcmd):
+        self.stubbed.append('RESUME_BASE')
+        if self.pause_resume['is_paused']:
+            self.pause_resume['is_paused'] = False
+            self.print_stats['state'] = 'printing'
+
+    def job(self, state):
+        """Set print_stats.state, as virtual_sdcard would."""
+        self.print_stats['state'] = state
+
+    def commands(self):
+        """The stubbed commands run so far, by name."""
+        return [c.split()[0].upper() for c in self.stubbed if c.strip()]
+
+    def effect(self, name):
+        return self.printer.lookup_object('led_effect ' + name)
 
     def cmd_STOP_LED_EFFECTS(self, gcmd):
         # The M1 macros never pass LEDS=, so every effect stops.
@@ -375,8 +423,20 @@ class LedTestCase(unittest.TestCase):
         self.assertEqual(self.leds.printer.shutdowns, [])
 
     def print_end(self):
+        """PRINT_END as a print file runs it, then the file ends."""
         self.leds.run('PRINT_END')
-        self.assertIn('TURN_OFF_HEATERS', self.leds.stubbed)
+        for name in SHUTDOWN:
+            self.assertIn(name, self.leds.commands())
+        if self.leds.print_stats['state'] == 'printing':
+            self.leds.job('complete')
+
+    def expect_error(self, script):
+        """Run script, which must raise; forget the error it reported."""
+        with self.assertRaises(gcode.CommandError):
+            self.leds.run(script)
+        self.assertTrue(self.leds.errors())
+        self.leds.responses.clear()
+        self.log.records.clear()
 
 
 class HarnessCanFail(LedTestCase):
@@ -393,13 +453,23 @@ class HarnessCanFail(LedTestCase):
         self.leds.responses.clear()
 
     def test_a_raising_timer_is_seen(self):
-        # DelayedGcode logs and swallows a template that raises, with no
-        # '!!' response, so tearDown checks the log as well.
-        self.leds.run('SAVE_VARIABLE VARIABLE=muon_led VALUE="{\'mode\': 1}"')
-        self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE DURATION=1')
+        # DelayedGcode logs and swallows what its script raises, so
+        # tearDown checks the responses and the log.
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.leds.effect('muon_mode').fail = True
+        self.leds.run('SET_GCODE_VARIABLE MACRO=LED_TIMEOUT_STATE '
+                      'VARIABLE=laststate VALUE="\'LED_COMPLETE\'"')
+        self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_COMPLETE_DONE '
+                      'DURATION=1')
         self.leds.wait(2)
+        self.assertTrue(self.leds.errors())
         records, self.log.records = self.log.records, []
-        self.assertTrue(any('_LED_MODE_RESTORE' in r for r in records))
+        self.assertTrue(records)
+        self.leds.responses.clear()
+
+    def test_an_effect_can_be_made_to_fail(self):
+        self.leds.effect('info').fail = True
+        self.expect_error('LED_INFO')
 
 
 class StatusModeUnchanged(LedTestCase):
@@ -436,7 +506,12 @@ class StatusModeUnchanged(LedTestCase):
 
 
 class ModeChangeWhileBusy(LedTestCase):
-    """Finding 1: LED_MODE during a status effect saves, and defers."""
+    """#61 finding 1: LED_MODE during a print's own effect saves, and
+    defers."""
+
+    def setUp(self):
+        super().setUp()
+        self.leds.job('printing')
 
     def test_mid_print_keeps_the_progress_display(self):
         self.leds.run('LED_SETUP_PROGRESS')
@@ -486,12 +561,13 @@ class ModeChangeWhileBusy(LedTestCase):
 
 
 class ModeAfterPrintEnd(LedTestCase):
-    """Finding 2: the selected mode comes back after a print."""
+    """#61 finding 2: the selected mode comes back after a print."""
 
     def setUp(self):
         super().setUp()
         self.leds.run('LED_MODE MODE=gradient H=30 H2=210')
         self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.leds.job('printing')
         self.leds.run('LED_SETUP_PROGRESS')
         self.leds.run('LED_PRINTING')
 
@@ -544,7 +620,7 @@ class ModeAfterPrintEnd(LedTestCase):
 
 
 class CustomReadyRecordsState(LedTestCase):
-    """Finding 3: LED_READY records READY whatever the idle look is."""
+    """#61 finding 3: LED_READY records READY whatever the idle look is."""
 
     def test_status_after_custom_ready_does_not_resume_info(self):
         self.leds.run('LED_MODE MODE=solid H=30')
@@ -565,7 +641,7 @@ class CustomReadyRecordsState(LedTestCase):
 
 
 class CustomModeTimeout(LedTestCase):
-    """Finding 4: the LED timeout applies to a custom idle mode."""
+    """#61 finding 4: the LED timeout applies to a custom idle mode."""
 
     def setUp(self):
         super().setUp()
@@ -599,6 +675,227 @@ class CustomModeTimeout(LedTestCase):
         self.leds.run('LED_TIMEOUT_SET M=-1')
         self.leds.wait(3600)
         self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+
+class LedsNeverBlockShutdown(LedTestCase):
+    """KAN-568 S1: no LED macro stands between the end of a print and the
+    heaters, part fan and motors turning off."""
+
+    def setUp(self):
+        super().setUp()
+        self.leds.job('printing')
+        self.leds.run('LED_SETUP_PROGRESS')
+        self.leds.run('LED_PRINTING')
+
+    def assert_shut_down(self):
+        done = self.leds.commands()
+        for name in SHUTDOWN:
+            self.assertIn(name, done)
+
+    def test_a_negative_complete_hold_cannot_raise(self):
+        for mode in ('solid', 'status'):
+            with self.subTest(mode=mode):
+                self.leds.stubbed.clear()
+                self.leds.run('LED_MODE MODE=%s' % (mode,))
+                self.leds.run('SET_GCODE_VARIABLE MACRO=LED_MODE '
+                              'VARIABLE=complete_hold VALUE=-1')
+                self.leds.run('PRINT_END')
+                self.assert_shut_down()
+                self.assertEqual(self.leds.lit(), {'complete'})
+                # Clamped to 0: no return, so the glow stays.
+                self.leds.wait(3600)
+                self.assertEqual(self.leds.lit(), {'complete'})
+
+    def test_print_end_shuts_down_when_an_led_macro_raises(self):
+        self.leds.effect('complete').fail = True
+        self.expect_error('PRINT_END')
+        self.assert_shut_down()
+        self.assertIn('RESTORE_GCODE_STATE', self.leds.commands())
+
+    def test_cancel_print_shuts_down_when_an_led_macro_raises(self):
+        self.leds.effect('complete').fail = True
+        self.expect_error('CANCEL_PRINT')
+        self.assertIn('CANCEL_PRINT_BASE', self.leds.commands())
+        self.assert_shut_down()
+
+    def test_cancel_print_ends_on_the_glow(self):
+        self.leds.run('CANCEL_PRINT')
+        self.assert_shut_down()
+        self.assertEqual(self.leds.lit(), {'complete'})
+        self.assertEqual(self.leds.print_stats['state'], 'cancelled')
+
+    def test_a_print_error_turns_the_heaters_off_first(self):
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.leds.effect('muon_mode').fail = True
+        self.expect_error('_ON_PRINT_ERROR')
+        self.assertIn('TURN_OFF_HEATERS', self.leds.commands())
+
+
+class ConnectPulseRestoresState(LedTestCase):
+    """KAN-568 S2: the LED_CONNECTED pulse goes back to the state it
+    interrupted, and never records READY on its own."""
+
+    def start_print(self):
+        self.leds.job('printing')
+        self.leds.run('LED_SETUP_PROGRESS')
+        self.leds.run('LED_PRINTING')
+
+    def test_connect_mid_print(self):
+        for mode in ('status', 'solid'):
+            with self.subTest(mode=mode):
+                self.leds.job('standby')
+                self.leds.run('LED_READY')
+                self.leds.run('LED_MODE MODE=%s H=30' % (mode,))
+                self.start_print()
+                self.leds.run('LED_CONNECTED')
+                self.assertEqual(self.leds.lit(), {'connected'})
+                self.leds.wait(1)
+                self.assertEqual(self.leds.lit(), PROGRESS)
+                self.assertEqual(self.leds.laststate(), 'LED_PRINTING')
+                # So a mode chosen now still waits.
+                self.leds.run('LED_MODE MODE=rainbow')
+                self.assertEqual(self.leds.lit(), PROGRESS)
+
+    def test_disconnect_mid_print_shows_the_pause(self):
+        # TOOLHEAD_DISCONNECT: LED_CONNECTED, then PAUSE while printing.
+        for mode in ('status', 'solid'):
+            with self.subTest(mode=mode):
+                self.leds.job('standby')
+                self.leds.run('LED_READY')
+                self.leds.run('LED_MODE MODE=%s H=30' % (mode,))
+                self.start_print()
+                self.leds.run('LED_CONNECTED')
+                self.leds.run('PAUSE')
+                self.leds.wait(1)
+                self.assertEqual(self.leds.lit(), {'info'})
+                self.assertEqual(self.leds.laststate(), 'LED_INFO')
+                self.leds.run('RESUME')
+                self.assertEqual(self.leds.lit(), PROGRESS)
+                self.assertEqual(self.leds.print_stats['state'], 'printing')
+
+    def test_connect_when_idle(self):
+        self.leds.run('LED_CONNECTED')
+        self.leds.wait(1)
+        self.assertEqual(self.leds.lit(), {'ready'})
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.leds.run('LED_CONNECTED')
+        self.leds.wait(1)
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+    def test_connect_during_the_glow_after_a_print(self):
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.start_print()
+        self.print_end()
+        self.leds.wait(10)
+        self.leds.run('LED_CONNECTED')
+        self.leds.wait(1)
+        self.assertEqual(self.leds.lit(), {'complete'})
+        self.leds.wait(600)
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+
+class ModeShowsWhenNoPrint(LedTestCase):
+    """KAN-568 S3: with no print running or paused, a chosen mode shows
+    whatever state an unload, a prompt or a failed print left."""
+
+    def test_after_an_unload(self):
+        self.leds.run('UNLOAD_FILAMENT TEMP=250')
+        self.assertEqual(self.leds.laststate(), 'LED_INFO')
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.laststate(), 'LED_READY')
+
+    def test_after_a_dismissed_filament_prompt(self):
+        for prompt in ('FILAMENT_INSERT_MODE_PROMPT',
+                       'FILAMENT_INSERT_LOAD_FAILED_PROMPT'):
+            with self.subTest(prompt=prompt):
+                self.leds.run('LED_MODE MODE=status')
+                self.leds.run(prompt)
+                self.assertEqual(self.leds.lit(), {'info'})
+                self.leds.run('LED_MODE MODE=chase H=0 H2=180')
+                self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+    def test_after_a_failed_print(self):
+        self.leds.job('printing')
+        self.leds.run('LED_SETUP_PROGRESS')
+        self.leds.run('_ON_PRINT_ERROR')
+        self.assertIn('TURN_OFF_HEATERS', self.leds.commands())
+        # 'status' keeps what the failed print left lit, as before.
+        self.assertEqual(self.leds.lit(), SETUP)
+        self.leds.job('error')
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+    def test_a_mode_chosen_during_a_print_that_fails(self):
+        self.leds.job('printing')
+        self.leds.run('LED_PRINTING')
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.assertEqual(self.leds.lit(), PROGRESS)
+        self.leds.run('_ON_PRINT_ERROR')
+        self.assertIn('TURN_OFF_HEATERS', self.leds.commands())
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.laststate(), 'LED_READY')
+
+    def test_a_paused_print_still_defers(self):
+        self.leds.job('printing')
+        self.leds.run('LED_PRINTING')
+        self.leds.run('PAUSE')
+        self.leds.run('LED_MODE MODE=solid H=30')
+        self.assertEqual(self.leds.lit(), {'info'})
+        self.leds.run('RESUME')
+        self.assertEqual(self.leds.lit(), PROGRESS)
+
+
+class SavedModeAndStandalone(LedTestCase):
+    """KAN-568 nits: a bad saved mode, and led.cfg on its own."""
+
+    def restore(self, value):
+        self.leds.run('SAVE_VARIABLE VARIABLE=muon_led VALUE="%s"' % (value,))
+        self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE DURATION=1')
+        self.leds.wait(2)
+
+    def test_an_unknown_saved_mode_is_status(self):
+        self.restore("{'mode': 'neon', 'h': 10, 'h2': 20, 'bright': 50, "
+                     "'speed': 50}")
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'], 'status')
+        self.assertEqual(self.leds.lit(), {'ready'})
+
+    def test_missing_saved_numbers_keep_the_defaults(self):
+        self.restore("{'mode': 'solid'}")
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'], 'solid')
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['h'], 0.)
+        self.assertEqual(self.leds.lit(), {'muon_mode'})
+
+    def test_a_good_saved_mode_is_restored(self):
+        self.restore("{'mode': 'breathe', 'h': 90, 'h2': 180, "
+                     "'bright': 40, 'speed': 30}")
+        self.assertEqual(self.leds.mode_params()['MODE'], 'breathe')
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['bright'], 40.)
+
+
+class LedCfgWithoutModes(unittest.TestCase):
+    """KAN-568 nit: led.cfg (and print.cfg) work without led_modes.cfg."""
+
+    def test_status_behaviour_without_led_modes(self):
+        log = _ErrorLog()
+        logging.getLogger().addHandler(log)
+        self.addCleanup(logging.getLogger().removeHandler, log)
+        with tempfile.TemporaryDirectory() as tmp:
+            leds = M1Leds(os.path.join(tmp, 'variables.cfg'),
+                          includes=('led.cfg', 'print.cfg'))
+            leds.run('LED_INFO')
+            leds.run('LED_READY')
+            self.assertEqual(leds.lit(), {'ready'})
+            leds.job('printing')
+            leds.run('LED_PRINTING')
+            leds.run('LED_CONNECTED')
+            leds.wait(1)
+            self.assertEqual(leds.lit(), PROGRESS)
+            leds.run('PRINT_END')
+            self.assertEqual(leds.lit(), {'complete'})
+            leds.run('_ON_PRINT_ERROR')
+            self.assertEqual(leds.errors(), [])
+        self.assertEqual(log.records, [])
 
 
 if __name__ == '__main__':
