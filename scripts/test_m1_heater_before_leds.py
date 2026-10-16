@@ -41,7 +41,7 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'M118', 'RESPOND', 'FORCE_MOVE', 'SET_STEPPER_ENABLE',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
-         'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT')
+         'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
@@ -107,6 +107,17 @@ class M1:
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
         printer.add_object('filament_switch_sensor filament_sensor_toolhead',
                            Status({'filament_detected': False}))
+        # What HOTEND_FAN_CHECK reads: a healthy, idle heatsink fan.
+        self.heatsink = {'temperature': 40.0, 'speed': 0.3, 'rpm': 0.0}
+        printer.add_object('temperature_fan toolhead_heatsink',
+                           Status(self.heatsink))
+        self.fan_air = {'temperature': 35.0}
+        printer.add_object('temperature_sensor toolhead_fan_air',
+                           Status(self.fan_air))
+        printer.add_object('mcu toolhead',
+                           Status({'non_critical_disconnected': False}))
+        self.bed_detector = {'bedRemoved': False, 'restoreTarget': 60.0}
+        printer.add_object('bed_removal_detector', Status(self.bed_detector))
         # Names of stubbed commands a test wants to raise.
         self.raising = set()
 
@@ -344,17 +355,22 @@ class ResumeRefusedWithADeadFan(_M1TestCase):
                         'VARIABLE=%s VALUE=%d' % (name, value))
         self.m1.timeline.clear()
 
-    def assert_refused(self):
-        self.run_failing_script('RESUME')
+    def assert_refused(self, script='RESUME'):
+        self.run_failing_script(script)
         self.assertNotIn('M104', self.m1.names())
         self.assertNotIn('RESUME_BASE', self.m1.names())
+        # Nothing ran before the refusal: no LEDs (LED_PRINTING), no bed
+        # reheat, no prompt taken down.
+        self.assertNotIn('SET_LED_EFFECT', self.m1.names())
+        self.assertNotIn('M190', self.m1.names())
+        self.assertNotIn('RESPOND', self.m1.names())
         self.assertEqual(self.m1.extruder['target'], 0.)
         self.assertTrue(self.m1.pause_resume['is_paused'])
 
     def run_failing_script(self, script):
         with self.assertRaises(gcode.CommandError):
             self.m1.run(script)
-        self.assertTrue(any('RESUME refused' in r
+        self.assertTrue(any('Resume refused' in r
                             for r in self.m1.responses))
         self.m1.responses.clear()
         self.log.records.clear()
@@ -371,6 +387,10 @@ class ResumeRefusedWithADeadFan(_M1TestCase):
         self.m1.run('PAUSE')
         self.stall(hotend_stop_count=3)
         self.assert_refused()
+
+    def test_bed_resume_button_refused_before_reheating_the_bed(self):
+        self.stall(hotend_stop_count=3)
+        self.assert_refused('_BED_RESUME_NOW')
 
     def test_allowed_once_the_fault_clears(self):
         self.stall(hotend_stop_count=2)
@@ -495,6 +515,137 @@ class PauseTargetIsChecked(_M1TestCase):
         self.m1.run('PAUSE')
         self.assertEqual(self.m1.macro_vars('PAUSE')['saved_hotend_target'],
                          215.)
+
+
+class _FanCheckTestCase(_M1TestCase):
+    """Runs the real HOTEND_FAN_CHECK against a heatsink the test sets."""
+
+    def check(self, times=1):
+        for _ in range(times):
+            self.m1.run('HOTEND_FAN_CHECK')
+
+    def counts(self):
+        v = self.m1.macro_vars('HOTEND_FAN_CHECK')
+        return v['hotend_stop_count'], v['sensor_bad_count']
+
+    def fan_dead(self):
+        # Flat out and losing: past over_temp_c (51 C at a 215 C nozzle)
+        # and 21 C over its air.
+        self.m1.heatsink.update(temperature=56.0, speed=1.0)
+
+    def sensor_open(self):
+        # Open circuit reads about -35 C; the curve then commands 0.
+        self.m1.heatsink.update(temperature=-35.0, speed=0.0)
+
+    def trip(self):
+        self.check(3)
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.assertTrue(self.m1.pause_resume['is_paused'])
+
+    def resume_refused(self):
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('RESUME')
+        self.assertNotIn('M104', self.m1.names())
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+
+class SensorLatchHolds(_FanCheckTestCase):
+    """#73 c9adca81 review B: an open heatsink sensor stays latched after
+    the nozzle cools, so RESUME stays refused."""
+
+    def setUp(self):
+        super().setUp()
+        self.sensor_open()
+        self.trip()
+        self.assertEqual(self.counts()[1], 3)
+
+    def test_stays_latched_after_the_nozzle_cools(self):
+        self.m1.extruder['temperature'] = 95.
+        self.check(5)
+        self.assertEqual(self.counts()[1], 3)
+        self.resume_refused()
+
+    def test_clears_when_the_reading_is_plausible_again(self):
+        self.m1.extruder['temperature'] = 95.
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.check()
+        self.assertEqual(self.counts()[1], 0)
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertIn('M104 S215.0', self.m1.timeline)
+
+    def test_a_preheat_with_the_sensor_still_open_is_cut(self):
+        self.m1.extruder['temperature'] = 95.
+        self.check()
+        self.m1.run('M104 S215')
+        self.check()
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+
+class LatchedFaultCutsHeat(_FanCheckTestCase):
+    """#73 c9adca81 review S-2: while the fan check is latched and the fault
+    still holds, any heat request is cut at the next check. Each entry point
+    heats with M104 or SET_HEATER_TEMPERATURE (print.cfg, filament.cfg);
+    each test issues the command that entry point sends, except the unlock
+    release, which runs for real."""
+
+    def setUp(self):
+        super().setUp()
+        self.fan_dead()
+        self.trip()
+
+    def assert_cut(self):
+        self.check()
+        self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def test_print_start_after_a_cancel(self):
+        self.m1.run('CANCEL_PRINT')
+        self.assertFalse(self.m1.pause_resume['is_paused'])
+        # A new print: PRINT_START's M104 S{PREHEAT_EXTRUDER_TEMP}.
+        self.m1.print_stats['state'] = 'printing'
+        self.m1.timeline.clear()
+        self.m1.run('M104 S215')
+        self.assert_cut()
+        # And the new print is paused.
+        self.assertIn('PAUSE_BASE', self.m1.names())
+
+    def test_unload_from_the_m600_prompt(self):
+        # UNLOAD_FILAMENT TEMP=250: M104 S{EXTRUDER_TEMP}, while paused.
+        self.m1.run('M104 S250')
+        self.assert_cut()
+
+    def test_load_filament_purge(self):
+        # FILAMENT_INSERT_FULL_PURGE: M104 S{EXTRUDER_TEMP}.
+        self.m1.print_stats['state'] = 'standby'
+        self.m1.run('M104 S240')
+        self.assert_cut()
+
+    def test_console_preheat(self):
+        for command in ('M104 S215',
+                        'SET_HEATER_TEMPERATURE HEATER=extruder TARGET=215'):
+            with self.subTest(command=command):
+                self.m1.run(command)
+                self.assert_cut()
+
+    def test_unlock_release(self):
+        # The press saved 215; the stall happened during the hold.
+        self.m1.run('SET_GCODE_VARIABLE MACRO=TOOLHEAD_UMBILICAL_UNLOCK_BUTTON'
+                    '_PRESSED VARIABLE=saved_hotend_target VALUE=215.0')
+        self.m1.run('SET_GCODE_VARIABLE MACRO=TOOLHEAD_UMBILICAL_UNLOCK_BUTTON'
+                    '_PRESSED VARIABLE=changed_hotend_target VALUE=1')
+        self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED')
+        self.assertEqual(self.m1.extruder['target'], 215.)
+        self.assert_cut()
+
+    def test_heat_is_not_cut_once_the_fault_clears(self):
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.check()
+        self.assertEqual(self.counts()[0], 0)
+        self.m1.run('M104 S215')
+        self.check()
+        self.assertEqual(self.m1.extruder['target'], 215.)
 
 
 if __name__ == '__main__':
