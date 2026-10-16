@@ -955,12 +955,14 @@ The following commands are available when a
 [muon_ads1220 config section](Config_Reference.md#muon-b1-shared-ads1220-muon_ads1220)
 is enabled.
 
-#### MUON_ADS1220_STATS
-`MUON_ADS1220_STATS CHIP=<name>`: Report how the mcu has been sampling
+#### MUON_ADC_STATS
+`MUON_ADC_STATS CHIP=<name>`: Report how the mcu has been sampling
 the chip since it was configured: new conversions, repeated codes, held
 copies and empty slots, late reads (a conversion may have been lost),
 temperature reads, reads taken while a probe was armed, timer overruns,
-stalls and the hotend excitation mode.
+stalls and the hotend excitation mode. While the load cell is streaming
+it also reports the chip's measured conversion rate (and so its internal
+oscillator error) and the rate delivered after temperature slices.
 
 #### MUON_HOTEND_STATUS
 `MUON_HOTEND_STATUS HEATER=<heater>`: Report the detected hotend type,
