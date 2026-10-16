@@ -32,6 +32,10 @@ class BedRemovalDetector:
         self.pause_resume = self.printer.load_object(config, 'pause_resume')
 
         self.bed_removed = False
+        # False until the readings have said one way or the other. bed_removed
+        # starts False, which would otherwise read as "plate present" before
+        # anything was measured -- z_power must not power the bed on that.
+        self.plate_known = False
         # None means no removal is outstanding. Distinct from 0., which means
         # a removal happened while the bed was genuinely off.
         self.restore_target = None
@@ -65,9 +69,12 @@ class BedRemovalDetector:
         if len(self.window) == self.window.maxlen:
             avg_temp = sum(self.window) / len(self.window)
             if not self.bed_removed and avg_temp < self.remove_thr:
+                self.plate_known = True
                 self.handle_bed_removal(eventtime)
             elif self.bed_removed and avg_temp > self.attach_thr:
                 self.handle_bed_reconnection()
+            elif not self.plate_known and avg_temp > self.attach_thr:
+                self.plate_known = True
 
         return eventtime + self.bed_check_interval
 
@@ -133,11 +140,20 @@ class BedRemovalDetector:
             lambda et: self._run_macro(et, 'BED_ATTACHED'))
         self.log.info('Bed attached, monitoring resumed')
 
+    def plate_present(self):
+        """True or False once measured, None before (or between thresholds
+        at startup). The single source of plate presence: z_power gates the
+        bed feed on it."""
+        if not self.plate_known:
+            return None
+        return not self.bed_removed
+
     def get_status(self, eventtime):
         # restore_target is read by _BED_RESUME_NOW to put the bed back where
         # it was before resuming. The macro only compares it against zero, so
         # "no removal outstanding" is published as 0. rather than as None.
         return {'bedRemoved': self.bed_removed,
+                'plateKnown': self.plate_known,
                 'restoreTarget': self.restore_target or 0.}
 
 

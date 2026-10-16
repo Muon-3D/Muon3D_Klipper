@@ -11,9 +11,9 @@
 # stops being true. With the plate off, the bed-side contacts are not left
 # live at 48 V; with the column out, the Z connector is not either.
 #
-# Inputs: the Z_PRESENT lever divider (ADC, three bands), the bed heater's
-# own thermistor (plate present), the eFuse PGOOD (digital) and IMON
-# (ADC, current). Output: the eFuse enable. The bed heater refuses a target
+# Inputs: the Z_PRESENT lever divider (ADC, three bands), plate presence
+# from [bed_removal_detector] (the single owner of that judgement), the
+# eFuse PGOOD (digital) and IMON (ADC, current). Output: the eFuse enable. The bed heater refuses a target
 # unless the path is READY, and a PGOOD drop or a current fault latches the
 # path off until Z_POWER_RESET.
 import logging
@@ -35,6 +35,22 @@ INHIBITED = 'inhibited'     # held off by Z_POWER_INHIBIT
 FAULT = 'fault'             # latched until Z_POWER_RESET
 
 
+# What is wrong and what to do about it, as shown to the user
+REASONS = {
+    ABSENT: "the Z column is not connected: fold the Z axis down into"
+            " the base",
+    UNLOCKED: "the Z column is not locked: push the locking lever down",
+    UNKNOWN: "the Z column sensor reading is not recognised (see"
+             " Z_POWER_STATUS)",
+    NO_PLATE: "no bed plate detected: attach the bed plate",
+    POWERING: "bed power is starting up",
+    INHIBITED: "bed power is held off (Z_POWER_INHIBIT ENABLE=0 releases"
+               " it)",
+    FAULT: "bed power fault: %s. Check the bed and its cable, then run"
+           " Z_POWER_RESET",
+}
+
+
 def decide(z_band, plate_present, fault, inhibited):
     """Pure decision: (state before PGOOD confirmation, reason, enable).
 
@@ -44,18 +60,18 @@ def decide(z_band, plate_present, fault, inhibited):
     'powering' into 'ready' once PGOOD confirms.
     """
     if fault:
-        return FAULT, "bed power fault: %s. Check the bed and its cable,"             " then run Z_POWER_RESET" % (fault,), False
+        return FAULT, REASONS[FAULT] % (fault,), False
     if inhibited:
-        return INHIBITED, "bed power is held off (Z_POWER_INHIBIT ENABLE=0"             " releases it)", False
+        return INHIBITED, REASONS[INHIBITED], False
     if z_band == 'absent':
-        return ABSENT, "the Z column is not connected: fold the Z axis"             " down into the base", False
+        return ABSENT, REASONS[ABSENT], False
     if z_band == 'unlocked':
-        return UNLOCKED, "the Z column is not locked: push the locking"             " lever down", False
+        return UNLOCKED, REASONS[UNLOCKED], False
     if z_band != 'locked':
-        return UNKNOWN, "the Z column sensor reading is not recognised"             " (see Z_POWER_STATUS)", False
+        return UNKNOWN, REASONS[UNKNOWN], False
     if not plate_present:
-        return NO_PLATE, "no bed plate detected: attach the bed plate", False
-    return POWERING, "bed power is starting up", True
+        return NO_PLATE, REASONS[NO_PLATE], False
+    return POWERING, REASONS[POWERING], True
 
 
 def classify_band(ratio, bands):
@@ -138,18 +154,11 @@ class ZPower:
                                                  minval=0.)
         self.supply_voltage = config.getfloat('supply_voltage', 45., above=0.)
         self.over_since = self.idle_over_since = None
-        # Plate present, from the bed heater's own (raw) thermistor reading
+        # Plate presence comes from [bed_removal_detector], which owns that
+        # judgement (and BED_REMOVED / BED_ATTACHED and the resume target).
         self.heater_name = config.get('heater', 'heater_bed')
         self.heater = None
-        # Same hysteresis as bed_removal_detector (remove -15, attach -5):
-        # an open thermistor (no plate) reads about -20 to -26 C.
-        self.plate_absent_below = config.getfloat('plate_absent_below', -15.)
-        self.plate_present_above = config.getfloat(
-            'plate_present_above', -5., minval=self.plate_absent_below)
-        self.plate_max_temp = config.getfloat(
-            'plate_max_temp', 150., above=self.plate_present_above)
-        self.plate = Debounce(config.getint('plate_samples', 2, minval=1))
-        self.last_plate_time = 0.
+        self.detector = None
         # Power-up confirmation
         self.power_good_timeout = config.getfloat('power_good_timeout', 0.5,
                                                   above=0.)
@@ -190,6 +199,12 @@ class ZPower:
     def _handle_connect(self):
         pheaters = self.printer.lookup_object('heaters')
         self.heater = pheaters.lookup_heater(self.heater_name)
+        self.detector = self.printer.lookup_object('bed_removal_detector',
+                                                   None)
+        if self.detector is None:
+            raise self.printer.config_error(
+                "%s needs [bed_removal_detector] for plate presence"
+                % (self.name,))
         # Interlock: refuse a heating target unless the path is READY.
         set_temp = self.heater.set_temp
         def guarded_set_temp(degrees):
@@ -224,18 +239,7 @@ class ZPower:
         self.current = max(0., raw - (self.current_offset or 0.))
     # Main loop
     def _plate_present(self):
-        heater = self.heater
-        if heater.last_temp_time == self.last_plate_time:
-            return self.plate.value
-        self.last_plate_time = heater.last_temp_time
-        temp = heater.last_temp
-        if temp < self.plate_absent_below or temp > self.plate_max_temp:
-            present = False
-        elif temp > self.plate_present_above:
-            present = True
-        else:
-            present = self.plate.value  # inside the hysteresis band
-        return self.plate.update(present)
+        return self.detector.plate_present()
     def _set_enable(self, value, eventtime):
         if value == self.enabled:
             return
@@ -344,7 +348,7 @@ class ZPower:
         return {'state': self.state,
                 'reason': self.reason,
                 'z': self.z_band.value,
-                'plate_present': self.plate.value,
+                'plate_present': self.detector.plate_present(),
                 'enabled': self.enabled,
                 'power_good': self.power_good,
                 'present_ratio': self.present_ratio,
