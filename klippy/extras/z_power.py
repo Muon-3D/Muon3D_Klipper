@@ -44,18 +44,18 @@ def decide(z_band, plate_present, fault, inhibited):
     'powering' into 'ready' once PGOOD confirms.
     """
     if fault:
-        return FAULT, fault, False
+        return FAULT, "bed power fault: %s. Check the bed and its cable,"             " then run Z_POWER_RESET" % (fault,), False
     if inhibited:
-        return INHIBITED, "held off by Z_POWER_INHIBIT", False
+        return INHIBITED, "bed power is held off (Z_POWER_INHIBIT ENABLE=0"             " releases it)", False
     if z_band == 'absent':
-        return ABSENT, "Z column not connected", False
+        return ABSENT, "the Z column is not connected: fold the Z axis"             " down into the base", False
     if z_band == 'unlocked':
-        return UNLOCKED, "Z column lever not locked", False
+        return UNLOCKED, "the Z column is not locked: push the locking"             " lever down", False
     if z_band != 'locked':
-        return UNKNOWN, "Z_PRESENT reading matches no band", False
+        return UNKNOWN, "the Z column sensor reading is not recognised"             " (see Z_POWER_STATUS)", False
     if not plate_present:
-        return NO_PLATE, "no plate on the bed thermistor", False
-    return POWERING, "", True
+        return NO_PLATE, "no bed plate detected: attach the bed plate", False
+    return POWERING, "bed power is starting up", True
 
 
 def classify_band(ratio, bands):
@@ -115,8 +115,12 @@ class ZPower:
             lo, hi = self._get_range(config, 'present_%s_range' % (band,))
             self.bands.append((band, (lo, hi)))
         self.z_band = Debounce(config.getint('present_samples', 3, minval=1))
-        # IMON current (optional)
+        # IMON current (optional). IMON reads a small non-zero value with
+        # the feed off (~0.11 A equivalent on gimlet), so the zero is learnt
+        # while the enable is off and subtracted while it is on.
         self.current = None
+        self.raw_current = None
+        self.current_offset = None
         self.current_scale = (config.getfloat('adc_voltage', 3.3, above=0.)
                               * config.getfloat('current_per_volt', 2.24,
                                                 above=0.))
@@ -137,9 +141,13 @@ class ZPower:
         # Plate present, from the bed heater's own (raw) thermistor reading
         self.heater_name = config.get('heater', 'heater_bed')
         self.heater = None
-        self.plate_min_temp = config.getfloat('plate_min_temp', -10.)
-        self.plate_max_temp = config.getfloat('plate_max_temp', 150.,
-                                              above=self.plate_min_temp)
+        # Same hysteresis as bed_removal_detector (remove -15, attach -5):
+        # an open thermistor (no plate) reads about -20 to -26 C.
+        self.plate_absent_below = config.getfloat('plate_absent_below', -15.)
+        self.plate_present_above = config.getfloat(
+            'plate_present_above', -5., minval=self.plate_absent_below)
+        self.plate_max_temp = config.getfloat(
+            'plate_max_temp', 150., above=self.plate_present_above)
         self.plate = Debounce(config.getint('plate_samples', 2, minval=1))
         self.last_plate_time = 0.
         # Power-up confirmation
@@ -183,8 +191,7 @@ class ZPower:
         def guarded_set_temp(degrees):
             if degrees and self.state != READY:
                 raise self.printer.command_error(
-                    "%s cannot heat: bed power is %s (%s)"
-                    % (self.heater_name, self.state, self.reason))
+                    "Cannot heat the bed: %s" % (self.reason,))
             set_temp(degrees)
         self._raw_set_temp = set_temp
         self.heater.set_temp = guarded_set_temp
@@ -200,7 +207,17 @@ class ZPower:
     def _present_callback(self, read_time, read_value):
         self.present_ratio = read_value
     def _current_callback(self, read_time, read_value):
-        self.current = read_value * self.current_scale
+        self.raw_current = read_value * self.current_scale
+    def _update_current(self):
+        raw = self.raw_current
+        if raw is None:
+            return
+        if not self.enabled:
+            if self.current_offset is None:
+                self.current_offset = raw
+            else:
+                self.current_offset += (raw - self.current_offset) * 0.1
+        self.current = max(0., raw - (self.current_offset or 0.))
     # Main loop
     def _plate_present(self):
         heater = self.heater
@@ -208,8 +225,13 @@ class ZPower:
             return self.plate.value
         self.last_plate_time = heater.last_temp_time
         temp = heater.last_temp
-        return self.plate.update(
-            self.plate_min_temp <= temp <= self.plate_max_temp)
+        if temp < self.plate_absent_below or temp > self.plate_max_temp:
+            present = False
+        elif temp > self.plate_present_above:
+            present = True
+        else:
+            present = self.plate.value  # inside the hysteresis band
+        return self.plate.update(present)
     def _set_enable(self, value, eventtime):
         if value == self.enabled:
             return
@@ -255,6 +277,7 @@ class ZPower:
             band = self.z_band.update(classify_band(self.present_ratio,
                                                     self.bands))
         plate = self._plate_present()
+        self._update_current()
         if self.enabled:
             self._check_current(eventtime)
         state, reason, enable = decide(band, plate, self.fault,
@@ -263,7 +286,7 @@ class ZPower:
             if not self.enabled:
                 self.powering_since = eventtime
             elif self.power_good:
-                state, reason = READY, ""
+                state, reason = READY, "bed power is on"
                 self.powering_since = None
             elif self.powering_since is None:
                 # PGOOD dropped after the path was up: the eFuse tripped.
