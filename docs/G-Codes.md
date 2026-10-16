@@ -949,6 +949,27 @@ updated. If TEMPLATE is an empty string then this command will clear
 any previous template assigned to the LED (one can then use `SET_LED`
 commands to manage the LED's color settings).
 
+### [muon_ads1220]
+
+The following commands are available when a
+[muon_ads1220 config section](Config_Reference.md#muon-b1-shared-ads1220-muon_ads1220)
+is enabled.
+
+#### MUON_ADS1220_STATS
+`MUON_ADS1220_STATS CHIP=<name>`: Report how the mcu has been sampling
+the chip since it was configured: new conversions, repeated codes, held
+copies and empty slots, late reads (a conversion may have been lost),
+temperature reads, reads taken while a probe was armed, timer overruns,
+stalls and the hotend excitation mode.
+
+#### MUON_HOTEND_STATUS
+`MUON_HOTEND_STATUS HEATER=<heater>`: Report the detected hotend type,
+the detection state and the last sensor resistance.
+
+#### MUON_HOTEND_DETECT
+`MUON_HOTEND_DETECT HEATER=<heater>`: Re-run hotend type detection. The
+heater must be off.
+
 ### [load_cell]
 
 The following commands are enabled if a

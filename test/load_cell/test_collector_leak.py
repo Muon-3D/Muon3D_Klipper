@@ -68,6 +68,9 @@ class FakeHoming:
 class FakePrinter:
     def __init__(self, toolhead):
         self.objects = {'toolhead': toolhead, 'homing': FakeHoming()}
+        self.events = []
+    def send_event(self, event, *params):
+        self.events.append(event)
     def get_reactor(self):
         return None
     def lookup_object(self, name, default=None):
@@ -145,6 +148,8 @@ def test_raise_between_descent_and_collect():
     class Descent:
         def probing_move(self, gcmd):
             return [10., 10., 0., 0.], collector
+        def get_load_cell(self):
+            return cell
 
     t = object.__new__(load_cell_probe.TappingMove)
     t._printer = printer
@@ -156,6 +161,10 @@ def test_raise_between_descent_and_collect():
     else:
         raise AssertionError("run_tap was expected to raise")
     assert_stopped(collector, cell)
+    # A failed tap still ends its probe window, or a sensor sharing the
+    # load cell's ADC (muon_ads1220) would hold the heater off for good
+    assert printer.events == ["load_cell_probe:tap_begin",
+                              "load_cell_probe:tap_end"], printer.events
 
 
 def main():
