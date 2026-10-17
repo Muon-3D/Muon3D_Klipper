@@ -1762,6 +1762,13 @@ print.
 #### SDCARD_RESET_FILE
 `SDCARD_RESET_FILE`: Unload file and clear SD state.
 
+### [raise_error]
+
+#### RAISE_ERROR
+`RAISE_ERROR MSG=<text>`: Stop the running script with the error `<text>`.
+Available when a [raise_error config section](Config_Reference.md#raise_error)
+is enabled.
+
 ### [z_power]
 
 The following commands are available when a
