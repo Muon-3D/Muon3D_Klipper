@@ -263,6 +263,9 @@ class ZPower:
         self.fault = reason
         logging.error("%s: fault: %s", self.name, reason)
         self._run_template(self.fault_template)
+    def latch_fault(self, reason):
+        """Latch a fault found elsewhere (e.g. [heater_supply])."""
+        self._latch_fault(reason, self.reactor.monotonic())
     def _check_current(self, eventtime):
         if self.current is None:
             return

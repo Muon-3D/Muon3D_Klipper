@@ -131,6 +131,11 @@ start_test z_power "Test z_power decisions"
 $PYTHON test/z_power/test_z_power.py
 finish_test z_power "Test z_power decisions"
 
+# MUON: bed heater live supply power, resistance learning and heater check.
+start_test heater_supply "Test heater_supply and MPC on a simulated bed"
+$PYTHON test/heater_supply/test_heater_supply.py
+finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
