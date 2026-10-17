@@ -143,6 +143,9 @@ class Harness(unittest.TestCase):
         zp._run_template = lambda tmpl: zp.scripts.append(tmpl)
         zp.lost_template = 'LOST'
         zp.fault_template = 'FAULT'
+        zp.z_change_template = 'ZCHANGE'
+        zp.last_band = None
+        zp.band_seen = False
         # Install the interlock the way _handle_connect does
         raw = zp.heater.set_temp
         def guarded(degrees):
@@ -217,7 +220,7 @@ class Harness(unittest.TestCase):
         self.assertEqual(zp.heater.target, 0.)
         self.assertNotIn('LOST', zp.scripts)  # bed_removal_detector pauses
 
-    def test_unlocking_runs_lost_gcode(self):
+    def test_unlocking_runs_the_column_hook_not_lost(self):
         zp = self.make()
         self.tick(zp, 1.0)
         zp.power_good = True
@@ -225,6 +228,33 @@ class Harness(unittest.TestCase):
         self.tick(zp, 1.2, ratio=0.5)
         self.assertEqual(zp.state, UNLOCKED)
         self.assertFalse(zp.enabled)
+        self.assertNotIn('LOST', zp.scripts)
+        self.assertIn('ZCHANGE', zp.scripts)
+        self.assertEqual(zp.z_band.value, 'unlocked')
+
+    def test_first_reading_is_not_a_change(self):
+        zp = self.make()
+        self.tick(zp, 1.0, ratio=0.99)
+        self.assertEqual(zp.scripts, [])
+
+    def test_removal_and_unknown_are_reported(self):
+        zp = self.make()
+        self.tick(zp, 1.0)                     # locked
+        self.tick(zp, 1.1, ratio=0.99)         # pulled off
+        self.assertEqual(zp.scripts.count('ZCHANGE'), 1)
+        self.assertEqual(zp.z_band.value, 'absent')
+        self.tick(zp, 1.2, ratio=0.3)          # matches no band
+        self.assertEqual(zp.scripts.count('ZCHANGE'), 2)
+        self.assertIsNone(zp.z_band.value)
+
+    def test_inhibit_runs_lost_gcode(self):
+        zp = self.make()
+        self.tick(zp, 1.0)
+        zp.power_good = True
+        self.tick(zp, 1.1)
+        zp.inhibited = True
+        self.tick(zp, 1.2)
+        self.assertEqual(zp.state, INHIBITED)
         self.assertIn('LOST', zp.scripts)
 
     def test_current_with_heater_off_latches_fault(self):
