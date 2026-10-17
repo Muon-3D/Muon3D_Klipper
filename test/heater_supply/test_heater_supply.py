@@ -520,8 +520,12 @@ class TestCalibrationHeatup(unittest.TestCase):
         cal.heatup_test(FakeGcmd(), 60., TuningControl(bed), supply)
         self.assertTrue(supply.estimator.confident)
         self.assertGreater(bed.sensor, 59.9)
-        self.assertAlmostEqual(supply.calibration_power(),
-                               45. ** 2 / bed.resistance(), delta=5.)
+        # R rose through the heat-up, so its mean power lies between the
+        # cold power and the hot power.
+        cold, hot = 45. ** 2 / bed.r25, 45. ** 2 / bed.resistance()
+        power = supply.calibration_power()
+        self.assertLess(hot, power)
+        self.assertLess(power, cold)
 
     def test_heatup_aborts_when_r_never_settles(self):
         cal, bed, supply = calibration(noise=0.1)
