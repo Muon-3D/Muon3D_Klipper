@@ -25,6 +25,12 @@
 # The same reading checks the heater: fully on, with a resistance outside
 # `resistance_range` for `fault_time` (an open heater reads as infinite),
 # latches a [z_power] fault, which turns the bed power off.
+#
+# MPC_CALIBRATE fits its constants to the mean measured power of its
+# fully-on heat-up, so they are in real watts. It refuses to start without
+# bed power, aborts if the resistance has not settled (CONFIDENT_SAMPLES
+# readings in a row within AGREE of R) by `confirm_time` into the heat-up,
+# and saves the resistance with the constants.
 import logging
 
 POLL_INTERVAL = 0.1
@@ -32,14 +38,16 @@ FULL_DUTY = 0.999      # last_pwm_value at or above this is "fully on"
 MIN_AMPS = 0.01        # below this the heater draws nothing measurable
 MIN_VOLTS = 1.0        # a supply reading below this is not a reading
 SAVE_CHANGE = 0.01     # stage a new R once it moves this fraction
-SAVE_SAMPLES = 10      # in-band samples a window needs before R is staged
+AGREE = 0.02           # a reading within this fraction of R agrees with it
+CONFIDENT_SAMPLES = 20  # consecutive agreeing readings for a confident R
 
 
 class ResistanceEstimator:
     """Learns a heater's resistance from (duty, volts, amps) readings.
 
     No Klipper objects, so the test suite can drive it directly. update()
-    returns a fault reason, or None.
+    returns a fault reason, or None. The eFuse current is taken as the
+    heater's own: the Z column draws nothing measurable beside it.
     """
     def __init__(self, resistance, resistance_range, settle_time=1.0,
                  fault_time=2.0, learn_time=3.0):
@@ -48,49 +56,55 @@ class ResistanceEstimator:
         self.settle_time = settle_time
         self.fault_time = fault_time
         self.learn_time = learn_time
-        self.idle_current = 0.
         self.measured = None        # last fully-on resistance reading
-        self.window_samples = 0     # in-band samples in this fully-on window
-        self.full_since = self.off_since = self.bad_since = None
+        self.full_since = self.bad_since = None
         self.last_time = None
+        # The last fully-on window. Kept after it ends, for MPC_CALIBRATE.
+        self.window_samples = 0     # in-band readings
+        self.window_energy = 0.     # sum of V * I over them
+        self.agreeing = 0           # consecutive readings within AGREE of R
+        self.confident = False      # agreeing reached CONFIDENT_SAMPLES
     def _alpha(self, eventtime):
         dt = 0. if self.last_time is None else eventtime - self.last_time
         return max(0., min(1., dt / self.learn_time))
+    def window_power(self):
+        """Mean fully-on power over the last window, or None."""
+        if not self.window_samples:
+            return None
+        return self.window_energy / self.window_samples
     def update(self, eventtime, duty, volts, amps, powered):
         alpha = self._alpha(eventtime)
         self.last_time = eventtime
-        if not powered or volts is None or amps is None:
-            self.full_since = self.off_since = self.bad_since = None
+        if not powered or volts is None or amps is None or duty < FULL_DUTY:
+            self.full_since = self.bad_since = None
             return None
-        # Which steady window are we in, if any?
-        if duty >= FULL_DUTY:
-            self.off_since = None
-            if self.full_since is None:
-                self.full_since = eventtime
-                self.window_samples = 0
-        elif duty <= 0.:
-            self.full_since = None
-            if self.off_since is None:
-                self.off_since = eventtime
-        else:
-            self.full_since = self.off_since = None
-        # Heater off: what the eFuse still carries is the Z column itself.
-        if (self.off_since is not None
-                and eventtime - self.off_since >= self.settle_time):
-            self.idle_current += (amps - self.idle_current) * alpha
-        if (self.full_since is None
-                or eventtime - self.full_since < self.settle_time):
-            self.bad_since = None
+        if self.full_since is None:
+            self.full_since = eventtime
+            self.window_samples = self.agreeing = 0
+            self.window_energy = 0.
+            self.confident = False
+        if eventtime - self.full_since < self.settle_time:
             return None
-        # Heater fully on and settled: the reading is the heater's own.
-        heater_amps = amps - self.idle_current
-        r = volts / heater_amps if heater_amps > MIN_AMPS else float('inf')
+        # Fully on and settled: IMON is steady, and it is all the heater.
+        r = volts / amps if amps > MIN_AMPS else float('inf')
         self.measured = r
         if self.low <= r <= self.high:
             self.bad_since = None
+            if not self.window_samples:
+                # Start each window from its own first reading: the stored
+                # R may belong to another plate, or to a colder heater.
+                self.resistance = r
+            if abs(r - self.resistance) <= AGREE * self.resistance:
+                self.agreeing += 1
+            else:
+                self.agreeing = 0
+            self.confident = (self.confident
+                              or self.agreeing >= CONFIDENT_SAMPLES)
             self.resistance += (r - self.resistance) * alpha
             self.window_samples += 1
+            self.window_energy += volts * amps
             return None
+        self.agreeing = 0
         if self.bad_since is None:
             self.bad_since = eventtime
         if eventtime - self.bad_since < self.fault_time:
@@ -99,7 +113,7 @@ class ResistanceEstimator:
             return ("the heater draws no current when fully on: check the"
                     " bed plate contacts and the heater")
         return ("the heater measures %.1f ohm fully on (%.2f A at %.1f V),"
-                " outside %.1f-%.1f ohm" % (r, heater_amps, volts, self.low,
+                " outside %.1f-%.1f ohm" % (r, amps, volts, self.low,
                                             self.high))
 
 
@@ -120,6 +134,7 @@ class HeaterSupply:
             settle_time=config.getfloat('settle_time', 1.0, above=0.),
             fault_time=config.getfloat('fault_time', 2.0, above=0.),
             learn_time=config.getfloat('learn_time', 3.0, above=0.))
+        self.confirm_time = config.getfloat('confirm_time', 10.0, above=0.)
         self.saved_resistance = resistance
         self.nominal_voltage = config.getfloat('voltage', above=MIN_VOLTS)
         self.current_source_name = config.get('current_source', None)
@@ -172,17 +187,52 @@ class HeaterSupply:
         if was_full and self.estimator.full_since is None:
             self._stage_resistance()
         return eventtime + POLL_INTERVAL
-    def _stage_resistance(self):
+    def _stage_resistance(self, force=False):
         r = self.estimator.resistance
-        if self.estimator.window_samples < SAVE_SAMPLES:
+        if not self.estimator.confident:
             return
-        if abs(r - self.saved_resistance) < SAVE_CHANGE * self.saved_resistance:
+        if (not force and abs(r - self.saved_resistance)
+                < SAVE_CHANGE * self.saved_resistance):
             return
         logging.info("%s: resistance %.3f -> %.3f ohm", self.name,
                      self.saved_resistance, r)
         self.saved_resistance = r
         configfile = self.printer.lookup_object('configfile')
         configfile.set(self.name, 'resistance', "%.3f" % (r,))
+    # MPC_CALIBRATE
+    def check_calibration(self, heating_time):
+        """Raise unless the heat-up so far gives a resistance to trust.
+
+        Called through the calibration heat-up: bed power must be on, and
+        within confirm_time of full power the resistance must be confident.
+        """
+        if self.current_source is None:
+            return
+        error = self.printer.command_error
+        if self.current_source.state != 'ready':
+            raise error("bed power is off (%s), so the heater resistance"
+                        " cannot be measured" % (self.current_source.reason,))
+        if self.fault is not None:
+            raise error(self.fault)
+        if (heating_time > self.confirm_time
+                and not self.estimator.confident):
+            raise error("the heater resistance did not settle within %.0fs"
+                        " of full power (last reading %s ohm)"
+                        % (self.confirm_time, self.estimator.measured))
+    def calibration_power(self):
+        """The heater's mean fully-on power over the calibration heat-up.
+
+        MPC_CALIBRATE fits its constants to this, so they are in measured
+        watts. Saves the resistance with them.
+        """
+        if self.current_source is None:
+            return self.available_power()
+        power = self.estimator.window_power()
+        if not self.estimator.confident or power is None:
+            raise self.printer.command_error(
+                "the heater resistance was not measured during the heat-up")
+        self._stage_resistance(force=True)
+        return power
     def get_status(self, eventtime):
         est = self.estimator
         volts = self.voltage()
@@ -191,7 +241,7 @@ class HeaterSupply:
                 'resistance': round(est.resistance, 3),
                 'measured_resistance': (None if est.measured is None
                                         else round(est.measured, 3)),
-                'idle_current': round(est.idle_current, 3),
+                'confident': est.confident,
                 'available_power': round(self.available_power(), 1),
                 'power': round(duty * self.available_power(), 1),
                 'fault': self.fault}

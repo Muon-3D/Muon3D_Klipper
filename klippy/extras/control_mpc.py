@@ -94,14 +94,19 @@ class ControlMPC:
 
     # Helpers
 
-    def heater_power(self):
-        """Watts the heater delivers at 100% duty, now."""
+    def get_supply(self):
+        """The [heater_supply] for this heater, or None."""
         if self.supply is None:
             self.supply = self.printer.lookup_object(
                 "heater_supply " + self.heater.get_name(), False
             )
-        if self.supply:
-            return self.supply.available_power()
+        return self.supply or None
+
+    def heater_power(self):
+        """Watts the heater delivers at 100% duty, now."""
+        supply = self.get_supply()
+        if supply is not None:
+            return supply.available_power()
         return self.const_heater_power
 
     def max_heater_power(self):
@@ -397,16 +402,30 @@ class MpcCalibrate:
             "STABLE_POLL_INTERVAL", 0.2, above=0.0
         )
 
+        # With a [heater_supply], the fit uses the heater's measured power,
+        # so the resistance must be measurable and must settle early in the
+        # heat-up. Refuse before the long wait for ambient if it cannot be.
+        supply = self.orig_control.get_supply()
+        if supply is not None:
+            supply.check_calibration(0.0)
+
         control = TuningControl(self.heater)
         old_control = self.heater.set_control(control)
         try:
             ambient_temp = self.await_ambient(
                 gcmd, control, threshold_temp, ambient_settle_rate
             )
-            samples = self.heatup_test(gcmd, target_temp, control)
+            samples = self.heatup_test(gcmd, target_temp, control, supply)
+            heater_power = self.orig_control.max_heater_power()
+            if supply is not None:
+                heater_power = supply.calibration_power()
+                gcmd.respond_info(
+                    "Heater resistance %.3f ohm, mean heat-up power %.1f W"
+                    % (supply.estimator.resistance, heater_power)
+                )
             first_res = self.process_first_pass(
                 samples,
-                self.orig_control.max_heater_power(),
+                heater_power,
                 ambient_temp,
                 threshold_temp,
                 use_analytic,
@@ -445,7 +464,7 @@ class MpcCalibrate:
                 first_res,
                 transfer_res,
                 ambient_temp,
-                self.orig_control.max_heater_power(),
+                heater_power,
             )
             logging.info("Second pass: %s", second_res)
 
@@ -592,15 +611,18 @@ class MpcCalibrate:
         self.heater.alter_target(0.0)
         return ambient_temp
 
-    def heatup_test(self, gcmd, target_temp, control):
+    def heatup_test(self, gcmd, target_temp, control, supply=None):
         gcmd.respond_info(
             "Performing heatup test, target is %.1f degrees" % (target_temp,)
         )
         control.set_output(self.heater.get_max_power(), target_temp)
 
         control.logging = True
+        start = self.printer.get_reactor().monotonic()
 
         def process(eventtime):
+            if supply is not None:
+                supply.check_calibration(eventtime - start)
             temp, _ = self.heater.get_temp(eventtime)
             return temp < target_temp
 

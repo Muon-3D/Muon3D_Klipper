@@ -11,7 +11,8 @@ sys.path.insert(0, KLIPPY)
 
 from extras import heater_supply  # noqa: E402
 from extras.heater_supply import ResistanceEstimator  # noqa: E402
-from extras.control_mpc import ControlMPC  # noqa: E402
+from extras.control_mpc import (ControlMPC, MpcCalibrate,
+                                TuningControl)  # noqa: E402
 
 DT = 0.1
 R_TRUE = 12.0
@@ -52,12 +53,37 @@ class TestEstimator(unittest.TestCase):
             lambda: rnd.choice((0., 45. / R_TRUE)))
         self.assertEqual(est.resistance, 11.0)
 
-    def test_subtracts_the_idle_current(self):
+    def test_confident_after_settle_and_agreeing_readings(self):
         est = self.make()
-        t, _ = run(est, 20., 0., 45., 0.2)         # Z column draws 0.2 A
-        self.assertAlmostEqual(est.idle_current, 0.2, delta=0.01)
-        run(est, 30., 1.0, 45., 45. / R_TRUE + 0.2, start=t)
-        self.assertAlmostEqual(est.resistance, R_TRUE, delta=0.02)
+        run(est, 2.9, 1.0, 45., 45. / R_TRUE)   # 1 s settle + 19 readings
+        self.assertFalse(est.confident)
+        run(est, 0.2, 1.0, 45., 45. / R_TRUE, start=2.9)
+        self.assertTrue(est.confident)
+
+    def test_a_stored_r_from_another_plate_does_not_slow_it(self):
+        est = self.make(r=9.0)                  # true R is 33% higher
+        run(est, 3.1, 1.0, 45., 45. / R_TRUE)
+        self.assertTrue(est.confident)
+        self.assertAlmostEqual(est.resistance, R_TRUE, delta=0.01)
+
+    def test_noisy_readings_are_never_confident(self):
+        est = self.make()
+        rnd = random.Random(4)
+        run(est, 30., 1.0, 45.,
+            lambda: 45. / (R_TRUE * rnd.uniform(0.9, 1.1)))
+        self.assertFalse(est.confident)
+
+    def test_window_power_is_the_mean_heater_power(self):
+        est = self.make()
+        run(est, 10., 1.0, 45., 45. / R_TRUE)
+        self.assertAlmostEqual(est.window_power(), 45. ** 2 / R_TRUE)
+
+    def test_window_survives_the_heater_turning_off(self):
+        est = self.make()
+        t, _ = run(est, 5., 1.0, 45., 45. / R_TRUE)
+        run(est, 5., 0., 45., 0., start=t)
+        self.assertTrue(est.confident)
+        self.assertIsNotNone(est.window_power())
 
     def test_open_heater_faults_after_fault_time(self):
         est = self.make()
@@ -139,6 +165,7 @@ class FakeConfigfile:
 class FakeZPower:
     def __init__(self):
         self.state = 'ready'
+        self.reason = 'bed power is on'
         self.current = 0.
         self.faults = []
     def latch_fault(self, reason):
@@ -151,7 +178,13 @@ class FakeHeater:
         self.last_pwm_value = 0.
 
 
+class FakeCommandError(Exception):
+    pass
+
+
 class FakePrinter:
+    command_error = FakeCommandError
+
     def __init__(self, objects):
         self.objects = objects
         self.reactor = FakeReactor()
@@ -244,6 +277,38 @@ class TestHeaterSupply(unittest.TestCase):
         self.assertEqual(len(zp.faults), 1)
         self.assertIn("heater_bed: the heater draws no current",
                       zp.faults[0])
+
+    def test_calibration_refuses_without_bed_power(self):
+        supply, _h, zp, _cf = make_supply()
+        zp.state, zp.reason = 'unlocked', 'push the locking lever down'
+        with self.assertRaisesRegex(FakeCommandError, "lever"):
+            supply.check_calibration(0.)
+
+    def test_calibration_aborts_if_r_does_not_settle(self):
+        supply, heater, zp, _cf = make_supply()
+        rnd = random.Random(5)
+        heater.last_pwm_value = 1.0
+        t = 0.
+        while t < 12.:
+            t += DT
+            zp.current = 45. / (R_TRUE * rnd.uniform(0.9, 1.1))
+            supply._poll(t)
+            if t < 10.:
+                supply.check_calibration(t)
+        with self.assertRaisesRegex(FakeCommandError, "did not settle"):
+            supply.check_calibration(t)
+        with self.assertRaises(FakeCommandError):
+            supply.calibration_power()
+
+    def test_calibration_power_is_measured_and_saves_r(self):
+        supply, heater, zp, cf = make_supply(volts=46., resistance=R_TRUE)
+        t = drive(supply, heater, zp, 30., 1.0, 46. / R_TRUE)
+        supply.check_calibration(t)
+        drive(supply, heater, zp, 1., 0., 0., start=t)   # heat-up over
+        self.assertAlmostEqual(supply.calibration_power(),
+                               46. * 46. / R_TRUE, delta=0.01)
+        # Saved with the constants even though R barely moved.
+        self.assertIn(('heater_supply heater_bed', 'resistance'), cf.saved)
 
     def test_bad_range_is_a_config_error(self):
         with self.assertRaises(FakeConfigError):
@@ -386,6 +451,83 @@ class TestClosedLoop(unittest.TestCase):
         control = ControlMPC(dict(PROFILE), bed, load_clean=True,
                              register=False)
         self.assertEqual(control.heater_power(), 170.)
+
+
+
+class CalPrinter(FakePrinter):
+    """Runs wait_while against the simulated bed and a live supply."""
+    def __init__(self, objects, bed, supply, zp, amps_noise=0.):
+        FakePrinter.__init__(self, objects)
+        self.bed, self.supply, self.zp = bed, supply, zp
+        self.rnd = random.Random(6)
+        self.noise = amps_noise
+    def wait_while(self, process, *args):
+        t = self.reactor.time
+        while True:
+            t += DT
+            self.reactor.time = t
+            self.bed.duty = self.bed.last_pwm_value
+            self.bed.step(DT)
+            self.zp.current = (self.bed.volts / self.bed.resistance()
+                               * self.rnd.uniform(1. - self.noise,
+                                                  1. + self.noise))
+            self.supply._poll(t)
+            if not process(t):
+                return
+
+
+class CalBed(SimBed):
+    def __init__(self, volts):
+        SimBed.__init__(self, volts)
+        self.last_pwm_value = 0.
+        self.target = 0.
+    def set_pwm(self, read_time, value):
+        self.last_pwm_value = value
+    def set_temp(self, degrees):
+        self.target = degrees
+        self.last_pwm_value = 1.0 if degrees else 0.
+    def alter_target(self, degrees):
+        self.set_temp(degrees)
+
+
+class FakeGcmd:
+    def __init__(self):
+        self.messages = []
+    def respond_info(self, msg):
+        self.messages.append(msg)
+
+
+def calibration(noise):
+    bed = CalBed(45.)
+    zp, cf = FakeZPower(), FakeConfigfile()
+    objects = {'heaters': FakeHeaters(bed), 'z_power': zp,
+               'configfile': cf, 'tmc_driver_monitor': FakeMonitor(45.)}
+    printer = FakePrinter(objects)
+    supply = heater_supply.HeaterSupply(FakeConfig(
+        printer, 'heater_supply heater_bed',
+        {'resistance': 11.9, 'voltage': 45.0, 'current_source': 'z_power'}))
+    printer.handlers['klippy:connect']()
+    cal_printer = CalPrinter(objects, bed, supply, zp, noise)
+    cal_printer.reactor = printer.reactor
+    supply.printer = cal_printer
+    cal = MpcCalibrate(cal_printer, bed, None)
+    return cal, bed, supply
+
+
+class TestCalibrationHeatup(unittest.TestCase):
+    def test_heatup_measures_r_before_reaching_target(self):
+        cal, bed, supply = calibration(noise=0.002)
+        cal.heatup_test(FakeGcmd(), 60., TuningControl(bed), supply)
+        self.assertTrue(supply.estimator.confident)
+        self.assertGreater(bed.sensor, 59.9)
+        self.assertAlmostEqual(supply.calibration_power(),
+                               45. ** 2 / bed.resistance(), delta=5.)
+
+    def test_heatup_aborts_when_r_never_settles(self):
+        cal, bed, supply = calibration(noise=0.1)
+        with self.assertRaisesRegex(FakeCommandError, "did not settle"):
+            cal.heatup_test(FakeGcmd(), 60., TuningControl(bed), supply)
+        self.assertLess(bed.sensor, 40.)  # stopped early, not at target
 
 
 if __name__ == '__main__':
