@@ -33,7 +33,7 @@ import gcode  # noqa: E402
 from extras import delayed_gcode, gcode_macro  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
-            'toolhead.cfg', 'bed.cfg', 'filament.cfg')
+            'toolhead.cfg', 'bed.cfg', 'filament.cfg', 'calibration.cfg')
 
 # Commands the macros under test send that these files don't define, plus
 # CUT_FILAMENT and LOAD_FILAMENT (filament.cfg's, which only move).
@@ -42,9 +42,10 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
-         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION')
+         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION', 'PID_CALIBRATE')
 # Builtins the macros rename on klippy:connect.
-RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109')
+RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
+           'PROBE_CALIBRATE')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
 
 # The prompt a hot-end fan fault puts on the panel and in Fluidd.
@@ -665,6 +666,23 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
     def test_load_filament_purge(self):
         self.m1.print_stats['state'] = 'standby'
         self.refused('FILAMENT_INSERT_FULL_PURGE', 'Purge')
+        # The guard comes before the purge's own prompt_end: the only one
+        # is the fault prompt's.
+        ends = [line for line in self.m1.timeline
+                if 'action:prompt_end' in line]
+        self.assertEqual(len(ends), 1, self.m1.timeline)
+
+    def test_hotend_heating_calibration_refused(self):
+        self.refused('CALIBRATE_HEATING_HOTEND', 'Calibration')
+        self.assertNotIn('PID_CALIBRATE', self.m1.names())
+
+    def test_hotend_heating_calibration_runs_once_cleared(self):
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.m1.timeline.clear()
+        self.m1.run('CALIBRATE_HEATING_HOTEND')
+        self.assertIn('PID_CALIBRATE HEATER=extruder TARGET=220',
+                      self.m1.timeline)
 
     def test_m109_refused(self):
         self.refused('M109 S215', 'M109')
