@@ -173,6 +173,14 @@ class ZPower:
                                                        '')
         self.fault_template = gcode_macro.load_template(config, 'fault_gcode',
                                                         '')
+        # Run on every change of the Z column state after the first reading
+        # (the new state is the status object's `z`). The column, not the
+        # power path, decides what a print does: unlocked pauses, removed
+        # cancels.
+        self.z_change_template = gcode_macro.load_template(
+            config, 'z_change_gcode', '')
+        self.last_band = None
+        self.band_seen = False
         printer.register_event_handler('klippy:connect', self._handle_connect)
         printer.register_event_handler('klippy:ready', self._handle_ready)
         printer.register_event_handler('klippy:shutdown',
@@ -284,6 +292,7 @@ class ZPower:
         if self.present_ratio is not None:
             band = self.z_band.update(classify_band(self.present_ratio,
                                                     self.bands))
+            self._check_z_change(band)
         plate = self._plate_present()
         self._update_current()
         if self.enabled:
@@ -307,6 +316,18 @@ class ZPower:
         self._set_enable(enable, eventtime)
         self._transition(state, reason, eventtime)
         return eventtime + POLL_INTERVAL
+    def _check_z_change(self, band):
+        if band == self.last_band or (band is None and not self.band_seen):
+            return
+        previous = self.last_band if self.band_seen else None
+        self.last_band = band
+        if not self.band_seen:
+            # The first reading after startup is not a change.
+            self.band_seen = True
+            return
+        logging.info("%s: Z column %s -> %s", self.name,
+                     previous or 'unknown', band or 'unknown')
+        self._run_template(self.z_change_template)
     def _transition(self, state, reason, eventtime):
         prev = self.state
         self.state, self.reason = state, reason
@@ -315,12 +336,14 @@ class ZPower:
         logging.info("%s: %s -> %s (%s)", self.name, prev, state, reason)
         if prev != READY:
             return
-        # The path just went down: stop heating, and pause a print unless the
-        # plate came off (bed_removal_detector owns that pause and prompt).
+        # The path just went down: stop heating. What a print does about it
+        # belongs to whatever went away -- the plate (bed_removal_detector),
+        # the Z column (z_change_gcode) or a fault (fault_gcode) -- so
+        # lost_gcode is only for the path being held off by hand.
         _temp, target = self.heater.get_temp(eventtime)
         if target:
             self._raw_set_temp(0.)
-        if state not in (NO_PLATE, FAULT):
+        if state == INHIBITED:
             self._run_template(self.lost_template)
     def _run_template(self, template):
         script = template.render()
