@@ -16,6 +16,36 @@ BANDS = [('absent', (0.90, 1.0)), ('unlocked', (0.40, 0.60)),
          ('locked', (0.0, 0.20))]
 
 
+def config_bands():
+    """The present_*_range bands from the B1 config, in decide() order."""
+    path = os.path.join(KLIPPY, '..', 'core', 'M1', 'core.cfg')
+    bands = {}
+    for line in open(path):
+        line = line.split('#')[0].strip()
+        for band in ('absent', 'unlocked', 'locked'):
+            key = 'present_%s_range:' % (band,)
+            if line.startswith(key):
+                lo, hi = line[len(key):].split(',')
+                bands[band] = (float(lo), float(hi))
+    return [(band, bands[band]) for band in ('absent', 'unlocked', 'locked')]
+
+
+class TestConfigBands(unittest.TestCase):
+    # Ratios from the backboard schematic and the gimlet bench.
+    def test_each_lever_state_lands_in_its_band(self):
+        bands = config_bands()
+        for ratio, band in ((0.977, 'absent'), (1.0, 'absent'),
+                            (0.0, 'unlocked'), (0.348, 'locked'),
+                            (0.5, 'locked')):
+            self.assertEqual(z_power.classify_band(ratio, bands), band,
+                             ratio)
+
+    def test_bands_do_not_overlap(self):
+        spans = sorted(span for _band, span in config_bands())
+        for (_lo1, hi1), (lo2, _hi2) in zip(spans, spans[1:]):
+            self.assertLess(hi1, lo2)
+
+
 class TestDecide(unittest.TestCase):
     def test_comes_up_only_when_locked_with_a_plate(self):
         self.assertEqual(z_power.decide('locked', True, None, False)[0],
