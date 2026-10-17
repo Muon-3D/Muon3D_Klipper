@@ -4743,6 +4743,18 @@ The status object reports `mode`, `modes`, `commanded_speed` and
 #   factor (M220) to this value (1.0 = 100%).
 ```
 
+### [raise_error]
+
+Adds `RAISE_ERROR MSG=<text>`, which stops the running script with exactly
+that error. Use it to stop a macro such as PRINT_START with a readable
+message; Jinja's `action_raise_error` reports "Error evaluating ..." around
+the text. Send any prompt from an earlier command first: a macro renders
+in full before it runs.
+
+```
+[raise_error]
+```
+
 ### [tmc_driver_monitor]
 
 Die temperature and supply voltage of TMC2240 and TMC2241 drivers, read from
