@@ -7,9 +7,16 @@ class BedRemovalDetector:
         # thresholds
         self.remove_thr = config.getfloat('remove_threshold', -15.0)
         self.attach_thr = config.getfloat('attach_threshold', -5.0)
-        # buffer settings
-        buffer_len = config.getint('buffer_length', 5)
+        # Decide on fresh raw thermistor samples, not on the smoothed
+        # temperature polled every interval. The smoothed value (smooth_time
+        # 1.0) lags a pulled plate by most of a second, and the bed sensor
+        # only reports every 0.3 s, so a window of polls mostly held repeats
+        # of one sample. Two fresh samples is ~0.6 s from pull to decision,
+        # well inside the ~2 s before [verify_heater] would trip on the open
+        # reading. z_power uses the same thresholds to gate the bed feed.
+        buffer_len = config.getint('buffer_length', 2, minval=1)
         self.window = collections.deque(maxlen=buffer_len)
+        self.last_sample_time = None
         # check interval
         self.bed_check_interval = config.getfloat('interval', 0.1)
 
@@ -25,6 +32,10 @@ class BedRemovalDetector:
         self.pause_resume = self.printer.load_object(config, 'pause_resume')
 
         self.bed_removed = False
+        # False until the readings have said one way or the other. bed_removed
+        # starts False, which would otherwise read as "plate present" before
+        # anything was measured -- z_power must not power the bed on that.
+        self.plate_known = False
         # None means no removal is outstanding. Distinct from 0., which means
         # a removal happened while the bed was genuinely off.
         self.restore_target = None
@@ -40,8 +51,10 @@ class BedRemovalDetector:
                       self.bed_check_interval)
 
     def check_bed_temperature(self, eventtime):
-        raw_temp, _ = self.bed_heater.get_temp(eventtime)
-        self.window.append(raw_temp)
+        heater = self.bed_heater
+        if heater.last_temp_time != self.last_sample_time:
+            self.last_sample_time = heater.last_temp_time
+            self.window.append(heater.last_temp)
 
         if (self.restore_target is not None and not self.bed_removed
                 and not self.pause_resume.is_paused):
@@ -56,9 +69,12 @@ class BedRemovalDetector:
         if len(self.window) == self.window.maxlen:
             avg_temp = sum(self.window) / len(self.window)
             if not self.bed_removed and avg_temp < self.remove_thr:
+                self.plate_known = True
                 self.handle_bed_removal(eventtime)
             elif self.bed_removed and avg_temp > self.attach_thr:
                 self.handle_bed_reconnection()
+            elif not self.plate_known and avg_temp > self.attach_thr:
+                self.plate_known = True
 
         return eventtime + self.bed_check_interval
 
@@ -124,11 +140,20 @@ class BedRemovalDetector:
             lambda et: self._run_macro(et, 'BED_ATTACHED'))
         self.log.info('Bed attached, monitoring resumed')
 
+    def plate_present(self):
+        """True or False once measured, None before (or between thresholds
+        at startup). The single source of plate presence: z_power gates the
+        bed feed on it."""
+        if not self.plate_known:
+            return None
+        return not self.bed_removed
+
     def get_status(self, eventtime):
         # restore_target is read by _BED_RESUME_NOW to put the bed back where
         # it was before resuming. The macro only compares it against zero, so
         # "no removal outstanding" is published as 0. rather than as None.
         return {'bedRemoved': self.bed_removed,
+                'plateKnown': self.plate_known,
                 'restoreTarget': self.restore_target or 0.}
 
 

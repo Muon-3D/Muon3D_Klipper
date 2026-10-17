@@ -4652,6 +4652,69 @@ run_current:
 #   sensorless homing.
 ```
 
+### [z_power]
+
+Muon M1 B1 Z column and bed power path. The 48 V feed to the Z column and
+the removable bed passes through an eFuse whose enable this module drives.
+It switches the feed on only when the Z column is present with its lever
+locked (`present_pin`, a resistor divider read in three bands) and
+`[bed_removal_detector]` reports a plate, and off as soon as either stops
+being true. Plate presence is the detector's judgement alone (it is
+unknown, and the feed stays off, until the detector has measured), so a
+`[bed_removal_detector]` section is required.
+The bed heater refuses a target unless the path is `ready`. The eFuse PGOOD
+must rise within `power_good_timeout` of enabling, and a later PGOOD drop,
+a current above `max_current`, or current drawn with the bed heater off
+latch a fault that holds the feed off until `Z_POWER_RESET`. The status
+object reports `state`, `reason`, `z`, `plate_present`, `enabled`,
+`power_good`, `present_ratio`, `current` (A), `power` (W) and `fault`.
+
+```
+[z_power]
+enable_pin:
+#   The eFuse enable output. It is off at startup and on an mcu shutdown.
+#   This parameter must be provided.
+power_good_pin:
+#   The eFuse PGOOD input (high when the feed is up). This parameter must
+#   be provided.
+present_pin:
+#   The ADC pin reading the Z column presence and lever divider. This
+#   parameter must be provided.
+present_absent_range:
+present_unlocked_range:
+present_locked_range:
+#   "low, high" ADC ratio (0..1) for each Z_PRESENT state. A reading in no
+#   range counts as unknown and keeps the feed off. These parameters must
+#   be provided.
+#present_samples: 3
+#   Consecutive readings (0.1 s apart) before a Z_PRESENT state change is
+#   accepted.
+#current_pin:
+#   Optional ADC pin on the eFuse IMON output.
+#current_per_volt: 2.24
+#adc_voltage: 3.3
+#   Current in amps per volt at current_pin, and the ADC reference voltage.
+#max_current: 5.0
+#max_current_time: 0.5
+#   A current above max_current for max_current_time seconds is a fault.
+#idle_current: 1.0
+#idle_current_time: 2.0
+#   A current above idle_current for idle_current_time seconds while the
+#   bed heater is off is a fault.
+#supply_voltage: 45.0
+#   Used for the reported power when no [tmc_driver_monitor] supply
+#   reading is available.
+#heater: heater_bed
+#   The heater whose target is gated.
+#power_good_timeout: 0.5
+#   Seconds PGOOD has to rise after the enable is set.
+#lost_gcode:
+#   G-Code run when a READY path goes down for any reason other than the
+#   plate being removed (bed_removal_detector handles that) or a fault.
+#fault_gcode:
+#   G-Code run when a fault latches.
+```
+
 ### [fan_modes]
 
 Print modes for the part fan. The slicer's commanded fan speed is mapped
