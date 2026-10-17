@@ -1,0 +1,4 @@
+DICTIONARY atmega2560.dict
+CONFIG first_layer_nudge.cfg
+SHOULD_FAIL
+SDCARD_PRINT_FILE FILENAME=external_cap.gcode
