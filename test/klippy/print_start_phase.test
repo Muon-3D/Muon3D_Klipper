@@ -20,12 +20,12 @@ ASSERT_PHASE NAME=
 ASSERT_PHASE_T
 ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
-# The same print again: the mesh just probed covers it, so it is reused,
-# nothing is planned, and nothing is probed.
+# The same print again: the M1 probes before every print, so it is probed
+# again over the same points.
 _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_PHASE NAME=
-ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
+ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
 # 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
