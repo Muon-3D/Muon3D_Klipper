@@ -33,17 +33,18 @@ import gcode  # noqa: E402
 from extras import delayed_gcode, gcode_macro  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
-            'toolhead.cfg', 'bed.cfg')
+            'toolhead.cfg', 'bed.cfg', 'filament.cfg')
 
 # Commands the macros under test send that these files don't define, plus
-# CUT_FILAMENT and LOAD_FILAMENT (filament.cfg isn't loaded).
+# CUT_FILAMENT and LOAD_FILAMENT (filament.cfg's, which only move).
 STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'M118', 'RESPOND', 'FORCE_MOVE', 'SET_STEPPER_ENABLE',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
-         'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190')
+         'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
+         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION')
 # Builtins the macros rename on klippy:connect.
-RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106')
+RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
 
 # The prompt a hot-end fan fault puts on the panel and in Fluidd.
@@ -414,6 +415,11 @@ class ResumeRefusedWithADeadFan(_M1TestCase):
     def test_bed_resume_button_refused_before_reheating_the_bed(self):
         self.stall(hotend_stop_count=3)
         self.assert_refused('_BED_RESUME_NOW')
+        # The guard comes before _BED_RESUME_NOW's own prompt_end: the only
+        # one is the fault prompt's.
+        ends = [line for line in self.m1.timeline
+                if 'action:prompt_end' in line]
+        self.assertEqual(len(ends), 1, self.m1.timeline)
 
     def test_allowed_once_the_fault_clears(self):
         self.stall(hotend_stop_count=2)
@@ -640,16 +646,36 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
         # And the new print is paused.
         self.assertIn('PAUSE_BASE', self.m1.names())
 
+    def refused(self, script, what):
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run(script)
+        self.assertNotIn('M104', self.m1.names())
+        self.assertNotIn('M109.1', self.m1.names())
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.assertTrue(any(what + ' refused' in r
+                            for r in self.m1.responses), self.m1.responses)
+        self.m1.responses.clear()
+        self.log.records.clear()
+
     def test_unload_from_the_m600_prompt(self):
-        # UNLOAD_FILAMENT TEMP=250: M104 S{EXTRUDER_TEMP}, while paused.
-        self.m1.run('M104 S250')
-        self.assert_cut()
+        # Heats to 250 and waits holding the gcode lock: refused up front.
+        self.refused('UNLOAD_FILAMENT TEMP=250', 'Unload')
 
     def test_load_filament_purge(self):
-        # FILAMENT_INSERT_FULL_PURGE: M104 S{EXTRUDER_TEMP}.
         self.m1.print_stats['state'] = 'standby'
-        self.m1.run('M104 S240')
-        self.assert_cut()
+        self.refused('FILAMENT_INSERT_FULL_PURGE', 'Purge')
+
+    def test_m109_refused(self):
+        self.refused('M109 S215', 'M109')
+
+    def test_m109_to_zero_and_after_a_clear(self):
+        self.m1.run('M109 S0')
+        self.assertIn('M109.1 S0', self.m1.timeline)
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.m1.run('M109 S215')
+        self.assertIn('M109.1 S215', self.m1.timeline)
 
     def test_console_preheat(self):
         for command in ('M104 S215',
@@ -716,6 +742,19 @@ class StickyFanFault(_FanCheckTestCase):
         self.m1.extruder['temperature'] = 95.
         self.check()
         self.refuse_clear('not plausible')
+
+    def test_clear_resets_the_counters(self):
+        # Cleared before any check has seen the heatsink cool: the counter
+        # still stands at 3 and RESUME would refuse on it alone.
+        self.fan_dead()
+        self.trip()
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.assertEqual(self.counts()[0], 3)
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.counts(), (0, 0))
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertIn('M104 S215.0', self.m1.timeline)
 
     def test_clear_once_checked(self):
         self.fan_dead()
@@ -808,6 +847,26 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
         self.m1.run('CANCEL_PRINT')
         self.assertEqual(self.release(), [])
         self.assertEqual(self.m1.extruder['target'], 0.)
+
+    def test_no_reheat_while_the_fault_is_latched(self):
+        # Counters below 3, the sticky fault alone standing.
+        self.press()
+        self.m1.run('SET_GCODE_VARIABLE MACRO=HOTEND_FAN_CHECK '
+                    'VARIABLE=fault_latched VALUE=1')
+        self.assertNotIn('M104 S215.0', self.release())
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.m1.responses.clear()
+
+    def test_a_disconnect_during_the_hold(self):
+        self.press()
+        self.m1.run('TOOLHEAD_DISCONNECT')
+        self.assertEqual(self.release(), [])
+
+    def test_a_fan_stop_during_the_hold(self):
+        # The routine alone, with no latch: it forgets the press.
+        self.press()
+        self.m1.run('FAN_STOPPAGE_ROUTINE FAN_NAME="Motor Drivers"')
+        self.assertEqual(self.release(), [])
 
     def test_p6_a_second_release(self):
         self.press()
