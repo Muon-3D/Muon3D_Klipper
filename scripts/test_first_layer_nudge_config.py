@@ -40,7 +40,7 @@ def main():
     require(section(core, "[idle_timeout]"), "_FIRST_LAYER_NUDGE_DISARM",
             "core.cfg [idle_timeout]")
     require(nudge, "MOVE=1 MOVE_SPEED=5", NUDGE)
-    require(nudge, "candidate_um|abs > 100", NUDGE)
+    require(nudge, "candidate_nm|abs > 100000", NUDGE)
     print("first-layer nudge production include chain and hooks are sound")
 
 

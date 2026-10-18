@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, optparse, logging, subprocess
+import re
 
 TEMP_GCODE_FILE = "_test_.gcode"
 TEMP_LOG_FILE = "_test_.log"
@@ -16,6 +17,13 @@ TEMP_OUTPUT_FILE = "_test_output"
 
 class error(Exception):
     pass
+
+def runtime_error_matches(log, expected_error):
+    """Match only the last runtime error record, never the config dump."""
+    records = re.findall(
+        r"(?m)^.*(?:CommandError:|Exiting SD card print \(position \d+\):)"
+        r".*$", log)
+    return bool(records and expected_error in records[-1])
 
 class TestCase:
     def __init__(self, fname, dictdir, tempdir, verbose, keepfiles,
@@ -120,7 +128,10 @@ class TestCase:
         if expected_error is not None:
             with open(TEMP_LOG_FILE, 'r', errors='replace') as f:
                 log = f.read()
-            if expected_error not in log:
+            # The config is dumped into the log at startup, so searching the
+            # whole file can match EXPECT_ERROR text embedded in macro source.
+            # Restrict matching to the final runtime CommandError record.
+            if not runtime_error_matches(log, expected_error):
                 self.show_log()
                 raise error("Expected error text not found: %s"
                             % (expected_error,))

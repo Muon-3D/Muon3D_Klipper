@@ -21,6 +21,10 @@ class VirtualSD:
         self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
         self.current_file = None
         self.file_position = self.file_size = 0
+        # Monotonically identifies each file reset/load lifecycle.  In
+        # particular, restarting the same filename must still be observable to
+        # safety-sensitive macros.
+        self.start_generation = 0
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
@@ -96,6 +100,7 @@ class VirtualSD:
             'is_active': self.is_active(),
             'file_position': self.file_position,
             'file_size': self.file_size,
+            'start_generation': self.start_generation,
         }
     def file_path(self):
         if self.current_file:
@@ -130,6 +135,7 @@ class VirtualSD:
     def cmd_error(self, gcmd):
         raise gcmd.error("SD write not supported")
     def _reset_file(self):
+        self.start_generation += 1
         if self.current_file is not None:
             self.do_pause()
             self.current_file.close()
@@ -293,7 +299,12 @@ class VirtualSD:
                     return self.reactor.NEVER
                 lines = []
                 partial_input = ""
-        logging.info("Exiting SD card print (position %d)", self.file_position)
+        if error_message is not None:
+            logging.info("Exiting SD card print (position %d): %s",
+                         self.file_position, error_message)
+        else:
+            logging.info("Exiting SD card print (position %d)",
+                         self.file_position)
         self.work_timer = None
         self.cmd_from_sd = False
         if error_message is not None:
