@@ -38,6 +38,7 @@ class TestCase:
         # Parse file into test cases
         config_fname = gcode_fname = dict_fnames = None
         should_fail = multi_tests = False
+        expected_error = None
         gcode = []
         f = open(self.fname, 'r')
         for line in f:
@@ -53,11 +54,13 @@ class TestCase:
                     if not multi_tests:
                         multi_tests = True
                         self.launch_test(config_fname, dict_fnames,
-                                         gcode_fname, gcode, should_fail)
+                                         gcode_fname, gcode, should_fail,
+                                         expected_error)
                 config_fname = self.relpath(parts[1])
                 if multi_tests:
                     self.launch_test(config_fname, dict_fnames,
-                                     gcode_fname, gcode, should_fail)
+                                     gcode_fname, gcode, should_fail,
+                                     expected_error)
             elif parts[0] == "DICTIONARY":
                 dict_fnames = [self.relpath(parts[1], 'dict')]
                 for mcu_dict in parts[2:]:
@@ -68,14 +71,16 @@ class TestCase:
                 gcode_fname = self.relpath(parts[1])
             elif parts[0] == "SHOULD_FAIL":
                 should_fail = True
+            elif parts[0] == "EXPECT_ERROR":
+                expected_error = line.strip()[len("EXPECT_ERROR"):].strip()
             else:
                 gcode.append(line.strip())
         f.close()
         if not multi_tests:
             self.launch_test(config_fname, dict_fnames,
-                             gcode_fname, gcode, should_fail)
+                             gcode_fname, gcode, should_fail, expected_error)
     def launch_test(self, config_fname, dict_fnames, gcode_fname, gcode,
-                    should_fail):
+                    should_fail, expected_error):
         gcode_is_temp = False
         if gcode_fname is None:
             gcode_fname = self.relpath(TEMP_GCODE_FILE, 'temp')
@@ -112,6 +117,13 @@ class TestCase:
             if should_fail:
                 raise error("Test failed to raise an error")
             raise error("Error during test")
+        if expected_error is not None:
+            with open(TEMP_LOG_FILE, 'r', errors='replace') as f:
+                log = f.read()
+            if expected_error not in log:
+                self.show_log()
+                raise error("Expected error text not found: %s"
+                            % (expected_error,))
         # Do cleanup
         if self.keepfiles:
             return

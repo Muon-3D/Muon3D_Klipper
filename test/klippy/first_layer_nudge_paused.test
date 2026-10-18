@@ -1,4 +1,5 @@
 DICTIONARY atmega2560.dict
 CONFIG first_layer_nudge.cfg
 SHOULD_FAIL
+EXPECT_ERROR FIRST_LAYER_NUDGE refused: a print must be actively printing and not paused
 SDCARD_PRINT_FILE FILENAME=paused.gcode

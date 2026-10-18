@@ -1,0 +1,5 @@
+DICTIONARY atmega2560.dict
+CONFIG first_layer_nudge.cfg
+SHOULD_FAIL
+EXPECT_ERROR FIRST_LAYER_NUDGE refused: PRINT_START has not armed nudging for this print
+SDCARD_PRINT_FILE FILENAME=disarmed.gcode

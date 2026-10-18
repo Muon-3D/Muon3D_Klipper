@@ -1,4 +1,5 @@
 DICTIONARY atmega2560.dict
 CONFIG first_layer_nudge.cfg
 SHOULD_FAIL
+EXPECT_ERROR FIRST_LAYER_NUDGE refused: requested step would exceed the +/-0.10 mm cap
 SDCARD_PRINT_FILE FILENAME=external_cap.gcode

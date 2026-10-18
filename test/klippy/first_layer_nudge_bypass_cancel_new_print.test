@@ -1,0 +1,5 @@
+DICTIONARY atmega2560.dict
+CONFIG first_layer_nudge.cfg
+SHOULD_FAIL
+EXPECT_ERROR FIRST_LAYER_NUDGE refused: armed print identity no longer matches the current print
+SDCARD_PRINT_FILE FILENAME=bypass_cancel_new_print.gcode

@@ -1,0 +1,5 @@
+DICTIONARY atmega2560.dict
+CONFIG first_layer_nudge.cfg
+SHOULD_FAIL
+EXPECT_ERROR _FIRST_LAYER_NUDGE_RESET refused: only PRINT_START may reset the nudge budget
+SDCARD_PRINT_FILE FILENAME=manual_reset.gcode
