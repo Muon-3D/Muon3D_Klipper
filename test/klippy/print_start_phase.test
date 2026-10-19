@@ -19,6 +19,7 @@ ASSERT_SEEN WANT="wipe:home resonance:home_z dock:resonance save_config:mesh doc
 ASSERT_SEQ SEQ=13
 ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=1
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 ASSERT_PHASE_T
 ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
@@ -28,6 +29,9 @@ _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=1
+# This negative assertion exercises the production gate's reuse branch, not
+# merely the sweep counter: the second request must explicitly report no sweep.
+ASSERT_LAST_RESONANCE_SWEPT VALUE=0
 ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
 
 # A reconnect may be a toolhead/nozzle swap and invalidates the session flag.
@@ -35,10 +39,12 @@ TOOLHEAD_CONNECT
 _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_SWEEPS COUNT=2
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 
 # FORCE remains an unconditional operator override after this session swept.
 FINETUNE_RESONANCE FORCE=1
 ASSERT_SWEEPS COUNT=3
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 
 # 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
