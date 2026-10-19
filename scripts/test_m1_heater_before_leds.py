@@ -22,6 +22,7 @@
 import logging
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,7 +31,7 @@ from test_m1_led_modes import (  # noqa: E402
     _parse_leds)
 import configfile  # noqa: E402
 import gcode  # noqa: E402
-from extras import delayed_gcode, gcode_macro  # noqa: E402
+from extras import delayed_gcode, gcode_macro, save_variables  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
             'toolhead.cfg', 'bed.cfg', 'filament.cfg', 'calibration.cfg')
@@ -87,7 +88,7 @@ class FailingLedEffect:
 
 
 class M1:
-    def __init__(self):
+    def __init__(self, variables_file):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
         self.gcode = gcode.GCodeDispatch(printer)
@@ -97,6 +98,14 @@ class M1:
         self.macro = gcode_macro.PrinterGCodeMacro(FakeConfig(
             printer, None, 'gcode_macro'))
         printer.add_object('gcode_macro', self.macro)
+        self.saved = save_variables.SaveVariables(FakeConfig(
+            printer, None, 'save_variables', {'filename': variables_file}))
+        printer.add_object('save_variables', self.saved)
+        # Put a recording/failure-injection shim around Klipper's real
+        # SAVE_VARIABLE command.  Successful calls still write and reload the
+        # actual file, which lets tests create a second M1 as a restart.
+        self.gcode.register_command('SAVE_VARIABLE', None)
+        self.gcode.register_command('SAVE_VARIABLE', self._save_variable)
         printer.add_object('toolhead', Status({
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
@@ -185,6 +194,12 @@ class M1:
         elif name == 'CLEAR_PAUSE':
             self.pause_resume['is_paused'] = False
 
+    def _save_variable(self, gcmd):
+        self.timeline.append(gcmd.get_commandline())
+        if 'SAVE_VARIABLE' in self.raising:
+            raise gcmd.error("SAVE_VARIABLE: failing on purpose")
+        self.saved.cmd_SAVE_VARIABLE(gcmd)
+
     def _m104(self, gcmd):
         self.timeline.append(gcmd.get_commandline())
         if 'M104' in self.raising:
@@ -249,7 +264,10 @@ class _M1TestCase(unittest.TestCase):
         self.log = _ErrorLog()
         logging.getLogger().addHandler(self.log)
         self.addCleanup(logging.getLogger().removeHandler, self.log)
-        self.m1 = M1()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.variables_file = os.path.join(self.tempdir.name, 'variables.cfg')
+        self.m1 = M1(self.variables_file)
 
     def tearDown(self):
         self.assertEqual([r for r in self.m1.responses if r.startswith('!!')
@@ -825,6 +843,75 @@ class StickyFanFault(_FanCheckTestCase):
                         self.m1.responses)
         self.m1.responses.clear()
         self.log.records.clear()
+
+
+class PersistentFanFault(_FanCheckTestCase):
+    """Jack, 18 Oct: the sticky fault survives every kind of restart."""
+
+    def saved_fault(self):
+        return self.m1.saved.get_status(0.)['variables'].get(
+            'hotend_fan_fault')
+
+    def restart(self):
+        self.m1 = M1(self.variables_file)
+        self.m1.timeline.clear()
+        self.restore_startup_fault()
+
+    def restore_startup_fault(self):
+        # CHECK_ALL_FANS also starts at one second, but this focused harness
+        # intentionally has no CPU/MD/PSU fan objects.  Leave that unrelated
+        # watchdog timer parked while firing the two-second restore timer.
+        for timer in self.m1.reactor.timers:
+            if timer[0] == 1.:
+                timer[0] = self.m1.reactor.NEVER
+        self.m1.reactor.advance(2.)
+
+    def test_latch_survives_restart_and_restores_the_prompt(self):
+        self.fan_dead()
+        self.trip()
+        self.assertEqual(self.saved_fault(), 1)
+        self.restart()
+        self.assertEqual(self.fault(), 1)
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
+
+    def test_clear_persists_zero(self):
+        self.fan_dead()
+        self.trip()
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.saved_fault(), 0)
+        self.restart()
+        self.assertEqual(self.fault(), 0)
+        self.assertEqual(self.m1.prompt_lines(), [])
+
+    def test_failed_latch_save_cannot_skip_heater_off_or_pause(self):
+        self.fan_dead()
+        self.m1.raising.add('SAVE_VARIABLE')
+        self.check(2)
+        with self.assertRaises(gcode.CommandError):
+            self.check()
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.assertTrue(self.m1.pause_resume['is_paused'])
+        self.assertEqual(self.fault(), 1)
+        self.m1.responses.clear()
+
+    def test_failed_clear_save_leaves_the_memory_latch_set(self):
+        self.fan_dead()
+        self.trip()
+        self.m1.heatsink.update(temperature=40.0, speed=0.3)
+        self.m1.raising.add('SAVE_VARIABLE')
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertEqual(self.fault(), 1)
+        self.assertEqual(self.saved_fault(), 1)
+        self.m1.responses.clear()
+
+    def test_startup_without_a_saved_fault_does_not_prompt(self):
+        self.m1.timeline.clear()
+        self.restore_startup_fault()
+        self.assertEqual(self.fault(), 0)
+        self.assertEqual(self.m1.prompt_lines(), [])
 
 
 class UnlockReleaseRestoresOnce(_FanCheckTestCase):
