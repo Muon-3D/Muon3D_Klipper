@@ -2,8 +2,9 @@
 DICTIONARY atmega2560.dict
 CONFIG print_start_phase.cfg
 
-# Nothing has run yet.
+# A fresh klippy process starts unswept; its first print must sweep.
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=0
 
 # A print whose slicer region crosses the no-go notch at the front (x 75 to
 # 125, y 0 to 34): 4 x 4 points on a 30 x 26 mm grid, rows alternating
@@ -17,6 +18,7 @@ ASSERT_SEEN WANT="wipe:home resonance:home_z dock:resonance save_config:mesh doc
 # Handover was the last mark, and clears it.
 ASSERT_SEQ SEQ=13
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=1
 ASSERT_PHASE_T
 ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
@@ -25,7 +27,18 @@ ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/14
 _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=1
 ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
+
+# A reconnect may be a toolhead/nozzle swap and invalidates the session flag.
+TOOLHEAD_CONNECT
+_TEST_RESET
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=2
+
+# FORCE remains an unconditional operator override after this session swept.
+FINETUNE_RESONANCE FORCE=1
+ASSERT_SWEEPS COUNT=3
 
 # 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
