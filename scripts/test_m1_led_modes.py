@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.join(ROOT, 'klippy'))
 
 import configfile  # noqa: E402
 import gcode  # noqa: E402
-from extras import delayed_gcode, gcode_macro, save_variables  # noqa: E402
+from extras import (delayed_gcode, gcode_macro, print_end_park,
+                    save_variables)  # noqa: E402
 
 # The files under test, as core/M1/macros/macros.cfg includes them.
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'filament.cfg')
@@ -318,6 +319,8 @@ class M1Leds:
                 if name.upper() in STUB_COMMANDS:
                     continue
                 obj = gcode_macro.GCodeMacro(config)
+            elif kind == 'print_end_park':
+                obj = print_end_park.load_config(config)
             elif kind == 'delayed_gcode':
                 obj = delayed_gcode.DelayedGcode(config)
             elif kind == 'led_effect':

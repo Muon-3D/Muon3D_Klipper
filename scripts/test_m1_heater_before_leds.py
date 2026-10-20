@@ -30,7 +30,7 @@ from test_m1_led_modes import (  # noqa: E402
     _parse_leds)
 import configfile  # noqa: E402
 import gcode  # noqa: E402
-from extras import delayed_gcode, gcode_macro  # noqa: E402
+from extras import delayed_gcode, gcode_macro, print_end_park  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
             'toolhead.cfg', 'bed.cfg', 'filament.cfg', 'calibration.cfg')
@@ -134,6 +134,7 @@ class M1:
         printer.add_object('bed_removal_detector', Status(self.bed_detector))
         # Names of stubbed commands a test wants to raise.
         self.raising = set()
+        self.raising_lines = set()
 
         self.timeline = []
         for name in STUBS + RENAMED:
@@ -154,6 +155,8 @@ class M1:
                 if name.upper() in STUBS:
                     continue
                 obj = gcode_macro.GCodeMacro(config)
+            elif kind == 'print_end_park':
+                obj = print_end_park.load_config(config)
             elif kind == 'delayed_gcode':
                 obj = delayed_gcode.DelayedGcode(config)
             elif kind == 'led_effect':
@@ -169,7 +172,8 @@ class M1:
         line = gcmd.get_commandline()
         self.timeline.append(line)
         name = line.split()[0].upper()
-        if name in self.raising:
+        if (name in self.raising or any(
+                line.startswith(prefix) for prefix in self.raising_lines)):
             raise gcmd.error("%s: failing on purpose" % (name,))
         # As pause_resume and virtual_sdcard do: a pause while idle sets
         # is_paused and leaves print_stats alone.
@@ -995,6 +999,35 @@ class ButtonSim:
 
     def reconnect(self):
         self.printer.send('toolhead:reconnect')
+
+
+
+class CancelParkTests(_M1TestCase):
+    # A refused XY park used to abort PRINT_END before state/LED/unlock
+    # cleanup. Exercise the actual CANCEL_PRINT -> PRINT_END macro chain.
+    def test_cancel_continues_after_park_refusal(self):
+        m = self.m1
+        unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        unlock.update(e_was_enabled=1, changed_hotend_target=1)
+        m.raising_lines.add('G0 X195 Y10')
+        m.run('CANCEL_PRINT')
+        names = m.names()
+        self.assertEqual(m.print_stats['state'], 'cancelled')
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertIn('M84', names)
+        self.assertIn('RESTORE_GCODE_STATE NAME=STATE_PRINT_END', m.timeline)
+        self.assertIsNotNone(m.first_led())
+        self.assertLess(names.index('TURN_OFF_HEATERS'), names.index('G0'))
+        self.assertNotIn('CUT_FILAMENT', names)
+        self.assertEqual(names.count('G0'), 2)  # lift, then refused XY
+        self.assertEqual([r for r in m.responses if r.startswith('!!')],
+                         ['!! G0: failing on purpose'])
+        m.responses[:] = [r for r in m.responses if not r.startswith('!!')]
+        self.assertTrue(any('parking skipped' in r for r in m.responses),
+                        m.responses)
+        unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        self.assertEqual(unlock['e_was_enabled'], 0)
+        self.assertEqual(unlock['changed_hotend_target'], 0)
 
 
 if __name__ == '__main__':
