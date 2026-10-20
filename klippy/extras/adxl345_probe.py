@@ -1,41 +1,14 @@
 import logging
 import pins
-from . import probe, adxl345, homing
+from . import probe, homing, accel_tap_chip
 
-REG_THRESH_TAP = 0x1D
-REG_DUR = 0x21
-REG_TAP_AXES = 0x2A
-REG_INT_ENABLE = 0x2E
-REG_INT_MAP = 0x2F
-REG_INT_SOURCE = 0x30
-
-DUR_SCALE = 0.000625  # 0.625 msec / LSB
-TAP_SCALE = 0.0625 * adxl345.FREEFALL_ACCEL
-INT_SINGLE_TAP = 0x40
-
-TAP_AXIS_BITS = {'x': 0x01, 'y': 0x02, 'z': 0x04}
+TAP_AXIS_BITS = accel_tap_chip.TAP_AXIS_BITS
 VALID_TAP_AXES = ''.join(TAP_AXIS_BITS.keys())
 
 ADXL345_REST_TIME = .1
 TAP_TEST_SAMPLE_TIME = .000015
 TAP_TEST_SAMPLE_COUNT = 4
 TAP_TEST_REST_TIME = .001
-
-
-class _FileOutputRegs:
-    # Stand-in for the adxl345 register interface when klippy runs in
-    # file-output (regression test) mode and SPI reads return nothing.
-    def __init__(self, mcu):
-        self.mcu = mcu
-
-    def set_reg(self, reg, val, minclock=0):
-        pass
-
-    def read_reg(self, reg, minclock=0, reqclock=0):
-        return 0
-
-    def check_connected(self):
-        pass
 
 
 class ADXL345TapEndstop:
@@ -119,12 +92,17 @@ class ADXL345Probe:
             int_pin = int_pin[1:].strip()
         if int_pin not in ('int1', 'int2'):
             raise config.error("int_pin must be either 'int1' or 'int2'")
-        self.int_map = 0x40 if int_pin == 'int2' else 0x00
 
-        self.adxl345 = self.printer.lookup_object(config.get('chip', 'adxl345'))
-        self._adxl_mcu = self.adxl345.mcu
+        # The chip section ([adxl345] or [lis2dw]) picks the tap backend.
+        accel = self.printer.lookup_object(config.get('chip', 'adxl345'))
+        self._adxl_mcu = accel.mcu
+        regs = accel
         if self._adxl_mcu.is_fileoutput():
-            self.adxl345 = _FileOutputRegs(self._adxl_mcu)
+            regs = accel_tap_chip.FileOutputRegs(self._adxl_mcu)
+        self.adxl345 = regs
+        self.tap_chip = accel_tap_chip.lookup_tap_chip(
+            config, accel, regs, int_pin, self.inverted)
+        self.chip_name = self.tap_chip.name
         self.probe_pin = config.get('probe_pin')
         self.disable_fans = [f.strip() for f in
                              config.get("disable_fans", "").split(",")
@@ -133,9 +111,9 @@ class ADXL345Probe:
 
         # Configure per-axis tap profiles.
         default_tap_thresh = config.getfloat('tap_thresh', 5000.,
-                                             minval=TAP_SCALE, maxval=100000.)
+                                             **self._thresh_limits())
         default_tap_dur = config.getfloat('tap_dur', 0.01,
-                                          above=DUR_SCALE, maxval=0.1)
+                                          **self._dur_limits())
         default_tap_axes = config.get('tap_axes', 'xyz')
 
         self.tap_profiles = {
@@ -147,6 +125,10 @@ class ADXL345Probe:
                 config, 'z', default_tap_thresh, default_tap_dur,
                 default_tap_axes),
         }
+        for axis in 'xyz':
+            desc = self.tap_chip.describe_profile(self.tap_profiles[axis])
+            if desc:
+                logging.info("adxl345_probe %s profile%s", axis, desc)
         # Delay interrupt arming so startup jerk does not immediately trigger.
         default_homing_arm_delay = config.getfloat(
             'homing_tap_arm_delay', 0.030, minval=0., maxval=1.0)
@@ -293,13 +275,20 @@ class ADXL345Probe:
     def _mask_to_axes(self, mask):
         return ''.join([a for a in 'xyz' if mask & TAP_AXIS_BITS[a]])
 
+    def _thresh_limits(self):
+        return {'minval': self.tap_chip.thresh_min,
+                'maxval': self.tap_chip.thresh_max}
+
+    def _dur_limits(self):
+        return {'above': self.tap_chip.dur_above,
+                'maxval': self.tap_chip.dur_max}
+
     def _load_tap_profile(self, config, axis, default_thresh, default_dur,
                           default_tap_axes):
         tap_thresh = config.getfloat('%s_tap_thresh' % (axis,),
-                                     default_thresh,
-                                     minval=TAP_SCALE, maxval=100000.)
+                                     default_thresh, **self._thresh_limits())
         tap_dur = config.getfloat('%s_tap_dur' % (axis,), default_dur,
-                                  above=DUR_SCALE, maxval=0.1)
+                                  **self._dur_limits())
         tap_axes = config.get('%s_tap_axes' % (axis,), default_tap_axes)
         tap_axes_mask = self._parse_tap_axes(
             tap_axes, config.error, '%s_tap_axes' % (axis,))
@@ -339,18 +328,13 @@ class ADXL345Probe:
         return self.tap_profiles[axis]
 
     def _set_profile_regs(self, profile, minclock=0):
-        chip = self.adxl345
-        chip.set_reg(REG_TAP_AXES, profile['tap_axes_mask'], minclock=minclock)
-        chip.set_reg(REG_THRESH_TAP, int(profile['tap_thresh'] / TAP_SCALE),
-                     minclock=minclock)
-        chip.set_reg(REG_DUR, int(profile['tap_dur'] / DUR_SCALE),
-                     minclock=minclock)
+        self.tap_chip.set_profile(profile, minclock=minclock)
 
     def _merge_profiles(self, wrappers):
         profiles = [self._get_profile(w.get_axis()) for w in wrappers]
         tap_axes_mask = 0
-        tap_thresh = TAP_SCALE
-        tap_dur = DUR_SCALE
+        tap_thresh = self.tap_chip.thresh_min
+        tap_dur = 0.
         for p in profiles:
             tap_axes_mask |= p['tap_axes_mask']
             tap_thresh = max(tap_thresh, p['tap_thresh'])
@@ -362,11 +346,11 @@ class ADXL345Probe:
         }
 
     def _try_clear_tap(self, minclock=0):
-        chip = self.adxl345
+        chip = self.tap_chip
         tries = 8
         while tries > 0:
-            val = chip.read_reg(REG_INT_SOURCE, minclock=minclock)
-            if not (val & INT_SINGLE_TAP):
+            val = chip.read_source(minclock=minclock)
+            if not chip.source_has_tap(val):
                 return True
             tries -= 1
         return False
@@ -424,42 +408,42 @@ class ADXL345Probe:
         self._tap_enable_minclock = 0
         if self._tap_mode != mode:
             return self.reactor.NEVER
-        chip = self.adxl345
+        chip = self.tap_chip
         try:
             # Drop startup motion events that happened during arm delay.
-            chip.read_reg(REG_INT_SOURCE, minclock=minclock)
+            chip.read_source(minclock=minclock)
             if not self._try_clear_tap(minclock=minclock):
                 raise self.printer.command_error(
-                    "ADXL345 tap active before delayed arm")
-            chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=minclock)
+                    "%s tap active before delayed arm" % (self.chip_name,))
+            chip.arm(minclock=minclock)
         except Exception as e:
-            logging.exception("Failed delayed ADXL345 tap arm")
+            logging.exception("Failed delayed %s tap arm", self.chip_name)
             self.printer.invoke_shutdown(
-                "ADXL345 delayed tap arm failed: %s" % (str(e),))
+                "%s delayed tap arm failed: %s" % (self.chip_name, str(e)))
         return self.reactor.NEVER
 
     def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
         if self._tap_mode is not None:
             raise self.printer.command_error(
-                "ADXL345 tap detection already active (%s)" % (self._tap_mode,))
-        chip = self.adxl345
-        chip.check_connected()
+                "%s tap detection already active (%s)"
+                % (self.chip_name, self._tap_mode))
+        self.adxl345.check_connected()
+        chip = self.tap_chip
         toolhead = self.printer.lookup_object('toolhead')
         was_measuring = True
         try:
             toolhead.flush_step_generation()
             toolhead.dwell(ADXL345_REST_TIME)
             print_time = toolhead.get_last_move_time()
-            clock = chip.mcu.print_time_to_clock(print_time)
-            chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-            chip.read_reg(REG_INT_SOURCE)
+            clock = self._adxl_mcu.print_time_to_clock(print_time)
+            chip.disarm(minclock=clock)
+            chip.read_source()
             self._set_profile_regs(profile, minclock=clock)
-            was_measuring = chip.read_reg(adxl345.REG_POWER_CTL) == 0x08
-            if not was_measuring:
-                chip.set_reg(adxl345.REG_POWER_CTL, 0x08, minclock=clock)
+            was_measuring = chip.power_up(minclock=clock)
             if not self._try_clear_tap():
                 raise self.printer.command_error(
-                    "ADXL345 tap triggered before move, reduce sensitivity.")
+                    "%s tap triggered before move, reduce sensitivity."
+                    % (self.chip_name,))
             self._cancel_tap_enable_timer()
             if defer_arm:
                 pass
@@ -469,18 +453,19 @@ class ADXL345Probe:
                 self.reactor.update_timer(self._tap_enable_timer,
                                           self.reactor.monotonic() + arm_delay)
             else:
-                chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=clock)
+                chip.arm(minclock=clock)
         except Exception:
             self._cancel_tap_enable_timer()
             try:
-                chip.set_reg(REG_INT_ENABLE, 0x00)
+                chip.disarm()
             except Exception:
-                logging.exception("Unable to disable ADXL345 interrupt")
-            if not was_measuring:
-                try:
-                    chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
-                except Exception:
-                    logging.exception("Unable to restore ADXL345 power state")
+                logging.exception("Unable to disable %s interrupt",
+                                  self.chip_name)
+            try:
+                chip.power_restore(was_measuring)
+            except Exception:
+                logging.exception("Unable to restore %s power state",
+                                  self.chip_name)
             raise
         self._tap_was_measuring = was_measuring
         self._tap_mode = mode
@@ -490,19 +475,19 @@ class ADXL345Probe:
             return
         if mode is not None and self._tap_mode != mode:
             return
-        chip = self.adxl345
+        chip = self.tap_chip
         toolhead = self.printer.lookup_object('toolhead')
         try:
             self._cancel_tap_enable_timer()
             toolhead.dwell(ADXL345_REST_TIME)
             print_time = toolhead.get_last_move_time()
-            clock = chip.mcu.print_time_to_clock(print_time)
-            chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-            if not self._tap_was_measuring:
-                chip.set_reg(adxl345.REG_POWER_CTL, 0x00, minclock=clock)
+            clock = self._adxl_mcu.print_time_to_clock(print_time)
+            chip.disarm(minclock=clock)
+            chip.power_restore(self._tap_was_measuring, minclock=clock)
             if not self._try_clear_tap():
                 raise self.printer.command_error(
-                    "ADXL345 tap still active after move, reduce sensitivity.")
+                    "%s tap still active after move, reduce sensitivity."
+                    % (self.chip_name,))
         finally:
             self._tap_mode = None
             self._tap_was_measuring = False
@@ -744,40 +729,36 @@ class ADXL345Probe:
             try:
                 self._stop_tap('axis_homing')
             except Exception:
-                logging.exception("ADXL345 axis homing cleanup failed")
+                logging.exception("%s axis homing cleanup failed",
+                                  self.chip_name)
             self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
             try:
                 self._stop_tap('tap_test')
             except Exception:
-                logging.exception("ADXL345 tap test cleanup failed")
+                logging.exception("%s tap test cleanup failed", self.chip_name)
         elif self._tap_mode == 'probe':
             try:
                 self._stop_tap('probe')
             except Exception:
-                logging.exception("ADXL345 probe cleanup failed")
+                logging.exception("%s probe cleanup failed", self.chip_name)
             if not self._in_multi_probe:
                 self._set_fan_disabled(False)
             try:
                 self.deactivate_gcode.run_gcode_from_command()
             except Exception:
-                logging.exception("ADXL345 deactivate_gcode failed")
+                logging.exception("%s deactivate_gcode failed", self.chip_name)
 
     def init_adxl(self):
         self.phoming = self.printer.lookup_object('homing')
-        chip = self.adxl345
         if (getattr(self._adxl_mcu, 'is_non_critical', False)
                 and getattr(self._adxl_mcu, 'non_critical_disconnected', False)):
             self._adxl_initialized = False
-            logging.info("ADXL345 probe init deferred: MCU '%s' is disconnected",
-                         self._adxl_mcu.get_name())
+            logging.info("%s probe init deferred: MCU '%s' is disconnected",
+                         self.chip_name, self._adxl_mcu.get_name())
             return
-        chip.check_connected()
-        chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
-        chip.set_reg(adxl345.REG_DATA_FORMAT, 0x2B if self.inverted else 0x0B)
-        chip.set_reg(REG_INT_MAP, self.int_map)
-        chip.set_reg(REG_INT_ENABLE, 0x00)
-        self._set_profile_regs(self._get_profile('z'))
+        self.adxl345.check_connected()
+        self.tap_chip.init(self._get_profile('z'))
         self._try_clear_tap()
         self._adxl_initialized = True
 
@@ -786,7 +767,7 @@ class ADXL345Probe:
             self.init_adxl()
         except Exception:
             # Do not fail global reconnect flow on ADXL init errors.
-            logging.exception("ADXL345 probe reconnect init failed")
+            logging.exception("%s probe reconnect init failed", self.chip_name)
 
     def _handle_adxl_disconnect(self):
         self._adxl_initialized = False
@@ -825,7 +806,7 @@ class ADXL345Probe:
             try:
                 self.deactivate_gcode.run_gcode_from_command()
             except Exception:
-                logging.exception("ADXL345 deactivate_gcode failed")
+                logging.exception("%s deactivate_gcode failed", self.chip_name)
             raise
         if not self._in_multi_probe:
             self._set_fan_disabled(True)
@@ -855,23 +836,32 @@ class ADXL345Probe:
         if self.cmd_helper is None:
             return {
                 'tap_mode': self._tap_mode,
+                'chip_type': self.chip_name,
                 'profiles': {
-                    axis: {
-                        'tap_thresh': p['tap_thresh'],
-                        'tap_dur': p['tap_dur'],
-                        'tap_axes': self._mask_to_axes(p['tap_axes_mask']),
-                    }
+                    axis: self._profile_status(p)
                     for axis, p in self.tap_profiles.items()
                 },
             }
         return self.cmd_helper.get_status(eventtime)
+
+    def _profile_status(self, p):
+        # *_effective: what the chip's registers can actually represent.
+        eff = self.tap_chip.effective(p)
+        return {
+            'tap_thresh': p['tap_thresh'],
+            'tap_dur': p['tap_dur'],
+            'tap_axes': self._mask_to_axes(p['tap_axes_mask']),
+            'tap_thresh_effective': eff['tap_thresh'],
+            'tap_dur_effective': eff['tap_dur'],
+        }
 
     def start_probe_session(self, gcmd):
         self._require_z_probe()
         return self.probe_session.start_probe_session(gcmd)
 
     cmd_SET_ACCEL_PROBE_help = (
-        "Configure ADXL345 tap profiles for X/Y endstops and optional Z probe. "
+        "Configure accelerometer tap profiles for X/Y endstops and optional"
+        " Z probe. "
         "Params: AXIS=<X|Y|Z|ALL> TAP_THRESH=<mm/s^2> TAP_DUR=<s> "
         "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s>"
     )
@@ -901,10 +891,9 @@ class ADXL345Probe:
         new_dur = None
         new_axes_mask = None
         if has_thresh:
-            new_thresh = gcmd.get_float('TAP_THRESH', minval=TAP_SCALE,
-                                        maxval=100000.)
+            new_thresh = gcmd.get_float('TAP_THRESH', **self._thresh_limits())
         if has_dur:
-            new_dur = gcmd.get_float('TAP_DUR', above=DUR_SCALE, maxval=0.1)
+            new_dur = gcmd.get_float('TAP_DUR', **self._dur_limits())
         if has_axes:
             axes = gcmd.get('TAP_AXES')
             new_axes_mask = self._parse_tap_axes(axes, gcmd.error, 'TAP_AXES')
@@ -928,11 +917,12 @@ class ADXL345Probe:
         for a in 'xyz':
             p = self._get_profile(a)
             lines.append(
-                "ADXL345 profile %s: tap_thresh=%.3f tap_dur=%.6f tap_axes=%s"
-                " homing_tap_arm_delay=%.4f"
-                % (a.upper(), p['tap_thresh'], p['tap_dur'],
+                "%s profile %s: tap_thresh=%.3f tap_dur=%.6f tap_axes=%s"
+                " homing_tap_arm_delay=%.4f%s"
+                % (self.chip_name, a.upper(), p['tap_thresh'], p['tap_dur'],
                    self._mask_to_axes(p['tap_axes_mask']),
-                   self.axis_homing_arm_delay.get(a, 0.)))
+                   self.axis_homing_arm_delay.get(a, 0.),
+                   self.tap_chip.describe_profile(p)))
         gcmd.respond_info("\n".join(lines))
 
     def cmd_ADXL_TEST_TAP(self, gcmd):
@@ -950,34 +940,40 @@ class ADXL345Probe:
         profile = dict(self._get_profile(axis))
         if 'TAP_THRESH' in params:
             profile['tap_thresh'] = gcmd.get_float(
-                'TAP_THRESH', minval=TAP_SCALE, maxval=100000.)
+                'TAP_THRESH', **self._thresh_limits())
         if 'TAP_DUR' in params:
             profile['tap_dur'] = gcmd.get_float(
-                'TAP_DUR', above=DUR_SCALE, maxval=0.1)
+                'TAP_DUR', **self._dur_limits())
         if 'TAP_AXES' in params:
             profile['tap_axes_mask'] = self._parse_tap_axes(
                 gcmd.get('TAP_AXES'), gcmd.error, 'TAP_AXES')
 
         gcmd.respond_info(
             "ADXL_TEST_TAP: axis=%s taps=%d timeout=%.2fs quiet=%.2fs "
-            "tap_thresh=%.3f tap_dur=%.6f tap_axes=%s"
+            "tap_thresh=%.3f tap_dur=%.6f tap_axes=%s%s"
             % (axis.upper(), taps, timeout, quiet_time,
                profile['tap_thresh'], profile['tap_dur'],
-               self._mask_to_axes(profile['tap_axes_mask'])))
+               self._mask_to_axes(profile['tap_axes_mask']),
+               self.tap_chip.describe_profile(profile)))
 
         reactor = self.printer.get_reactor()
         for tap_num in range(taps):
             self._start_tap(profile, 'tap_test')
+            source = None
             try:
                 did_trigger = self._wait_for_tap(wrapper, timeout)
+                if did_trigger:
+                    # Which chip axis fired: the axes_map check (LIS2DW12).
+                    source = self.tap_chip.describe_trigger()
             finally:
                 self._stop_tap('tap_test')
             if not did_trigger:
                 raise gcmd.error(
                     "ADXL_TEST_TAP timed out waiting for tap %d/%d on axis %s"
                     % (tap_num + 1, taps, axis.upper()))
-            gcmd.respond_info("ADXL_TEST_TAP: tap %d/%d detected"
-                              % (tap_num + 1, taps))
+            gcmd.respond_info("ADXL_TEST_TAP: tap %d/%d detected%s"
+                              % (tap_num + 1, taps,
+                                 " (%s)" % (source,) if source else ""))
             if quiet_time > 0. and tap_num + 1 < taps:
                 reactor.pause(reactor.monotonic() + quiet_time)
 

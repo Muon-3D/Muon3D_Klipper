@@ -132,6 +132,12 @@ start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
 finish_test load_cell "Test load cell collector is stopped on a failed tap"
 
+# MUON: the tap register bytes adxl345_probe writes, ADXL345 (A1) and
+# LIS2DW12 (B1). File-output klippy tests drop every register write.
+start_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+$PYTHON test/adxl345_probe/test_accel_tap_chip.py
+finish_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
