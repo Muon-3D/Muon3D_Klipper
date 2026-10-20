@@ -518,6 +518,91 @@ def test_requires_load_cell_probe():
     raise AssertionError("no config error without [load_cell_probe]")
 
 
+
+class ReplayTrapQ:
+    """Only the external executed-motion history, in load-cell print time."""
+    def __init__(self):
+        self.z_moves = []
+        self.axis = 'z'
+    def get_trapq_position(self, t):
+        return ((50., 50., 21.6), 0.)
+    def extract_trapq(self, start, end):
+        class Move:
+            pass
+        moves = []
+        for begin, finish in self.z_moves:
+            if begin < end and finish > start:
+                move = Move()
+                move.print_time, move.move_t = begin, finish - begin
+                move.x_r = -1. if self.axis == 'x' else 0.
+                move.y_r = -1. if self.axis == 'y' else 0.
+                move.z_r = -1. if self.axis == 'z' else 0.
+                moves.append(move)
+        return moves, []
+
+
+def replay_motion(r):
+    trapq = ReplayTrapQ()
+    class Report:
+        dtrapqs = {'toolhead': trapq}
+    r.printer.objects['motion_report'] = Report()
+    return trapq
+
+
+def test_unlock_offset_replay():
+    # Incident envelope: three 16 mm FORCE_MOVE filament retracts left a
+    # 717295-count offset at Z=21.6. No Z motion accompanied the load step.
+    r = Rig(z=21.6)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    for load, duration in ((240000, 0.10), (480000, 0.10),
+                           (717295, 0.4995)):
+        r.feed(load, duration)
+    check(r.status()['contact'], 'offset still guarded before steady 0.5 s')
+    r.feed(717295, 0.002)
+    check(r.status()['load'] == 0 and not r.status()['contact'],
+          'steady unlock offset re-zeroes without restarting Klipper')
+    check(r.refused(60, 50, 21.6) is None,
+          'XY resumes after stationary offset relock')
+    trapq.z_moves.append((r.t, r.t + 0.05))
+    r.feed(917295, 0.025)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'new contact detects 200000 counts above the relocked zero')
+    check(r.refused(70, 50, 21.6) == REFUSAL,
+          'new real contact still refuses XY after offset recovery')
+
+
+def test_motion_contact_never_relocks_while_held():
+    for axis in ('x', 'y', 'z'):
+        r = Rig(z=0.5)
+        trapq = replay_motion(r)
+        trapq.axis = axis
+        r.feed(0, 0.5)
+        trapq.z_moves.append((r.t, r.t + 0.05))
+        r.feed(200000, 1.5)
+        check(r.status()['contact'] and r.status()['load'] == 200000,
+              'contact beginning during %s motion remains latched' % axis)
+        r.printer.toolhead.print_time = r.t - 0.1
+        check(r.refused(60, 50, 0.5) == REFUSAL,
+              'held %s contact still refuses XY after relock interval' % axis)
+
+
+def test_unknown_motion_and_changing_offsets_do_not_relock():
+    r = Rig()
+    r.feed(0, 0.5)
+    r.feed(717295, 1.5)
+    check(r.status()['contact'] and r.status()['load'] == 717295,
+          'unknown executed motion never absorbs above-threshold load')
+    r = Rig(z=21.6)
+    replay_motion(r)
+    r.feed(0, 0.5)
+    for _ in range(6):
+        r.feed(200000, 0.1)
+        r.feed(250000, 0.1)
+    check(r.status()['contact'] and r.status()['load'] == 250000,
+          'changing load outside the band does not count as steady offset')
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith('test_') and callable(v)]

@@ -52,8 +52,8 @@ class ContactGuard:
         self.band = config.getint('baseline_band_counts',
                                   self.threshold // 4, minval=1,
                                   maxval=self.threshold // 2)
-        # A load that sits outside the band but never becomes contact for
-        # this long is drift, not a touch, and the baseline jumps to it.
+        # Relock a steady offset after this long. Above-threshold offsets
+        # may relock only when they began without executed XYZ motion.
         self.relock_time = config.getfloat('relock_time', 0.5, above=0.)
         # Moves are checked as they enter the lookahead queue, before the
         # moves ahead of them have run.  Starting below this machine Z (or
@@ -83,6 +83,10 @@ class ContactGuard:
         self.drift_since = None
         self.drift_sum = 0.
         self.drift_count = 0
+        self.drift_min = self.drift_max = None
+        self.offset_can_relock = None
+        self.motion_known = False
+        self.motion_intervals = []
         self.recent = collections.deque()
         self.stream_systime = None  # last time pty input was seen
         self.sim_time = None
@@ -282,11 +286,37 @@ class ContactGuard:
             ignore_before = float('inf')
         else:
             ignore_before = self._holdoff_end()
+        self._update_motion_history(samples[0][0], samples[-1][0])
         sign = self.probe.get_press_direction(
             self.baseline if self.baseline is not None else samples[0][2])
         for sample in samples:
             self._process_sample(sample[0], sample[2], sign, ignore_before)
         return True
+
+    def _update_motion_history(self, start, end):
+        # Samples and trapq share print_time. A queued toolhead position can
+        # already be past a descent which the load-cell samples still cover.
+        # Extract once per batch, not once per 2 kHz sample. Keep the C data
+        # alive only here; the detector needs plain time intervals.
+        self.motion_known = False
+        self.motion_intervals = []
+        report = self.printer.lookup_object('motion_report', None)
+        trapq = None if report is None else report.dtrapqs.get('toolhead')
+        if trapq is None:
+            return
+        start -= self.relock_time
+        pos, velocity = trapq.get_trapq_position(start)
+        self.motion_known = pos is not None
+        moves, cdata = trapq.extract_trapq(start, end)
+        self.motion_intervals = [
+            (m.print_time, m.print_time + m.move_t) for m in moves
+            if (abs(m.x_r) > MOVE_EPSILON or abs(m.y_r) > MOVE_EPSILON
+                or abs(m.z_r) > MOVE_EPSILON)]
+
+    def _stationary(self, t):
+        return self.motion_known and not any(
+            begin <= t and end > t - self.relock_time
+            for begin, end in self.motion_intervals)
 
     def _reset_detector(self):
         self.contact = False
@@ -294,6 +324,8 @@ class ContactGuard:
         self.drift_since = None
         self.drift_sum = 0.
         self.drift_count = 0
+        self.drift_min = self.drift_max = None
+        self.offset_can_relock = None
 
     def _process_sample(self, t, counts, sign, ignore_before):
         if self.data_time is None or t > self.data_time:
@@ -318,6 +350,14 @@ class ContactGuard:
         self.prev_time = t
         load = sign * (counts - self.baseline)
         self.load = load
+        if abs(load) < self.band:
+            self.offset_can_relock = None
+        elif self.offset_can_relock is None:
+            self.offset_can_relock = self._stationary(t)
+        elif not self._stationary(t):
+            # Once motion could have caused this touch, remaining still
+            # must never age it out. Release or homing clears the latch.
+            self.offset_can_relock = False
         # Contact hysteresis
         if load > self.threshold:
             if self.above_since is None:
@@ -333,14 +373,14 @@ class ContactGuard:
             if (self.above_since is not None
                     and t - self.above_since >= self.on_time - TIME_EPSILON):
                 self.contact = True
-                self.drift_since = None
                 logging.info("contact_guard: contact, load %d", load)
         elif (self.below_since is not None
                 and t - self.below_since >= self.off_time - TIME_EPSILON):
             self.contact = False
             logging.info("contact_guard: contact released, load %d", load)
-        if self.contact or self.above_since is not None:
-            # The baseline never follows a touch
+        if ((self.contact or self.above_since is not None)
+                and not self.offset_can_relock):
+            # Never absorb a touch that could have begun during motion
             self.drift_since = None
             return
         # Baseline: follow small changes slowly
@@ -348,19 +388,23 @@ class ContactGuard:
             self.baseline += (counts - self.baseline) * min(1., dt / self.tau)
             self.drift_since = None
             return
-        # Outside the band and not a contact: drift that outran the
-        # baseline, or a zero taken under load that is now off.  Contact
-        # is a step that crosses the threshold within milliseconds, so a
-        # load that lingers here is not one.
-        if self.drift_since is None:
+        # Require a steady window, not merely time outside the band. An
+        # unlock retract may change filament tension in several steps.
+        if (self.drift_since is None
+                or counts < self.drift_max - self.band
+                or counts > self.drift_min + self.band):
             self.drift_since = t
             self.drift_sum = 0.
             self.drift_count = 0
+            self.drift_min = self.drift_max = counts
+        self.drift_min = min(self.drift_min, counts)
+        self.drift_max = max(self.drift_max, counts)
         self.drift_sum += counts
         self.drift_count += 1
         if t - self.drift_since >= self.relock_time - TIME_EPSILON:
             self.baseline = self.drift_sum / self.drift_count
-            self.drift_since = None
+            self._reset_detector()
+            self.load = sign * (counts - self.baseline)
             logging.info("contact_guard: baseline relocked, load was %d",
                          load)
 
