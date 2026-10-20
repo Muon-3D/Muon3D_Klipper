@@ -172,8 +172,8 @@ class M1:
         line = gcmd.get_commandline()
         self.timeline.append(line)
         name = line.split()[0].upper()
-        if (name in self.raising
-                or any(line.startswith(prefix) for prefix in self.raising_lines)):
+        if (name in self.raising or any(
+                line.startswith(prefix) for prefix in self.raising_lines)):
             raise gcmd.error("%s: failing on purpose" % (name,))
         # As pause_resume and virtual_sdcard do: a pause while idle sets
         # is_paused and leaves print_stats alone.
