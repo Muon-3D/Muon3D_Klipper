@@ -11,10 +11,11 @@ class BootId:
     def __init__(self, config):
         path = config.get("path", BOOT_ID_PATH)
         try:
-            with open(path) as f:
+            with open(path, encoding="ascii") as f:
                 self.boot_id = f.read().strip()
-        except OSError:
-            # Unknown, never equal to a saved id: callers must treat "" as
+        except (OSError, ValueError):
+            # Unreadable or non-ASCII (UnicodeDecodeError is a ValueError): unknown.
+            # Never equal to a saved id: callers must treat "" as
             # "cannot prove the same boot" and fall back to the safe path.
             self.boot_id = ""
 
