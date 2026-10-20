@@ -3059,6 +3059,73 @@ sensor_pin:
 #   name in the above list.
 ```
 
+### Muon B1 hotend sensor (muon_hotend)
+
+The Muon B1 toolhead reads its hotend sensor through the shared
+`[muon_ads1220]` chip (see the load cell section). The hotend may carry a
+100k NTC (ATC Semitec 104NT-4-R025H42G) or a PT1000. Which one is fitted is
+detected every time the toolhead connects, with the heater held off
+throughout, and heating is refused until it is known:
+
+1. The sensor is measured in PT1000 mode (100uA IDAC, safe for both). An
+   IDAC at compliance, or a resistance outside 800-3000 ohm, can only be
+   an NTC.
+2. Inside that band the resistance is watched for a few seconds: rising
+   means a hot NTC cooling, falling a hot PT1000 cooling, steady a PT1000
+   at ambient (confirmed against `heatsink_sensor`).
+3. An NTC is then switched to its divider excitation and checked once
+   settled.
+
+The detected hotend's `max_temp`, PID and mcu range check are then applied.
+An open or shorted sensor shuts the toolhead mcu down from the mcu side; on
+a non-critical toolhead that is a toolhead disconnect.
+
+```
+sensor_type: muon_hotend
+muon_ads1220:
+#   The name of the [muon_ads1220] section. This parameter must be
+#   provided.
+#heatsink_sensor:
+#   A temperature object (e.g. "temperature_fan toolhead_heatsink") used
+#   to confirm a PT1000 at ambient during detection.
+#hotend_type: auto
+#   auto, ntc or pt1000. A fixed type skips the detection (not the
+#   settling time).
+#ntc_max_temp: 265
+#pt1000_max_temp: 350
+#   max_temp applied for each hotend type. Each must be at or below the
+#   heater's own max_temp, which should therefore be set to the higher of
+#   the two.
+#ntc_pid_Kp:
+#ntc_pid_Ki:
+#ntc_pid_Kd:
+#pt1000_pid_Kp:
+#pt1000_pid_Ki:
+#pt1000_pid_Kd:
+#   Optional PID parameters applied for each hotend type (control: pid
+#   only). When not set the heater's own pid_Kp etc. are kept.
+#ntc_temperature1: 25
+#ntc_resistance1: 100000
+#ntc_temperature2: 160
+#ntc_resistance2: 1074
+#ntc_temperature3: 300
+#ntc_resistance3: 82.78
+#   NTC Steinhart-Hart points. The defaults are the Semitec 104NT-4.
+#range_check_count: 4
+#   Consecutive out of range readings before the mcu shuts down.
+#detect_min_resistance: 800
+#detect_max_resistance: 3000
+#   The band in which a PT1000 and a hot NTC cannot be told apart from
+#   one reading.
+#detect_steady_rate: 1.0
+#   Resistance change (ohm/s) below which the reading counts as steady.
+#detect_watch_time: 3.0
+#detect_settle_time: 1.5
+#ntc_settle_time: 1.0
+#detect_timeout: 30
+#detect_heatsink_tolerance: 15
+```
+
 ### BMP180/BMP280/BME280/BMP388/BME680 temperature sensor
 
 BMP180/BMP280/BME280/BMP388/BME680 two wire interface (I2C) environmental sensors.
@@ -5535,6 +5602,98 @@ cs_pin:
 #vref:
 #   The selected voltage reference. Valid values are: 'internal', 'REF0', 'REF1'
 #   and 'analog_supply'. Default is 'internal'.
+```
+
+#### Muon B1 shared ADS1220 (muon_ads1220)
+The Muon B1 toolhead has one ADS1220 that measures both the load cell and
+the hotend temperature sensor, and its DRDY pin is not connected. The chip
+is configured once in a `[muon_ads1220]` section; the load cell and the
+hotend heater each refer to it by name. See also the `muon_hotend`
+temperature sensor.
+
+The mcu reads RDATA at 2.2 times the nominal conversion rate. A changed
+value is a new conversion; an unchanged value is reported again only once
+a conversion must have completed since the last one, so a conversion that
+happens to repeat the previous 24-bit code is not lost. Each conversion
+is reported once, within one read interval (230us at 2000SPS) of
+completing. Every `temperature_interval` the input multiplexer is switched
+to the hotend sensor for one or two fully settled conversions (about 1.7ms
+for an NTC and 2.8ms for a PT1000 at 2000SPS) and back. Those slices are
+paused while a load cell probe trigger is armed, and the heater is held
+off from the tare to the end of each tap. The mcu range checks the hotend
+reading itself, and checks the chip's configuration registers on every
+temperature read.
+
+The rate reported to the load cell (1977 for sample_rate 2000, i.e.
+4.096MHz / 2072) is the chip's nominal conversion rate, which is what a
+probe's filters see: temperature reads pause while it is armed. Outside
+probing, `LOAD_CELL_DIAGNOSTIC` measures less: the temperature slices take
+about 1.3% of the samples with a PT1000 (or while detection is failing,
+which leaves the chip in PT1000 mode) and 0.7% with an NTC, and the
+internal oscillator may be up to 2% slow. `MUON_ADC_STATS` reports the
+two separately.
+
+```
+[muon_ads1220 toolhead]
+cs_pin:
+#   The pin connected to the ADS1220 chip select line. This parameter
+#   must be provided.
+#spi_speed: 4000000
+#   The SPI speed (in hz). The mcu reads the chip ~4400 times a second
+#   at 2000SPS, so this should stay fast. The default is 4000000.
+#spi_bus:
+#spi_software_sclk_pin:
+#spi_software_mosi_pin:
+#spi_software_miso_pin:
+#   See the "common SPI settings" section for a description of the
+#   above parameters.
+high_side_pin:
+#   The pin that switches 3.3V onto the hotend sensor for an NTC (B1:
+#   !toolhead:gpio2, a P-FET that is on when the pin is low). It is off
+#   for a PT1000, which is excited by the chip's IDAC instead. This
+#   parameter must be provided.
+#gain: 64
+#sample_rate: 2000
+#   Load cell gain and turbo mode sample rate (40, 90, 180, 350, 660,
+#   1200 or 2000). The reference is always the analog supply.
+#input_mux: AIN0_AIN1
+#pga_bypass: False
+#   Load cell input pair and PGA setting, as for the ads1220 sensor.
+#reference_resistor: 4700
+#   The resistor from AIN3 (TEMP_SENSOR_LO) to ground (B1: R43).
+#pt1000_idac_current: 100
+#   IDAC current in uA for a PT1000 (50, 100 or 250). The IDAC is routed
+#   to REFP0. The default is 100.
+#pt1000_gain: 4
+#   Gain (1, 2 or 4, PGA bypassed) for both PT1000 readings.
+#analog_supply_voltage: 3.3
+#   Only used to predict the reference resistor reading during hotend
+#   detection.
+#temperature_interval: 0.200
+#   Time between hotend temperature reads (0.100 to 0.250 seconds).
+#temperature_settle_conversions: 2
+#   Conversions to wait after switching the multiplexer to the hotend
+#   sensor before reading. The first conversion after a register write
+#   is already fully settled; the second adds margin for the inputs.
+#max_temperature_pause: 4.0
+#   How long temperature reads may pause for an armed probe. Past this
+#   the mcu takes a temperature read anyway (logged as a warning). The
+#   heater is held off for the whole tap, so this only bounds how stale
+#   the reported temperature can get.
+#stall_conversions: 64
+#   An unsaturated load cell reading that repeats for this many
+#   conversions means the chip stopped converting; an armed probe then
+#   fails with an error.
+```
+
+To use the chip as a load cell, set `sensor_type: muon_ads1220` and
+`muon_ads1220: <name>` in a `[load_cell]` or `[load_cell_probe]` section:
+```
+[load_cell_probe]
+sensor_type: muon_ads1220
+muon_ads1220: toolhead
+#   The name of the [muon_ads1220] section. This parameter must be
+#   provided.
 ```
 
 ### [load_cell_probe]
