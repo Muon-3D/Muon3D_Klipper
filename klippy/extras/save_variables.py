@@ -4,9 +4,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging, ast, configparser, tempfile
-
-FAN_FAULT_VARIABLE = 'hotend_fan_fault'
+import os, logging, ast, configparser
 
 class SaveVariables:
     def __init__(self, config):
@@ -14,6 +12,8 @@ class SaveVariables:
         self.filename = os.path.expanduser(config.get('filename'))
         self.allVariables = {}
         try:
+            if not os.path.exists(self.filename):
+                open(self.filename, "w").close()
             self.loadVariables()
         except self.printer.command_error as e:
             raise config.error(str(e))
@@ -24,23 +24,14 @@ class SaveVariables:
         allvars = {}
         varfile = configparser.ConfigParser()
         try:
-            with open(self.filename) as f:
-                varfile.read_file(f)
+            varfile.read(self.filename)
             if varfile.has_section('Variables'):
                 for name, val in varfile.items('Variables'):
                     allvars[name] = ast.literal_eval(val)
-            fault = allvars.get(FAN_FAULT_VARIABLE)
-            if type(fault) is not int or fault not in (0, 1):
-                allvars[FAN_FAULT_VARIABLE] = 1
-        except FileNotFoundError:
-            allvars = {FAN_FAULT_VARIABLE: 1}
-        except Exception:
-            # This safety latch is the one variable that must never default
-            # open.  Keep other save_variables users operational, but require
-            # an explicit fan check after a missing, unreadable, or corrupt
-            # file rather than silently treating it as "no fault".
-            logging.exception("Unable to read existing variable file")
-            allvars = {FAN_FAULT_VARIABLE: 1}
+        except:
+            msg = "Unable to parse existing variable file"
+            logging.exception(msg)
+            raise self.printer.command_error(msg)
         self.allVariables = allvars
     cmd_SAVE_VARIABLE_help = "Save arbitrary variables to disk"
     def cmd_SAVE_VARIABLE(self, gcmd):
@@ -59,24 +50,11 @@ class SaveVariables:
         varfile.add_section('Variables')
         for name, val in sorted(newvars.items()):
             varfile.set('Variables', name, repr(val))
-        tmpname = None
         try:
-            directory = os.path.dirname(os.path.abspath(self.filename))
-            with tempfile.NamedTemporaryFile(
-                    mode='w', dir=directory, prefix='.save_variables.',
-                    delete=False) as f:
-                tmpname = f.name
-                varfile.write(f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmpname, self.filename)
-            tmpname = None
-        except Exception:
-            if tmpname is not None:
-                try:
-                    os.unlink(tmpname)
-                except OSError:
-                    pass
+            f = open(self.filename, "w")
+            varfile.write(f)
+            f.close()
+        except:
             msg = "Unable to save variable"
             logging.exception(msg)
             raise gcmd.error(msg)

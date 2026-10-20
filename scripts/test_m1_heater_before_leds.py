@@ -32,7 +32,8 @@ from test_m1_led_modes import (  # noqa: E402
     _parse_leds)
 import configfile  # noqa: E402
 import gcode  # noqa: E402
-from extras import delayed_gcode, gcode_macro, save_variables  # noqa: E402
+from extras import (delayed_gcode, gcode_macro, hotend_fan_latch,
+                    save_variables)  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
             'toolhead.cfg', 'bed.cfg', 'filament.cfg', 'calibration.cfg')
@@ -102,6 +103,14 @@ class M1:
         self.saved = save_variables.SaveVariables(FakeConfig(
             printer, None, 'save_variables', {'filename': variables_file}))
         printer.add_object('save_variables', self.saved)
+        self.latch_status = {
+            'latched': bool(self.saved.allVariables.get(
+                'hotend_fan_fault', 0)), 'restored': True}
+        printer.add_object('hotend_fan_latch', Status(self.latch_status))
+        self.gcode.register_command('HOTEND_FAN_LATCH_SET',
+                                    self._latch_set)
+        self.gcode.register_command('HOTEND_FAN_LATCH_CONFIRM',
+                                    self._latch_confirm)
         # Put a recording/failure-injection shim around Klipper's real
         # SAVE_VARIABLE command.  Successful calls still write and reload the
         # actual file, which lets tests create a second M1 as a restart.
@@ -185,6 +194,16 @@ class M1:
             if timer[0] == 1.:
                 timer[0] = self.reactor.NEVER
         self.reactor.advance(2.)
+
+    def _latch_set(self, gcmd):
+        self.latch_status['latched'] = True
+
+    def _latch_confirm(self, gcmd):
+        temp = self.heatsink['temperature']
+        if temp >= 51. or temp <= -10.:
+            raise gcmd.error('Fan fault not cleared: heatsink sensor %.1fC'
+                             % (temp,))
+        self.latch_status['latched'] = False
 
     def _record(self, gcmd):
         line = gcmd.get_commandline()
@@ -875,114 +894,94 @@ class StickyFanFault(_FanCheckTestCase):
         self.log.records.clear()
 
 
-class PersistentFanFault(_FanCheckTestCase):
-    """Jack, 18 Oct: the sticky fault survives every kind of restart."""
+class PythonHeaterLatch(unittest.TestCase):
+    """The Python gate, unlike macro renames/variables, is unavoidable."""
 
-    def saved_fault(self):
-        return self.m1.saved.get_status(0.)['variables'].get(
-            'hotend_fan_fault')
+    class Heater:
+        def __init__(self):
+            self.target_temp = 0.
 
-    def restart(self):
-        # Deliberately stop inside the two-second window. The old helper ran
-        # the restore here and therefore could not expose startup races.
-        self.m1 = M1(self.variables_file, restore_startup=False)
-        self.m1.timeline.clear()
+        def set_temp(self, value):
+            self.target_temp = value
 
-    def restore_startup_fault(self):
-        self.m1.restore_startup_fault()
+        def alter_target(self, value):
+            self.target_temp = value
 
-    def test_latch_survives_restart_and_restores_the_prompt(self):
-        self.fan_dead()
-        self.trip()
-        self.assertEqual(self.saved_fault(), 1)
-        self.restart()
-        self.restore_startup_fault()
-        self.assertEqual(self.fault(), 1)
-        self.assertEqual(self.m1.extruder['target'], 0.)
-        self.assertEqual(self.m1.prompt_lines(), FAULT_PROMPT)
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.state_file = os.path.join(self.tempdir.name, 'latch.state')
+        self.variables_file = os.path.join(self.tempdir.name, 'variables.cfg')
+        with open(self.variables_file, 'w') as f:
+            f.write('[Variables]\nmuon_led = \'party\'\nmesh_valid = 1\n')
+        self.printer = FakePrinter(FakeReactor())
+        self.gcode = gcode.GCodeDispatch(self.printer)
+        self.printer.add_object('gcode', self.gcode)
+        self.heater = self.Heater()
+        self.printer.add_object('extruder', self.heater)
+        self.heatsink = Status({'temperature': 40.})
+        self.printer.add_object('temperature_fan toolhead_heatsink',
+                                self.heatsink)
+        self.latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            self.printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        self.printer.add_object('hotend_fan_latch', self.latch)
+        self.printer.send_event('klippy:connect')
+        self.printer.send_event('klippy:ready')
 
-    def test_clear_persists_zero(self):
-        self.fan_dead()
-        self.trip()
-        self.m1.heatsink.update(temperature=40.0, speed=0.3)
-        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
-        self.assertEqual(self.saved_fault(), 0)
-        self.restart()
-        self.restore_startup_fault()
-        self.assertEqual(self.fault(), 0)
-        self.assertEqual(self.m1.prompt_lines(), [])
-
-    def test_failed_latch_save_cannot_skip_heater_off_or_pause(self):
-        self.fan_dead()
-        self.m1.raising.add('SAVE_VARIABLE')
-        self.check(2)
+    def assert_refused(self, setter):
         with self.assertRaises(gcode.CommandError):
-            self.check()
-        self.assertEqual(self.m1.extruder['target'], 0.)
-        self.assertTrue(self.m1.pause_resume['is_paused'])
-        self.assertEqual(self.fault(), 1)
-        self.m1.responses.clear()
+            setter(215.)
+        self.assertEqual(self.heater.target_temp, 0.)
 
-    def test_failed_clear_save_leaves_the_memory_latch_set(self):
-        self.fan_dead()
-        self.trip()
-        self.m1.heatsink.update(temperature=40.0, speed=0.3)
-        self.m1.raising.add('SAVE_VARIABLE')
+    def test_all_renamed_command_bypasses_reach_the_python_gate(self):
+        # These setters model M104.1/M109.1, SET_HEATER_TEMPERATURE_BASE,
+        # PID_CALIBRATE_BASE and remote/API callers respectively: all of them
+        # ultimately reach one of the heater's two target-setting methods.
+        routes = {
+            'M104.1': self.heater.set_temp,
+            'M109.1': self.heater.set_temp,
+            'SET_HEATER_TEMPERATURE_BASE': self.heater.set_temp,
+            'PID_CALIBRATE_BASE': self.heater.set_temp,
+            'remote set_temp': self.heater.set_temp,
+            'internal alter_target': self.heater.alter_target,
+        }
+        for name, setter in routes.items():
+            with self.subTest(route=name):
+                self.assert_refused(setter)
+
+    def test_macro_and_saved_variable_edits_cannot_clear_latch(self):
+        # SET_GCODE_VARIABLE and SAVE_VARIABLE can mutate these decoys, but
+        # the Python-owned state remains closed.
+        macro_variables = {'fault_latched': 0, 'fault_restored': 1}
+        saved_variables = {'hotend_fan_fault': 0}
+        self.assertEqual(macro_variables['fault_latched'], 0)
+        self.assertEqual(saved_variables['hotend_fan_fault'], 0)
+        self.assert_refused(self.heater.set_temp)
+
+    def test_zero_and_cooling_targets_always_work(self):
+        self.heater.set_temp(0.)
+        self.heater.alter_target(0.)
+        self.assertEqual(self.heater.target_temp, 0.)
+
+    def test_confirm_is_the_only_open_path_and_checks_sensor(self):
+        self.heatsink.status['temperature'] = 55.
         with self.assertRaises(gcode.CommandError):
-            self.m1.run('HOTEND_FAN_FAULT_CLEAR')
-        self.assertEqual(self.fault(), 1)
-        self.assertEqual(self.saved_fault(), 1)
-        self.m1.responses.clear()
+            self.gcode.run_script('HOTEND_FAN_LATCH_CONFIRM')
+        self.assert_refused(self.heater.set_temp)
+        self.heatsink.status['temperature'] = 40.
+        self.gcode.run_script('HOTEND_FAN_LATCH_CONFIRM')
+        self.heater.set_temp(215.)
+        self.assertEqual(self.heater.target_temp, 215.)
 
-    def test_startup_without_a_saved_fault_does_not_prompt(self):
-        self.restart()
-        self.m1.timeline.clear()
-        self.restore_startup_fault()
-        self.assertEqual(self.fault(), 0)
-        self.assertEqual(self.m1.prompt_lines(), [])
-
-    def test_heating_is_refused_before_restore_runs(self):
-        self.fan_dead()
-        self.trip()
-        self.restart()
-        for command in ('PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA',
-                        'RESUME', 'M109 S215', 'M104 S215',
-                        'SET_HEATER_TEMPERATURE HEATER=extruder TARGET=215'):
-            with self.subTest(command=command):
-                self.m1.extruder['target'] = 0.
-                with self.assertRaises(gcode.CommandError):
-                    self.m1.run(command)
-                self.assertEqual(self.m1.extruder['target'], 0.)
-                self.m1.responses.clear()
-                self.log.records.clear()
-
-    def test_corrupt_or_truncated_file_fails_closed(self):
-        for contents in ('', '[Variables]\nhotend_fan_fault = nonsense\n',
-                         '[Variables]\nhotend_fan_fault = 2\n',
-                         '[Variables]\nhotend_fan_fault = 1.0\n'):
-            with self.subTest(contents=contents):
-                with open(self.variables_file, 'w') as f:
-                    f.write(contents)
-                self.restart()
-                self.assertEqual(self.saved_fault(), 1)
-                self.restore_startup_fault()
-                self.assertEqual(self.fault(), 1)
-                self.log.records.clear()
-
-    def test_interrupted_atomic_write_preserves_latched_file(self):
-        self.fan_dead()
-        self.trip()
-        self.assertEqual(self.saved_fault(), 1)
-        self.m1.heatsink.update(temperature=40.0, speed=0.3)
-        with mock.patch('extras.save_variables.os.replace',
-                        side_effect=OSError('interrupted')):
-            with self.assertRaises(gcode.CommandError):
-                self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+    def test_corrupt_latch_fails_closed_without_touching_saved_variables(self):
+        with open(self.state_file, 'w') as f:
+            f.write('not a latch state')
         with open(self.variables_file) as f:
-            self.assertIn('hotend_fan_fault = 1', f.read())
-        self.assertEqual(self.fault(), 1)
-        self.m1.responses.clear()
-        self.log.records.clear()
+            before = f.read()
+        self.assertTrue(self.latch._read_state())
+        with open(self.variables_file) as f:
+            self.assertEqual(f.read(), before)
 
 
 class UnlockReleaseRestoresOnce(_FanCheckTestCase):
@@ -1027,8 +1026,9 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
     def test_no_reheat_while_the_fault_is_latched(self):
         # Counters below 3, the sticky fault alone standing.
         self.press()
+        self.m1.run('HOTEND_FAN_LATCH_SET')
         self.m1.run('SET_GCODE_VARIABLE MACRO=HOTEND_FAN_CHECK '
-                    'VARIABLE=fault_latched VALUE=1')
+                    'VARIABLE=fault_latched VALUE=0')
         self.assertNotIn('M104 S215.0', self.release())
         self.assertEqual(self.m1.extruder['target'], 0.)
         self.m1.responses.clear()
