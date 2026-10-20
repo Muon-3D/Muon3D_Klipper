@@ -21,14 +21,13 @@ class HotendFanLatch:
             'heatsink_sensor', 'temperature_fan toolhead_heatsink')
         self.max_clear_temp = config.getfloat('max_clear_temp', 51.)
         self.min_clear_temp = config.getfloat('min_clear_temp', -10.)
-        # D-018 is deliberately one option.  The shipped/default policy is
-        # fail-closed; sites may opt into an unlatched first boot explicitly.
-        self.missing_file_latched = config.getboolean(
-            'missing_file_latched', True)
+        self._corrupt_reason = None
         self.latched = self._read_state()
         self._latched_write_pending = self.latched
         self.heater = self._set_temp = self._alter_target = None
         self.printer.register_event_handler('klippy:connect', self._connect)
+        self.printer.register_event_handler('klippy:ready',
+                                            self._announce_corrupt)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('HOTEND_FAN_LATCH_SET', self.cmd_latch)
         # Private implementation hook used only by HOTEND_FAN_FAULT_CLEAR.
@@ -37,24 +36,40 @@ class HotendFanLatch:
         self._retry_timer = reactor.register_timer(
             self._retry_pending, reactor.monotonic() + 5.)
 
-    def _read_state(self):
-        if os.path.exists(self.marker_filename):
-            return True
+    def _exists(self, path):
+        # True/False only when the answer is certain.  Raises on any error
+        # other than "no such file", so an unreadable directory is never
+        # mistaken for an absent file.  A dangling symlink is not absent.
         try:
+            os.lstat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _read_state(self):
+        # D-018 (Jack, 20 Oct 2026): an ABSENT state file means no fault
+        # (fresh flash, or never written) and heating is allowed.  A file that
+        # exists but cannot be read or parsed (permissions, empty, garbage,
+        # a directory, a dangling symlink) is corrupt and fails closed.  A
+        # trip marker always wins: a trip writes it before anything else.
+        try:
+            if self._exists(self.marker_filename):
+                return True
+            if not self._exists(self.filename):
+                logging.info('Hot-end fan latch file is absent; no fault')
+                return False
             with open(self.filename) as f:
                 value = f.read().strip()
             if value == 'latched':
                 return True
             if value == 'unlatched':
                 return False
-            raise ValueError('invalid latch state')
-        except FileNotFoundError:
-            logging.warning('Hot-end fan latch file is missing; %s',
-                            'latched' if self.missing_file_latched
-                            else 'using configured first-boot exemption')
-            return self.missing_file_latched
+            raise ValueError('invalid latch state %r' % (value,))
         except Exception:
-            logging.exception('Unable to read hot-end fan latch; latching')
+            logging.exception('Hot-end fan latch file %s is unreadable or '
+                              'corrupt; latching', self.filename)
+            self._corrupt_reason = ('state file %s is corrupt or unreadable'
+                                    % (self.filename,))
             return True
 
     def _fsync_directory(self, directory):
@@ -141,6 +156,16 @@ class HotendFanLatch:
             self.heater.alter_target = self._guarded_alter_target
         if self.latched:
             self._force_off()
+
+    def _announce_corrupt(self):
+        if self._corrupt_reason is None:
+            return
+        try:
+            self.printer.lookup_object('gcode').respond_info(
+                'Hot-end fan fault latched: %s. Check the fan, then press '
+                'Fan checked to clear it.' % (self._corrupt_reason,))
+        except Exception:
+            logging.exception('Unable to announce hot-end fan latch')
 
     def _force_off(self):
         if self.heater is not None:

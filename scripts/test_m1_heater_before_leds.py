@@ -929,6 +929,32 @@ class PythonHeaterLatch(unittest.TestCase):
         self.printer.send_event('klippy:connect')
         self.printer.send_event('klippy:ready')
 
+    def trip(self):
+        # D-018: a fresh latch with no state file is clear, so tests of the
+        # latched behaviour trip it first, as a fan fault would.
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assertTrue(self.latch.latched)
+
+    def start_latch(self):
+        """A fresh klippy start reading self.state_file; returns the latch,
+        its heater and the lines it sent to the console."""
+        printer = FakePrinter(FakeReactor())
+        dispatch = gcode.GCodeDispatch(printer)
+        printer.add_object('gcode', dispatch)
+        heater = self.Heater()
+        printer.add_object('extruder', heater)
+        printer.add_object('temperature_fan toolhead_heatsink',
+                           Status({'temperature': 40.}))
+        console = []
+        dispatch.respond_info = lambda msg, log=True: (
+            console.append(msg) if 'fan fault' in msg else None)
+        latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        printer.send_event('klippy:connect')
+        printer.send_event('klippy:ready')
+        return latch, heater, console
+
     def assert_refused(self, setter):
         with self.assertRaises(gcode.CommandError):
             setter(215.)
@@ -966,6 +992,7 @@ class PythonHeaterLatch(unittest.TestCase):
         # These setters model M104.1/M109.1, SET_HEATER_TEMPERATURE_BASE,
         # PID_CALIBRATE_BASE and remote/API callers respectively: all of them
         # ultimately reach one of the heater's two target-setting methods.
+        self.trip()
         routes = {
             'M104.1': self.heater.set_temp,
             'M109.1': self.heater.set_temp,
@@ -981,6 +1008,7 @@ class PythonHeaterLatch(unittest.TestCase):
     def test_macro_and_saved_variable_edits_cannot_clear_latch(self):
         # SET_GCODE_VARIABLE and SAVE_VARIABLE can mutate these decoys, but
         # the Python-owned state remains closed.
+        self.trip()
         macro_variables = {'fault_latched': 0, 'fault_restored': 1}
         saved_variables = {'hotend_fan_fault': 0}
         self.assertEqual(macro_variables['fault_latched'], 0)
@@ -993,6 +1021,7 @@ class PythonHeaterLatch(unittest.TestCase):
         self.assertEqual(self.heater.target_temp, 0.)
 
     def test_confirm_is_the_only_open_path_and_checks_sensor(self):
+        self.trip()
         self.heatsink.status['temperature'] = 55.
         with self.assertRaises(gcode.CommandError):
             self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
@@ -1026,6 +1055,99 @@ class PythonHeaterLatch(unittest.TestCase):
         self.assertTrue(self.latch._read_state())
         with open(self.variables_file) as f:
             self.assertEqual(f.read(), before)
+
+
+    # D-018 (Jack, 20 Oct 2026): absent file = clear, corrupt file = latched.
+    def test_d018_absent_file_is_clear_and_heating_is_allowed(self):
+        self.assertFalse(os.path.exists(self.state_file))
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        self.assertEqual(heater.target_temp, 215.)
+        self.assertEqual(console, [])
+
+    def test_d018_absent_file_but_trip_marker_is_latched(self):
+        with open(self.state_file + '.trip', 'w') as f:
+            f.write('latched\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def test_d018_file_without_the_fault_key_is_corrupt(self):
+        # Not a latch file at all (e.g. a variables.cfg pointed at by
+        # mistake): present but unparseable, so latched.
+        with open(self.state_file, 'w') as f:
+            f.write('[Variables]\nmesh_valid = 1\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+
+    def test_d018_corrupt_files_are_latched_and_say_why(self):
+        for name, content in (('garbage', 'not a latch state'),
+                              ('empty', ''), ('binary', '\x00\x01\x02')):
+            with self.subTest(content=name):
+                with open(self.state_file, 'w') as f:
+                    f.write(content)
+                latch, heater, console = self.start_latch()
+                self.assertTrue(latch.latched)
+                with self.assertRaises(gcode.CommandError):
+                    heater.set_temp(215.)
+                self.assertEqual(heater.target_temp, 0.)
+                self.assertEqual(len(console), 1)
+                self.assertIn('corrupt or unreadable', console[0])
+                self.assertIn('Fan checked', console[0])
+
+    def test_d018_unreadable_file_is_latched_not_absent(self):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        real_open = open
+
+        def deny(path, *args, **kwargs):
+            if path == self.state_file:
+                raise PermissionError(13, 'Permission denied')
+            return real_open(path, *args, **kwargs)
+        with mock.patch('builtins.open', side_effect=deny):
+            latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.assertEqual(len(console), 1)
+
+    def test_d018_directory_or_dangling_symlink_is_latched(self):
+        os.mkdir(self.state_file)
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        os.rmdir(self.state_file)
+        try:
+            os.symlink(os.path.join(self.tempdir.name, 'nowhere'),
+                       self.state_file)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable here')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+
+    def test_d018_valid_file_fault_1_is_latched(self):
+        with open(self.state_file, 'w') as f:
+            f.write('latched\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+        self.assertEqual(console, [])
+
+    def test_d018_valid_file_fault_0_is_clear(self):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        self.assertEqual(heater.target_temp, 215.)
+
+    def test_d018_trip_then_restart_is_latched_until_cleared(self):
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
 
 
 class UnlockReleaseRestoresOnce(_FanCheckTestCase):
