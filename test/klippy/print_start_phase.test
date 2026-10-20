@@ -2,6 +2,9 @@
 DICTIONARY atmega2560.dict
 CONFIG print_start_phase.cfg
 
+# A variables file left by an earlier run must not make the first print a reuse.
+RESET_RESONANCE_CALIBRATION
+
 # A fresh klippy process starts unswept; its first print must sweep.
 ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=0
@@ -34,7 +37,11 @@ ASSERT_SWEEPS COUNT=1
 ASSERT_LAST_RESONANCE_SWEPT VALUE=0
 ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
 
-# A reconnect may be a toolhead/nozzle swap and invalidates the session flag.
+# A real toolhead swap is TOOLHEAD_DISCONNECT (RESET_CALIBRATION, so
+# RESET_RESONANCE_CALIBRATION) and then TOOLHEAD_CONNECT. The disconnect half is
+# what forces the re-sweep; the connect half alone only zeroes the session flag,
+# because it also runs at every startup.
+RESET_RESONANCE_CALIBRATION
 TOOLHEAD_CONNECT
 _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
@@ -45,6 +52,41 @@ ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 FINETUNE_RESONANCE FORCE=1
 ASSERT_SWEEPS COUNT=3
 ASSERT_LAST_RESONANCE_SWEPT VALUE=1
+
+# KAN-747: once per POWER-ON. A klippy restart (RESTART, FIRMWARE_RESTART) zeroes
+# the in-memory flag but not the boot, and the saved sweep is still valid, so the
+# next print reuses it. SET_GCODE_VARIABLE is what a fresh process looks like.
+SET_GCODE_VARIABLE MACRO=FINETUNE_RESONANCE VARIABLE=swept_this_session VALUE=0
+_TEST_RESET
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=3
+ASSERT_LAST_RESONANCE_SWEPT VALUE=0
+ASSERT_SAVED_BOOT_ID_IS_CURRENT
+
+# ...and the print after that, in the same process, also reuses it.
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=3
+
+# A reboot: the saved id is from an earlier boot, so the first print sweeps.
+SAVE_VARIABLE VARIABLE=resonance_boot_id VALUE='"00000000-earlier-boot"'
+SET_GCODE_VARIABLE MACRO=FINETUNE_RESONANCE VARIABLE=swept_this_session VALUE=0
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=4
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
+ASSERT_SAVED_BOOT_ID_IS_CURRENT
+
+# A restart after a toolhead disconnect (valid=0) sweeps even on the same boot.
+RESET_RESONANCE_CALIBRATION
+SET_GCODE_VARIABLE MACRO=FINETUNE_RESONANCE VARIABLE=swept_this_session VALUE=0
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=5
+
+# A save from before this change has no boot id at all: sweep once to adopt it.
+SAVE_VARIABLE VARIABLE=resonance_valid VALUE=1
+SAVE_VARIABLE VARIABLE=resonance_boot_id VALUE='""'
+SET_GCODE_VARIABLE MACRO=FINETUNE_RESONANCE VARIABLE=swept_this_session VALUE=0
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=6
 
 # 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
