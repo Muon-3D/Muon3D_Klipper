@@ -18,6 +18,8 @@ MAX_SCHEDULE_TICKS = (1<<31) - 1
 # Maximum time all MCUs can internally schedule into the future.
 # Directly caused by the limitation of MAX_SCHEDULE_TICKS.
 MAX_NOMINAL_DURATION = 3.0
+# Upper bound on one openocd reset run for restart_method: swdio
+SWDIO_OPENOCD_TIMEOUT = 10.
 
 ######################################################################
 # Command transmit helper classes
@@ -731,11 +733,28 @@ class MCURestartHelper:
                      self._name, self._openocd_config)
         cmd = ["openocd", "-f", self._openocd_config,
                "-c", "init; reset run; exit"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        if result.stdout:
-            logging.info("openocd stdout: %s", result.stdout.strip())
-        if result.stderr:
-            logging.info("openocd stderr: %s", result.stderr.strip())
+        # Poll the process through the reactor rather than subprocess.run().
+        # A blocking wait stalls every timer in klippy for as long as openocd
+        # runs (~0.2 s when the target is absent), so step generation for the
+        # other MCUs falls behind and the main MCU shuts down with "Timer too
+        # close". The non-critical reconnect loop runs this every 2-30 s for
+        # as long as the toolhead is unplugged, including during the park
+        # move that TOOLHEAD_DISCONNECT starts.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        deadline = self._reactor.monotonic() + SWDIO_OPENOCD_TIMEOUT
+        while proc.poll() is None:
+            if self._reactor.monotonic() > deadline:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd, SWDIO_OPENOCD_TIMEOUT)
+            self._reactor.pause(self._reactor.monotonic() + 0.010)
+        output = proc.stdout.read()
+        proc.stdout.close()
+        if output:
+            logging.info("openocd output: %s", output.strip())
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output)
     def _firmware_restart(self, force=False):
         if self._is_mcu_bridge and not force:
             return
