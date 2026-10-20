@@ -1,4 +1,10 @@
-# Persistent, fail-closed hot-end fan safety latch.
+"""Persistent, fail-closed hot-end fan safety latch.
+
+This protects against crashes, power loss, and operator mistakes.  It is not a
+security boundary against a malicious local user with shell access.  In that
+threat model, the realpath lookup followed later by replace still has a TOCTOU
+window; a shell user able to change the path can also change the state files.
+"""
 #
 # Copyright (C) 2026 Muon 3D
 # This file may be distributed under the terms of the GNU GPLv3 license.
@@ -9,6 +15,7 @@ class HotendFanLatch:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.filename = os.path.expanduser(config.get('state_file'))
+        self.marker_filename = self.filename + '.trip'
         self.heater_name = config.get('heater', 'extruder')
         self.sensor_name = config.get(
             'heatsink_sensor', 'temperature_fan toolhead_heatsink')
@@ -19,13 +26,20 @@ class HotendFanLatch:
         self.missing_file_latched = config.getboolean(
             'missing_file_latched', True)
         self.latched = self._read_state()
+        self._latched_write_pending = self.latched
         self.heater = self._set_temp = self._alter_target = None
         self.printer.register_event_handler('klippy:connect', self._connect)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('HOTEND_FAN_LATCH_SET', self.cmd_latch)
-        gcode.register_command('HOTEND_FAN_LATCH_CONFIRM', self.cmd_confirm)
+        # Private implementation hook used only by HOTEND_FAN_FAULT_CLEAR.
+        gcode.register_command('_HOTEND_FAN_LATCH_CONFIRM', self.cmd_confirm)
+        reactor = self.printer.get_reactor()
+        self._retry_timer = reactor.register_timer(
+            self._retry_pending, reactor.monotonic() + 5.)
 
     def _read_state(self):
+        if os.path.exists(self.marker_filename):
+            return True
         try:
             with open(self.filename) as f:
                 value = f.read().strip()
@@ -43,7 +57,31 @@ class HotendFanLatch:
             logging.exception('Unable to read hot-end fan latch; latching')
             return True
 
-    def _write_state(self):
+    def _fsync_directory(self, directory):
+        if os.name == "posix":  # directory fsync is a POSIX notion
+            dirfd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+
+    def _create_trip_marker(self):
+        path = os.path.realpath(self.marker_filename)
+        directory = os.path.dirname(os.path.abspath(path))
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return
+        try:
+            os.write(fd, b'latched\n')
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._fsync_directory(directory)
+
+    def _write_state(self, latched=None):
+        if latched is None:
+            latched = self.latched
         # Resolve a symlink and replace its target, not the link itself.
         path = os.path.realpath(self.filename)
         directory = os.path.dirname(os.path.abspath(path))
@@ -57,20 +95,22 @@ class HotendFanLatch:
             fd, tmpname = tempfile.mkstemp(prefix='.hotend_fan_latch.',
                                            dir=directory)
             with os.fdopen(fd, 'w') as f:
-                f.write('latched\n' if self.latched else 'unlatched\n')
+                f.write('latched\n' if latched else 'unlatched\n')
                 if old_stat is not None:
-                    os.fchmod(f.fileno(), stat.S_IMODE(old_stat.st_mode))
-                    os.fchown(f.fileno(), old_stat.st_uid, old_stat.st_gid)
+                    if hasattr(os, 'fchmod'):  # POSIX only; the printer runs Linux
+                        os.fchmod(f.fileno(), stat.S_IMODE(old_stat.st_mode))
+                    if hasattr(os, 'fchown'):  # POSIX only; the printer runs Linux
+                        os.fchown(f.fileno(), old_stat.st_uid, old_stat.st_gid)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmpname, path)
             tmpname = None
-            if os.name == "posix":  # directory fsync is a POSIX notion
-                dirfd = os.open(directory, os.O_RDONLY)
-                try:
-                    os.fsync(dirfd)
-                finally:
-                    os.close(dirfd)
+            self._fsync_directory(directory)
+            with open(path) as f:
+                written = f.read().strip()
+            expected = 'latched' if latched else 'unlatched'
+            if written != expected:
+                raise IOError('hot-end fan latch read-back did not match')
         except Exception:
             if tmpname is not None:
                 try:
@@ -80,6 +120,16 @@ class HotendFanLatch:
             logging.exception('Unable to persist hot-end fan latch')
             raise self.printer.command_error(
                 'Unable to persist hot-end fan latch')
+
+    def _retry_pending(self, eventtime):
+        if self.latched and self._latched_write_pending:
+            try:
+                self._create_trip_marker()
+                self._write_state(True)
+                self._latched_write_pending = False
+            except Exception:
+                pass
+        return eventtime + 5.
 
     def _connect(self):
         extruder = self.printer.lookup_object(self.heater_name)
@@ -114,8 +164,13 @@ class HotendFanLatch:
 
     def cmd_latch(self, gcmd):
         self.latched = True
+        self._latched_write_pending = True
         self._force_off()
-        self._write_state()
+        # The create-only marker must precede replacement of an old unlatched
+        # state, so interruption at every later point remains fail-closed.
+        self._create_trip_marker()
+        self._write_state(True)
+        self._latched_write_pending = False
 
     def cmd_confirm(self, gcmd):
         sensor = self.printer.lookup_object(self.sensor_name)
@@ -130,13 +185,29 @@ class HotendFanLatch:
                              'an implausible %.1fC.' % (temp,))
         # Persist before opening the in-memory gate.  A failed write therefore
         # leaves both the current process and the next startup fail-closed.
-        previous = self.latched
-        self.latched = False
+        # Confirm the durable latched state on any clear/retry opportunity.
+        if self._latched_write_pending:
+            self._create_trip_marker()
+            self._write_state(True)
+            self._latched_write_pending = False
+        self._write_state(False)
+        marker = os.path.realpath(self.marker_filename)
         try:
-            self._write_state()
+            os.unlink(marker)
+            self._fsync_directory(os.path.dirname(os.path.abspath(marker)))
+        except FileNotFoundError:
+            pass
         except Exception:
-            self.latched = previous
-            raise
+            # Keep the live gate closed if marker removal was not durable.
+            self.latched = True
+            self._latched_write_pending = True
+            try:
+                self._create_trip_marker()
+            except Exception:
+                pass
+            raise self.printer.command_error(
+                'Unable to clear persistent hot-end fan latch')
+        self.latched = False
 
     def get_status(self, eventtime):
         return {'latched': self.latched, 'restored': True}

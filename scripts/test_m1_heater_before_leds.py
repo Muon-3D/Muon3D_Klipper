@@ -109,7 +109,7 @@ class M1:
         printer.add_object('hotend_fan_latch', Status(self.latch_status))
         self.gcode.register_command('HOTEND_FAN_LATCH_SET',
                                     self._latch_set)
-        self.gcode.register_command('HOTEND_FAN_LATCH_CONFIRM',
+        self.gcode.register_command('_HOTEND_FAN_LATCH_CONFIRM',
                                     self._latch_confirm)
         # Put a recording/failure-injection shim around Klipper's real
         # SAVE_VARIABLE command.  Successful calls still write and reload the
@@ -934,6 +934,34 @@ class PythonHeaterLatch(unittest.TestCase):
             setter(215.)
         self.assertEqual(self.heater.target_temp, 0.)
 
+    def assert_restart_is_latched(self):
+        printer = FakePrinter(FakeReactor())
+        dispatch = gcode.GCodeDispatch(printer)
+        printer.add_object('gcode', dispatch)
+        heater = self.Heater()
+        printer.add_object('extruder', heater)
+        printer.add_object('temperature_fan toolhead_heatsink',
+                           Status({'temperature': 40.}))
+        latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        printer.send_event('klippy:connect')
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def trip_with_failure_then_assert_restart_latched(self, patcher):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        marker = self.state_file + '.trip'
+        if os.path.exists(marker):
+            os.unlink(marker)
+        with patcher:
+            with self.assertRaises((OSError, gcode.CommandError)):
+                self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assertTrue(self.latch.latched)
+        self.assert_restart_is_latched()
+
     def test_all_renamed_command_bypasses_reach_the_python_gate(self):
         # These setters model M104.1/M109.1, SET_HEATER_TEMPERATURE_BASE,
         # PID_CALIBRATE_BASE and remote/API callers respectively: all of them
@@ -967,12 +995,28 @@ class PythonHeaterLatch(unittest.TestCase):
     def test_confirm_is_the_only_open_path_and_checks_sensor(self):
         self.heatsink.status['temperature'] = 55.
         with self.assertRaises(gcode.CommandError):
-            self.gcode.run_script('HOTEND_FAN_LATCH_CONFIRM')
+            self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
         self.assert_refused(self.heater.set_temp)
         self.heatsink.status['temperature'] = 40.
-        self.gcode.run_script('HOTEND_FAN_LATCH_CONFIRM')
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
         self.heater.set_temp(215.)
         self.assertEqual(self.heater.target_temp, 215.)
+
+    def test_public_python_confirm_command_is_not_registered(self):
+        self.assertNotIn('HOTEND_FAN_LATCH_CONFIRM',
+                         self.gcode.ready_gcode_handlers)
+
+    def test_marker_survives_marker_write_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'write', side_effect=OSError('write')))
+
+    def test_marker_survives_state_replace_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'replace', side_effect=OSError('replace')))
+
+    def test_marker_survives_fsync_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'fsync', side_effect=OSError('fsync')))
 
     def test_corrupt_latch_fails_closed_without_touching_saved_variables(self):
         with open(self.state_file, 'w') as f:
