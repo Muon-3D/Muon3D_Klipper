@@ -41,5 +41,6 @@ jobs:
     - name: Upload micro-controller data dictionaries
       uses: actions/upload-artifact@v4
       with:
+        retention-days: 3
         name: data-dict
         path: ci_build/dict
