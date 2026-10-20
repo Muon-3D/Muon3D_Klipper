@@ -90,7 +90,7 @@ class FailingLedEffect:
 
 
 class M1:
-    def __init__(self, variables_file, restore_startup=True):
+    def __init__(self, variables_file, restore_startup=True, latched=False):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
         self.gcode = gcode.GCodeDispatch(printer)
@@ -104,8 +104,8 @@ class M1:
             printer, None, 'save_variables', {'filename': variables_file}))
         printer.add_object('save_variables', self.saved)
         self.latch_status = {
-            'latched': bool(self.saved.allVariables.get(
-                'hotend_fan_fault', 0)), 'restored': True}
+            'latched': bool(latched or self.saved.allVariables.get(
+                'hotend_fan_fault', 0))}
         printer.add_object('hotend_fan_latch', Status(self.latch_status))
         self.gcode.register_command('HOTEND_FAN_LATCH_SET',
                                     self._latch_set)
@@ -983,8 +983,9 @@ class PythonHeaterLatch(unittest.TestCase):
         if os.path.exists(marker):
             os.unlink(marker)
         with patcher:
-            with self.assertRaises((OSError, gcode.CommandError)):
-                self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+            # The latch closes in memory and the call still returns, so the
+            # macro can go on to show the prompt; the failure is reported.
+            self.gcode.run_script('HOTEND_FAN_LATCH_SET')
         self.assertTrue(self.latch.latched)
         self.assert_restart_is_latched()
 
@@ -1008,12 +1009,19 @@ class PythonHeaterLatch(unittest.TestCase):
     def test_macro_and_saved_variable_edits_cannot_clear_latch(self):
         # SET_GCODE_VARIABLE and SAVE_VARIABLE can mutate these decoys, but
         # the Python-owned state remains closed.
+        # Real mutations: rewrite the saved-variables file to say no fault,
+        # delete it, and restart.  The latch must come back closed each time.
         self.trip()
-        macro_variables = {'fault_latched': 0, 'fault_restored': 1}
-        saved_variables = {'hotend_fan_fault': 0}
-        self.assertEqual(macro_variables['fault_latched'], 0)
-        self.assertEqual(saved_variables['hotend_fan_fault'], 0)
-        self.assert_refused(self.heater.set_temp)
+        for content in ('[Variables]\nhotend_fan_fault = 0\n', None):
+            if content is None:
+                os.unlink(self.variables_file)
+            else:
+                with open(self.variables_file, 'w') as f:
+                    f.write(content)
+            self.assert_refused(self.heater.set_temp)
+            self.assert_restart_is_latched()
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assert_refused(self.heater.alter_target)
 
     def test_zero_and_cooling_targets_always_work(self):
         self.heater.set_temp(0.)
@@ -1065,6 +1073,66 @@ class PythonHeaterLatch(unittest.TestCase):
         heater.set_temp(215.)
         self.assertEqual(heater.target_temp, 215.)
         self.assertEqual(console, [])
+
+    def test_exists_only_treats_enoent_as_absent(self):
+        import errno
+        self.assertFalse(self.latch._exists(self.state_file))
+        for code in (errno.EACCES, errno.ENOTDIR, errno.EIO):
+            with self.subTest(errno=code):
+                with mock.patch.object(os, 'lstat',
+                                       side_effect=OSError(code, 'x')):
+                    with self.assertRaises(OSError):
+                        self.latch._exists(self.state_file)
+                    # ...and a restart on that error is latched, not clear.
+                    latch, heater, console = self.start_latch()
+                    self.assertTrue(latch.latched)
+
+    def test_marker_is_fsynced(self):
+        opened, synced = [], []
+        real_open, real_fsync = os.open, os.fsync
+
+        def spy_open(path, *a, **k):
+            fd = real_open(path, *a, **k)
+            if str(path).endswith('.trip'):
+                opened.append(fd)
+            return fd
+
+        def spy_fsync(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+        with mock.patch.object(os, 'open', spy_open),                 mock.patch.object(os, 'fsync', spy_fsync):
+            self.latch._create_trip_marker()
+        self.assertEqual(len(opened), 1)
+        self.assertIn(opened[0], synced)
+
+    def test_missing_state_directory_is_created_and_clear(self):
+        self.state_file = os.path.join(self.tempdir.name, 'cal', 'latch.state')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(os.path.isdir(os.path.dirname(self.state_file)))
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        # A trip now persists, so a restart is latched.
+        latch.cmd_latch(mock.Mock())
+        latch2, heater2, console2 = self.start_latch()
+        self.assertTrue(latch2.latched)
+
+    def test_uncreatable_state_directory_is_latched_with_a_message(self):
+        blocker = os.path.join(self.tempdir.name, 'afile')
+        with open(blocker, 'w') as f:
+            f.write('x')
+        self.state_file = os.path.join(blocker, 'latch.state')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.assertEqual(len(console), 1)
+        self.assertIn('cannot be created', console[0])
+
+    def test_persistence_failure_still_latches_and_warns(self):
+        cmd = mock.Mock()
+        with mock.patch.object(os, 'replace', side_effect=OSError('replace')),                 mock.patch.object(os, 'write', side_effect=OSError('write')):
+            self.latch.cmd_latch(cmd)
+        self.assertTrue(self.latch.latched)
+        self.assert_refused(self.heater.set_temp)
+        self.assertIn('could NOT be saved', cmd.respond_info.call_args[0][0])
 
     def test_d018_absent_file_but_trip_marker_is_latched(self):
         with open(self.state_file + '.trip', 'w') as f:
@@ -1148,6 +1216,39 @@ class PythonHeaterLatch(unittest.TestCase):
         self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
         latch, heater, console = self.start_latch()
         self.assertFalse(latch.latched)
+
+
+class ClearAfterRestart(_FanCheckTestCase):
+    """The macro variable fault_latched is 0 after every restart, the Python
+    latch is not: Fan checked must still reach _HOTEND_FAN_LATCH_CONFIRM."""
+
+    def restart_latched(self):
+        self.m1 = M1(self.variables_file, latched=True)
+        self.assertEqual(self.m1.macro_vars('HOTEND_FAN_CHECK')
+                         ['fault_latched'], 0)
+
+    def test_fan_checked_clears_after_a_restart(self):
+        self.restart_latched()
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertFalse(self.m1.latch_status['latched'])
+        self.assertFalse([r for r in self.m1.responses
+                          if 'No hot-end fan fault' in r])
+
+    def test_fan_checked_still_refuses_while_the_heatsink_is_hot(self):
+        self.restart_latched()
+        self.m1.heatsink['temperature'] = 55.
+        self.m1.latch_status['latched'] = True
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertTrue(self.m1.latch_status['latched'])
+        self.assertTrue(any('51C or more' in r for r in self.m1.responses))
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+    def test_nothing_latched_anywhere_says_so(self):
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertTrue([r for r in self.m1.responses
+                         if 'No hot-end fan fault' in r])
 
 
 class UnlockReleaseRestoresOnce(_FanCheckTestCase):

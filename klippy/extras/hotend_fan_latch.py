@@ -53,6 +53,16 @@ class HotendFanLatch:
         # a directory, a dangling symlink) is corrupt and fails closed.  A
         # trip marker always wins: a trip writes it before anything else.
         try:
+            # The persisted calibration directory must exist, or a later trip
+            # could not be written and a restart would silently clear it.  If
+            # it cannot be made, that is corrupt (latched), never "absent".
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(self.filename)),
+                            mode=0o755, exist_ok=True)
+            except Exception:
+                self._corrupt_reason = ('state directory for %s cannot be '
+                                        'created' % (self.filename,))
+                raise
             if self._exists(self.marker_filename):
                 return True
             if not self._exists(self.filename):
@@ -68,8 +78,9 @@ class HotendFanLatch:
         except Exception:
             logging.exception('Hot-end fan latch file %s is unreadable or '
                               'corrupt; latching', self.filename)
-            self._corrupt_reason = ('state file %s is corrupt or unreadable'
-                                    % (self.filename,))
+            if self._corrupt_reason is None:
+                self._corrupt_reason = ('state file %s is corrupt or '
+                                        'unreadable' % (self.filename,))
             return True
 
     def _fsync_directory(self, directory):
@@ -193,9 +204,24 @@ class HotendFanLatch:
         self._force_off()
         # The create-only marker must precede replacement of an old unlatched
         # state, so interruption at every later point remains fail-closed.
-        self._create_trip_marker()
-        self._write_state(True)
-        self._latched_write_pending = False
+        # The latch is already closed in memory, so a persistence failure must
+        # not stop the caller showing the Fan checked prompt: report it loudly
+        # instead of raising, and keep retrying from the timer.
+        failures = []
+        for step in (self._create_trip_marker,
+                     lambda: self._write_state(True)):
+            try:
+                step()
+            except Exception as e:
+                logging.exception('Unable to persist hot-end fan latch')
+                failures.append(str(e) or e.__class__.__name__)
+        if failures:
+            gcmd.respond_info(
+                '!! WARNING: the hot-end fan fault is latched in memory but '
+                'could NOT be saved (%s). A restart before it saves may lose '
+                'the fault. Check the fan.' % ('; '.join(failures),))
+        else:
+            self._latched_write_pending = False
 
     def cmd_confirm(self, gcmd):
         sensor = self.printer.lookup_object(self.sensor_name)
@@ -235,7 +261,7 @@ class HotendFanLatch:
         self.latched = False
 
     def get_status(self, eventtime):
-        return {'latched': self.latched, 'restored': True}
+        return {'latched': self.latched}
 
 
 def load_config(config):
