@@ -5662,8 +5662,21 @@ recognised as a job. See the
 #   The zero only follows the load while it is within this many counts of
 #   it. The default is a quarter of threshold_counts.
 #relock_time: 0.5
-#   A load outside the band that does not become contact within this many
-#   seconds is treated as drift, and the zero moves to it.
+#   A load outside the band that stays steady under threshold_counts for
+#   this many seconds is treated as drift, and the zero moves to it. A load
+#   above threshold_counts is contact and is never aged out, however still
+#   the toolhead is: FORCE_MOVE and a bed moved by hand do not appear in
+#   the toolhead's motion. Contact ends when the load falls, by positive
+#   clearance (below), at the next homing or probing move, or with
+#   SET_CONTACT_GUARD REZERO=1.
+#clearance_lift: 1.0
+#   Positive clearance. A contact whose load falls by at least
+#   threshold_counts as the executed toolhead Z rises, and then stays
+#   within the band while Z rises a further clearance_lift mm, has left
+#   what it touched; the remaining load becomes the new zero.
+#rezero_min_z: 10.0
+#   SET_CONTACT_GUARD REZERO=1 is refused unless Z is homed and the
+#   toolhead is at least this high.
 #sync_below_z: 3.0
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,

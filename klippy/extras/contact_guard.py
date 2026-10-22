@@ -52,9 +52,23 @@ class ContactGuard:
         self.band = config.getint('baseline_band_counts',
                                   self.threshold // 4, minval=1,
                                   maxval=self.threshold // 2)
-        # Relock a steady offset after this long. Above-threshold offsets
-        # may relock only when they began without executed XYZ motion.
+        # Relock a steady sub-threshold offset after this long.  A load
+        # above the threshold is contact and is never aged out: a stationary
+        # toolhead trapq does not mean the nozzle is clear, because
+        # FORCE_MOVE runs on its own trapq and the bed can be moved by hand.
         self.relock_time = config.getfloat('relock_time', 0.5, above=0.)
+        # Positive clearance.  A latched contact whose load fell by at least
+        # the threshold as Z rose, and then stayed steady while the executed
+        # toolhead Z rose a further clearance_lift, has left what it touched
+        # (the plate deflects ~0.01 mm per 200000 counts); what is left is
+        # an offset and becomes the new zero.
+        self.clearance_lift = config.getfloat('clearance_lift', 1.0,
+                                              above=0.)
+        # SET_CONTACT_GUARD REZERO=1 is the explicit recovery for an offset
+        # that does not follow Z (filament tension after the unlock
+        # retract).  It only runs with Z homed and the toolhead at least
+        # this high, on a steady load.
+        self.rezero_min_z = config.getfloat('rezero_min_z', 10.0)
         # Moves are checked as they enter the lookahead queue, before the
         # moves ahead of them have run.  Starting below this machine Z (or
         # with Z unhomed) the queued motion could put the nozzle on the
@@ -84,9 +98,11 @@ class ContactGuard:
         self.drift_sum = 0.
         self.drift_count = 0
         self.drift_min = self.drift_max = None
-        self.offset_can_relock = None
+        self.clear_peak = None  # (lowest Z while held, peak load since)
+        self.clear_win = None
         self.motion_known = False
-        self.motion_intervals = []
+        self.motion_base_z = None
+        self.motion_moves = []
         self.recent = collections.deque()
         self.stream_systime = None  # last time pty input was seen
         self.sim_time = None
@@ -294,29 +310,42 @@ class ContactGuard:
         return True
 
     def _update_motion_history(self, start, end):
-        # Samples and trapq share print_time. A queued toolhead position can
-        # already be past a descent which the load-cell samples still cover.
-        # Extract once per batch, not once per 2 kHz sample. Keep the C data
-        # alive only here; the detector needs plain time intervals.
+        # Executed toolhead Z at each sample time, for positive clearance.
+        # Samples and trapq share print_time.  Extract once per batch, not
+        # once per 2 kHz sample, and keep only plain tuples.  This is the
+        # toolhead trapq only: it says how far the toolhead rose, never
+        # that nothing else moved (FORCE_MOVE has its own trapq), so it is
+        # used only to release a contact, never to absorb one.
         self.motion_known = False
-        self.motion_intervals = []
+        self.motion_base_z = None
+        self.motion_moves = []
+        if not self.contact:
+            return
         report = self.printer.lookup_object('motion_report', None)
         trapq = None if report is None else report.dtrapqs.get('toolhead')
         if trapq is None:
             return
-        start -= self.relock_time
         pos, velocity = trapq.get_trapq_position(start)
-        self.motion_known = pos is not None
+        if pos is None:
+            return
         moves, cdata = trapq.extract_trapq(start, end)
-        self.motion_intervals = [
-            (m.print_time, m.print_time + m.move_t) for m in moves
-            if (abs(m.x_r) > MOVE_EPSILON or abs(m.y_r) > MOVE_EPSILON
-                or abs(m.z_r) > MOVE_EPSILON)]
+        self.motion_known = True
+        self.motion_base_z = pos[2]
+        self.motion_moves = sorted(
+            (m.print_time, m.move_t, m.start_v, m.accel, m.start_z, m.z_r)
+            for m in moves)
 
-    def _stationary(self, t):
-        return self.motion_known and not any(
-            begin <= t and end > t - self.relock_time
-            for begin, end in self.motion_intervals)
+    def _z_at(self, t):
+        if not self.motion_known:
+            return None
+        z = self.motion_base_z
+        for print_time, move_t, start_v, accel, start_z, z_r in \
+                self.motion_moves:
+            if print_time > t:
+                break
+            move_time = max(0., min(move_t, t - print_time))
+            z = start_z + z_r * (start_v + .5 * accel * move_time) * move_time
+        return z
 
     def _reset_detector(self):
         self.contact = False
@@ -325,7 +354,46 @@ class ContactGuard:
         self.drift_sum = 0.
         self.drift_count = 0
         self.drift_min = self.drift_max = None
-        self.offset_can_relock = None
+        self.clear_peak = None
+        self.clear_win = None
+
+    def _check_clearance(self, t, counts, load, sign):
+        # Called for each sample while contact is latched.  True once the
+        # contact has been positively cleared and the baseline re-zeroed.
+        z = self._z_at(t)
+        if z is None:
+            # Without executed Z there is no evidence of clearance
+            self.clear_peak = self.clear_win = None
+            return False
+        # The fall must happen as Z rises: the peak counts only from the
+        # lowest executed Z, so a load that fell with the toolhead still
+        # (a FORCE_MOVE backing off part way) is no evidence.
+        low = self.clear_peak
+        if low is None or z <= low[0] + MOVE_EPSILON:
+            self.clear_peak = (min(z, low[0]) if low else z, load)
+        elif load > low[1]:
+            self.clear_peak = (low[0], load)
+        win = self.clear_win
+        if (win is None or counts < win['max'] - self.band
+                or counts > win['min'] + self.band):
+            # The load moved: restart the steady window here
+            win = self.clear_win = {'z0': z, 'min': counts, 'max': counts,
+                                    'sum': 0., 'n': 0}
+        win['min'] = min(win['min'], counts)
+        win['max'] = max(win['max'], counts)
+        win['sum'] += counts
+        win['n'] += 1
+        mean = win['sum'] / win['n']
+        dropped = self.clear_peak[1] - sign * (mean - self.baseline)
+        if (z - win['z0'] < self.clearance_lift - MOVE_EPSILON
+                or dropped < self.threshold):
+            return False
+        self.baseline = mean
+        self._reset_detector()
+        logging.info("contact_guard: contact cleared by a %.3f mm Z lift,"
+                     " load fell %d; residual %d re-zeroed",
+                     z - win['z0'], dropped, load)
+        return True
 
     def _process_sample(self, t, counts, sign, ignore_before):
         if self.data_time is None or t > self.data_time:
@@ -350,14 +418,6 @@ class ContactGuard:
         self.prev_time = t
         load = sign * (counts - self.baseline)
         self.load = load
-        if abs(load) < self.band:
-            self.offset_can_relock = None
-        elif self.offset_can_relock is None:
-            self.offset_can_relock = self._stationary(t)
-        elif not self._stationary(t):
-            # Once motion could have caused this touch, remaining still
-            # must never age it out. Release or homing clears the latch.
-            self.offset_can_relock = False
         # Contact hysteresis
         if load > self.threshold:
             if self.above_since is None:
@@ -373,14 +433,19 @@ class ContactGuard:
             if (self.above_since is not None
                     and t - self.above_since >= self.on_time - TIME_EPSILON):
                 self.contact = True
+                self.clear_peak = self.clear_win = None
                 logging.info("contact_guard: contact, load %d", load)
         elif (self.below_since is not None
                 and t - self.below_since >= self.off_time - TIME_EPSILON):
             self.contact = False
             logging.info("contact_guard: contact released, load %d", load)
-        if ((self.contact or self.above_since is not None)
-                and not self.offset_can_relock):
-            # Never absorb a touch that could have begun during motion
+        elif self._check_clearance(t, counts, load, sign):
+            self.load = sign * (counts - self.baseline)
+            return
+        if self.contact or self.above_since is not None:
+            # The baseline never follows a touch, however long or still it
+            # is.  Only release, positive clearance, a homing or probing
+            # move, or SET_CONTACT_GUARD REZERO=1 ends it.
             self.drift_since = None
             return
         # Baseline: follow small changes slowly
@@ -417,12 +482,53 @@ class ContactGuard:
             'enabled': self.enabled,
         }
 
+    def _rezero(self):
+        # The explicit, bounded recovery: an operator or macro asserts that
+        # the steady load the cell reads now is not contact.  Bounded by
+        # Z homed and high above the plate, settled samples, and a load
+        # that is not changing; otherwise refused, and contact stays.
+        if self._is_homing():
+            raise self.gcode.error("contact_guard: cannot re-zero while"
+                                   " homing")
+        eventtime = self.reactor.monotonic()
+        kin_status = self.toolhead.get_kinematics().get_status(eventtime)
+        if 'z' not in kin_status['homed_axes']:
+            raise self.gcode.error("contact_guard: re-zero needs Z homed")
+        z = self.toolhead.get_position()[2]
+        if z < self.rezero_min_z:
+            raise self.gcode.error(
+                "contact_guard: re-zero needs the toolhead at Z %.1f or"
+                " higher (it is at %.2f)" % (self.rezero_min_z, z))
+        # Judge the load after everything queued has executed
+        self._sync()
+        eventtime = self.reactor.monotonic()
+        if (not self.recent or self.sample_systime is None
+                or eventtime - self.sample_systime > STREAM_TIMEOUT
+                or self.data_time < self._holdoff_end()):
+            raise self.gcode.error("contact_guard: re-zero needs current"
+                                   " load cell samples")
+        counts = [c for t, c in self.recent]
+        if max(counts) - min(counts) > self.band:
+            raise self.gcode.error("contact_guard: load is changing, not"
+                                   " re-zeroing")
+        old = self.load
+        self.baseline = float(sum(counts)) / len(counts)
+        self._reset_detector()
+        self.load = 0.
+        logging.info("contact_guard: re-zeroed by command at Z %.2f, load"
+                     " was %d", z, old)
+        return old
+
     cmd_SET_CONTACT_GUARD_help = (
-        "Enable or disable refusing XY moves while the nozzle touches")
+        "Enable or disable refusing XY moves while the nozzle touches;"
+        " REZERO=1 re-zeroes a steady offset with the toolhead high")
     def cmd_SET_CONTACT_GUARD(self, gcmd):
         enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
         if enable is not None:
             self.enabled = bool(enable)
+        if gcmd.get_int('REZERO', 0, minval=0, maxval=1):
+            old = self._rezero()
+            gcmd.respond_info("contact_guard: re-zeroed, load was %d" % old)
         status = self.get_status(self.reactor.monotonic())
         gcmd.respond_info("contact_guard: enabled=%d active=%d contact=%d"
                           " load=%d" % (status['enabled'], status['active'],

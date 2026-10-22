@@ -329,22 +329,24 @@ def test_trigger_holdoff():
     check(r.status()['contact'], "load past the hold-off is contact")
 
 
+class Cmd:
+    def __init__(self, **params):
+        self.params = params
+        self.info = []
+    def get_int(self, name, default, minval=None, maxval=None):
+        return self.params.get(name, default)
+    def respond_info(self, msg):
+        self.info.append(msg)
+
+
 def test_enable():
     r = Rig()
     r.in_contact()
-    class Cmd:
-        def __init__(self, enable):
-            self.enable = enable
-            self.info = []
-        def get_int(self, name, default, minval=None, maxval=None):
-            return self.enable
-        def respond_info(self, msg):
-            self.info.append(msg)
-    r.guard.cmd_SET_CONTACT_GUARD(Cmd(0))
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0))
     check(r.status() == {'contact': False, 'load': 200000, 'active': False,
                          'enabled': False}, "ENABLE=0 makes it inactive")
     check(r.refused(60, 50, 5) is None, "XY allowed with ENABLE=0")
-    r.guard.cmd_SET_CONTACT_GUARD(Cmd(1))
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
     check(r.refused(70, 50, 5) == REFUSAL, "ENABLE=1 refuses again")
 
 
@@ -518,58 +520,251 @@ def test_requires_load_cell_probe():
     raise AssertionError("no config error without [load_cell_probe]")
 
 
+class TrapQMove:
+    pass
+
 
 class ReplayTrapQ:
-    """Only the external executed-motion history, in load-cell print time."""
-    def __init__(self):
+    """The executed toolhead trapq, in load-cell print time.
+
+    Constant-velocity moves only.  `z_moves` (with `axis`) are short 1 mm
+    moves along one axis; `add_move` records a real displacement, so the
+    position follows it.  FORCE_MOVE and a hand on the bed never appear
+    here, exactly as in klippy.
+    """
+    def __init__(self, pos=(50., 50., 21.6)):
+        self.start = tuple(pos)
+        self.moves = []
         self.z_moves = []
         self.axis = 'z'
-    def get_trapq_position(self, t):
-        return ((50., 50., 21.6), 0.)
-    def extract_trapq(self, start, end):
-        class Move:
-            pass
-        moves = []
+    def add_move(self, begin, duration, dx=0., dy=0., dz=0.):
+        pos = self.position(float('inf'))
+        self.moves.append((begin, duration, pos, (dx, dy, dz)))
+    def _all(self):
+        moves = list(self.moves)
         for begin, finish in self.z_moves:
-            if begin < end and finish > start:
-                move = Move()
-                move.print_time, move.move_t = begin, finish - begin
-                move.x_r = -1. if self.axis == 'x' else 0.
-                move.y_r = -1. if self.axis == 'y' else 0.
-                move.z_r = -1. if self.axis == 'z' else 0.
-                moves.append(move)
+            d = {'x': (1., 0., 0.), 'y': (0., 1., 0.),
+                 'z': (0., 0., 1.)}[self.axis]
+            moves.append((begin, finish - begin, self.start,
+                          tuple(-c for c in d)))
+        return sorted(moves)
+    def position(self, t):
+        pos = self.start
+        for begin, duration, start, d in self._all():
+            if begin > t:
+                break
+            frac = max(0., min(1., (t - begin) / duration))
+            pos = tuple(s + c * frac for s, c in zip(start, d))
+        return pos
+    def get_trapq_position(self, t):
+        return self.position(t), 0.
+    def extract_trapq(self, start, end):
+        moves = []
+        for begin, duration, s, d in self._all():
+            if begin < end and begin + duration > start:
+                dist = sum(c * c for c in d) ** .5
+                m = TrapQMove()
+                m.print_time, m.move_t = begin, duration
+                m.start_v, m.accel = dist / duration, 0.
+                m.start_x, m.start_y, m.start_z = s
+                m.x_r, m.y_r, m.z_r = (c / dist for c in d)
+                moves.append(m)
         return moves, []
 
 
-def replay_motion(r):
-    trapq = ReplayTrapQ()
+def replay_motion(r, pos=None):
+    trapq = ReplayTrapQ(pos or (50., 50., r.printer.toolhead.position[2]))
     class Report:
         dtrapqs = {'toolhead': trapq}
     r.printer.objects['motion_report'] = Report()
     return trapq
 
 
-def test_unlock_offset_replay():
-    # Incident envelope: three 16 mm FORCE_MOVE filament retracts left a
-    # 717295-count offset at Z=21.6. No Z motion accompanied the load step.
+def test_stationary_contact_stays_latched():
+    # KAN-828: the toolhead trapq is still, the load is a sustained real
+    # touch (FORCE_MOVE of a Z stepper, or the bed moved by hand)
+    r = Rig(z=0.5)
+    replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(200000, 0.05)
+    check(r.status()['contact'], 'stationary touch is contact at 50 ms')
+    r.feed(200000, 5.)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'a still toolhead never ages a held touch into the zero (5 s)')
+    check(r.refused(60, 50, 0.5) == REFUSAL,
+          'XY still refused while the stationary touch remains')
+    r.feed(0, 0.1)
+    check(not r.status()['contact'] and r.refused(60, 50, 0.5) is None,
+          'and allowed once the load falls away')
+
+
+def test_direct_stepper_contact_stays_latched():
+    # FORCE_MOVE runs on its own trapq: the toolhead trapq shows only the
+    # XY move that ended long before, and reports the toolhead high above
+    # the plate, while the stepper drove the nozzle into it in steps.
+    for z in (0.5, 21.6):
+        r = Rig(z=z)
+        trapq = replay_motion(r)
+        r.feed(0, 0.5)
+        trapq.add_move(r.t - 2., 0.2, dx=10.)
+        for load in (240000, 480000, 717295):
+            r.feed(load, 0.1)
+        r.feed(717295, 3.)
+        check(r.status()['contact'] and r.status()['load'] == 717295,
+              'FORCE_MOVE contact at toolhead Z %.1f stays latched' % z)
+        check(r.refused(60, 50, z) == REFUSAL,
+              'and XY is refused at toolhead Z %.1f' % z)
+        # A FORCE_MOVE back off the plate is not seen in the trapq, but
+        # the load falling is a normal release
+        r.feed(0, 0.06)
+        check(not r.status()['contact'] and r.refused(60, 50, z) is None,
+              'FORCE_MOVE back off releases at toolhead Z %.1f' % z)
+
+
+def test_unlock_offset_needs_explicit_rezero():
+    # KAN-742 incident envelope: three 16 mm FORCE_MOVE filament retracts
+    # left a 717295-count offset at Z=21.6 with no Z motion.  The guard
+    # cannot tell that from a touch, so it stays latched until told.
     r = Rig(z=21.6)
-    trapq = replay_motion(r)
+    replay_motion(r)
     r.feed(0, 0.5)
     for load, duration in ((240000, 0.10), (480000, 0.10),
-                           (717295, 0.4995)):
+                           (717295, 2.)):
         r.feed(load, duration)
-    check(r.status()['contact'], 'offset still guarded before steady 0.5 s')
-    r.feed(717295, 0.002)
-    check(r.status()['load'] == 0 and not r.status()['contact'],
-          'steady unlock offset re-zeroes without restarting Klipper')
-    check(r.refused(60, 50, 21.6) is None,
-          'XY resumes after stationary offset relock')
-    trapq.z_moves.append((r.t, r.t + 0.05))
+    check(r.status()['contact'], 'steady unlock offset stays latched')
+    check(r.refused(60, 50, 21.6) == REFUSAL, 'XY refused until re-zeroed')
+    cmd = Cmd(REZERO=1)
+    r.guard.cmd_SET_CONTACT_GUARD(cmd)
+    check(r.status() == {'contact': False, 'load': 0, 'active': True,
+                         'enabled': True}, 'REZERO=1 at Z 21.6 re-zeroes')
+    check('load was 717295' in cmd.info[0], 'and reports what it absorbed')
+    r.feed(717295, 0.1)
+    check(abs(r.status()['load']) < 1000 and r.refused(60, 50, 21.6) is None,
+          'XY resumes after the explicit re-zero')
     r.feed(917295, 0.025)
     check(r.status()['contact'] and r.status()['load'] == 200000,
-          'new contact detects 200000 counts above the relocked zero')
+          'new contact detects 200000 counts above the re-zeroed load')
     check(r.refused(70, 50, 21.6) == REFUSAL,
-          'new real contact still refuses XY after offset recovery')
+          'new real contact still refuses XY after the re-zero')
+
+
+def rezero_error(r):
+    try:
+        r.guard.cmd_SET_CONTACT_GUARD(Cmd(REZERO=1))
+    except CommandError as err:
+        return str(err)
+    return None
+
+
+def test_rezero_is_bounded():
+    def held(z=21.6):
+        r = Rig(z=z)
+        r.feed(0, 0.5)
+        r.feed(717295, 1.)
+        return r
+    r = held(z=0.5)
+    err = rezero_error(r)
+    check(err is not None and 'Z 10.0 or higher' in err,
+          'REZERO refused near the plate: %s' % err)
+    check(r.status()['contact'] and r.refused(60, 50, 0.5) == REFUSAL,
+          'and the contact stays latched')
+    r = held(z=9.9)
+    check(rezero_error(r) is not None, 'REZERO refused at Z 9.9')
+    r = held()
+    r.printer.toolhead.homed_axes = 'xy'
+    check('Z homed' in (rezero_error(r) or ''), 'REZERO refused, Z unhomed')
+    check(r.status()['contact'], 'and the contact stays latched')
+    r = held()
+    r.printer.homing_override.in_script = True
+    check('homing' in (rezero_error(r) or ''), 'REZERO refused while homing')
+    r = held()
+    for _ in range(5):
+        r.feed(717295, 0.004)
+        r.feed(717295 + 3 * r.guard.band, 0.004)
+    check('changing' in (rezero_error(r) or ''),
+          'REZERO refused on a changing load')
+    check(r.status()['contact'], 'and the contact stays latched')
+    r = held()
+    r.printer.reactor.now += 1.01
+    check('current' in (rezero_error(r) or ''),
+          'REZERO refused with a stale stream')
+    r = held()
+    r.printer.probe.trigger_time = r.t + 1.
+    check('current' in (rezero_error(r) or ''),
+          'REZERO refused inside a tap ring')
+    r = held(z=10.)
+    check(rezero_error(r) is None and not r.status()['contact'],
+          'REZERO allowed at exactly rezero_min_z')
+
+
+def test_positive_clearance_rezeroes_the_residual():
+    # A touch latched at the plate, and while it was held the zero drifted
+    # 150000 counts in the pressing direction.  Lifting Z drops the press,
+    # and the residual then stays put while Z keeps rising: cleared.
+    r = Rig(z=0.5)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(350000, 0.3)
+    check(r.status()['contact'], 'contact')
+    trapq.add_move(r.t, 0.3, dz=1.5)   # 5 mm/s from Z 0.5 to 2.0
+    r.feed(350000, 0.01)               # the first 0.05 mm still pressing
+    r.feed(150000, 0.14)               # 0.75 mm lifted: not yet
+    check(r.status()['contact'], 'still latched 0.75 mm into the lift')
+    r.feed(150000, 0.08)               # past 1.0 mm of steady lift
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'load fell 200000 then held over 1 mm of Z rise: re-zeroed')
+    r.move(50, 50, 2.)
+    check(r.refused(60, 50, 2.) is None, 'XY allowed after clearance')
+    r.feed(150000 + 200000, 0.05)
+    check(r.status()['contact'], 'a new press above the residual is contact')
+
+
+def test_clearance_needs_lift_drop_and_steady_load():
+    def latched():
+        r = Rig(z=0.5)
+        trapq = replay_motion(r)
+        r.feed(0, 0.5)
+        r.feed(350000, 0.3)
+        return r, trapq
+    # Lift too short
+    r, trapq = latched()
+    trapq.add_move(r.t, 0.16, dz=0.8)
+    r.feed(350000, 0.01)
+    r.feed(150000, 2.)
+    check(r.status()['contact'], 'a 0.8 mm lift is not clearance')
+    # The load fell before Z rose (a FORCE_MOVE backing off part way, the
+    # toolhead still), then held through a long lift
+    r, trapq = latched()
+    r.feed(150000, 0.5)
+    trapq.add_move(r.t, 1., dz=5.)
+    r.feed(150000, 2.)
+    check(r.status()['contact'],
+          'a fall that came before the lift is not clearance')
+    # The load does not drop: it does not follow Z, so it is not known to
+    # be off the plate (the unlock offset; needs REZERO)
+    r, trapq = latched()
+    trapq.add_move(r.t, 1., dz=5.)
+    r.feed(350000, 2.)
+    check(r.status()['contact'], 'a lift the load ignores is not clearance')
+    # A compliant contact: the load keeps falling the whole lift
+    r, trapq = latched()
+    trapq.add_move(r.t, 1., dz=2.)
+    for i in range(100):
+        r.feed(350000 - 1500 * i, 0.01)
+    r.feed(200000, 2.)
+    check(r.status()['contact'],
+          'a load still falling with Z is not clearance')
+    # Z lowering
+    r, trapq = latched()
+    trapq.add_move(r.t, 0.3, dz=-1.5)
+    r.feed(150000, 2.)
+    check(r.status()['contact'], 'Z going down is not clearance')
+    # No executed-motion history at all
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.feed(350000, 0.3)
+    r.feed(150000, 2.)
+    check(r.status()['contact'], 'no trapq: no clearance')
 
 
 def test_motion_contact_never_relocks_while_held():
@@ -601,6 +796,19 @@ def test_unknown_motion_and_changing_offsets_do_not_relock():
         r.feed(250000, 0.1)
     check(r.status()['contact'] and r.status()['load'] == 250000,
           'changing load outside the band does not count as steady offset')
+
+
+def test_stationary_sub_threshold_offset_still_relocks():
+    # Genuine offsets that are not contact still re-zero with the toolhead
+    # still, as on master
+    r = Rig(z=21.6)
+    replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(60000, 0.6)
+    check(abs(r.status()['load']) < 1000 and not r.status()['contact'],
+          'a steady 60000-count offset under the threshold re-zeroes')
+    r.feed(60000 + 200000, 0.05)
+    check(r.status()['contact'], 'contact measured from the new zero')
 
 
 def main():
