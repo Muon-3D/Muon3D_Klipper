@@ -185,6 +185,35 @@ class FakePrinter:
         return {}
 
 
+class FakeStepper:
+    def __init__(self, axis):
+        self.axis = axis
+    def is_active_axis(self, axis):
+        return axis == self.axis
+    def get_step_dist(self):
+        return 0.0025
+
+
+class FakeStepperPosition:
+    def __init__(self, axis, travel):
+        self.stepper = FakeStepper(axis)
+        self.start_pos = 1000
+        self.trig_pos = self.start_pos - int(round(travel / 0.0025))
+
+
+class FakeHomingMove:
+    """What homing_move_end sees: how far each stepper went to trigger."""
+    def __init__(self, axis='z', travel=5.):
+        self.stepper_positions = [FakeStepperPosition(axis, travel)]
+
+
+class FakeHomingState:
+    def __init__(self, axes):
+        self.axes = axes
+    def get_axes(self):
+        return self.axes
+
+
 class Rig:
     """A guard wired to fakes, with a sample clock."""
     def __init__(self, values=None, z=5.):
@@ -220,6 +249,25 @@ class Rig:
         except CommandError as err:
             return str(err)
         return None
+    def homing_move(self, axis='z', travel=5.):
+        hmove = FakeHomingMove(axis, travel)
+        self.printer.send_event("homing:homing_move_begin", hmove)
+        self.printer.send_event("homing:homing_move_end", hmove)
+    def set_position(self, at=None):
+        # toolhead.set_position marks the trapq at the current print_time;
+        # the samples that follow are newer.  print_time is then put back
+        # so later syncs do not wait for motion that never ran.
+        th = self.printer.toolhead
+        print_time, th.print_time = th.print_time, (self.t if at is None
+                                                    else at)
+        self.printer.send_event("toolhead:set_position")
+        th.print_time = print_time
+    def home_z(self, axes=(2,)):
+        """G28 Z through home_rails: resets the position, then homes."""
+        hs = FakeHomingState(list(axes))
+        self.printer.send_event("homing:home_rails_begin", hs, [])
+        self.set_position()
+        self.printer.send_event("homing:home_rails_end", hs, [])
     def in_contact(self):
         self.feed(0, 0.5)
         self.feed(200000, 0.05)
@@ -302,10 +350,11 @@ def test_inactive_states():
 def test_homing_move():
     r = Rig()
     r.feed(0, 0.5)
-    r.printer.send_event("homing:homing_move_begin", None)
+    hmove = FakeHomingMove('z', 5.)
+    r.printer.send_event("homing:homing_move_begin", hmove)
     check(not r.status()['active'], "inactive during a homing move")
     r.feed(200000, 0.3)          # a tap: ignored, not contact or drift
-    r.printer.send_event("homing:homing_move_end", None)
+    r.printer.send_event("homing:homing_move_end", hmove)
     # 10 ms is shorter than the 50 ms a real contact takes to release
     r.feed(0, 0.01)
     check(r.status() == {'contact': False, 'load': 0, 'active': True,
@@ -351,31 +400,46 @@ def test_enable():
 
 
 def test_drift():
+    # Raw zero drift, measured at ~9000 counts/s.  Toward unloading it is
+    # followed without limit.  Toward pressing it is followed only up to
+    # max_absorbed_counts from the trusted zero: past that it reads as
+    # load and, past the threshold, as contact (fail safe; G28 re-zeroes).
     r = Rig()
     r.feed(0, 1.)
     worst = 0
-    for sign in (1., -1.):
-        for _ in range(60):
-            r.feed(0, 1., drift=sign * 9000.)
-            worst = max(worst, abs(r.status()['load']))
-            check_quiet = not r.status()['contact']
-            if not check_quiet:
-                raise AssertionError("drift read as contact")
+    for _ in range(60):
+        r.feed(0, 1., drift=9000.)          # raw up: unloading on the M1
+        worst = max(worst, abs(r.status()['load']))
+        if r.status()['contact']:
+            raise AssertionError("drift read as contact")
     check(worst < THRESHOLD / 4,
-          "9000 counts/s drift for 60 s each way is followed inside the"
+          "9000 counts/s unloading drift for 60 s is followed inside the"
           " band (worst %d)" % worst)
+    for _ in range(4):
+        r.feed(0, 1., drift=-9000.)         # 36000 back: within the cap
+        worst = max(worst, abs(r.status()['load']))
+    check(worst < THRESHOLD / 4 and not r.status()['contact'],
+          "36000 counts of pressing drift is still followed (worst %d)"
+          % worst)
+    r.feed(0, 20., drift=-9000.)
+    check(r.status()['contact'],
+          "pressing drift far past max_absorbed_counts reads as contact")
+    r.homing_move('z', 5.)
+    r.feed(0, 0.1)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          "and a Z homing move re-zeroes it")
 
 
 def test_relock():
     r = Rig()
     r.feed(0, 0.5)
-    r.feed(50000, 0.4995)        # outside the band, under the threshold
-    check(r.status()['load'] == 50000, "a lingering offset is not absorbed"
+    r.feed(40000, 0.4995)        # outside the band, under the threshold
+    check(r.status()['load'] == 40000, "a lingering offset is not absorbed"
           " before 0.5 s")
-    r.feed(50000, 0.001)         # the sample at 0.5 s re-zeroes
-    r.feed(50000, 0.0005)
+    r.feed(40000, 0.001)         # the sample at 0.5 s re-zeroes
+    r.feed(40000, 0.0005)
     check(abs(r.status()['load']) < 1000, "and is re-zeroed at 0.5 s")
-    r.feed(50000 + 200000, 0.05)
+    r.feed(40000 + 200000, 0.05)
     check(r.status()['contact'], "contact is measured from the new zero")
     # A zero taken while pressing reads strongly negative once released
     r = Rig()
@@ -398,11 +462,11 @@ def test_homing_reanchors():
     r.drift = 150000. * PRESS
     r.feed(0, 0.2)
     check(r.status()['contact'], "stale zero still reads contact")
-    r.printer.send_event("homing:homing_move_begin", None)
-    r.printer.send_event("homing:homing_move_end", None)
+    r.homing_move('z', 5.)
     r.feed(0, 0.1)
     check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
-          "a homing move re-zeroes on what it read before moving")
+          "a Z homing move that travelled 5 mm re-zeroes on what it read"
+          " before moving")
 
 
 def test_sync_before_deciding_near_the_plate():
@@ -540,6 +604,10 @@ class ReplayTrapQ:
     def add_move(self, begin, duration, dx=0., dy=0., dz=0.):
         pos = self.position(float('inf'))
         self.moves.append((begin, duration, pos, (dx, dy, dz)))
+    def add_reset(self, begin, z):
+        """SET_KINEMATIC_POSITION: a zero-length marker at a new Z."""
+        x, y, _ = self.position(float('inf'))
+        self.moves.append((begin, 0., (x, y, z), (0., 0., 0.)))
     def _all(self):
         moves = list(self.moves)
         for begin, finish in self.z_moves:
@@ -553,7 +621,8 @@ class ReplayTrapQ:
         for begin, duration, start, d in self._all():
             if begin > t:
                 break
-            frac = max(0., min(1., (t - begin) / duration))
+            frac = (1. if not duration
+                    else max(0., min(1., (t - begin) / duration)))
             pos = tuple(s + c * frac for s, c in zip(start, d))
         return pos
     def get_trapq_position(self, t):
@@ -561,13 +630,15 @@ class ReplayTrapQ:
     def extract_trapq(self, start, end):
         moves = []
         for begin, duration, s, d in self._all():
-            if begin < end and begin + duration > start:
+            if begin < end and begin + duration >= start:
                 dist = sum(c * c for c in d) ** .5
                 m = TrapQMove()
                 m.print_time, m.move_t = begin, duration
-                m.start_v, m.accel = dist / duration, 0.
+                m.start_v = dist / duration if duration else 0.
+                m.accel = 0.
                 m.start_x, m.start_y, m.start_z = s
-                m.x_r, m.y_r, m.z_r = (c / dist for c in d)
+                m.x_r, m.y_r, m.z_r = ((c / dist for c in d) if dist
+                                       else (0., 0., 0.))
                 moves.append(m)
         return moves, []
 
@@ -633,6 +704,7 @@ def test_unlock_offset_needs_explicit_rezero():
         r.feed(load, duration)
     check(r.status()['contact'], 'steady unlock offset stays latched')
     check(r.refused(60, 50, 21.6) == REFUSAL, 'XY refused until re-zeroed')
+    r.home_z()
     cmd = Cmd(REZERO=1)
     r.guard.cmd_SET_CONTACT_GUARD(cmd)
     check(r.status() == {'contact': False, 'load': 0, 'active': True,
@@ -659,6 +731,7 @@ def rezero_error(r):
 def test_rezero_is_bounded():
     def held(z=21.6):
         r = Rig(z=z)
+        r.home_z()
         r.feed(0, 0.5)
         r.feed(717295, 1.)
         return r
@@ -767,6 +840,139 @@ def test_clearance_needs_lift_drop_and_steady_load():
     check(r.status()['contact'], 'no trapq: no clearance')
 
 
+def test_samples_older_than_a_reset_are_no_evidence():
+    # Samples trail the host: both resets of review #86 A can be handled
+    # before the samples that span them arrive.  Those samples straddle
+    # two frames and must not be compared across them.
+    r = Rig(z=5.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(300000, 0.5)
+    t1, t2 = r.t + 0.1, r.t + 0.4
+    trapq.add_reset(t1, 7.)
+    r.set_position(at=t1)
+    trapq.add_reset(t2, 8.5)
+    r.set_position(at=t2)
+    r.feed(300000, 0.2)          # spans the jump to 7
+    r.feed(200000, 0.4)          # partial relax, then spans the jump to 8.5
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'samples from before a reset are not compared with Z after it')
+
+
+def test_position_reset_is_not_clearance():
+    # Review #86 A: two SET_KINEMATIC_POSITION jumps with a partial relax
+    # between them looked like "the load fell as Z rose, then held while
+    # Z rose 1.5 mm" while the nozzle still pressed 200000
+    r = Rig(z=5.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(300000, 0.5)
+    check(r.status()['contact'], 'held touch')
+    trapq.add_reset(r.t, 7.)
+    r.set_position()
+    r.feed(300000, 0.1)
+    r.feed(200000, 0.2)
+    trapq.add_reset(r.t, 8.5)
+    r.set_position()
+    r.feed(200000, 0.2)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'position resets are not Z rise: still latched at 200000')
+    check(r.refused(100, 50, 5.) == REFUSAL, 'and XY is refused')
+    # A real lift after the reset is still evidence, in the new frame
+    trapq.add_move(r.t, 0.3, dz=1.5)
+    r.feed(300000, 0.01)
+    r.feed(100000, 0.29)
+    check(not r.status()['contact'],
+          'a real lift after the reset still clears')
+
+
+def test_rezero_needs_real_z_home():
+    # Review #86 B: toolhead Z >= 10 is not proof of height after
+    # SET_KINEMATIC_POSITION or a FORCE_MOVE of a Z stepper
+    def held():
+        r = Rig(z=20.)
+        r.feed(0, 0.5)
+        r.feed(200000, 1.)
+        return r
+    r = held()
+    check('G28' in (rezero_error(r) or ''),
+          'REZERO refused before any real Z home')
+    r = held()
+    r.home_z()
+    r.set_position()                       # SET_KINEMATIC_POSITION Z=20
+    check('G28' in (rezero_error(r) or ''),
+          'REZERO refused after a position reset')
+    check(r.status()['contact'], 'and the touch stays latched')
+    r = held()
+    r.home_z()
+    r.printer.send_event("force_move:manual_move", FakeStepper('z'))
+    check('G28' in (rezero_error(r) or ''),
+          'REZERO refused after FORCE_MOVE of a Z stepper')
+    r = held()
+    r.home_z(axes=(0, 1))
+    check('G28' in (rezero_error(r) or ''),
+          'homing only X and Y does not make Z trusted')
+    r = held()
+    r.home_z()
+    r.printer.send_event("force_move:manual_move", FakeStepper('x'))
+    check(rezero_error(r) is None and not r.status()['contact'],
+          'FORCE_MOVE of a non-Z stepper (the unlock retract) keeps trust')
+
+
+def test_only_clear_z_homing_rezeroes():
+    # Review #86 C: an X or Y homing move, or a probe started on the
+    # plate, used to re-zero on the pressed load
+    for axis, travel, what in (('x', 50., 'an X homing move'),
+                               ('y', 50., 'a Y homing move'),
+                               ('z', 0.005, 'a probe started on the plate')):
+        r = Rig(z=5.)
+        r.feed(0, 0.5)
+        r.feed(200000, 0.5)
+        r.homing_move(axis, travel)
+        r.feed(200000, 0.5)
+        check(r.status()['contact'] and r.status()['load'] == 200000,
+              '%s does not absorb a held touch' % what)
+        check(r.refused(100, 50, 5.) == REFUSAL,
+              'XY still refused after %s' % what)
+    # A Z move that travelled 0.1 mm or more began clear: its re-zero
+    # also clears an offset latched as contact (the KAN-742 unlock offset)
+    r = Rig(z=21.6)
+    r.feed(0, 0.5)
+    r.feed(717295, 1.)
+    r.homing_move('z', 0.1)
+    r.feed(717295, 0.1)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'G28 Z / a probe that travelled re-zeroes a latched offset')
+
+
+def test_staircase_is_bounded():
+    # Review #86 D: four steady 80000 steps each relocked; 320000 of real
+    # press read as zero
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    r.feed(80000, 0.6)
+    check(not r.status()['contact'], 'one 80000 step is not contact')
+    check(r.status()['load'] == 80000 - THRESHOLD // 2,
+          'and only max_absorbed_counts (45000) of it is absorbed')
+    r.feed(160000, 0.6)
+    check(r.status()['contact'] and r.status()['load'] == 160000 - 45000,
+          'the second step is contact')
+    for load in (240000, 320000):
+        r.feed(load, 0.6)
+    check(r.status()['contact'], 'and the staircase stays latched')
+    check(r.refused(100, 50, 5.) == REFUSAL, 'XY refused')
+    # Unloading moves the trusted zero freely: a zero first taken under
+    # load, once released, bounds later steps from the real zero
+    r = Rig(z=5.)
+    r.feed(200000, 0.5)
+    r.feed(0, 0.6)
+    r.feed(80000, 0.6)
+    r.feed(160000, 0.6)
+    check(r.status()['contact'],
+          'steps after a released loaded zero are bounded from the real'
+          ' zero')
+
+
 def test_motion_contact_never_relocks_while_held():
     for axis in ('x', 'y', 'z'):
         r = Rig(z=0.5)
@@ -804,10 +1010,10 @@ def test_stationary_sub_threshold_offset_still_relocks():
     r = Rig(z=21.6)
     replay_motion(r)
     r.feed(0, 0.5)
-    r.feed(60000, 0.6)
+    r.feed(40000, 0.6)
     check(abs(r.status()['load']) < 1000 and not r.status()['contact'],
-          'a steady 60000-count offset under the threshold re-zeroes')
-    r.feed(60000 + 200000, 0.05)
+          'a steady 40000-count offset under the threshold re-zeroes')
+    r.feed(40000 + 200000, 0.05)
     check(r.status()['contact'], 'contact measured from the new zero')
 
 

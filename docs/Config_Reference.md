@@ -5667,16 +5667,29 @@ recognised as a job. See the
 #   above threshold_counts is contact and is never aged out, however still
 #   the toolhead is: FORCE_MOVE and a bed moved by hand do not appear in
 #   the toolhead's motion. Contact ends when the load falls, by positive
-#   clearance (below), at the next homing or probing move, or with
+#   clearance (below), at a Z homing or probing move that travelled at
+#   least 0.1 mm before triggering (which re-zeroes on what the cell read
+#   just before it; X and Y homing moves never re-zero), or with
 #   SET_CONTACT_GUARD REZERO=1.
+#max_absorbed_counts:
+#   Relocks and drift following may move the zero toward pressing by at
+#   most this many counts in total from the trusted zero: the last real
+#   zero (Z homing or probing, positive clearance, REZERO), or anything
+#   less pressed since. Beyond it the excess reads as load, and past
+#   threshold_counts as contact, so steps that are each under the
+#   threshold cannot add up to an absorbed press. Movement toward
+#   unloading is not limited. The default is half of threshold_counts.
 #clearance_lift: 1.0
 #   Positive clearance. A contact whose load falls by at least
 #   threshold_counts as the executed toolhead Z rises, and then stays
 #   within the band while Z rises a further clearance_lift mm, has left
-#   what it touched; the remaining load becomes the new zero.
+#   what it touched; the remaining load becomes the new zero. A position
+#   reset (SET_KINEMATIC_POSITION, homing) is not a rise: evidence from
+#   before it is discarded.
 #rezero_min_z: 10.0
-#   SET_CONTACT_GUARD REZERO=1 is refused unless Z is homed and the
-#   toolhead is at least this high.
+#   SET_CONTACT_GUARD REZERO=1 is refused unless the toolhead is at least
+#   this high, with Z homed by a homing move (G28) since the last
+#   SET_KINEMATIC_POSITION or FORCE_MOVE of a Z stepper.
 #sync_below_z: 3.0
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,

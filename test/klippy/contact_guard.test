@@ -86,11 +86,13 @@ ASSERT_GUARD ACTIVE=1 CONTACT=0
 CONTACT_GUARD_SIMULATE PLATE=0
 G1 X50 Y50 Z5
 
-# Tare drift of 9000 counts/s for 20 s (180000, twice the threshold) is
-# followed by the baseline and never reads as contact
+# Tare drift: 9000 counts/s for 20 s toward unloading (180000, twice the
+# threshold) is followed freely; 36000 back toward pressing is within
+# max_absorbed_counts and still followed.  Neither reads
+# as contact
 CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=9000
 ASSERT_GUARD ACTIVE=1 CONTACT=0
-CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=-9000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=4 DRIFT=-9000
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 
 # bed_mesh still applies under the guard
@@ -136,7 +138,18 @@ ASSERT_GUARD ACTIVE=1 CONTACT=1
 G1 Z20 F600
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
 ASSERT_GUARD ACTIVE=1 CONTACT=1
-# The explicit recovery, with Z homed and the toolhead above rezero_min_z
+# The FORCE_MOVE left Z untrusted, so REZERO is refused here
+# (contact_guard_forcemove_rezero.test).  Release, then G28 Z trusts Z.
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G28 Z
+G1 Z20 F600
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
+# A steady offset that is not a touch (filament tension) latches
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=1
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+# The explicit recovery: Z homed by G28 since the last position reset or
+# FORCE_MOVE, and the toolhead above rezero_min_z
 SET_CONTACT_GUARD REZERO=1
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1

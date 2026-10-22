@@ -293,15 +293,19 @@ The following command is available when a
 enabled.
 
 #### SET_CONTACT_GUARD
-`SET_CONTACT_GUARD [ENABLE=<0|1>] [REZERO=1]`: Turn the contact guard off
-or back on, for macros that must move X or Y with the nozzle loaded.
+`SET_CONTACT_GUARD [ENABLE=<0|1>] [REZERO=1]`: Turn the contact guard
+off or back on, for macros that must move X or Y with the nozzle loaded.
 REZERO=1 takes the steady load the cell reads now as the new zero and
-clears contact; it is for an offset that is not a touch, such as filament
-tension after an extruder FORCE_MOVE. It waits for queued moves, and fails
-(leaving contact as it was) unless Z is homed, the toolhead is at or above
-`rezero_min_z`, current samples are arriving outside a probe's hold-off,
-and the load is not changing. Without parameters it reports whether it is
-enabled, active and in contact, and the current load.
+clears contact; it is for an offset that is not a touch, such as
+filament tension after an extruder FORCE_MOVE. It waits for queued
+moves, and fails (leaving contact as it was) unless Z was homed by a
+homing move (G28) since the last SET_KINEMATIC_POSITION or FORCE_MOVE of
+a Z stepper, the toolhead is at or above `rezero_min_z`, current samples
+are arriving outside a probe's hold-off, and the load is not changing. A
+machine that homes Z only with a probe and SET_KINEMATIC_POSITION never
+meets the first condition, so there G28 is the recovery. Without
+parameters it reports whether it is enabled, active and in contact, and
+the current load.
 
 ### [delayed_gcode]
 
