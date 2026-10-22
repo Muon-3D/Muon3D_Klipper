@@ -130,6 +130,22 @@ trigger_analog_note_error(struct trigger_analog *ta, uint8_t sensor_code)
     cancel_homing(ta, sensor_code + TE_SENSOR_SPECIFIC);
 }
 
+// Check if a homing/probing trigger is armed (sensors that time-share
+// their ADC must not leave it blind while this is true)
+int
+trigger_analog_is_armed(struct trigger_analog *ta)
+{
+    return ta && (ta->flags & TA_CAN_TRIGGER);
+}
+
+// A sensor is working but deliberately not delivering samples
+void
+trigger_analog_note_alive(struct trigger_analog *ta)
+{
+    if (ta)
+        monitor_note_activity(ta);
+}
+
 // Used by Sensors to report new raw ADC sample
 void
 trigger_analog_update(struct trigger_analog *ta, int32_t sample)
