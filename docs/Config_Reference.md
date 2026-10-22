@@ -5631,13 +5631,20 @@ probes the guard watches the `[load_cell_probe]` load cell and reports
 contact when the load stays above `threshold_counts`. While it does, a
 G-code move with an X or Y component that does not also raise Z fails with
 "Nozzle is touching the plate: lift Z before moving X or Y". A move that
-starts below `sync_below_z`, or with Z unhomed, first waits for the moves
+starts below `sync_below_z`, or with Z unhomed, or within on_time of data
+after a probe's hold-off or a gap in the stream, first waits for the moves
 queued ahead of it to run and is decided on the load cell readings after
-them. The guard is inactive during a job (a virtual_sdcard print that is
-printing or paused, or commands arriving over the G-code pty, until 5
-seconds after the last), during homing, probing and NOZZLE_WIPE_SMART, for
-`holdoff_time` after each probe trigger, and when no load cell samples have
-arrived for 1 second. A print sent line by line through the API is not
+them. It fails closed: if those readings do not arrive, or the stream has
+stopped while contact was latched or near the plate, the move is refused
+too ("no current load cell data"). A Z homing move that lifts at least
+`clearance_lift` (the M1 G28's protected Z lift) re-zeroes on the steady
+load after it, so G28 recovers a false latch even with Z unhomed. The
+guard is inactive during a job (a virtual_sdcard print that is printing or
+paused, or commands arriving over the G-code pty, until 5 seconds after
+the last), during homing, probing and NOZZLE_WIPE_SMART, for
+`holdoff_time` after each probe trigger, and, high above the plate with no
+contact latched, when no load cell samples have arrived for 1 second (the
+toolhead unplugged). A print sent line by line through the API is not
 recognised as a job. See the
 [SET_CONTACT_GUARD](G-Codes.md#set_contact_guard) command.
 

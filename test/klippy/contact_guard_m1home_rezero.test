@@ -1,5 +1,7 @@
 # Review #86 R2-2: on the M1's homing_override Z home (probe plus
-# SET_KINEMATIC_POSITION) REZERO works on a steady offset at Z 20.
+# SET_KINEMATIC_POSITION) REZERO works on a steady offset at Z 20.  The
+# offset is at contact level, so the operator says FORCE=1 (review #86
+# R4-3: Z 20 says nothing about a part under the nozzle).
 DICTIONARY atmega2560.dict
 CONFIG contact_guard_m1home.cfg
 
@@ -10,7 +12,7 @@ CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.5
 ASSERT_GUARD ACTIVE=1 CONTACT=1
 ASSERT_POSITION TOOLHEAD_Z=20
-SET_CONTACT_GUARD REZERO=1
+SET_CONTACT_GUARD REZERO=1 FORCE=1
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.5
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 G1 X100 Y50 F6000

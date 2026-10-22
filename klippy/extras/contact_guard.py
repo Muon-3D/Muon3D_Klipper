@@ -9,15 +9,23 @@
 #
 # The guard is a gcode_move transform at the head of the chain, so it sees
 # moves in G-code coordinates before skew_correction or bed_mesh alter them.
-import logging, collections
+import logging, collections, sys
 
 REFUSAL = "Nozzle is touching the plate: lift Z before moving X or Y"
+# Fail closed: near the plate, or while the last state was contact, an XY
+# move with no load cell data covering its start is refused too
+NO_DATA = ("contact_guard: no current load cell data, so contact cannot"
+           " be ruled out: lift Z before moving X or Y")
 
 # With no load cell samples for this long the guard goes inactive rather
 # than act on a stale reading (toolhead MCU disconnected, stream stopped).
 STREAM_TIMEOUT = 1.0
-# Samples averaged to re-zero the baseline at the start of a homing move.
+# Samples averaged to re-zero the baseline at the start of a homing move,
+# and after a Z homing move that lifted (see _lift_zero_sample).
 ANCHOR_TIME = 0.020
+# After an upward Z homing move, re-zero on the first steady samples seen
+# within this much post-move data, or give up.
+LIFT_ZERO_WINDOW = 0.5
 # A Z homing or probing move re-zeroes on what the cell read before it only
 # if Z travelled at least this far down (toward the plate) before the
 # trigger.  The M1's cell runs out of range (MCU guard) at ~0.093 mm of
@@ -136,11 +144,16 @@ class ContactGuard:
         # the trapq; samples up to the newest one are no clearance evidence
         self.position_reset_time = float('-inf')
         self.absorbed = 0.  # pressing-direction zero movement since zero
-        # The next gcode:command_error is the guard's own (a refusal, or a
-        # REZERO it turned down), which says nothing about homing
-        self.own_error = False
+        # The guard's own last error (a refusal, or a REZERO it turned
+        # down).  gcode:command_error fires for it once per macro level;
+        # none of those say anything about homing.
+        self.own_error = None
         self.homing_candidate = None
         self.pending_zero = None  # applied once homing ends without error
+        # After a Z homing move that lifted: re-zero on post-move samples
+        self.lift_zero = None
+        # Time of the first sample after the last gap in the stream
+        self.resume_time = None
         # Z homed for real since the last position reset, FORCE_MOVE of a
         # Z stepper, or Z motor disable
         self.z_trusted = False
@@ -234,13 +247,39 @@ class ContactGuard:
         eventtime = self.reactor.monotonic()
         if not self._may_refuse(eventtime):
             return
-        if self._contact_possible(last, eventtime):
-            self._sync()
+        possible = self._contact_possible(last, eventtime)
+        held = self.contact or self.above_since is not None
+        if possible or self._settling() or self.lift_zero is not None:
+            # Decide on samples that cover this move's start: after the
+            # moves queued ahead of it, past a tap's ring, and with on_time
+            # of data since any gap
+            if not self._sync():
+                logging.info("contact_guard: refused move %s -> %s, no"
+                             " samples", last[:3], list(newpos[:3]))
+                raise self._own_error(NO_DATA)
             eventtime = self.reactor.monotonic()
+        if self._stale(eventtime) and (held or possible):
+            # The stream stopped while touching, or near the plate: still
+            # touching, as far as anything says
+            raise self._own_error(NO_DATA)
         if self.contact and self.is_active(eventtime):
             logging.info("contact_guard: refused move %s -> %s, load %d",
                          last[:3], list(newpos[:3]), self.load)
             raise self._own_error(REFUSAL)
+
+    def _stale(self, eventtime):
+        return (self.sample_systime is None
+                or eventtime - self.sample_systime > STREAM_TIMEOUT)
+
+    def _settling(self):
+        # The detector has had less than on_time of data since a probe's
+        # hold-off or a gap: a touch there (PROBE leaves the nozzle on
+        # what it hit) is not latched yet
+        if self.data_time is None:
+            return False
+        since = max(self._holdoff_end(), self.resume_time
+                    if self.resume_time is not None else float('-inf'))
+        return self.data_time < since + self.on_time + SYNC_MARGIN
 
     def _contact_possible(self, last, eventtime):
         kin_status = self.toolhead.get_kinematics().get_status(eventtime)
@@ -253,33 +292,41 @@ class ContactGuard:
         # past the ring of a tap that just happened.  This stalls only moves
         # that start near the plate.
         self.toolhead.wait_moves()
-        target = max(self.toolhead.print_time, self._holdoff_end())
+        target = max(self.toolhead.print_time, self._holdoff_end(),
+                     self.resume_time if self.resume_time is not None
+                     else float('-inf'))
         target += self.on_time + SYNC_MARGIN
         if self.sim_plate is not None:
             self._sim_plate_until(target)
-            return
+            return True
         mcu = self.load_cell.sensor.get_mcu()
         if mcu.is_fileoutput():
             # Batch mode: no samples will come and print_time is not clock
-            return
+            return True
         now = self.reactor.monotonic()
         deadline = (now + SYNC_TIMEOUT
                     + max(0., target - mcu.estimated_print_time(now)))
-        while self.data_time is None or self.data_time < target:
+        # A re-zero pending from a Z lift is also waited for, until the
+        # deadline: it may be what releases a false latch
+        while (self.data_time is None or self.data_time < target
+               or self.lift_zero is not None):
             if now >= deadline:
-                logging.info("contact_guard: no samples past %.3f, deciding"
-                             " on what it has", target)
-                return
+                break
             now = self.reactor.pause(now + 0.005)
+        if self.data_time is None or self.data_time < target:
+            logging.info("contact_guard: no samples past %.3f", target)
+            return False
+        return True
 
     def _own_error(self, msg):
-        self.own_error = True
-        return self.gcode.error(msg)
+        self.own_error = self.gcode.error(msg)
+        return self.own_error
 
     # Inactive states
     def _handle_homing_move_begin(self, hmove):
         self.homing_moves += 1
-        self.own_error = False
+        self.lift_zero = None
+        self.own_error = None
         # Remember what the cell read just before the move.  It becomes the
         # zero at the end only if this was a Z move that travelled far
         # enough to prove the nozzle was clear when it began: an X or Y
@@ -290,21 +337,23 @@ class ContactGuard:
                                      / len(self.recent))
 
     def _z_travel(self, hmove):
-        # Distance the Z steppers moved down (toward the plate) before the
-        # trigger, in mm
+        # (down, up): how far the Z steppers moved toward and away from the
+        # plate before the trigger, in mm, from their own step counts
         batch = self.printer.get_start_args().get('debuginput') is not None
-        travel = 0.
+        down = up = 0.
         for sp in getattr(hmove, 'stepper_positions', []):
             if sp.trig_pos is None or not sp.stepper.is_active_axis('z'):
                 continue
             if batch:
                 # Batch mode simulates no stepper motion (as
-                # check_no_movement does): take a Z move as having moved
-                return float('inf')
+                # check_no_movement does): take a Z move as a probe that
+                # moved
+                return float('inf'), 0.
             mtc = sp.stepper.mcu_to_commanded_position
-            down = mtc(sp.start_pos) - mtc(sp.trig_pos)
-            travel = max(travel, down)
-        return travel
+            moved = mtc(sp.start_pos) - mtc(sp.trig_pos)
+            down = max(down, moved)
+            up = max(up, -moved)
+        return down, up
 
     def _override_active(self):
         ho = self.homing_override
@@ -313,7 +362,19 @@ class ContactGuard:
     def _handle_homing_move_end(self, hmove):
         self.homing_moves = max(0, self.homing_moves - 1)
         candidate, self.homing_candidate = self.homing_candidate, None
-        travel = self._z_travel(hmove)
+        travel, lifted = self._z_travel(hmove)
+        if lifted >= self.clearance_lift - MOVE_EPSILON:
+            # A real lift (the G28 macro's AXIS_PROTECTED_MOVE Z+10), on the
+            # steppers' own counts.  Its samples are not watched, so the
+            # reading before it proves nothing; a steady reading after it
+            # is not a touch (it would have fallen away) unless the cell is
+            # at the end of its range.  This is what lets G28 recover a
+            # false latch with Z unhomed, when G1 Z is not allowed.
+            self.lift_zero = {'after': self.toolhead.print_time,
+                              'start': None, 'samples': []}
+            logging.info("contact_guard: Z homing move lifted %.3f mm;"
+                         " re-zeroing on the steady load after it", lifted)
+            return
         if travel < HOMING_CLEAR_TRAVEL - MOVE_EPSILON:
             return
         if self._override_active():
@@ -335,6 +396,33 @@ class ContactGuard:
         self.pending_zero = None
         self._real_zero()
 
+    def _lift_zero_sample(self, t, counts, sign):
+        # After an upward Z homing move: the first ANCHOR_TIME of steady,
+        # in-range readings becomes the zero
+        lz = self.lift_zero
+        if lz['start'] is None:
+            lz['start'] = t
+        if t - lz['start'] > LIFT_ZERO_WINDOW:
+            self.lift_zero = None
+            logging.info("contact_guard: no steady load after the lift;"
+                         " not re-zeroing")
+            return False
+        if self._out_of_range(counts, sign):
+            lz['samples'] = []
+            return False
+        lz['samples'].append((t, counts))
+        values = [c for st, c in lz['samples']]
+        if max(values) - min(values) > self.band:
+            lz['samples'] = [(t, counts)]
+            return False
+        if t - lz['samples'][0][0] < ANCHOR_TIME - TIME_EPSILON:
+            return False
+        self.baseline = float(sum(values)) / len(values)
+        self.lift_zero = None
+        self._real_zero()
+        logging.info("contact_guard: re-zeroed on the load after a Z lift")
+        return True
+
     def _real_zero(self):
         # The baseline was just set from evidence that nothing touched
         self.absorbed = 0.
@@ -342,7 +430,7 @@ class ContactGuard:
 
     def _handle_home_rails_begin(self, homing_state, rails):
         self.homing_rails = True
-        self.own_error = False
+        self.own_error = None
 
     def _handle_home_rails_end(self, homing_state, rails):
         self.homing_rails = False
@@ -362,7 +450,7 @@ class ContactGuard:
         # jump.  That is not motion, so it is no clearance evidence, and Z
         # is no longer known to be where homing put it.
         self.clear_win = None
-        self.own_error = False
+        self.own_error = None
         if self.toolhead is None:
             return
         print_time = self.toolhead.print_time
@@ -385,7 +473,7 @@ class ContactGuard:
         # FORCE_MOVE / STEPPER_BUZZ moved a stepper behind the toolhead's
         # back; if it drives Z, the toolhead Z no longer says where the
         # nozzle is
-        self.own_error = False
+        self.own_error = None
         if stepper.is_active_axis('z'):
             self.z_trusted = self.probe_since_reset = False
 
@@ -401,14 +489,14 @@ class ContactGuard:
         # A failed G28 does not send home_rails_end
         self.homing_moves = 0
         self.homing_rails = False
-        if self.own_error:
-            # The guard's own refusal: nothing homed or probed since it
-            # was raised (any of that clears the mark), so Z is as trusted
-            # as it was
-            self.own_error = False
+        if (self.own_error is not None
+                and sys.exc_info()[1] is self.own_error):
+            # The guard's own refusal, at whatever macro level: nothing
+            # homed or probed since it was raised (any of that clears the
+            # mark), so Z is as trusted as it was
             return
         # A homing or probing move that ended in an error proves nothing
-        self.pending_zero = None
+        self.pending_zero = self.lift_zero = None
         self.z_trusted = self.probe_since_reset = False
 
     def _is_homing(self):
@@ -470,16 +558,22 @@ class ContactGuard:
         if not samples:
             return True
         self.sample_systime = self.reactor.monotonic()
-        if self._is_homing():
+        anchor_only = False
+        if self.homing_moves or self.homing_rails:
             ignore_before = float('inf')
         else:
             ignore_before = self._holdoff_end()
+            # Between the moves of a homing_override script (the M1's tare
+            # pauses before each probe) keep the readings as the anchor
+            # for the next probe's re-zero, but do not judge contact
+            anchor_only = self._is_homing()
         self._apply_pending_zero()
         self._update_motion_history(samples[0][0], samples[-1][0])
         sign = self.probe.get_press_direction(
             self.baseline if self.baseline is not None else samples[0][2])
         for sample in samples:
-            self._process_sample(sample[0], sample[2], sign, ignore_before)
+            self._process_sample(sample[0], sample[2], sign, ignore_before,
+                                 anchor_only)
         return True
 
     def _update_motion_history(self, start, end):
@@ -625,7 +719,8 @@ class ContactGuard:
                      " re-zeroed", load, travel)
         return True
 
-    def _process_sample(self, t, counts, sign, ignore_before):
+    def _process_sample(self, t, counts, sign, ignore_before,
+                        anchor_only=False):
         if self.data_time is None or t > self.data_time:
             self.data_time = t
         if t < ignore_before:
@@ -639,11 +734,18 @@ class ContactGuard:
             self.recent.clear()
             self.prev_time = None
             self.in_gap = False
+            self.resume_time = t
         self.recent.append((t, counts))
         while self.recent and self.recent[0][0] < t - ANCHOR_TIME:
             self.recent.popleft()
+        if anchor_only:
+            return
         if self.baseline is None:
             self.baseline = float(counts)
+        if (self.lift_zero is not None and t > self.lift_zero['after']
+                and self._lift_zero_sample(t, counts, sign)):
+            self.load = sign * (counts - self.baseline)
+            return
         dt = 0. if self.prev_time is None else max(0., t - self.prev_time)
         self.prev_time = t
         load = sign * (counts - self.baseline)
@@ -720,7 +822,7 @@ class ContactGuard:
             'enabled': self.enabled,
         }
 
-    def _rezero(self):
+    def _rezero(self, force=False):
         # The explicit, bounded recovery: an operator or macro asserts that
         # the steady load the cell reads now is not contact.  Bounded by
         # Z homed and high above the plate, settled samples, and a load
@@ -753,8 +855,26 @@ class ContactGuard:
         if max(counts) - min(counts) > self.band:
             raise self._own_error("contact_guard: load is changing, not"
                                    " re-zeroing")
+        sign = self.probe.get_press_direction(self.baseline)
+        if any(self._out_of_range(c, sign) for c in counts):
+            # Flat at the end of the cell's range: no reading at all
+            raise self._own_error(
+                "contact_guard: the load cell is at the end of its range,"
+                " not re-zeroing")
+        mean = float(sum(counts)) / len(counts)
+        if (self.contact or sign * (mean - self.baseline) >= self.threshold):
+            # Toolhead Z says nothing about a part or fixture under the
+            # nozzle; a load that does not follow a 1 mm lift does
+            if not force:
+                raise self._own_error(
+                    "contact_guard: the load is at contact level; lift Z"
+                    " 1 mm to clear an offset that does not follow Z, or"
+                    " REZERO=1 FORCE=1 if nothing is touching")
+            logging.warning("contact_guard: REZERO FORCE=1 absorbing a"
+                            " contact-level load of %d at Z %.2f",
+                            sign * (mean - self.baseline), z)
         old = self.load
-        self.baseline = float(sum(counts)) / len(counts)
+        self.baseline = mean
         self._real_zero()
         self.load = 0.
         logging.info("contact_guard: re-zeroed by command at Z %.2f, load"
@@ -763,13 +883,15 @@ class ContactGuard:
 
     cmd_SET_CONTACT_GUARD_help = (
         "Enable or disable refusing XY moves while the nozzle touches;"
-        " REZERO=1 re-zeroes a steady offset with the toolhead high")
+        " REZERO=1 [FORCE=1] re-zeroes a steady offset with the toolhead"
+        " high")
     def cmd_SET_CONTACT_GUARD(self, gcmd):
         enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
         if enable is not None:
             self.enabled = bool(enable)
         if gcmd.get_int('REZERO', 0, minval=0, maxval=1):
-            old = self._rezero()
+            old = self._rezero(
+                force=bool(gcmd.get_int('FORCE', 0, minval=0, maxval=1)))
             gcmd.respond_info("contact_guard: re-zeroed, load was %d" % old)
         status = self.get_status(self.reactor.monotonic())
         gcmd.respond_info("contact_guard: enabled=%d active=%d contact=%d"

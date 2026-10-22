@@ -6,6 +6,16 @@ ContactGuard with fakes and asserts what that cannot: the refusal's exact
 text, the timing boundaries, and the states that make the guard inactive.
 
     python3 test/contact_guard/test_contact_guard.py
+
+What test/klippy batch mode cannot cover, and so is tested only here:
+CONTACT_GUARD_SIMULATE feeds samples only when it is called, starting
+after the queued motion, and _sync returns at once in batch mode.  So no
+batch test can see samples during a Z move (positive clearance, the lift
+re-zero after an upward Z homing move), a stream that stops or lags (fail
+closed), the wait after a probe trigger or a gap, or samples arriving
+inside homing_override between its tares unless the test config feeds
+them (contact_guard_m1home.cfg does).  The trapq fake follows
+trapq_extract_old's boundary rules, which batch mode found the hard way.
 """
 import os
 import sys
@@ -276,8 +286,17 @@ class Rig:
         try:
             self.move(x, y, z, e)
         except CommandError as err:
+            self.report(err)
             return str(err)
         return None
+    def report(self, err, levels=1):
+        """gcode.py sends gcode:command_error while handling the error,
+        once per macro level it passes through"""
+        for _ in range(levels):
+            try:
+                raise err
+            except CommandError:
+                self.printer.send_event("gcode:command_error")
     def homing_move(self, axis='z', travel=5.):
         hmove = FakeHomingMove(axis, travel)
         self.printer.send_event("homing:homing_move_begin", hmove)
@@ -405,7 +424,15 @@ def test_trigger_holdoff():
     check(r.status() == {'contact': False, 'load': 0, 'active': False,
                          'enabled': True},
           "inactive and ignoring load for 0.5 s after a trigger")
-    check(r.refused(60, 50, 5) is None, "XY allowed in the hold-off")
+    # An XY move in the hold-off waits it out and decides on what follows
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.005))
+    check(r.refused(60, 50, 5) is None and r.printer.reactor.pauses > 0,
+          "XY in the hold-off waits for it to end; clear after: allowed")
+    r.printer.reactor.on_pause[:] = []
+    r = Rig()
+    r.feed(0, 0.5)
+    r.printer.probe.trigger_time = r.t
+    r.feed(200000, 0.5)
     r.feed(200000, 0.02)         # 500 .. 519.5 ms
     check(r.status()['active'] and not r.status()['contact'],
           "active at 0.5 s; contact needs 20 ms from there")
@@ -549,18 +576,29 @@ def test_no_stall_away_from_the_plate():
 
 
 def test_sync_gives_up_without_samples():
+    # Review #86 R4-1b: the wait used to give up and decide on samples
+    # from before the motion.  It now fails closed.
     r = Rig(z=0.5)
     r.feed(0, 0.5)
     r.printer.reactor.now = 90. + r.t   # the MCU clock is at the data
     start = r.printer.reactor.now
     r.printer.toolhead.print_time = r.t + 0.1
-    check(r.refused(60, 50, 0.5) is None,
-          "no samples after the motion: decides on what it has")
+    check(r.refused(60, 50, 0.5) == contact_guard.NO_DATA,
+          "no samples after the motion: refused (no current data)")
     waited = r.printer.reactor.now - start
     # 0.1 s of motion + 0.025 s for on_time and margin + the 0.5 s timeout
     check(0.6 <= waited < 0.65,
-          "and gives up 0.5 s after the samples were due (waited %.3f s)"
-          % waited)
+          "after waiting 0.5 s past when the samples were due (waited"
+          " %.3f s)" % waited)
+    # A stream that lags (1 ms of data per 5 ms) never covers the move
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.reactor.now = 90. + r.t
+    r.printer.toolhead.print_time = r.t + 0.3
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.001))
+    check(r.refused(60, 50, 0.5) == contact_guard.NO_DATA,
+          "a lagging stream that does not reach the move: refused")
+
 
 
 def test_sync_waits_out_the_ring():
@@ -732,7 +770,7 @@ def test_unlock_offset_needs_explicit_rezero():
     check(r.status()['contact'], 'steady unlock offset stays latched')
     check(r.refused(60, 50, 21.6) == REFUSAL, 'XY refused until re-zeroed')
     r.home_z()
-    cmd = Cmd(REZERO=1)
+    cmd = Cmd(REZERO=1, FORCE=1)
     r.guard.cmd_SET_CONTACT_GUARD(cmd)
     check(r.status() == {'contact': False, 'load': 0, 'active': True,
                          'enabled': True}, 'REZERO=1 at Z 21.6 re-zeroes')
@@ -747,10 +785,12 @@ def test_unlock_offset_needs_explicit_rezero():
           'new real contact still refuses XY after the re-zero')
 
 
-def rezero_error(r):
+def rezero_error(r, force=1):
+    """REZERO=1 (FORCE=1 by default: these offsets are at contact level)"""
     try:
-        r.guard.cmd_SET_CONTACT_GUARD(Cmd(REZERO=1))
+        r.guard.cmd_SET_CONTACT_GUARD(Cmd(REZERO=1, FORCE=force))
     except CommandError as err:
+        r.report(err)
         return str(err)
     return None
 
@@ -1097,22 +1137,26 @@ def test_end_of_range_is_no_clearance():
 
 def test_own_refusal_keeps_z_trust():
     # Review #86 R3-c: the guard's own refusal is a command error, and it
-    # used to drop the Z trust, so REZERO needed a fresh G28
-    r = Rig(z=20.)
-    r.home_z()
-    r.feed(0, 0.5)
-    r.feed(200000, 1.)
-    check(r.refused(60, 50, 20.) == REFUSAL, 'XY refused')
-    r.printer.send_event("gcode:command_error")
-    check(rezero_error(r) is None and not r.status()['contact'],
-          'REZERO still works after the refusal')
+    # used to drop the Z trust, so REZERO needed a fresh G28.  R4-7: inside
+    # a macro gcode:command_error fires once per level.
+    for levels in (1, 2, 3):
+        r = Rig(z=20.)
+        r.home_z()
+        r.feed(0, 0.5)
+        r.feed(200000, 1.)
+        try:
+            r.move(60, 50, 20.)
+        except CommandError as err:
+            r.report(err, levels)
+        check(rezero_error(r) is None and not r.status()['contact'],
+              'REZERO still works after a refusal %d macro level(s) deep'
+              % levels)
     # REZERO's own refusals keep it too
     r = Rig(z=5.)
     r.home_z()
     r.feed(0, 0.5)
     r.feed(200000, 1.)
     check(rezero_error(r) is not None, 'REZERO refused at Z 5')
-    r.printer.send_event("gcode:command_error")
     r.printer.toolhead.position[2] = 20.
     check(rezero_error(r) is None, 'and works once the toolhead is high')
     # Any homing activity after the refusal takes the exemption away: a
@@ -1129,11 +1173,12 @@ def test_own_refusal_keeps_z_trust():
     # Other command errors still drop it
     r = Rig(z=20.)
     r.home_z()
-    r.printer.send_event("gcode:command_error")
+    r.report(CommandError('Move out of range'))
     r.feed(0, 0.5)
     r.feed(200000, 1.)
     check('G28' in (rezero_error(r) or ''),
           'any other command error drops the trust')
+
 
 
 def test_steady_offset_over_z_rezeroes():
@@ -1269,14 +1314,20 @@ def test_z_motor_off_clears_trust():
 
 def test_upward_or_failed_homing_does_not_rezero():
     # Review #86 R2-4: an upward Z homing move (AXIS_PROTECTED_MOVE Z+10)
-    # started while pressing re-zeroed on the pressed load
+    # started while pressing re-zeroed on the pressed load from before it.
+    # Now the pre-move reading is never used for a lift; after it the touch
+    # is gone and the load reads its true zero.
     r = Rig(z=5.)
     r.feed(0, 0.5)
     r.feed(200000, 0.5)
     r.homing_move('z', -10.)
-    r.feed(200000, 0.5)
+    r.feed(0, 0.5)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'after an upward Z homing move the released load reads zero')
+    r.feed(200000, 0.05)
     check(r.status()['contact'] and r.status()['load'] == 200000,
-          'upward Z travel does not re-zero')
+          'and a new press reads in full (the pressed load was not the'
+          ' zero)')
     # A downward move that ends in an error does not re-zero either
     r = Rig(z=5.)
     r.feed(0, 0.5)
@@ -1286,6 +1337,174 @@ def test_upward_or_failed_homing_does_not_rezero():
     r.feed(200000, 0.5)
     check(r.status()['contact'] and r.status()['load'] == 200000,
           'a homing move that errored does not re-zero')
+
+
+
+def test_stale_stream_fails_closed():
+    # Review #86 R4-1a: with no samples for 1 s a latched contact was
+    # forgotten and XY allowed
+    for z in (0.5, 20.):
+        r = Rig(z=z)
+        r.feed(0, 0.5)
+        r.feed(200000, 0.5)
+        r.printer.reactor.now += 1.01
+        check(r.refused(60, 50, z) == contact_guard.NO_DATA,
+              'latched, then no samples for 1 s: XY refused at Z %.1f' % z)
+        check(r.refused(50, 50, z + 1.) is None,
+              'and Z alone still moves (the way out)')
+    # Clear, near the plate, stream stopped: refused (the wait finds none)
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.printer.reactor.now += 1.01
+    check(r.refused(60, 50, 0.5) == contact_guard.NO_DATA,
+          'clear near the plate with no samples: refused')
+    # Clear, high above the plate, stream stopped: allowed.  The last state
+    # was clear and nothing queued can reach the plate; this is the
+    # toolhead unplugged (its MCU is non-critical) parking or docking.
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.printer.reactor.now += 1.01
+    check(r.refused(60, 50, 20.) is None,
+          'clear at Z 20 with no samples: allowed (documented)')
+    check(r.refused(70, 50, 20.) is None and
+          r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0)) is None,
+          'ENABLE=0 is always available')
+
+
+def test_post_trigger_waits_at_any_z():
+    # Review #86 R4-2: PROBE leaves the nozzle on what it hit.  At Z >= 3
+    # nothing waited, so XY in the 0.52 s after a trigger went through.
+    for z in (5., 20.):
+        r = Rig(z=z)
+        r.feed(0, 0.5)
+        r.printer.probe.trigger_time = r.t
+        r.feed(300000, 0.2)          # in the ring
+        r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
+        check(r.refused(60, 50, z) == REFUSAL,
+              'XY 0.2 s after a trigger at Z %.0f waits, then is refused'
+              % z)
+        r = Rig(z=z)
+        r.feed(0, 0.5)
+        r.printer.probe.trigger_time = r.t
+        r.feed(300000, 0.51)         # 10 ms past the hold-off
+        r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
+        check(r.refused(60, 50, z) == REFUSAL,
+              '10 ms after the hold-off at Z %.0f: waits for on_time, then'
+              ' refused' % z)
+    # Any gap in the stream gets the same wait
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.printer.send_event("homing:homing_move_begin", FakeHomingMove('x'))
+    r.feed(300000, 0.1)              # ignored while homing
+    r.printer.send_event("homing:homing_move_end", FakeHomingMove('x'))
+    r.feed(300000, 0.005)            # 5 ms of data since the gap
+    r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
+    check(r.refused(60, 50, 20.) == REFUSAL,
+          'XY 5 ms after a gap waits for on_time of data, then refused')
+
+
+def test_rezero_refuses_contact_level_and_end_of_range():
+    # Review #86 R4-3: REZERO's Z >= 10 says nothing about a part under the
+    # nozzle, and it took a reading flat at the plateau
+    def held(load, ref_max=None):
+        r = Rig(z=30.)
+        r.printer.probe.reference_max = ref_max
+        r.home_z()
+        r.feed(0, 0.5)
+        r.feed(load, 1.)
+        return r
+    r = held(400000)                 # jogged down onto a 30 mm part
+    err = rezero_error(r, force=0)
+    check(err is not None and 'lift Z' in err,
+          'REZERO refused at contact level without FORCE: %s' % err)
+    check(r.refused(60, 50, 30.) == REFUSAL, 'and XY stays refused')
+    r = held(60000)                  # under the threshold, not latched
+    check(rezero_error(r, force=0) is None, 'a sub-threshold offset is'
+          ' re-zeroed without FORCE')
+    r = held(400000)
+    check(rezero_error(r, force=1) is None and not r.status()['contact'],
+          'FORCE=1 is the operator saying nothing touches (logged)')
+    ref_max = ZERO + PRESS * 1920000
+    r = held(1830000, ref_max)
+    err = rezero_error(r, force=1)
+    check(err is not None and 'end of its range' in err,
+          'flat at the reference_max plateau: refused even with FORCE')
+    r = held(0x800000 + ZERO * PRESS)
+    check('end of its range' in (rezero_error(r, force=1) or ''),
+          'clipped at the ADC rail: refused even with FORCE')
+
+
+def test_m1_home_rezeroes_with_samples_flowing():
+    # Review #86 R4-6: the M1's homing_override tares (a reactor pause) with
+    # samples arriving; they were ignored and emptied the anchor, so its
+    # G28 never re-zeroed
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(300000, 1.)
+    check(r.status()['contact'], 'false latch (a 300000 offset)')
+    ho = r.printer.homing_override
+    ho.in_script = True
+    r.set_position()                 # SET_KINEMATIC_POSITION Z=max
+    r.feed(300000, 0.3)              # LOAD_CELL_TARE, PROBE's tare pause
+    check(r.status()['active'] is False, 'inactive inside the script')
+    r.homing_move('z', 5.)           # the probe: 5 mm down, then a trigger
+    r.set_position()                 # Z from the probe
+    ho.in_script = False
+    r.feed(300000, 0.1)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'the M1 G28 re-zeroes on the reading before its probe')
+    check(rezero_error(r) is None, 'and Z is trusted for REZERO')
+
+
+def test_nothing_is_judged_inside_a_homing_script():
+    # Inside homing_override the readings only anchor the next probe's
+    # re-zero: no relock or drift following happens there, so a probe that
+    # then fails leaves the zero as it was
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    ho = r.printer.homing_override
+    ho.in_script = True
+    r.feed(60000, 0.6)               # a steady sub-threshold step
+    r.homing_move('z', 0.005)        # the probe triggers at once: fails
+    r.printer.send_event("gcode:command_error")
+    ho.in_script = False
+    r.feed(60000, 0.1)
+    check(r.status()['load'] == 60000,
+          'a step seen only inside the script was not absorbed')
+
+
+def test_upward_homing_lift_clears_false_latch():
+    # Review #86 R4-4: a false latch with Z unhomed (motors off): G1 Z is
+    # not allowed, and the G28 macro's own XY moves were refused.  Its
+    # AXIS_PROTECTED_MOVE Z+10 (a homing move) now proves the steady load
+    # after it is no touch.
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(300000, 1.)
+    r.printer.toolhead.homed_axes = ''
+    check(r.status()['contact'], 'false latch, Z unhomed')
+    r.homing_move('z', -10.)         # AXIS_PROTECTED_MOVE AXIS=Z DIST=10
+    # _HOME_X's first XY move comes before any sample: it waits for them
+    r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
+    check(r.refused(50, 10, 20.) is None and not r.status()['contact'],
+          'the G28 macro XY move after the lift is allowed')
+    # The same lift with the cell at the end of its range is no evidence
+    r = Rig(z=20.)
+    r.printer.probe.reference_max = ZERO + PRESS * 1920000
+    r.feed(0, 0.5)
+    r.feed(1830000, 1.)
+    r.homing_move('z', -10.)
+    r.printer.reactor.on_pause.append(lambda: r.feed(1830000, 0.005))
+    check(r.refused(50, 10, 20.) == REFUSAL,
+          'a lift with the cell flat at the plateau: still refused')
+    # A load still changing after the lift is no evidence either
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(300000, 1.)
+    r.homing_move('z', -10.)
+    for i in range(60):
+        r.feed(300000 + 30000 * (i % 2), 0.01)
+    check(r.status()['contact'], 'a changing load after the lift: latched')
 
 
 def test_motion_contact_never_relocks_while_held():

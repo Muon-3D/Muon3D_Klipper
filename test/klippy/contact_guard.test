@@ -151,8 +151,10 @@ CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.1
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=1
 ASSERT_GUARD ACTIVE=1 CONTACT=1
 # The explicit recovery: Z homed by G28 since the last position reset or
-# FORCE_MOVE, and the toolhead above rezero_min_z
-SET_CONTACT_GUARD REZERO=1
+# FORCE_MOVE, and the toolhead above rezero_min_z.  The offset is at
+# contact level, so it takes FORCE=1 (contact_guard_rezero_pressing.test
+# is the same without it, refused).
+SET_CONTACT_GUARD REZERO=1 FORCE=1
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
 ASSERT_GUARD ACTIVE=1 CONTACT=0
