@@ -1555,11 +1555,10 @@ def test_upward_homing_lift_clears_false_latch():
 
 
 def test_unlock_retract_then_lift():
-    # KAN-742 / D-048: the retract leaves a 717295-count tension offset at
-    # Z 21.6 with nothing touching (latched); a 0.3 s settle and a 1.2 mm
-    # lift and back at 5 mm/s clear it, no REZERO, no FORCE.  This is the
-    # lift variant of _UNLOCK_CLEAR_GUARD_OFFSET (47971b0c) and any user
-    # jog of the same size.
+    # KAN-742: the unlock retract leaves a 717295-count tension offset at
+    # Z 21.6 with nothing touching (latched).  The unlock press moves
+    # nothing (D-048); a user's own jog clears it, here a 1.2 mm lift and
+    # back at 5 mm/s after 0.3 s, with no REZERO and no FORCE.
     r = Rig(z=21.6)
     trapq = replay_motion(r)
     r.feed(0, 0.5)
