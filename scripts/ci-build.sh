@@ -62,6 +62,9 @@ start_test m1_led_modes "Test M1 LED macros"
 $PYTHON scripts/test_m1_led_modes.py
 # KAN-569: on fault paths the hot end turns off before any LED command.
 $PYTHON scripts/test_m1_heater_before_leds.py
+# KAN-742: the unlock press reports the contact_guard offset its retract
+# leaves, moves nothing, and never uses REZERO FORCE.
+$PYTHON scripts/test_m1_unlock_guard_offset.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
