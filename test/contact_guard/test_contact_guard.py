@@ -1456,6 +1456,53 @@ def test_m1_home_rezeroes_with_samples_flowing():
     check(rezero_error(r) is None, 'and Z is trusted for REZERO')
 
 
+def test_g28_lift_rezero_survives_home_y():
+    # Review #86 R5-1: in a plain G28 the macro's _HOME_Y homing move began
+    # before any post-lift samples arrived, which dropped the lift re-zero;
+    # _HOME_X's G1 Y10 was then refused after its SET_HOMED placeholders,
+    # leaving the machine falsely homed (KAN-573).  The re-zero is now
+    # settled inside the lift's own homing_move_end, while samples flow.
+    r = Rig(z=20.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    for load, d in ((240000, .1), (480000, .1), (717295, 1.)):
+        r.feed(load, d)                      # unlock tension, latched
+    check(r.status()['contact'], 'tension latched')
+    r.printer.toolhead.homed_axes = ''       # idle_timeout M84
+    r.z_motor(False)
+    r.set_position()                         # SKP Z=100 SET_HOMED=Z
+    hm = FakeHomingMove('z', -10.)           # AXIS_PROTECTED_MOVE Z+10
+    r.printer.send_event("homing:homing_move_begin", hm)
+    trapq.add_move(r.t, 1., dz=10.)
+    r.feed(717295, 1.)                       # ignored: inside the move
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(717295, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+    check(r.guard.lift_zero is None and not r.status()['contact'],
+          'the lift re-zero is decided before homing_move_end returns')
+    # _HOME_Y: SKPs, AXIS_PROTECTED_MOVE AXIS=Y, G28.1 Y
+    r.set_position()
+    hy = FakeHomingMove('y', 5.)
+    r.printer.send_event("homing:homing_move_begin", hy)
+    r.feed(717295, 0.2)
+    r.printer.send_event("homing:homing_move_end", hy)
+    hs = FakeHomingState([1])
+    r.printer.send_event("homing:home_rails_begin", hs, [])
+    r.printer.send_event("homing:homing_move_begin", hy)
+    r.feed(717295, 0.5)
+    r.printer.send_event("homing:homing_move_end", hy)
+    r.printer.send_event("homing:home_rails_end", hs, [])
+    r.feed(717295, 0.2)
+    r.printer.toolhead.homed_axes = 'xyz'    # _HOME_X: SET_HOMED=YXZ
+    r.guard.last_position = [50., 50., 110., 0.]
+    r.printer.toolhead.print_time = 0.
+    check(r.refused(50, 60, 110.) is None,
+          'with _HOME_Y in between, _HOME_X G1 Y10 is allowed')
+    r.feed(717295 + 200000, 0.05)
+    check(r.status()['contact'], 'a real touch afterwards still latches')
+
+
 def test_nothing_is_judged_inside_a_homing_script():
     # Inside homing_override the readings only anchor the next probe's
     # re-zero: no relock or drift following happens there, so a probe that

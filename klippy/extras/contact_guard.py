@@ -374,6 +374,7 @@ class ContactGuard:
                               'start': None, 'samples': []}
             logging.info("contact_guard: Z homing move lifted %.3f mm;"
                          " re-zeroing on the steady load after it", lifted)
+            self._settle_lift_zero()
             return
         if travel < HOMING_CLEAR_TRAVEL - MOVE_EPSILON:
             return
@@ -395,6 +396,27 @@ class ContactGuard:
         self.baseline = self.pending_zero
         self.pending_zero = None
         self._real_zero()
+
+    def _settle_lift_zero(self):
+        # Decide the lift re-zero here, before anything else moves: the
+        # G28 macro's next command (_HOME_Y's AXIS_PROTECTED_MOVE) is a
+        # homing move, which would drop it, and its later G1 Y10 is then
+        # refused part way through homing (KAN-573: falsely homed).  The
+        # evidence stays "just after the lift, before any XY travel".
+        # Called from homing_move_end, where homing_moves has already been
+        # decremented, so the samples that arrive while pausing are used.
+        mcu = self.load_cell.sensor.get_mcu()
+        if mcu.is_fileoutput():
+            return
+        now = self.reactor.monotonic()
+        deadline = (now + SYNC_TIMEOUT + LIFT_ZERO_WINDOW
+                    + max(0., self.lift_zero['after']
+                          - mcu.estimated_print_time(now)))
+        while self.lift_zero is not None and now < deadline:
+            now = self.reactor.pause(now + 0.005)
+        if self.lift_zero is not None:
+            logging.info("contact_guard: no samples after the lift; the"
+                         " re-zero stays pending")
 
     def _lift_zero_sample(self, t, counts, sign):
         # After an upward Z homing move: the first ANCHOR_TIME of steady,
