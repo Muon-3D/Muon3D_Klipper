@@ -1507,6 +1507,64 @@ def test_upward_homing_lift_clears_false_latch():
     check(r.status()['contact'], 'a changing load after the lift: latched')
 
 
+def test_unlock_retract_then_lift():
+    # KAN-742 / D-048: the unlock macro's sequence.  The retract leaves a
+    # 717295-count tension offset at Z 21.6 with nothing touching (latched),
+    # then _UNLOCK_CLEAR_GUARD_OFFSET waits 0.3 s and lifts 1.2 mm and back
+    # at 5 mm/s.  The lift clears it; no REZERO, no FORCE.
+    r = Rig(z=21.6)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    for load, duration in ((240000, 0.10), (480000, 0.10), (717295, 0.10)):
+        r.feed(load, duration)       # FORCE_MOVE extruder -16
+    check(r.status()['contact'], 'the retract offset latches')
+    r.feed(717295, 0.3)              # G4 P300
+    trapq.add_move(r.t, 0.24, dz=1.2)
+    r.feed(717295, 0.24)             # G1 Z1.2 F300
+    trapq.add_move(r.t, 0.24, dz=-1.2)
+    r.feed(717295, 0.24)             # G1 Z-1.2 F300
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'the 1.2 mm lift and return clears the offset')
+    check(r.refused(60, 50, 21.6) is None, 'and CANCEL_PRINT can park')
+    r.feed(717295 + 200000, 0.05)
+    check(r.status()['contact'] and r.refused(70, 50, 21.6) == REFUSAL,
+          'a real touch afterwards is still caught')
+    # A real touch under the nozzle is not cleared by the same lift: it
+    # falls away as Z rises, so nothing is re-zeroed on it
+    r = Rig(z=0.5)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(300000, 0.4)
+    trapq.add_move(r.t, 0.24, dz=1.2)
+    r.feed(0, 0.24)
+    trapq.add_move(r.t, 0.24, dz=-1.2)
+    r.feed(300000, 0.24)
+    check(r.status()['contact'] and r.status()['load'] == 300000,
+          'a touch the lift leaves and the return finds is still contact')
+
+
+def test_rezero_try_reports_instead_of_raising():
+    # The macro fallback: REZERO=1 TRY=1 on a contact-level load (no FORCE)
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.feed(717295, 1.)
+    cmd = Cmd(REZERO=1, TRY=1)
+    r.guard.cmd_SET_CONTACT_GUARD(cmd)
+    check(any('not re-zeroed' in m for m in cmd.info)
+          and r.status()['contact'],
+          'TRY=1: refused, reported, contact left latched')
+    r.feed(40000, 0.6)               # a sub-threshold offset instead
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.feed(40000, 0.1)
+    cmd = Cmd(REZERO=1, TRY=1)
+    r.guard.cmd_SET_CONTACT_GUARD(cmd)
+    check(any('re-zeroed, load was' in m for m in cmd.info),
+          'TRY=1 re-zeroes what REZERO would')
+
+
 def test_motion_contact_never_relocks_while_held():
     for axis in ('x', 'y', 'z'):
         r = Rig(z=0.5)

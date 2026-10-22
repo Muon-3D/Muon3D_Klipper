@@ -293,22 +293,24 @@ The following command is available when a
 enabled.
 
 #### SET_CONTACT_GUARD
-`SET_CONTACT_GUARD [ENABLE=<0|1>] [REZERO=1 [FORCE=1]]`: Turn the
-contact guard off or back on, for macros that must move X or Y with the
-nozzle loaded. REZERO=1 takes the steady load the cell reads now as the
-new zero and clears contact; it is for an offset that is not a touch,
-such as filament tension after an extruder FORCE_MOVE. It waits for
-queued moves, and fails (leaving contact as it was) unless Z was really
-homed (see `rezero_min_z`) since the last SET_KINEMATIC_POSITION that
-changed Z, FORCE_MOVE of a Z stepper or Z motor disable, the toolhead is
-at or above `rezero_min_z`, current samples are arriving outside a
-probe's hold-off, the load is not changing, and the cell is not at the
-end of its range. A load at contact level (latched, or at
+`SET_CONTACT_GUARD [ENABLE=<0|1>] [REZERO=1 [FORCE=1] [TRY=1]]`: Turn
+the contact guard off or back on, for macros that must move X or Y with
+the nozzle loaded. REZERO=1 takes the steady load the cell reads now as
+the new zero and clears contact; it is for an offset that is not a
+touch, such as filament tension after an extruder FORCE_MOVE. It waits
+for queued moves, and fails (leaving contact as it was) unless Z was
+really homed (see `rezero_min_z`) since the last SET_KINEMATIC_POSITION
+that changed Z, FORCE_MOVE of a Z stepper or Z motor disable, the
+toolhead is at or above `rezero_min_z`, current samples are arriving
+outside a probe's hold-off, the load is not changing, and the cell is
+not at the end of its range. A load at contact level (latched, or at
 `threshold_counts` or more) also needs FORCE=1, which is logged:
 toolhead Z says nothing about a part under the nozzle. Moving Z up by
 `clearance_lift` with the load steady clears such an offset without
-either. Without parameters it reports whether it is enabled, active and
-in contact, and the current load.
+either. TRY=1 reports a refused REZERO instead of raising an error, for
+macros that must carry on (the M1 unlock press uses it only when it
+cannot lift). Without parameters it reports whether it is enabled,
+active and in contact, and the current load.
 
 ### [delayed_gcode]
 

@@ -890,9 +890,20 @@ class ContactGuard:
         if enable is not None:
             self.enabled = bool(enable)
         if gcmd.get_int('REZERO', 0, minval=0, maxval=1):
-            old = self._rezero(
-                force=bool(gcmd.get_int('FORCE', 0, minval=0, maxval=1)))
-            gcmd.respond_info("contact_guard: re-zeroed, load was %d" % old)
+            force = bool(gcmd.get_int('FORCE', 0, minval=0, maxval=1))
+            # TRY=1 (for macros): a refusal is reported, not raised, so
+            # the macro carries on and nothing is re-zeroed
+            try_only = bool(gcmd.get_int('TRY', 0, minval=0, maxval=1))
+            try:
+                old = self._rezero(force=force)
+            except self.gcode.error as err:
+                if not try_only:
+                    raise
+                self.own_error = None
+                gcmd.respond_info("%s (not re-zeroed)" % (err,))
+            else:
+                gcmd.respond_info("contact_guard: re-zeroed, load was %d"
+                                  % old)
         status = self.get_status(self.reactor.monotonic())
         gcmd.respond_info("contact_guard: enabled=%d active=%d contact=%d"
                           " load=%d" % (status['enabled'], status['active'],
