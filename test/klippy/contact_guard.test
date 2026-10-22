@@ -86,11 +86,13 @@ ASSERT_GUARD ACTIVE=1 CONTACT=0
 CONTACT_GUARD_SIMULATE PLATE=0
 G1 X50 Y50 Z5
 
-# Tare drift of 9000 counts/s for 20 s (180000, twice the threshold) is
-# followed by the baseline either way and never reads as contact
+# Tare drift: 9000 counts/s for 20 s toward unloading (180000, twice the
+# threshold) is followed freely; 36000 back toward pressing is within
+# max_absorbed_counts and still followed.  Neither reads as contact
+# (contact_guard_drift.test goes past the budget).
 CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=9000
 ASSERT_GUARD ACTIVE=1 CONTACT=0
-CONTACT_GUARD_SIMULATE LOAD=0 DURATION=20 DRIFT=-9000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=4 DRIFT=-9000
 ASSERT_GUARD ACTIVE=1 CONTACT=0
 
 # bed_mesh still applies under the guard

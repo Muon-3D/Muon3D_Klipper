@@ -80,6 +80,8 @@ class FakeMcu:
 class FakeSensor:
     def get_mcu(self):
         return FakeMcu()
+    def get_range(self):
+        return -0x800000, 0x7FFFFF      # the ADS1220's 24 bits
 
 
 class FakeLoadCell:
@@ -94,8 +96,11 @@ class FakeProbe:
     def __init__(self):
         self.load_cell = FakeLoadCell()
         self.trigger_time = 0.
+        self.reference_max = None
     def get_load_cell(self):
         return self.load_cell
+    def get_reference_max_load_counts(self):
+        return self.reference_max
     def get_last_trigger_time(self):
         return self.trigger_time
     def get_press_direction(self, zero_counts):
@@ -430,20 +435,26 @@ def test_enable():
 
 
 def test_drift():
-    # Raw zero drift, measured at ~9000 counts/s, is followed inside the
-    # band in either direction and never reads as contact (review #86 R2-1)
+    # Raw zero drift, measured at ~9000 counts/s.  Toward unloading it is
+    # followed without limit; toward pressing up to max_absorbed_counts
+    # since the last real zero, and past that it reads as load
     r = Rig()
     r.feed(0, 1.)
     worst = 0
-    for sign in (1., -1.):
-        for _ in range(60):
-            r.feed(0, 1., drift=sign * 9000.)
-            worst = max(worst, abs(r.status()['load']))
-            if r.status()['contact']:
-                raise AssertionError("drift read as contact")
+    for _ in range(60):
+        r.feed(0, 1., drift=9000.)          # raw up: unloading on the M1
+        worst = max(worst, abs(r.status()['load']))
+        if r.status()['contact']:
+            raise AssertionError("drift read as contact")
     check(worst < THRESHOLD / 4,
-          "9000 counts/s drift for 60 s each way is followed inside the"
+          "9000 counts/s unloading drift for 60 s is followed inside the"
           " band (worst %d)" % worst)
+    for _ in range(4):
+        r.feed(0, 1., drift=-9000.)         # 36000 back: within the cap
+        worst = max(worst, abs(r.status()['load']))
+    check(worst < THRESHOLD / 4 and not r.status()['contact'],
+          "36000 counts of pressing drift is still followed (worst %d)"
+          % worst)
 
 
 def test_relock():
@@ -835,18 +846,24 @@ def test_clearance_needs_steady_load_over_z():
     r.feed(350000, 0.3)
     r.feed(150000, 2.)
     check(r.status()['contact'], 'no trapq: no clearance')
-    # A load that does not follow 1 mm or more of real Z travel, up or
-    # down, is not a touch: the plate would change it by millions
-    for what, dz, before in (('a lift the load ignores', 5., None),
-                             ('a fall before the lift, then held', 5., 0.5),
-                             ('a descent the load ignores', -1.5, None)):
+    # A latched load that does not follow 1 mm or more of real Z lift is
+    # not a touch: the plate would change it by millions
+    for what, before in (('a lift the load ignores', None),
+                         ('a fall before the lift, then held', 0.5)):
         r, trapq = latched()
         if before:
             r.feed(150000, before)
-        trapq.add_move(r.t, 1., dz=dz)
+        trapq.add_move(r.t, 1., dz=5.)
         r.feed(150000, 2.)
         check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
               '%s: re-zeroed' % what)
+    # Review #86 R3-a: latched, a descent the reading ignores is a cell
+    # that stopped measuring, not clearance
+    r, trapq = latched()
+    trapq.add_move(r.t, 1., dz=-1.5)
+    r.feed(150000, 2.)
+    check(r.status()['contact'] and r.refused(60, 50, 0.5) == REFUSAL,
+          'latched, a descent the load ignores stays latched')
 
 
 def test_samples_older_than_a_reset_are_no_evidence():
@@ -992,25 +1009,131 @@ def test_staircase_is_bounded():
           ' zero')
 
 
-def test_drift_alone_never_latches():
-    # Review #86 R2-1: with nothing touching, drift toward pressing, and
-    # drift out and back, latched false contact within 16 s.  60 s each.
-    for rate in (9000., 4500., 2000.):
+def lift_clears(r, trapq, z):
+    """A 1 mm G1 Z lift, watched by the stream, then XY at the new Z."""
+    trapq.add_move(r.t, 0.2, dz=1.)
+    r.feed(0, 0.25, drift=r.last_drift)
+    r.move(50, 50, z + 1.)
+    return (not r.status()['contact']
+            and r.refused(60, 50, z + 1.) is None)
+
+
+def test_drift_latch_clears_with_a_lift():
+    # Review #86 R2-1 / R3-b: drift toward pressing past max_absorbed_counts
+    # latches contact with nothing touching.  That is a nuisance, not a
+    # lockout: the 1 mm Z lift the refusal asks for clears it.
+    for rate in (9000., 4500.):
         r = Rig(z=20.)
-        replay_motion(r)
+        trapq = replay_motion(r)
         r.feed(0, 0.5)
+        r.last_drift = -rate
         r.feed(0, 60., drift=-rate)        # raw down: pressing on the M1
-        check(not r.status()['contact'] and r.refused(60, 50, 20.) is None,
-              '60 s of %d counts/s pressing drift is not contact' % rate)
-    for excursion in (90000., 180000., 540000.):
-        r = Rig(z=20.)
+        check(r.status()['contact'],
+              '60 s of %d counts/s pressing drift latches' % rate)
+        check(lift_clears(r, trapq, 20.),
+              'and a 1 mm Z lift clears it; XY allowed')
+    # Out and back: the unloading leg gives nothing back on the return
+    r = Rig(z=20.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(0, 60., drift=9000.)
+    r.feed(0, 60., drift=-9000.)
+    r.last_drift = 0.
+    check(lift_clears(r, trapq, 20.),
+          'out-and-back drift: whatever it reads, a 1 mm lift clears it')
+
+
+def test_slow_creep_is_bounded():
+    # Review #86 R3-b: creep up to ~22000 counts/s (1.1 um/s at the M1's
+    # stiffness) was followed by the drift tracker without limit: 132 um
+    # of press absorbed in 120 s, then XY allowed
+    for rate in (5000., 22000.):
+        r = Rig(z=0.5)
         r.feed(0, 0.5)
-        secs = excursion / 9000.
-        r.feed(0, secs, drift=9000.)       # unloading ...
-        r.feed(0, secs, drift=-9000.)      # ... and back
-        r.feed(0, 5.)
-        check(not r.status()['contact'],
-              'out-and-back drift of %d is not contact' % excursion)
+        r.feed(0, 120., drift=-rate)
+        check(r.status()['contact'] and r.refused(60, 50, 0.5) == REFUSAL,
+              'creep of %d counts/s for 120 s latches and refuses XY' % rate)
+    # Inside the budget it is still followed
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.feed(0, 4., drift=-9000.)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 22500,
+          '36000 counts of creep is followed')
+
+
+def test_end_of_range_is_no_clearance():
+    # Review #86 R3-a: the M1's preloaded cell reads flat near
+    # reference_max_load_counts however hard it is pressed, and the ADC
+    # clips at its rails.  A flat reading there is no evidence.
+    def latched(ref_max):
+        r = Rig(z=0.5)
+        r.printer.probe.reference_max = ref_max
+        trapq = replay_motion(r)
+        r.feed(0, 0.5)
+        r.feed(350000, 0.3)
+        return r, trapq
+    ref_max = ZERO + PRESS * 1920000       # tare to reference_max: 1.92 M
+    for plateau in (1800000, 1830000):
+        for dz, what in ((-1.5, 'descent'), (1.5, 'lift')):
+            r, trapq = latched(ref_max)
+            trapq.add_move(r.t, 1., dz=dz)
+            r.feed(plateau, 2.)
+            check(r.status()['contact'] and r.refused(60, 50, 0.5) == REFUSAL,
+                  'flat at %d (reference_max plateau) through a 1.5 mm %s:'
+                  ' stays latched' % (plateau, what))
+    # Clipped at the ADC rail, with no reference_max configured
+    rail = 0x800000 + ZERO * PRESS         # load that puts raw at -0x800000
+    r, trapq = latched(None)
+    trapq.add_move(r.t, 1., dz=1.5)
+    r.feed(rail, 2.)
+    check(r.status()['contact'], 'clipped at the ADC rail through a lift:'
+          ' stays latched')
+    # Well inside the range the same lift still clears
+    r, trapq = latched(ref_max)
+    trapq.add_move(r.t, 1., dz=1.5)
+    r.feed(150000, 2.)
+    check(not r.status()['contact'], 'inside the range a lift still clears')
+
+
+def test_own_refusal_keeps_z_trust():
+    # Review #86 R3-c: the guard's own refusal is a command error, and it
+    # used to drop the Z trust, so REZERO needed a fresh G28
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check(r.refused(60, 50, 20.) == REFUSAL, 'XY refused')
+    r.printer.send_event("gcode:command_error")
+    check(rezero_error(r) is None and not r.status()['contact'],
+          'REZERO still works after the refusal')
+    # REZERO's own refusals keep it too
+    r = Rig(z=5.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check(rezero_error(r) is not None, 'REZERO refused at Z 5')
+    r.printer.send_event("gcode:command_error")
+    r.printer.toolhead.position[2] = 20.
+    check(rezero_error(r) is None, 'and works once the toolhead is high')
+    # Any homing activity after the refusal takes the exemption away: a
+    # failed probe after it still drops the trust
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    r.refused(60, 50, 20.)
+    r.homing_move('z', 0.005)
+    r.printer.send_event("gcode:command_error")
+    check('G28' in (rezero_error(r) or ''),
+          'a failed homing move after a refusal still drops the trust')
+    # Other command errors still drop it
+    r = Rig(z=20.)
+    r.home_z()
+    r.printer.send_event("gcode:command_error")
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check('G28' in (rezero_error(r) or ''),
+          'any other command error drops the trust')
 
 
 def test_steady_offset_over_z_rezeroes():

@@ -5672,21 +5672,25 @@ recognised as a job. See the
 #   on what the cell read just before it; X and Y homing moves and upward
 #   moves never re-zero), or with SET_CONTACT_GUARD REZERO=1.
 #max_absorbed_counts:
-#   Steady relocks may move the zero toward pressing by at most this many
-#   counts in total since the last real zero (Z homing or probing,
-#   positive clearance, REZERO); a relock toward unloading gives that
-#   back. Beyond it the excess reads as load, and past threshold_counts
-#   as contact, so steps that are each under the threshold cannot add up
-#   to an absorbed press. Slow drift, followed inside the band, is not
-#   counted, so drift alone never latches contact. The default is half
-#   of threshold_counts.
+#   Drift following and steady relocks together may move the zero toward
+#   pressing by at most this many counts in total since the last real
+#   zero (Z homing or probing, positive clearance, REZERO); moving back
+#   toward unloading gives it back. Beyond it the excess reads as load,
+#   and past threshold_counts as contact, so neither steps that are each
+#   under the threshold nor slow creep (a hot end growing into the plate)
+#   can add up to an absorbed press. Drift toward pressing past it latches
+#   contact with nothing touching; a 1 mm Z lift clears that. The default
+#   is half of threshold_counts.
 #clearance_lift: 1.0
 #   Positive clearance. A load that stays within the band while the
-#   executed toolhead Z travels clearance_lift mm (up or down) is not a
-#   touch, since a touch changes with Z; it becomes the new zero, whether
-#   or not it was latched as contact. A position reset
-#   (SET_KINEMATIC_POSITION, homing) or a Z motor enable change in between
-#   breaks the evidence.
+#   executed toolhead Z travels clearance_lift mm is not a touch, since a
+#   touch changes with Z; it becomes the new zero. While contact is
+#   latched only upward travel counts: going on down with the reading
+#   unchanged means the cell stopped measuring. Readings within 10% of
+#   reference_max_load_counts (from the zero) or 1% of the ADC range of
+#   its rails are never evidence, since the cell reads flat there however
+#   hard it is pressed. A position reset (SET_KINEMATIC_POSITION, homing),
+#   a Z motor enable change or a gap in the samples breaks the evidence.
 #rezero_min_z: 10.0
 #   SET_CONTACT_GUARD REZERO=1 is refused unless the toolhead is at least
 #   this high, with Z really homed since the last SET_KINEMATIC_POSITION
@@ -5694,6 +5698,7 @@ recognised as a job. See the
 #   Z home is G28 through an endstop, or a homing_override script whose Z
 #   probe triggered after at least 0.1 mm of downward travel (the
 #   SET_KINEMATIC_POSITION that follows it, from the probe, keeps it).
+#   Any G-code error other than the guard's own refusals also drops it.
 #sync_below_z: 3.0
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,
