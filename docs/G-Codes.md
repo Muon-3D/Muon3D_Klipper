@@ -308,9 +308,9 @@ not at the end of its range. A load at contact level (latched, or at
 toolhead Z says nothing about a part under the nozzle. Moving Z up by
 `clearance_lift` with the load steady clears such an offset without
 either. TRY=1 reports a refused REZERO instead of raising an error, for
-macros that must carry on (the M1 unlock press uses it only when it
-cannot lift). Without parameters it reports whether it is enabled,
-active and in contact, and the current load.
+macros that must carry on (the M1 unlock press uses it). Without
+parameters it reports whether it is enabled, active and in contact, and
+the current load.
 
 ### [delayed_gcode]
 

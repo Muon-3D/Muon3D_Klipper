@@ -1555,10 +1555,11 @@ def test_upward_homing_lift_clears_false_latch():
 
 
 def test_unlock_retract_then_lift():
-    # KAN-742 / D-048: the unlock macro's sequence.  The retract leaves a
-    # 717295-count tension offset at Z 21.6 with nothing touching (latched),
-    # then _UNLOCK_CLEAR_GUARD_OFFSET waits 0.3 s and lifts 1.2 mm and back
-    # at 5 mm/s.  The lift clears it; no REZERO, no FORCE.
+    # KAN-742 / D-048: the retract leaves a 717295-count tension offset at
+    # Z 21.6 with nothing touching (latched); a 0.3 s settle and a 1.2 mm
+    # lift and back at 5 mm/s clear it, no REZERO, no FORCE.  This is the
+    # lift variant of _UNLOCK_CLEAR_GUARD_OFFSET (47971b0c) and any user
+    # jog of the same size.
     r = Rig(z=21.6)
     trapq = replay_motion(r)
     r.feed(0, 0.5)
@@ -1588,6 +1589,24 @@ def test_unlock_retract_then_lift():
     r.feed(300000, 0.24)
     check(r.status()['contact'] and r.status()['load'] == 300000,
           'a touch the lift leaves and the return finds is still contact')
+
+
+def test_print_end_lift_clears_unlock_offset():
+    # Review #86 R5-2 (r5_noop): with the unlock press making no motion,
+    # KAN-742's own path still recovers: PRINT_END / CANCEL_PRINT raise Z
+    # 6 mm, M400, then park XY.  That lift is the proof.
+    for z in (21.6, 0.3):
+        r = Rig(z=z)
+        trapq = replay_motion(r)
+        r.feed(0, 0.5)
+        for load, d in ((240000, .1), (480000, .1), (717295, 1.)):
+            r.feed(load, d)
+        check(r.status()['contact'], 'tension latched at Z %.1f' % z)
+        trapq.add_move(r.t, 0.6, dz=6.)      # G0 Z+6 F600
+        r.feed(717295, 0.65)                 # M400
+        r.move(50, 50, z + 6.)
+        check(r.refused(195, 10, z + 6.) is None,
+              'PRINT_END park after the 6 mm lift is allowed (Z %.1f)' % z)
 
 
 def test_rezero_try_reports_instead_of_raising():
