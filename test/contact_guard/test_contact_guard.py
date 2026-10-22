@@ -118,6 +118,9 @@ class FakeToolhead:
         self.waits = 0
     def get_kinematics(self):
         return self
+    def get_steppers(self):
+        return [FakeStepper('x', 'stepper_x'), FakeStepper('y', 'stepper_y'),
+                FakeStepper('z', 'stepper_z')]
     def get_status(self, eventtime):
         return {'homed_axes': self.homed_axes}
     def wait_moves(self):
@@ -170,6 +173,7 @@ class FakePrinter:
             'homing_override': self.homing_override,
             'nozzle_wipe_smart': self.nozzle_wipe,
             'gcode_io': self.gcode_io,
+            'stepper_enable': FakeStepperEnable(),
         }
         self.handlers = {}
     def get_reactor(self):
@@ -186,18 +190,38 @@ class FakePrinter:
 
 
 class FakeStepper:
-    def __init__(self, axis):
+    def __init__(self, axis, name=None):
         self.axis = axis
+        self.name = name or 'stepper_' + axis
+    def get_name(self):
+        return self.name
     def is_active_axis(self, axis):
         return axis == self.axis
     def get_step_dist(self):
         return 0.0025
+    def mcu_to_commanded_position(self, mcu_pos):
+        return mcu_pos * 0.0025
+
+
+class FakeEnableTracking:
+    def __init__(self):
+        self.callbacks = []
+    def register_state_callback(self, cb):
+        self.callbacks.append(cb)
+
+
+class FakeStepperEnable:
+    def __init__(self):
+        self.lines = {}
+    def lookup_enable(self, name):
+        return self.lines.setdefault(name, FakeEnableTracking())
 
 
 class FakeStepperPosition:
     def __init__(self, axis, travel):
+        # travel > 0 is down (toward the plate), < 0 up
         self.stepper = FakeStepper(axis)
-        self.start_pos = 1000
+        self.start_pos = 100000
         self.trig_pos = self.start_pos - int(round(travel / 0.0025))
 
 
@@ -268,6 +292,12 @@ class Rig:
         self.printer.send_event("homing:home_rails_begin", hs, [])
         self.set_position()
         self.printer.send_event("homing:home_rails_end", hs, [])
+    def z_motor(self, enabled):
+        """SET_STEPPER_ENABLE STEPPER=stepper_z ENABLE=..."""
+        line = self.printer.objects['stepper_enable'].lookup_enable(
+            'stepper_z')
+        for cb in line.callbacks:
+            cb(self.t, enabled)
     def in_contact(self):
         self.feed(0, 0.5)
         self.feed(200000, 0.05)
@@ -400,34 +430,20 @@ def test_enable():
 
 
 def test_drift():
-    # Raw zero drift, measured at ~9000 counts/s.  Toward unloading it is
-    # followed without limit.  Toward pressing it is followed only up to
-    # max_absorbed_counts from the trusted zero: past that it reads as
-    # load and, past the threshold, as contact (fail safe; G28 re-zeroes).
+    # Raw zero drift, measured at ~9000 counts/s, is followed inside the
+    # band in either direction and never reads as contact (review #86 R2-1)
     r = Rig()
     r.feed(0, 1.)
     worst = 0
-    for _ in range(60):
-        r.feed(0, 1., drift=9000.)          # raw up: unloading on the M1
-        worst = max(worst, abs(r.status()['load']))
-        if r.status()['contact']:
-            raise AssertionError("drift read as contact")
+    for sign in (1., -1.):
+        for _ in range(60):
+            r.feed(0, 1., drift=sign * 9000.)
+            worst = max(worst, abs(r.status()['load']))
+            if r.status()['contact']:
+                raise AssertionError("drift read as contact")
     check(worst < THRESHOLD / 4,
-          "9000 counts/s unloading drift for 60 s is followed inside the"
+          "9000 counts/s drift for 60 s each way is followed inside the"
           " band (worst %d)" % worst)
-    for _ in range(4):
-        r.feed(0, 1., drift=-9000.)         # 36000 back: within the cap
-        worst = max(worst, abs(r.status()['load']))
-    check(worst < THRESHOLD / 4 and not r.status()['contact'],
-          "36000 counts of pressing drift is still followed (worst %d)"
-          % worst)
-    r.feed(0, 20., drift=-9000.)
-    check(r.status()['contact'],
-          "pressing drift far past max_absorbed_counts reads as contact")
-    r.homing_move('z', 5.)
-    r.feed(0, 0.1)
-    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
-          "and a Z homing move re-zeroes it")
 
 
 def test_relock():
@@ -619,7 +635,7 @@ class ReplayTrapQ:
     def position(self, t):
         pos = self.start
         for begin, duration, start, d in self._all():
-            if begin > t:
+            if begin >= t:  # as trapq_extract_old
                 break
             frac = (1. if not duration
                     else max(0., min(1., (t - begin) / duration)))
@@ -630,7 +646,7 @@ class ReplayTrapQ:
     def extract_trapq(self, start, end):
         moves = []
         for begin, duration, s, d in self._all():
-            if begin < end and begin + duration >= start:
+            if begin < end and begin + duration > start:
                 dist = sum(c * c for c in d) ** .5
                 m = TrapQMove()
                 m.print_time, m.move_t = begin, duration
@@ -792,7 +808,7 @@ def test_positive_clearance_rezeroes_the_residual():
     check(r.status()['contact'], 'a new press above the residual is contact')
 
 
-def test_clearance_needs_lift_drop_and_steady_load():
+def test_clearance_needs_steady_load_over_z():
     def latched():
         r = Rig(z=0.5)
         trapq = replay_motion(r)
@@ -805,20 +821,6 @@ def test_clearance_needs_lift_drop_and_steady_load():
     r.feed(350000, 0.01)
     r.feed(150000, 2.)
     check(r.status()['contact'], 'a 0.8 mm lift is not clearance')
-    # The load fell before Z rose (a FORCE_MOVE backing off part way, the
-    # toolhead still), then held through a long lift
-    r, trapq = latched()
-    r.feed(150000, 0.5)
-    trapq.add_move(r.t, 1., dz=5.)
-    r.feed(150000, 2.)
-    check(r.status()['contact'],
-          'a fall that came before the lift is not clearance')
-    # The load does not drop: it does not follow Z, so it is not known to
-    # be off the plate (the unlock offset; needs REZERO)
-    r, trapq = latched()
-    trapq.add_move(r.t, 1., dz=5.)
-    r.feed(350000, 2.)
-    check(r.status()['contact'], 'a lift the load ignores is not clearance')
     # A compliant contact: the load keeps falling the whole lift
     r, trapq = latched()
     trapq.add_move(r.t, 1., dz=2.)
@@ -827,17 +829,24 @@ def test_clearance_needs_lift_drop_and_steady_load():
     r.feed(200000, 2.)
     check(r.status()['contact'],
           'a load still falling with Z is not clearance')
-    # Z lowering
-    r, trapq = latched()
-    trapq.add_move(r.t, 0.3, dz=-1.5)
-    r.feed(150000, 2.)
-    check(r.status()['contact'], 'Z going down is not clearance')
     # No executed-motion history at all
     r = Rig(z=0.5)
     r.feed(0, 0.5)
     r.feed(350000, 0.3)
     r.feed(150000, 2.)
     check(r.status()['contact'], 'no trapq: no clearance')
+    # A load that does not follow 1 mm or more of real Z travel, up or
+    # down, is not a touch: the plate would change it by millions
+    for what, dz, before in (('a lift the load ignores', 5., None),
+                             ('a fall before the lift, then held', 5., 0.5),
+                             ('a descent the load ignores', -1.5, None)):
+        r, trapq = latched()
+        if before:
+            r.feed(150000, before)
+        trapq.add_move(r.t, 1., dz=dz)
+        r.feed(150000, 2.)
+        check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+              '%s: re-zeroed' % what)
 
 
 def test_samples_older_than_a_reset_are_no_evidence():
@@ -961,8 +970,18 @@ def test_staircase_is_bounded():
         r.feed(load, 0.6)
     check(r.status()['contact'], 'and the staircase stays latched')
     check(r.refused(100, 50, 5.) == REFUSAL, 'XY refused')
-    # Unloading moves the trusted zero freely: a zero first taken under
-    # load, once released, bounds later steps from the real zero
+    # Unloading gives the capacity back: a released step can be absorbed
+    # again
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    r.feed(80000, 0.6)
+    r.feed(0, 0.6)
+    check(abs(r.status()['load']) < 1000, 'release relocks back to zero')
+    r.feed(80000, 0.6)
+    check(r.status()['load'] == 80000 - 45000,
+          'and the next step is absorbed up to the cap again')
+    # A zero first taken under load gives no extra capacity: once
+    # released, later steps are bounded from the real zero
     r = Rig(z=5.)
     r.feed(200000, 0.5)
     r.feed(0, 0.6)
@@ -971,6 +990,179 @@ def test_staircase_is_bounded():
     check(r.status()['contact'],
           'steps after a released loaded zero are bounded from the real'
           ' zero')
+
+
+def test_drift_alone_never_latches():
+    # Review #86 R2-1: with nothing touching, drift toward pressing, and
+    # drift out and back, latched false contact within 16 s.  60 s each.
+    for rate in (9000., 4500., 2000.):
+        r = Rig(z=20.)
+        replay_motion(r)
+        r.feed(0, 0.5)
+        r.feed(0, 60., drift=-rate)        # raw down: pressing on the M1
+        check(not r.status()['contact'] and r.refused(60, 50, 20.) is None,
+              '60 s of %d counts/s pressing drift is not contact' % rate)
+    for excursion in (90000., 180000., 540000.):
+        r = Rig(z=20.)
+        r.feed(0, 0.5)
+        secs = excursion / 9000.
+        r.feed(0, secs, drift=9000.)       # unloading ...
+        r.feed(0, secs, drift=-9000.)      # ... and back
+        r.feed(0, 5.)
+        check(not r.status()['contact'],
+              'out-and-back drift of %d is not contact' % excursion)
+
+
+def test_steady_offset_over_z_rezeroes():
+    # The KAN-742 unlock offset, latched as contact at Z 21.6, clears once
+    # the toolhead really moves 1 mm and the load ignores it: no REZERO, no
+    # G28 needed
+    r = Rig(z=21.6)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    for load, duration in ((240000, 0.1), (480000, 0.1), (717295, 1.)):
+        r.feed(load, duration)
+    check(r.status()['contact'], 'unlock offset latched')
+    trapq.add_move(r.t, 0.5, dz=1.)
+    r.feed(717295, 0.49)
+    check(r.status()['contact'], 'not before 1 mm of travel')
+    r.feed(717295, 0.02)
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'steady over 1 mm of Z: re-zeroed')
+    r.feed(717295 + 200000, 0.05)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'a new press is measured from the new zero')
+    # A capped sub-threshold offset (not contact) also re-zeroes fully
+    r = Rig(z=20.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(80000, 0.6)
+    check(r.status()['load'] == 80000 - THRESHOLD // 2, 'capped relock')
+    trapq.add_move(r.t, 0.5, dz=-1.)
+    r.feed(80000, 0.6)
+    check(abs(r.status()['load']) < 1000, 'then re-zeroed by 1 mm of Z')
+    # A position reset in the middle of the travel breaks the evidence
+    r = Rig(z=21.6)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(300000, 0.5)
+    trapq.add_move(r.t, 0.3, dz=0.6)
+    r.feed(300000, 0.4)
+    trapq.add_reset(r.t, 30.)
+    r.set_position()
+    r.feed(300000, 0.1)
+    trapq.add_move(r.t, 0.3, dz=0.6)
+    r.feed(300000, 0.4)
+    check(r.status()['contact'],
+          'two 0.6 mm moves split by a reset are not 1 mm of travel')
+
+
+def test_clearance_needs_samples_through_the_travel():
+    # A stream gap across the Z move: the load before and after match, but
+    # nothing watched the travel, so it is no evidence
+    r = Rig(z=5.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(200000, 0.5)
+    trapq.add_move(r.t, 0.3, dz=15.)
+    r.n += int(0.4 * SPS)            # 0.4 s with no samples
+    r.feed(200000, 0.5)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'travel during a sample gap is not clearance')
+
+
+def test_m1_homing_override_trusts_z():
+    # Review #86 R2-2: the M1 homes Z in homing_override with
+    # SET_KINEMATIC_POSITION Z=max, PROBE, SET_KINEMATIC_POSITION from the
+    # probe.  That counts as a real Z home when the probe triggered after
+    # clear downward travel.
+    def held(probe_travel=5., fail=False):
+        r = Rig(z=20.)
+        ho = r.printer.homing_override
+        ho.in_script = True
+        r.set_position()                    # Z = axis maximum
+        r.homing_move('z', probe_travel)
+        if fail:
+            r.printer.send_event("gcode:command_error")
+        r.set_position()                    # Z from the probe
+        ho.in_script = False
+        r.feed(0, 0.5)
+        r.feed(200000, 1.)
+        return r
+    r = held()
+    check(rezero_error(r) is None and not r.status()['contact'],
+          'REZERO works after the M1 homing_override Z home')
+    r = held(probe_travel=0.005)
+    check('G28' in (rezero_error(r) or ''),
+          'a probe that started on the plate is not a Z home')
+    r = held(probe_travel=-10.)
+    check('G28' in (rezero_error(r) or ''),
+          'upward travel is not a Z home')
+    r = held(fail=True)
+    check('G28' in (rezero_error(r) or ''), 'a failed probe is not a Z home')
+    # The trust is for the one reset that follows the probe
+    r = held()
+    r.printer.homing_override.in_script = True
+    r.set_position()                        # the next G28's Z = max
+    r.printer.homing_override.in_script = False
+    check('G28' in (rezero_error(r) or ''),
+          'the next homing script reset is not covered')
+    # A bare PROBE outside homing_override does not re-reference Z
+    r = Rig(z=20.)
+    r.set_position()
+    r.homing_move('z', 5.)
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check('G28' in (rezero_error(r) or ''), 'a bare PROBE is not a Z home')
+
+
+def test_flags_only_reset_keeps_trust():
+    # SET_KINEMATIC_POSITION SET_HOMED=Z with Z unchanged (the M1's X/Y
+    # homing macros) is no new frame
+    r = Rig(z=20.)
+    replay_motion(r, pos=(50., 50., 20.))
+    r.home_z()
+    r.set_position()
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check(rezero_error(r) is None, 'a reset to the same Z keeps the trust')
+
+
+def test_z_motor_off_clears_trust():
+    # Review #86 R2-3: with the Z motor off the axis can be turned by hand
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    r.z_motor(False)
+    r.feed(200000, 1.)
+    check('motor off' in (rezero_error(r) or ''),
+          'REZERO refused after the Z motor was disabled')
+    check(r.status()['contact'] and r.refused(100, 50, 20.) == REFUSAL,
+          'and the touch stays latched, XY refused')
+    r.z_motor(True)
+    check('G28' in (rezero_error(r) or ''),
+          're-enabling the motor does not restore the trust')
+
+
+def test_upward_or_failed_homing_does_not_rezero():
+    # Review #86 R2-4: an upward Z homing move (AXIS_PROTECTED_MOVE Z+10)
+    # started while pressing re-zeroed on the pressed load
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    r.feed(200000, 0.5)
+    r.homing_move('z', -10.)
+    r.feed(200000, 0.5)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'upward Z travel does not re-zero')
+    # A downward move that ends in an error does not re-zero either
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    r.feed(200000, 0.5)
+    r.homing_move('z', 5.)
+    r.printer.send_event("gcode:command_error")
+    r.feed(200000, 0.5)
+    check(r.status()['contact'] and r.status()['load'] == 200000,
+          'a homing move that errored does not re-zero')
 
 
 def test_motion_contact_never_relocks_while_held():

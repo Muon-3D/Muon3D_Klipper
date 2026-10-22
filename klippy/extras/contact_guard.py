@@ -19,10 +19,11 @@ STREAM_TIMEOUT = 1.0
 # Samples averaged to re-zero the baseline at the start of a homing move.
 ANCHOR_TIME = 0.020
 # A Z homing or probing move re-zeroes on what the cell read before it only
-# if Z travelled at least this far before the trigger.  The M1's cell runs
-# out of range (MCU guard) at ~0.093 mm of deflection, so a nozzle already
-# pressing when the move began cannot travel this far further; a probe
-# started on the plate triggers almost at once.
+# if Z travelled at least this far down (toward the plate) before the
+# trigger.  The M1's cell runs out of range (MCU guard) at ~0.093 mm of
+# deflection, so a nozzle already pressing when the move began cannot
+# travel this far further down; a probe started on the plate triggers
+# almost at once.  Upward travel proves nothing about the start.
 HOMING_CLEAR_TRAVEL = 0.1
 # Below this a coordinate has not moved (G-code positions are floats).
 MOVE_EPSILON = 1e-6
@@ -32,6 +33,9 @@ TIME_EPSILON = 1e-6
 # end of the queued motion (plus on_time), and give up this long after the
 # samples should have arrived.
 SYNC_MARGIN = 0.005
+# Positive clearance must watch the whole Z travel: a gap between samples
+# longer than this (2 kHz is 0.5 ms) restarts its steady window.
+CLEAR_MAX_GAP = 0.005
 SYNC_TIMEOUT = 0.5
 # Commands arriving over the G-code pty are a streamed job; it is still
 # running this long after the last batch was seen.
@@ -63,24 +67,28 @@ class ContactGuard:
         # toolhead trapq does not mean the nozzle is clear, because
         # FORCE_MOVE runs on its own trapq and the bed can be moved by hand.
         self.relock_time = config.getfloat('relock_time', 0.5, above=0.)
-        # Positive clearance.  A latched contact whose load fell by at least
-        # the threshold as Z rose, and then stayed steady while the executed
-        # toolhead Z rose a further clearance_lift, has left what it touched
-        # (the plate deflects ~0.01 mm per 200000 counts); what is left is
-        # an offset and becomes the new zero.
+        # Positive clearance.  A load that stays within the band while the
+        # executed toolhead Z travels clearance_lift (up or down, with no
+        # position reset in between) is not touching anything stiff: the
+        # plate deflects ~0.01 mm per 200000 counts, so a touch changes by
+        # millions of counts over 1 mm.  Drift and filament tension do not
+        # follow Z.  The steady load becomes the new zero, latched or not.
         self.clearance_lift = config.getfloat('clearance_lift', 1.0,
                                               above=0.)
         # SET_CONTACT_GUARD REZERO=1 is the explicit recovery for an offset
         # that does not follow Z (filament tension after the unlock
-        # retract).  It only runs with Z homed by a real homing move since
-        # the last position reset or FORCE_MOVE, the toolhead at least this
-        # high, and a steady load.
+        # retract).  It only runs with Z really homed (home_rails, or a
+        # homing_override script whose Z probe triggered after clear
+        # downward travel) since the last position reset, FORCE_MOVE or
+        # Z motor disable, the toolhead at least this high, and a steady
+        # load.
         self.rezero_min_z = config.getfloat('rezero_min_z', 10.0)
-        # Steady sub-threshold relocks and drift following may move the
-        # zero in the pressing direction by at most this much, in total,
-        # from the trusted zero (the last real zero, or anything less
-        # pressed since).  Without it, steps each under the threshold
-        # (jogging Z down onto the plate) add up without limit.
+        # Steady sub-threshold relocks may move the zero in the pressing
+        # direction by at most this much in total since the last real zero
+        # (Z homing or probing, positive clearance, REZERO).  Without it,
+        # steps each under the threshold (jogging Z down onto the plate)
+        # add up without limit.  Slow drift, followed inside the band, is
+        # not counted: counting it latches false contact from drift alone.
         self.max_absorbed = config.getint('max_absorbed_counts',
                                           self.threshold // 2, minval=0,
                                           maxval=self.threshold - 1)
@@ -113,16 +121,19 @@ class ContactGuard:
         self.drift_sum = 0.
         self.drift_count = 0
         self.drift_min = self.drift_max = None
-        self.clear_peak = None  # (lowest Z while held, peak load since)
         self.clear_win = None
         # Toolhead position resets (SET_KINEMATIC_POSITION, homing) jump
         # the trapq; samples up to the newest one are no clearance evidence
         self.position_reset_time = float('-inf')
-        self.trusted_zero = None
+        self.relock_absorbed = 0.  # pressing-direction relocks since zero
         self.homing_candidate = None
-        # Z homed by a real homing move since the last position reset or
-        # FORCE_MOVE of a Z stepper
+        self.pending_zero = None  # applied once homing ends without error
+        # Z homed for real since the last position reset, FORCE_MOVE of a
+        # Z stepper, or Z motor disable
         self.z_trusted = False
+        # A homing_override probe triggered since the last position reset:
+        # the reset that follows it (Z from the probe) keeps the trust
+        self.probe_since_reset = False
         self.motion_known = False
         self.motion_base_z = None
         self.motion_moves = []
@@ -174,6 +185,14 @@ class ContactGuard:
                                                       None)
         self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode_io = self.printer.lookup_object('gcode_io', None)
+        # A disabled Z motor can be turned by hand: Z is no longer known
+        stepper_enable = self.printer.lookup_object('stepper_enable', None)
+        if stepper_enable is not None:
+            for stepper in self.toolhead.get_kinematics().get_steppers():
+                if stepper.is_active_axis('z'):
+                    stepper_enable.lookup_enable(
+                        stepper.get_name()).register_state_callback(
+                            self._handle_z_motor)
 
     def _handle_ready(self):
         # Registered at ready, after every klippy:connect transform
@@ -253,7 +272,8 @@ class ContactGuard:
                                      / len(self.recent))
 
     def _z_travel(self, hmove):
-        # Distance the Z steppers moved before the trigger, in mm
+        # Distance the Z steppers moved down (toward the plate) before the
+        # trigger, in mm
         batch = self.printer.get_start_args().get('debuginput') is not None
         travel = 0.
         for sp in getattr(hmove, 'stepper_positions', []):
@@ -263,22 +283,44 @@ class ContactGuard:
                 # Batch mode simulates no stepper motion (as
                 # check_no_movement does): take a Z move as having moved
                 return float('inf')
-            travel = max(travel, abs(sp.trig_pos - sp.start_pos)
-                         * sp.stepper.get_step_dist())
+            mtc = sp.stepper.mcu_to_commanded_position
+            down = mtc(sp.start_pos) - mtc(sp.trig_pos)
+            travel = max(travel, down)
         return travel
+
+    def _override_active(self):
+        ho = self.homing_override
+        return ho is not None and getattr(ho, 'in_script', False)
 
     def _handle_homing_move_end(self, hmove):
         self.homing_moves = max(0, self.homing_moves - 1)
         candidate, self.homing_candidate = self.homing_candidate, None
-        if candidate is None:
-            return
         travel = self._z_travel(hmove)
-        if travel < HOMING_CLEAR_TRAVEL:
+        if travel < HOMING_CLEAR_TRAVEL - MOVE_EPSILON:
             return
-        self.baseline = self.trusted_zero = candidate
+        if self._override_active():
+            # The M1 homes Z this way: a probe from clear travel, then
+            # SET_KINEMATIC_POSITION from what it measured.  A failed probe
+            # raises, and the command error takes the trust back.
+            self.z_trusted = True
+            self.probe_since_reset = True
+        if candidate is not None:
+            # Applied once the command finishes without error
+            self.pending_zero = candidate
+            logging.info("contact_guard: Z homing move travelled %.3f mm"
+                         " down; re-zeroing on what it read before", travel)
+
+    def _apply_pending_zero(self):
+        if self.pending_zero is None or self._is_homing():
+            return
+        self.baseline = self.pending_zero
+        self.pending_zero = None
+        self._real_zero()
+
+    def _real_zero(self):
+        # The baseline was just set from evidence that nothing touched
+        self.relock_absorbed = 0.
         self._reset_detector()
-        logging.info("contact_guard: re-zeroed by a Z homing move that"
-                     " travelled %.3f mm", travel)
 
     def _handle_home_rails_begin(self, homing_state, rails):
         self.homing_rails = True
@@ -288,27 +330,59 @@ class ContactGuard:
         if 2 in homing_state.get_axes():
             self.z_trusted = True
 
+    def _trapq_z_before(self, print_time):
+        report = self.printer.lookup_object('motion_report', None)
+        trapq = None if report is None else report.dtrapqs.get('toolhead')
+        if trapq is None:
+            return None
+        pos, velocity = trapq.get_trapq_position(print_time - TIME_EPSILON)
+        return None if pos is None else pos[2]
+
     def _handle_set_position(self):
-        # The trapq gets a zero-length marker at the new position: Z appears
-        # to jump.  It is not motion, so it is no clearance evidence, and Z
+        # The trapq gets a zero-length marker at the new position: Z may
+        # jump.  That is not motion, so it is no clearance evidence, and Z
         # is no longer known to be where homing put it.
-        self.clear_peak = self.clear_win = None
-        if self.toolhead is not None:
-            self.position_reset_time = self.toolhead.print_time
-        if not self.homing_rails:
-            self.z_trusted = False
+        self.clear_win = None
+        if self.toolhead is None:
+            return
+        print_time = self.toolhead.print_time
+        self.position_reset_time = print_time
+        if self.homing_rails or self.homing_moves:
+            # Inside a homing or probing move: from the steppers' own motion
+            return
+        old_z = self._trapq_z_before(print_time)
+        new_z = self.toolhead.get_position()[2]
+        if old_z is not None and abs(new_z - old_z) < MOVE_EPSILON:
+            # SET_KINEMATIC_POSITION SET_HOMED=... with Z unchanged
+            return
+        if self._override_active() and self.probe_since_reset:
+            # Z set from the probe that just triggered
+            self.probe_since_reset = False
+            return
+        self.z_trusted = self.probe_since_reset = False
 
     def _handle_manual_move(self, stepper):
         # FORCE_MOVE / STEPPER_BUZZ moved a stepper behind the toolhead's
         # back; if it drives Z, the toolhead Z no longer says where the
         # nozzle is
         if stepper.is_active_axis('z'):
-            self.z_trusted = False
+            self.z_trusted = self.probe_since_reset = False
+
+    def _handle_z_motor(self, print_time, enabled):
+        # Off, the axis can be moved by hand; samples either side of an
+        # enable change are not comparable for clearance
+        self.clear_win = None
+        self.position_reset_time = max(self.position_reset_time, print_time)
+        if not enabled:
+            self.z_trusted = self.probe_since_reset = False
 
     def _handle_command_error(self):
         # A failed G28 does not send home_rails_end
         self.homing_moves = 0
         self.homing_rails = False
+        # A homing or probing move that ended in an error proves nothing
+        self.pending_zero = None
+        self.z_trusted = self.probe_since_reset = False
 
     def _is_homing(self):
         if self.homing_moves or self.homing_rails:
@@ -373,6 +447,7 @@ class ContactGuard:
             ignore_before = float('inf')
         else:
             ignore_before = self._holdoff_end()
+        self._apply_pending_zero()
         self._update_motion_history(samples[0][0], samples[-1][0])
         sign = self.probe.get_press_direction(
             self.baseline if self.baseline is not None else samples[0][2])
@@ -384,18 +459,23 @@ class ContactGuard:
         # Executed toolhead Z at each sample time, for positive clearance.
         # Samples and trapq share print_time.  Extract once per batch, not
         # once per 2 kHz sample, and keep only plain tuples.  This is the
-        # toolhead trapq only: it says how far the toolhead rose, never
-        # that nothing else moved (FORCE_MOVE has its own trapq), so it is
-        # used only to release a contact, never to absorb one.
+        # toolhead trapq only: it says how far the toolhead moved, never
+        # that nothing else moved (FORCE_MOVE has its own trapq), so it
+        # only ever proves a load does not follow Z.
         self.motion_known = False
         self.motion_base_z = None
         self.motion_moves = []
-        if not self.contact:
+        if not self.contact and abs(self.load) < self.band:
             return
         report = self.printer.lookup_object('motion_report', None)
         trapq = None if report is None else report.dtrapqs.get('toolhead')
         if trapq is None:
             return
+        # trapq_extract_old skips a move starting exactly at the end of the
+        # query, so a batch that begins at a reset's zero-length marker
+        # would read the position from before it.  Query just past the
+        # newest reset instead; samples up to it are never used.
+        start = max(start, self.position_reset_time + TIME_EPSILON)
         pos, velocity = trapq.get_trapq_position(start)
         if pos is None:
             return
@@ -425,59 +505,53 @@ class ContactGuard:
         self.drift_sum = 0.
         self.drift_count = 0
         self.drift_min = self.drift_max = None
-        self.clear_peak = None
         self.clear_win = None
 
-    def _move_baseline(self, new, sign):
-        # Drift following and relocks.  Toward less pressed is free, and
-        # the trusted zero follows it; toward more pressed stops at
-        # max_absorbed_counts from the trusted zero, so the excess reads
-        # as load and, past the threshold, as contact.
-        trusted = self.trusted_zero
-        absorbed = sign * (new - trusted)
-        if absorbed > self.max_absorbed:
-            new = trusted + sign * self.max_absorbed
-        elif absorbed < 0.:
-            self.trusted_zero = new
-        self.baseline = new
+    def _relock(self, new, sign):
+        # A steady out-of-band offset.  Toward less pressed is free and
+        # gives back what earlier relocks absorbed; toward more pressed is
+        # limited to max_absorbed_counts in total since the last real zero.
+        step = sign * (new - self.baseline)
+        if step > 0.:
+            step = min(step, max(0., self.max_absorbed
+                                 - self.relock_absorbed))
+            self.relock_absorbed += step
+        else:
+            self.relock_absorbed = max(0., self.relock_absorbed + step)
+        self.baseline += sign * step
 
     def _check_clearance(self, t, counts, load, sign):
-        # Called for each sample while contact is latched.  True once the
-        # contact has been positively cleared and the baseline re-zeroed.
+        # Called for each sample that is contact or outside the band.  True
+        # once the load has held steady across clearance_lift of executed Z
+        # travel and the baseline was re-zeroed on it.
         z = self._z_at(t) if t > self.position_reset_time else None
         if z is None:
             # Without executed Z there is no evidence of clearance, and a
             # position reset separates two frames that cannot be compared
-            self.clear_peak = self.clear_win = None
+            self.clear_win = None
             return False
-        # The fall must happen as Z rises: the peak counts only from the
-        # lowest executed Z, so a load that fell with the toolhead still
-        # (a FORCE_MOVE backing off part way) is no evidence.
-        low = self.clear_peak
-        if low is None or z <= low[0] + MOVE_EPSILON:
-            self.clear_peak = (min(z, low[0]) if low else z, load)
-        elif load > low[1]:
-            self.clear_peak = (low[0], load)
         win = self.clear_win
         if (win is None or counts < win['max'] - self.band
-                or counts > win['min'] + self.band):
-            # The load moved: restart the steady window here
-            win = self.clear_win = {'z0': z, 'min': counts, 'max': counts,
-                                    'sum': 0., 'n': 0}
+                or counts > win['min'] + self.band
+                or t - win['t'] > CLEAR_MAX_GAP):
+            # The load moved, or samples are missing (the Z travel was not
+            # watched): restart the steady window here
+            win = self.clear_win = {'zmin': z, 'zmax': z, 'min': counts,
+                                    'max': counts, 'sum': 0., 'n': 0}
+        win['t'] = t
         win['min'] = min(win['min'], counts)
         win['max'] = max(win['max'], counts)
+        win['zmin'] = min(win['zmin'], z)
+        win['zmax'] = max(win['zmax'], z)
         win['sum'] += counts
         win['n'] += 1
-        mean = win['sum'] / win['n']
-        dropped = self.clear_peak[1] - sign * (mean - self.baseline)
-        if (z - win['z0'] < self.clearance_lift - MOVE_EPSILON
-                or dropped < self.threshold):
+        travel = win['zmax'] - win['zmin']
+        if travel < self.clearance_lift - MOVE_EPSILON:
             return False
-        self.baseline = self.trusted_zero = mean
-        self._reset_detector()
-        logging.info("contact_guard: contact cleared by a %.3f mm Z lift,"
-                     " load fell %d; residual %d re-zeroed",
-                     z - win['z0'], dropped, load)
+        self.baseline = win['sum'] / win['n']
+        self._real_zero()
+        logging.info("contact_guard: load %d held steady over %.3f mm of Z;"
+                     " re-zeroed", load, travel)
         return True
 
     def _process_sample(self, t, counts, sign, ignore_before):
@@ -498,7 +572,7 @@ class ContactGuard:
         while self.recent and self.recent[0][0] < t - ANCHOR_TIME:
             self.recent.popleft()
         if self.baseline is None:
-            self.baseline = self.trusted_zero = float(counts)
+            self.baseline = float(counts)
         dt = 0. if self.prev_time is None else max(0., t - self.prev_time)
         self.prev_time = t
         load = sign * (counts - self.baseline)
@@ -518,27 +592,27 @@ class ContactGuard:
             if (self.above_since is not None
                     and t - self.above_since >= self.on_time - TIME_EPSILON):
                 self.contact = True
-                self.clear_peak = self.clear_win = None
                 logging.info("contact_guard: contact, load %d", load)
         elif (self.below_since is not None
                 and t - self.below_since >= self.off_time - TIME_EPSILON):
             self.contact = False
             logging.info("contact_guard: contact released, load %d", load)
-        elif self._check_clearance(t, counts, load, sign):
+        if ((self.contact or abs(load) >= self.band)
+                and self._check_clearance(t, counts, load, sign)):
             self.load = sign * (counts - self.baseline)
             return
+        if abs(load) < self.band:
+            self.clear_win = None
         if self.contact or self.above_since is not None:
             # The baseline never follows a touch, however long or still it
-            # is.  Only release, positive clearance, a Z homing or probing
-            # move that proves it began clear, or SET_CONTACT_GUARD
-            # REZERO=1 ends it.
+            # is.  Only release, positive clearance (steady over Z travel),
+            # a Z homing or probing move that proves it began clear, or
+            # SET_CONTACT_GUARD REZERO=1 ends it.
             self.drift_since = None
             return
         # Baseline: follow small changes slowly
         if abs(load) < self.band:
-            self._move_baseline(
-                self.baseline + (counts - self.baseline)
-                * min(1., dt / self.tau), sign)
+            self.baseline += (counts - self.baseline) * min(1., dt / self.tau)
             self.drift_since = None
             return
         # Require a steady window, not merely time outside the band. An
@@ -555,9 +629,11 @@ class ContactGuard:
         self.drift_sum += counts
         self.drift_count += 1
         if t - self.drift_since >= self.relock_time - TIME_EPSILON:
-            old = self.baseline
-            self._move_baseline(self.drift_sum / self.drift_count, sign)
+            old, win = self.baseline, self.clear_win
+            self._relock(self.drift_sum / self.drift_count, sign)
             self._reset_detector()
+            # A Z move in progress may still prove the offset is not a touch
+            self.clear_win = win
             self.load = sign * (counts - self.baseline)
             if self.baseline != old:
                 logging.info("contact_guard: baseline relocked, load was %d,"
@@ -583,11 +659,11 @@ class ContactGuard:
         eventtime = self.reactor.monotonic()
         kin_status = self.toolhead.get_kinematics().get_status(eventtime)
         if 'z' not in kin_status['homed_axes'] or not self.z_trusted:
-            # SET_KINEMATIC_POSITION and FORCE_MOVE both leave a toolhead
-            # Z that says nothing about where the nozzle is
+            # SET_KINEMATIC_POSITION, FORCE_MOVE and a Z motor turned off
+            # all leave a toolhead Z that says nothing about the nozzle
             raise self.gcode.error(
                 "contact_guard: re-zero needs Z homed by G28 since the last"
-                " position reset or FORCE_MOVE")
+                " position reset, FORCE_MOVE or Z motor off")
         z = self.toolhead.get_position()[2]
         if z < self.rezero_min_z:
             raise self.gcode.error(
@@ -606,8 +682,8 @@ class ContactGuard:
             raise self.gcode.error("contact_guard: load is changing, not"
                                    " re-zeroing")
         old = self.load
-        self.baseline = self.trusted_zero = float(sum(counts)) / len(counts)
-        self._reset_detector()
+        self.baseline = float(sum(counts)) / len(counts)
+        self._real_zero()
         self.load = 0.
         logging.info("contact_guard: re-zeroed by command at Z %.2f, load"
                      " was %d", z, old)

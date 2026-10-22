@@ -5668,28 +5668,32 @@ recognised as a job. See the
 #   the toolhead is: FORCE_MOVE and a bed moved by hand do not appear in
 #   the toolhead's motion. Contact ends when the load falls, by positive
 #   clearance (below), at a Z homing or probing move that travelled at
-#   least 0.1 mm before triggering (which re-zeroes on what the cell read
-#   just before it; X and Y homing moves never re-zero), or with
-#   SET_CONTACT_GUARD REZERO=1.
+#   least 0.1 mm down before triggering, without error (which re-zeroes
+#   on what the cell read just before it; X and Y homing moves and upward
+#   moves never re-zero), or with SET_CONTACT_GUARD REZERO=1.
 #max_absorbed_counts:
-#   Relocks and drift following may move the zero toward pressing by at
-#   most this many counts in total from the trusted zero: the last real
-#   zero (Z homing or probing, positive clearance, REZERO), or anything
-#   less pressed since. Beyond it the excess reads as load, and past
-#   threshold_counts as contact, so steps that are each under the
-#   threshold cannot add up to an absorbed press. Movement toward
-#   unloading is not limited. The default is half of threshold_counts.
+#   Steady relocks may move the zero toward pressing by at most this many
+#   counts in total since the last real zero (Z homing or probing,
+#   positive clearance, REZERO); a relock toward unloading gives that
+#   back. Beyond it the excess reads as load, and past threshold_counts
+#   as contact, so steps that are each under the threshold cannot add up
+#   to an absorbed press. Slow drift, followed inside the band, is not
+#   counted, so drift alone never latches contact. The default is half
+#   of threshold_counts.
 #clearance_lift: 1.0
-#   Positive clearance. A contact whose load falls by at least
-#   threshold_counts as the executed toolhead Z rises, and then stays
-#   within the band while Z rises a further clearance_lift mm, has left
-#   what it touched; the remaining load becomes the new zero. A position
-#   reset (SET_KINEMATIC_POSITION, homing) is not a rise: evidence from
-#   before it is discarded.
+#   Positive clearance. A load that stays within the band while the
+#   executed toolhead Z travels clearance_lift mm (up or down) is not a
+#   touch, since a touch changes with Z; it becomes the new zero, whether
+#   or not it was latched as contact. A position reset
+#   (SET_KINEMATIC_POSITION, homing) or a Z motor enable change in between
+#   breaks the evidence.
 #rezero_min_z: 10.0
 #   SET_CONTACT_GUARD REZERO=1 is refused unless the toolhead is at least
-#   this high, with Z homed by a homing move (G28) since the last
-#   SET_KINEMATIC_POSITION or FORCE_MOVE of a Z stepper.
+#   this high, with Z really homed since the last SET_KINEMATIC_POSITION
+#   that changed Z, FORCE_MOVE of a Z stepper, or Z motor disable. A real
+#   Z home is G28 through an endstop, or a homing_override script whose Z
+#   probe triggered after at least 0.1 mm of downward travel (the
+#   SET_KINEMATIC_POSITION that follows it, from the probe, keeps it).
 #sync_below_z: 3.0
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,
