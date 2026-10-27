@@ -21,6 +21,9 @@ class HotendFanLatch:
             'heatsink_sensor', 'temperature_fan toolhead_heatsink')
         self.max_clear_temp = config.getfloat('max_clear_temp', 51.)
         self.min_clear_temp = config.getfloat('min_clear_temp', -10.)
+        # KAN-992: the clear needs a heatsink sample at most this old.
+        self.max_reading_age = config.getfloat('max_reading_age', 5.,
+                                               above=0.)
         self._corrupt_reason = None
         self.latched = self._read_state()
         self._latched_write_pending = self.latched
@@ -123,10 +126,13 @@ class HotendFanLatch:
             with os.fdopen(fd, 'w') as f:
                 f.write('latched\n' if latched else 'unlatched\n')
                 if old_stat is not None:
-                    if hasattr(os, 'fchmod'):  # POSIX only; the printer runs Linux
+                    # fchmod and fchown are POSIX only; the printer runs
+                    # Linux.
+                    if hasattr(os, 'fchmod'):
                         os.fchmod(f.fileno(), stat.S_IMODE(old_stat.st_mode))
-                    if hasattr(os, 'fchown'):  # POSIX only; the printer runs Linux
-                        os.fchown(f.fileno(), old_stat.st_uid, old_stat.st_gid)
+                    if hasattr(os, 'fchown'):
+                        os.fchown(f.fileno(), old_stat.st_uid,
+                                  old_stat.st_gid)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmpname, path)
@@ -223,10 +229,36 @@ class HotendFanLatch:
         else:
             self._latched_write_pending = False
 
-    def cmd_confirm(self, gcmd):
+    def _heatsink_temp(self, gcmd):
+        # KAN-992: until the sensor first reports, temperature_fan says
+        # 0.0C, which is inside the clear window.  A clear right after a
+        # restart passed on that placeholder.  Only a real, recent sample
+        # may show the heatsink is cool, so every way of not having one
+        # refuses: no sample yet, a stale one, a sensor that cannot say
+        # when it last read, or a status with no temperature in it.
         sensor = self.printer.lookup_object(self.sensor_name)
-        status = sensor.get_status(self.printer.get_reactor().monotonic())
-        temp = float(status.get('temperature', 0.))
+        eventtime = self.printer.get_reactor().monotonic()
+        read_time = getattr(sensor, 'last_temp_time', None)
+        if read_time is None:
+            raise gcmd.error('Fan fault not cleared: %s does not report '
+                             'when it last read.' % (self.sensor_name,))
+        if read_time <= 0.:
+            raise gcmd.error('Fan fault not cleared: heatsink temperature '
+                             'not available yet. Try again in a few '
+                             'seconds.')
+        mcu = self.printer.lookup_object('mcu')
+        age = mcu.estimated_print_time(eventtime) - read_time
+        if age > self.max_reading_age:
+            raise gcmd.error('Fan fault not cleared: the heatsink sensor '
+                             'last reported %.0fs ago.' % (age,))
+        temp = sensor.get_status(eventtime).get('temperature')
+        if temp is None:
+            raise gcmd.error('Fan fault not cleared: heatsink temperature '
+                             'not available.')
+        return float(temp)
+
+    def cmd_confirm(self, gcmd):
+        temp = self._heatsink_temp(gcmd)
         if temp >= self.max_clear_temp:
             raise gcmd.error('Fan fault not cleared: heatsink is still at '
                              '%.1fC (%.0fC or more).' %

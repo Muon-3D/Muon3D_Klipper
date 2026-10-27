@@ -898,6 +898,24 @@ class StickyFanFault(_FanCheckTestCase):
         self.log.records.clear()
 
 
+class Heatsink(Status):
+    """temperature_fan as the latch reads it: a status, and the print time
+    of its last real sample, which stays 0. until the sensor first reports
+    (KAN-992)."""
+
+    def __init__(self, status, last_temp_time=100.):
+        Status.__init__(self, status)
+        self.last_temp_time = last_temp_time
+
+
+class FakeMCU:
+    """Print time runs 100s ahead of the fake reactor, whose clock starts
+    at 0., so a Heatsink sampled at 100. is fresh."""
+
+    def estimated_print_time(self, eventtime):
+        return eventtime + 100.
+
+
 class PythonHeaterLatch(unittest.TestCase):
     """The Python gate, unlike macro renames/variables, is unavoidable."""
 
@@ -923,9 +941,10 @@ class PythonHeaterLatch(unittest.TestCase):
         self.printer.add_object('gcode', self.gcode)
         self.heater = self.Heater()
         self.printer.add_object('extruder', self.heater)
-        self.heatsink = Status({'temperature': 40.})
+        self.heatsink = Heatsink({'temperature': 40.})
         self.printer.add_object('temperature_fan toolhead_heatsink',
                                 self.heatsink)
+        self.printer.add_object('mcu', FakeMCU())
         self.latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
             self.printer, None, 'hotend_fan_latch',
             {'state_file': self.state_file}))
@@ -948,7 +967,8 @@ class PythonHeaterLatch(unittest.TestCase):
         heater = self.Heater()
         printer.add_object('extruder', heater)
         printer.add_object('temperature_fan toolhead_heatsink',
-                           Status({'temperature': 40.}))
+                           Heatsink({'temperature': 40.}))
+        printer.add_object('mcu', FakeMCU())
         console = []
         dispatch.respond_info = lambda msg, log=True: (
             console.append(msg) if 'fan fault' in msg else None)
@@ -971,7 +991,8 @@ class PythonHeaterLatch(unittest.TestCase):
         heater = self.Heater()
         printer.add_object('extruder', heater)
         printer.add_object('temperature_fan toolhead_heatsink',
-                           Status({'temperature': 40.}))
+                           Heatsink({'temperature': 40.}))
+        printer.add_object('mcu', FakeMCU())
         latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
             printer, None, 'hotend_fan_latch',
             {'state_file': self.state_file}))
@@ -1043,6 +1064,92 @@ class PythonHeaterLatch(unittest.TestCase):
         self.heater.set_temp(215.)
         self.assertEqual(self.heater.target_temp, 215.)
 
+    def assert_clear_refused(self, message):
+        with self.assertRaises(gcode.CommandError) as caught:
+            self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertIn(message, str(caught.exception))
+        self.assertTrue(self.latch.latched)
+        self.assert_refused(self.heater.set_temp)
+
+    def test_clear_waits_for_the_first_heatsink_sample(self):
+        # KAN-992, as found on the bench: Klipper restarted and Fan checked
+        # sent about 1s after ready, while temperature_fan still held its
+        # 0.0C placeholder.  0.0 is inside the clear window (-10 to 51), so
+        # the clear went through on no reading at all.
+        self.trip()
+        self.heatsink.status['temperature'] = 0.
+        self.heatsink.last_temp_time = 0.
+        self.assert_clear_refused('not available yet')
+        # The first real sample arrives, and the clear works as before.
+        self.heatsink.status['temperature'] = 31.
+        self.heatsink.last_temp_time = 100.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+        self.heater.set_temp(215.)
+        self.assertEqual(self.heater.target_temp, 215.)
+
+    def test_a_real_zero_degree_reading_still_clears(self):
+        # A cold room is not the placeholder: what matters is the sample.
+        self.trip()
+        self.heatsink.status['temperature'] = 0.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+
+    def test_clear_refuses_a_stale_sample(self):
+        self.trip()
+        self.heatsink.last_temp_time = 100. - 6.
+        self.assert_clear_refused('last reported 6s ago')
+        self.heatsink.last_temp_time = 100. - 4.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+
+    def test_clear_refuses_a_status_without_a_temperature(self):
+        # This used to read as 0.0 through .get('temperature', 0.).
+        self.trip()
+        del self.heatsink.status['temperature']
+        self.assert_clear_refused('not available')
+
+    def test_clear_refuses_a_sensor_that_cannot_say_when_it_read(self):
+        self.trip()
+        self.printer.add_object('temperature_fan toolhead_heatsink',
+                                Status({'temperature': 40.}))
+        self.assert_clear_refused('does not report when it last read')
+
+    def test_restart_then_immediate_clear_is_refused(self):
+        # The bench sequence end to end: a corrupt state file latches the
+        # fresh start, and the heatsink has not sampled yet.
+        with open(self.state_file, 'w') as f:
+            f.write('garbage')
+        latch, heater, _ = self.start_latch()
+        self.assertTrue(latch.latched)
+        heatsink = latch.printer.lookup_object(
+            'temperature_fan toolhead_heatsink')
+        heatsink.status['temperature'] = 0.
+        heatsink.last_temp_time = 0.
+        dispatch = latch.printer.lookup_object('gcode')
+        with self.assertRaises(gcode.CommandError):
+            dispatch.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def test_temperature_fan_records_when_it_sampled(self):
+        # The field the latch reads.  Upstream declares it and never sets it.
+        # Imported here: temperature_fan needs numpy, which CI installs
+        # (klippy-requirements.txt) and an offline run of the rest of this
+        # file does not.
+        try:
+            from extras import temperature_fan
+        except ImportError as e:
+            self.skipTest('temperature_fan needs %s' % (e.name,))
+        tf = temperature_fan.TemperatureFan.__new__(
+            temperature_fan.TemperatureFan)
+        tf.last_temp = tf.last_temp_time = 0.
+        tf.control = mock.Mock()
+        tf.temperature_callback(12.5, 38.)
+        self.assertEqual((tf.last_temp, tf.last_temp_time), (38., 12.5))
+        tf.control.temperature_callback.assert_called_once_with(12.5, 38.)
+
     def test_public_python_confirm_command_is_not_registered(self):
         self.assertNotIn('HOTEND_FAN_LATCH_CONFIRM',
                          self.gcode.ready_gcode_handlers)
@@ -1104,7 +1211,8 @@ class PythonHeaterLatch(unittest.TestCase):
         def spy_fsync(fd):
             synced.append(fd)
             return real_fsync(fd)
-        with mock.patch.object(os, 'open', spy_open),                 mock.patch.object(os, 'fsync', spy_fsync):
+        with mock.patch.object(os, 'open', spy_open), \
+                mock.patch.object(os, 'fsync', spy_fsync):
             self.latch._create_trip_marker()
         self.assertEqual(len(opened), 1)
         self.assertIn(opened[0], synced)
@@ -1132,7 +1240,8 @@ class PythonHeaterLatch(unittest.TestCase):
 
     def test_persistence_failure_still_latches_and_warns(self):
         cmd = mock.Mock()
-        with mock.patch.object(os, 'replace', side_effect=OSError('replace')),                 mock.patch.object(os, 'write', side_effect=OSError('write')):
+        with mock.patch.object(os, 'replace', side_effect=OSError('replace')), \
+                mock.patch.object(os, 'write', side_effect=OSError('write')):
             self.latch.cmd_latch(cmd)
         self.assertTrue(self.latch.latched)
         self.assert_refused(self.heater.set_temp)
