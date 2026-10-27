@@ -86,3 +86,19 @@ _PRINT_START_MARK PHASE=start
 ASSERT_PHASE NAME=start
 PRINT_END
 ASSERT_PHASE NAME=
+
+# KAN-990: a profile that calls PURGE_LINE asks for a purge lane. For the
+# part above it is 6 mm in front, at y 14, which is in the notch's rows, so
+# it steps left of the notch to x 13..73. The mesh covers it, and PURGE_LINE
+# draws along it here in klippy, once.
+PRINT_START BED=65 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98 PURGE_LANE=1
+ASSERT_PURGE_LANE LANE=13.00,73.00,14.00,1
+ASSERT_MESH_COVERS_PURGE_LANE
+PURGE_LINE
+ASSERT_PURGE_LANE LANE=
+PURGE_LINE
+
+# Asked for, but with no slicer region there is no lane to draw.
+PRINT_START BED=65 MATERIAL=PLA PURGE_LANE=1
+ASSERT_PURGE_LANE LANE=
+PURGE_LINE

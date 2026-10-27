@@ -83,14 +83,16 @@ class PurgeLine(_M1TestCase):
                                 if SKIPPED not in r]
         super().tearDown()
 
-    def print_start(self, mesh_min=None, mesh_max=None):
-        """Run PRINT_START; return the region both mesh macros got, or
-        None when they got none."""
+    def print_start(self, mesh_min=None, mesh_max=None, lane=True):
+        """Run PRINT_START, asking for a lane unless told not to; return
+        the region both mesh macros got, or None when they got none."""
         self.m1.timeline.clear()
         script = 'PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA'
         if mesh_min is not None:
             script += ' MESH_MIN=%s,%s MESH_MAX=%s,%s PROBE_COUNT=4,4' % (
                 mesh_min + mesh_max)
+        if lane:
+            script += ' PURGE_LANE=1'
         self.m1.run(script)
         regions = []
         for line in self.m1.timeline:
@@ -156,8 +158,8 @@ class PurgeLine(_M1TestCase):
     def lane(self):
         return self.m1.macro_vars('PURGE_LINE')['lane']
 
-    def run_part(self, mesh_min, mesh_max):
-        region = self.print_start(mesh_min, mesh_max)
+    def run_part(self, mesh_min, mesh_max, lane=True):
+        region = self.print_start(mesh_min, mesh_max, lane)
         part = (max(mesh_min[0], BED[0]), max(mesh_min[1], BED[1]),
                 min(mesh_max[0], BED[2]), min(mesh_max[1], BED[3]))
         return region, part
@@ -188,6 +190,13 @@ class PurgeLine(_M1TestCase):
         x0, x1, y, toward = self.lane()
         self.assertEqual(y, 34.0)
         self.assertLessEqual(x1, NOTCH[0])
+        self.assert_purge_probed(region, part)
+
+    def test_the_simulator_case(self):
+        # test/klippy/print_start_phase.test runs this one in klippy.
+        region, part = self.run_part((50, 20), (140, 98))
+        self.assertEqual(self.lane(), [13.0, 73.0, 14.0, 1])
+        self.assertEqual(region, (13.0, 14.0, 140.0, 98.0))
         self.assert_purge_probed(region, part)
 
     def test_lane_steps_right_of_the_notch(self):
@@ -226,6 +235,15 @@ class PurgeLine(_M1TestCase):
         self.assertIsNone(self.lane())
         self.assertEqual(region, (60.0, 40.0, 100.0, 80.0))
         self.assertEqual(self.purge(), [])
+
+    def test_no_lane_unless_asked(self):
+        # A profile that still draws its own purge: the region it sent,
+        # not grown, and PURGE_LINE does nothing.
+        region, part = self.run_part((87, 77), (113, 103), lane=False)
+        self.assertEqual(region, (87.0, 77.0, 113.0, 103.0))
+        self.assertIsNone(self.lane())
+        self.assertEqual(self.purge(), [])
+        self.assertTrue(self.skipped())
 
     def test_no_slicer_region_has_no_lane(self):
         self.assertIsNone(self.print_start())
