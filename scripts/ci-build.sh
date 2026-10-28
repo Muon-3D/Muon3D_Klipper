@@ -139,6 +139,11 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: a plate pull pauses only while a file is printing (KAN-272).
+start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+$PYTHON test/bed_removal/test_bed_removal_detector.py
+finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py

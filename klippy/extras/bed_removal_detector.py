@@ -25,6 +25,18 @@ class BedRemovalDetector:
         self.pause_resume = self.printer.load_object(config, 'pause_resume')
 
         self.bed_removed = False
+        # KAN-272: whether the latest removal came while a file was printing,
+        # and so paused it. Latched at removal time for BED_REMOVED, which
+        # renders later (behind the gcode mutex) and must not re-derive it
+        # from a state the pause itself has already changed.
+        self.removed_while_printing = False
+        # print_stats.print_start_time of the print whose PRINT_END has begun,
+        # or None. Keyed to that print, not a bare flag, so it cannot outlive
+        # it: a stale mark would silently suppress the KAN-79 pause on the
+        # next print. See _in_print_phase.
+        self.print_ending_start = None
+        self.print_stats = None
+        self.virtual_sdcard = None
         # None means no removal is outstanding. Distinct from 0., which means
         # a removal happened while the bed was genuinely off.
         self.restore_target = None
@@ -32,8 +44,16 @@ class BedRemovalDetector:
 
         # register startup handler
         self.printer.register_event_handler('klippy:ready', self.handle_ready)
+        self.gcode.register_command(
+            'SET_BED_REMOVAL_DETECTOR', self.cmd_SET_BED_REMOVAL_DETECTOR,
+            desc=self.cmd_SET_BED_REMOVAL_DETECTOR_help)
 
     def handle_ready(self):
+        # Optional: without [virtual_sdcard] nothing is ever a file print, so
+        # a plate pull only turns the heater off and runs BED_REMOVED.
+        self.print_stats = self.printer.lookup_object('print_stats', None)
+        self.virtual_sdcard = self.printer.lookup_object('virtual_sdcard',
+                                                         None)
         reactor = self.printer.get_reactor()
         reactor.register_timer(self.check_bed_temperature, reactor.NOW)
         self.log.info('BedRemovalDetector ready, checking every %.2f s',
@@ -105,7 +125,8 @@ class BedRemovalDetector:
         # now, not whenever the macro below wins the gcode mutex, because
         # what it is stopping is a toolhead extruding into open air. The
         # PAUSE in BED_REMOVED then completes the pause normally.
-        if self._is_printing(eventtime):
+        self.removed_while_printing = self._in_print_phase(eventtime)
+        if self.removed_while_printing:
             self.pause_resume.send_pause_command()
         reactor = self.printer.get_reactor()
         reactor.register_callback(
@@ -113,9 +134,62 @@ class BedRemovalDetector:
         self.log.info('Bed removal detected, bed heater off '
                       '(was %.1f C)', self.restore_target)
 
-    def _is_printing(self, eventtime):
-        idle_timeout = self.printer.lookup_object('idle_timeout')
-        return idle_timeout.get_status(eventtime)['state'] == 'Printing'
+    def _in_print_phase(self, eventtime):
+        """True while a file is printing and its PRINT_END has not begun.
+
+        KAN-272. This used to read idle_timeout, which says "Printing" after
+        any toolhead motion at all, not only while a file prints. On walnut
+        on 2026-10-01 startup gcode made it read "Printing" with no file
+        loaded, a plate pull paused the idle machine, and the pause carried
+        into the next print, where every pause-based fault path then did
+        nothing. It also missed a real print sitting in a long heat wait,
+        where idle_timeout drops to "Ready".
+
+        A file is printing when print_stats says "printing" and
+        virtual_sdcard is reading it. Both, so that neither a stale state
+        nor a pause in progress counts. "paused", "complete", "cancelled",
+        "error" and "standby" are all outside the print phase: there is
+        nothing left to stop.
+
+        The PRINT_END tail is a line of the file, so print_stats still says
+        "printing" through it. PRINT_END marks it with
+        SET_BED_REMOVAL_DETECTOR PRINT_ENDING=1 after the heaters are off.
+        The mark holds the print's start time and only counts while that is
+        still the running print's, so the next print is a print phase again
+        even if this timer never sampled the gap between them.
+        """
+        ps = self.print_stats
+        vsd = self.virtual_sdcard
+        if ps is None or vsd is None:
+            return False
+        if ps.get_status(eventtime)['state'] != 'printing':
+            return False
+        if not vsd.is_active():
+            return False
+        return not self._print_ending()
+
+    def _print_ending(self):
+        ps = self.print_stats
+        start = self.print_ending_start
+        return (ps is not None and start is not None
+                and ps.print_start_time == start)
+
+    cmd_SET_BED_REMOVAL_DETECTOR_help = (
+        "PRINT_ENDING=1 marks the running print's PRINT_END tail, where a "
+        "plate removal no longer pauses the file")
+
+    def cmd_SET_BED_REMOVAL_DETECTOR(self, gcmd):
+        ending = gcmd.get_int('PRINT_ENDING', None, minval=0, maxval=1)
+        if ending is None:
+            return
+        ps = self.print_stats
+        if not ending:
+            self.print_ending_start = None
+        elif ps is not None and ps.print_start_time is not None:
+            # Outside a print (a console PRINT_END, or CANCEL_PRINT's, which
+            # runs after print_stats has stopped) there is nothing to mark,
+            # and nothing to pause either.
+            self.print_ending_start = ps.print_start_time
 
     def handle_bed_reconnection(self):
         self.bed_removed = False
@@ -128,8 +202,13 @@ class BedRemovalDetector:
         # restore_target is read by _BED_RESUME_NOW to put the bed back where
         # it was before resuming. The macro only compares it against zero, so
         # "no removal outstanding" is published as 0. rather than as None.
+        #
+        # removedWhilePrinting is what BED_REMOVED reads to decide whether to
+        # PAUSE and say the print is paused. printEnding is informational.
         return {'bedRemoved': self.bed_removed,
-                'restoreTarget': self.restore_target or 0.}
+                'restoreTarget': self.restore_target or 0.,
+                'removedWhilePrinting': self.removed_while_printing,
+                'printEnding': self._print_ending()}
 
 
 def load_config(config):

@@ -45,7 +45,8 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
-         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION')
+         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION',
+         'SET_BED_REMOVAL_DETECTOR')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
            'PID_CALIBRATE', 'PROBE_CALIBRATE')
@@ -149,8 +150,14 @@ class M1:
                            Status(self.fan_air))
         printer.add_object('mcu toolhead',
                            Status({'non_critical_disconnected': False}))
-        self.bed_detector = {'bedRemoved': False, 'restoreTarget': 60.0}
+        # removedWhilePrinting: bed_removal_detector's own decision that the
+        # latest removal came while a file was printing (KAN-272).
+        self.bed_detector = {'bedRemoved': False, 'restoreTarget': 60.0,
+                             'removedWhilePrinting': True,
+                             'printEnding': False}
         printer.add_object('bed_removal_detector', Status(self.bed_detector))
+        self.sdcard = {'is_active': False}
+        printer.add_object('virtual_sdcard', Status(self.sdcard))
         # Names of stubbed commands a test wants to raise.
         self.raising = set()
         self.raising_lines = set()
@@ -1562,6 +1569,91 @@ class CancelParkTests(_M1TestCase):
         unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assertEqual(unlock['e_was_enabled'], 0)
         self.assertEqual(unlock['changed_hotend_target'], 0)
+
+
+
+class BedRemovedOutsideThePrintPhase(_M1TestCase):
+    """KAN-272: BED_REMOVED pauses only on bed_removal_detector's word that
+    a file was printing, whatever idle_timeout and print_stats read."""
+
+    def removed(self, while_printing):
+        m = self.m1
+        m.bed_detector.update(bedRemoved=True,
+                              removedWhilePrinting=while_printing)
+        m.timeline.clear()
+        m.run('BED_REMOVED')
+        return m.names()
+
+    def test_idle_with_startup_moves_does_not_pause(self):
+        # walnut, 2026-10-01: idle_timeout "Printing", nothing loaded.
+        m = self.m1
+        m.print_stats['state'] = 'standby'
+        names = self.removed(False)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines(), [])
+        # The non-pause actions still happen.
+        self.assertIn('_BED_MESH_INVALIDATE', names)
+        self.assertIn('RESPOND TYPE=command MSG="action:prompt_end"',
+                      m.timeline)
+        self.assertIn('SET_LED_EFFECT', names)
+
+    def test_print_end_tail_does_not_pause(self):
+        # print_stats still "printing" and the file still being read:
+        # PRINT_END is a line of it.
+        m = self.m1
+        m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        m.bed_detector['printEnding'] = True
+        names = self.removed(False)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertEqual(m.print_stats['state'], 'printing')
+        self.assertEqual(m.prompt_lines(), [])
+
+    def test_mid_print_pauses_and_says_so(self):
+        # KAN-79, unchanged. print_stats may already read "paused" by the
+        # time BED_REMOVED renders, because the detector paused the file.
+        m = self.m1
+        m.print_stats['state'] = 'paused'
+        names = self.removed(True)
+        self.assertIn('PAUSE_BASE', names)
+        self.assertTrue(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines()[0],
+                         'action:prompt_begin Bed Detached')
+
+    def test_resumed_before_this_rendered_pauses(self):
+        # Review of #KAN-272: plate pulled during RESUME's hot-end reheat
+        # wait. The print read "paused", so the detector sent nothing, and
+        # RESUME then restarted the file before BED_REMOVED got the mutex.
+        m = self.m1
+        m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        names = self.removed(False)
+        self.assertIn('PAUSE_BASE', names)
+        self.assertTrue(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines()[0],
+                         'action:prompt_begin Bed Detached')
+
+    def test_cancelled_before_this_rendered_does_not_pause(self):
+        # The detector paused a printing file, but a CANCEL_PRINT already
+        # queued for the mutex ran first and ended the print.
+        m = self.m1
+        m.print_stats['state'] = 'cancelled'
+        names = self.removed(True)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines(), [])
+
+    def test_print_end_marks_the_tail_after_the_heaters(self):
+        m = self.m1
+        m.timeline.clear()
+        m.run('PRINT_END')
+        names = m.names()
+        mark = m.timeline.index('SET_BED_REMOVAL_DETECTOR PRINT_ENDING=1')
+        self.assertLess(names.index('TURN_OFF_HEATERS'), mark)
+        self.assertLess(names.index('M107'), mark)
+        # Before the park, which is the window the ticket is about.
+        self.assertLess(mark, names.index('G0'))
 
 
 if __name__ == '__main__':
