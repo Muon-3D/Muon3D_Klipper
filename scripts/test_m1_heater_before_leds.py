@@ -156,6 +156,8 @@ class M1:
                              'removedWhilePrinting': True,
                              'printEnding': False}
         printer.add_object('bed_removal_detector', Status(self.bed_detector))
+        self.sdcard = {'is_active': False}
+        printer.add_object('virtual_sdcard', Status(self.sdcard))
         # Names of stubbed commands a test wants to raise.
         self.raising = set()
         self.raising_lines = set()
@@ -1597,9 +1599,12 @@ class BedRemovedOutsideThePrintPhase(_M1TestCase):
         self.assertIn('SET_LED_EFFECT', names)
 
     def test_print_end_tail_does_not_pause(self):
-        # print_stats still "printing": PRINT_END is a line of the file.
+        # print_stats still "printing" and the file still being read:
+        # PRINT_END is a line of it.
         m = self.m1
         m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        m.bed_detector['printEnding'] = True
         names = self.removed(False)
         self.assertNotIn('PAUSE_BASE', names)
         self.assertEqual(m.print_stats['state'], 'printing')
@@ -1615,6 +1620,29 @@ class BedRemovedOutsideThePrintPhase(_M1TestCase):
         self.assertTrue(m.pause_resume['is_paused'])
         self.assertEqual(m.prompt_lines()[0],
                          'action:prompt_begin Bed Detached')
+
+    def test_resumed_before_this_rendered_pauses(self):
+        # Review of #KAN-272: plate pulled during RESUME's hot-end reheat
+        # wait. The print read "paused", so the detector sent nothing, and
+        # RESUME then restarted the file before BED_REMOVED got the mutex.
+        m = self.m1
+        m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        names = self.removed(False)
+        self.assertIn('PAUSE_BASE', names)
+        self.assertTrue(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines()[0],
+                         'action:prompt_begin Bed Detached')
+
+    def test_cancelled_before_this_rendered_does_not_pause(self):
+        # The detector paused a printing file, but a CANCEL_PRINT already
+        # queued for the mutex ran first and ended the print.
+        m = self.m1
+        m.print_stats['state'] = 'cancelled'
+        names = self.removed(True)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines(), [])
 
     def test_print_end_marks_the_tail_after_the_heaters(self):
         m = self.m1
