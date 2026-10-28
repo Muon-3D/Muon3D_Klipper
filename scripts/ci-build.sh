@@ -55,6 +55,19 @@ finish_test check_macro_config "Check macro config"
 
 
 ######################################################################
+# Run the M1 LED state and user-mode macros through klippy's macro code
+######################################################################
+
+start_test m1_led_modes "Test M1 LED macros"
+$PYTHON scripts/test_m1_led_modes.py
+# KAN-569: on fault paths the hot end turns off before any LED command.
+$PYTHON scripts/test_m1_heater_before_leds.py
+# KAN-990: the start purge is drawn only where the bed mesh probed.
+$PYTHON scripts/test_m1_purge_line.py
+finish_test m1_led_modes "Test M1 LED macros"
+
+
+######################################################################
 # Check the M1 automatic filament load is still armed
 ######################################################################
 
@@ -131,6 +144,11 @@ finish_test contact_guard "Test contact_guard decisions"
 start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
 $PYTHON test/muon_ads1220/test_muon_ads1220.py
 finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+
+# MUON: a plate pull pauses only while a file is printing (KAN-272).
+start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+$PYTHON test/bed_removal/test_bed_removal_detector.py
+finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
