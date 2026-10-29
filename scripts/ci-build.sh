@@ -139,6 +139,12 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: B1 shared load cell / hotend ADS1220: the mcu's no-DRDY sampling
+# against a modelled chip, hotend detection, range limits, heater hold.
+start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+$PYTHON test/muon_ads1220/test_muon_ads1220.py
+finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py

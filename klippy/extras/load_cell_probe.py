@@ -5,7 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 import mcu
-from . import probe, trigger_analog, load_cell, hx71x, ads1220
+from . import probe, trigger_analog, load_cell, hx71x, ads1220, muon_ads1220
 
 np = None  # delay NumPy import until configuration time
 
@@ -216,6 +216,11 @@ class ContinuousTareFilterHelper:
         # update MCU filter from GCode command
         design = self._active_design.design_filter(gcmd.error)
         self._sos_filter.set_filter_design(design)
+
+
+# MUON: tell sensors sharing the load cell's ADC that a tap starts or ends
+def send_tap_event(printer, event, load_cell_inst):
+    printer.send_event(event, load_cell_inst)
 
 
 # check results from the collector for errors and raise an exception is found
@@ -717,14 +722,23 @@ class LoadCellProbingMove:
     # Wait for the MCU to trigger with no movement
     def probing_test(self, gcmd, timeout):
         self._config_helper.validate_probe_setup(gcmd)
-        self._pause_and_tare(gcmd)
-        toolhead = self._printer.lookup_object('toolhead')
-        print_time = toolhead.get_last_move_time()
-        self._mcu_trigger_analog.home_start(print_time, 0., 0, 0.)
-        return self._mcu_trigger_analog.home_wait(print_time + timeout)
+        send_tap_event(self._printer, "load_cell_probe:tap_begin",
+                       self._load_cell)
+        try:
+            self._pause_and_tare(gcmd)
+            toolhead = self._printer.lookup_object('toolhead')
+            print_time = toolhead.get_last_move_time()
+            self._mcu_trigger_analog.home_start(print_time, 0., 0, 0.)
+            return self._mcu_trigger_analog.home_wait(print_time + timeout)
+        finally:
+            send_tap_event(self._printer, "load_cell_probe:tap_end",
+                           self._load_cell)
 
     def get_last_trigger_time(self):
         return self._mcu_trigger_analog.get_last_trigger_time()
+
+    def get_load_cell(self):
+        return self._load_cell
 
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
@@ -755,15 +769,26 @@ class TappingMove:
 
     # perform a probing move and a pullback move
     def run_tap(self, gcmd):
-        # do the descending move
-        epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+        load_cell_inst = self._load_cell_probing_move.get_load_cell()
+        # MUON: the window from the tare to the end of the tap's samples.
+        # A sensor that shares its ADC (muon_ads1220) keeps the probe's
+        # samples unbroken and the heater quiet for it.
+        send_tap_event(self._printer, "load_cell_probe:tap_begin",
+                       load_cell_inst)
         try:
-            results = self._collect_tap(gcmd, collector)
-        except Exception:
-            # KAN-463: same leak as a failed descent.  collect_until stops
-            # the collector itself when it times out; nothing before it did.
-            collector.stop_collecting()
-            raise
+            # do the descending move
+            epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+            try:
+                results = self._collect_tap(gcmd, collector)
+            except Exception:
+                # KAN-463: same leak as a failed descent.  collect_until
+                # stops the collector itself when it times out; nothing
+                # before it did.
+                collector.stop_collecting()
+                raise
+        finally:
+            send_tap_event(self._printer, "load_cell_probe:tap_end",
+                           load_cell_inst)
         samples = check_sensor_errors(results, self._printer)
         self._load_cell_probing_move.note_baseline(samples)
         # Analyze the tap data
@@ -904,6 +929,7 @@ class LoadCellPrinterProbe:
         sensors = {}
         sensors.update(hx71x.HX71X_SENSOR_TYPES)
         sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+        sensors.update(muon_ads1220.MUON_ADS1220_SENSOR_TYPE)
         sensor_class = config.getchoice('sensor_type', sensors)
         sensor = sensor_class(config)
         self._load_cell = load_cell.LoadCell(config, sensor)
