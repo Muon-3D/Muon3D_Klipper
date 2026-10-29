@@ -284,22 +284,32 @@ class SerialReader:
             else:
                 self.handlers[key] = callback
     # ---- Non-critical MCU protection ----
-    def _is_noncritical_blocked(self):
-        # Non-critical link is unavailable: suppress host-side sends.
-        # This prevents background callbacks from crashing when reconnect is
-        # in progress but the serial queue has not been established yet.
+    def _is_noncritical_blocked(self, cmd=None, is_config=False):
+        # A live serial queue is not a configured MCU. During reconnect only
+        # handshake commands and the config helper may reach the wire.
         if self.mcu is None:
             return False
         if not getattr(self.mcu, "is_non_critical", False):
             return False
         if self.serialqueue is None:
             return True
-        return getattr(self.mcu, "non_critical_disconnected", False) and \
-               not getattr(self.mcu, "_connecting", False)
+        connecting = getattr(self.mcu, "_connecting", False)
+        if is_config:
+            return not connecting
+        if (not self.mcu.non_critical_disconnected
+                and getattr(self.mcu, "_configured", False)):
+            return False
+        if not connecting or cmd is None:
+            return True
+        msgid, _ = self.msgparser.msgid_parser.parse(cmd, 0)
+        msg = self.msgparser.messages_by_id.get(msgid)
+        return msg is None or msg.name not in (
+            'identify', 'get_config', 'get_clock', 'get_uptime',
+            'reset', 'config_reset', 'emergency_stop')
 
     # Command sending
-    def raw_send(self, cmd, minclock, reqclock, cmd_queue):
-        if self._is_noncritical_blocked():
+    def raw_send(self, cmd, minclock, reqclock, cmd_queue, is_config=False):
+        if self._is_noncritical_blocked(cmd, is_config):
             return
         if self.serialqueue is None:
             self._error("Serial connection closed")
@@ -307,7 +317,7 @@ class SerialReader:
                                     cmd, len(cmd), minclock, reqclock, 0)
 
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
-        if self.serialqueue is None or self._is_noncritical_blocked():
+        if self.serialqueue is None or self._is_noncritical_blocked(cmd):
             # Link is down or this MCU is intentionally blocked (non-critical disconnect).
             return
         self.last_notify_id += 1
@@ -323,9 +333,10 @@ class SerialReader:
                 return None
             self._error("Serial connection closed")
         return params
-    def send(self, msg, minclock=0, reqclock=0):
+    def send(self, msg, minclock=0, reqclock=0, is_config=False):
         cmd = self.msgparser.create_command(msg)
-        self.raw_send(cmd, minclock, reqclock, self.default_cmd_queue)
+        self.raw_send(cmd, minclock, reqclock, self.default_cmd_queue,
+                      is_config=is_config)
     def send_with_response(self, msg, response):
         cmd = self.msgparser.create_command(msg)
         src = SerialRetryCommand(self, response)
@@ -389,20 +400,9 @@ class SerialRetryCommand:
         if not retry:
             retries = 0
         while 1:
-            # If this is a non-critical MCU and it's offline (and not currently reconnecting),
-            # abort the wait loop immediately. Callers higher up should treat this as a soft failure.
-            if getattr(self.serial, "mcu", None) and \
-               getattr(self.serial.mcu, "is_non_critical", False) and \
-               getattr(self.serial.mcu, "non_critical_disconnected", False) and \
-               not getattr(self.serial.mcu, "_connecting", False):
+            if any(self.serial._is_noncritical_blocked(c) for c in cmds):
                 self.serial.register_response(None, self.name, self.oid)
-                raise error("non-critical MCU offline")
-            if getattr(self.serial, "mcu", None) and \
-               getattr(self.serial.mcu, "is_non_critical", False) and \
-               self.serial.serialqueue is None and \
-               not getattr(self.serial.mcu, "_connecting", False):
-                self.serial.register_response(None, self.name, self.oid)
-                raise error("non-critical MCU offline")
+                raise error("non-critical MCU offline or unconfigured")
 
             for cmd in cmds[:-1]:
                 self.serial.raw_send(cmd, minclock, reqclock, cmd_queue)

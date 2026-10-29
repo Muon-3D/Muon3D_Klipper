@@ -41,6 +41,8 @@ class PrinterMotionQueuing:
                                           ffi_lib.steppersyncmgr_free)
         self.syncemitters = []
         self.steppersyncs = []
+        # MCUs whose movequeue has been set up at least once (MUON)
+        self.movequeue_mcus = []
         self.steppersyncmgr_gen_steps = ffi_lib.steppersyncmgr_gen_steps
         # History expiration
         self.clear_history_time = 0.
@@ -100,7 +102,22 @@ class PrinterMotionQueuing:
         ss = self._lookup_steppersync(mcu)
         ffi_lib.steppersync_setup_movequeue(ss, serialqueue, move_count)
         mcu_freq = float(mcu.seconds_to_clock(1.))
-        ffi_lib.steppersync_set_time(ss, 0., mcu_freq)
+        time_offset = 0.
+        if any(m is mcu for m in self.movequeue_mcus):
+            # MUON: a non-critical MCU reconnecting. Its clock restarted
+            # near zero while print_time kept running, so the upstream
+            # placeholder offset of 0 maps the next step thousands of
+            # seconds into the MCU's future. stats() only corrects that on
+            # its next 1 s tick, and TOOLHEAD_CONNECT can queue extruder
+            # moves before then. Steps queued on offset 0 and then on the
+            # real offset run backwards, and the next flush fails with
+            # "stepcompress ... Invalid sequence" (boxwood, 2026-10-14).
+            # Calibrate now, exactly as stats() would.
+            time_offset, mcu_freq = mcu.calibrate_clock(
+                self.last_step_gen_time, self.reactor.monotonic())
+        else:
+            self.movequeue_mcus.append(mcu)
+        ffi_lib.steppersync_set_time(ss, time_offset, mcu_freq)
     def stats(self, eventtime):
         # Globally calibrate mcu clocks (and step generation clocks)
         sync_time = self.last_step_gen_time
