@@ -64,6 +64,8 @@ $PYTHON scripts/test_m1_led_modes.py
 $PYTHON scripts/test_m1_heater_before_leds.py
 # KAN-990: the start purge is drawn only where the bed mesh probed.
 $PYTHON scripts/test_m1_purge_line.py
+# KAN-234: PRINT_START's first tap is made below the ooze floor.
+$PYTHON scripts/test_m1_print_start_first_tap.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
