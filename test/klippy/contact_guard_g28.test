@@ -1,0 +1,12 @@
+# contact_guard stands down for the whole of a G28 macro (KAN-573): the
+# Y back-off inside it runs although the guard reads contact.  Outside G28
+# the same contact still refuses XY (contact_guard_g28_refuse.test).
+DICTIONARY atmega2560.dict
+CONFIG contact_guard_g28.cfg
+
+G28
+G90
+G1 X50 Y50 Z5 F6000
+# Inside G28 the samples were not judged; outside it the guard is active
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ACTIVE=1 CONTACT=0

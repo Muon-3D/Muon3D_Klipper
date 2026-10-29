@@ -64,7 +64,7 @@ class ContactGuard:
         self.enabled = True
         # Objects found at connect
         self.probe = self.load_cell = self.print_stats = None
-        self.homing_override = self.nozzle_wipe = None
+        self.homing_override = self.homing_scope = self.nozzle_wipe = None
         self.toolhead = self.gcode_io = None
         self.next_transform = None
         self.last_position = [0., 0., 0., 0.]
@@ -122,6 +122,10 @@ class ContactGuard:
         self.print_stats = self.printer.lookup_object('print_stats', None)
         self.homing_override = self.printer.lookup_object('homing_override',
                                                           None)
+        # The M1's G28 is a macro whose axis helpers make plain G1 moves
+        # (the Y back-off before X homes) with the toolhead still pressed
+        # against an axis end from a tap home (KAN-573)
+        self.homing_scope = self.printer.lookup_object('homing_scope', None)
         # The brush wipe drags the nozzle through the brush under load
         self.nozzle_wipe = self.printer.lookup_object('nozzle_wipe_smart',
                                                       None)
@@ -221,6 +225,8 @@ class ContactGuard:
 
     def _is_homing(self):
         if self.homing_moves or self.homing_rails:
+            return True
+        if getattr(self.homing_scope, 'in_scope', False):
             return True
         ho = self.homing_override
         return ho is not None and getattr(ho, 'in_script', False)
