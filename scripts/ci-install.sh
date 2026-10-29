@@ -45,6 +45,9 @@ if [ ! -f ${CACHE_DIR}/${PRU_ARCHIVE} ]; then
 fi
 cd ${BUILD_DIR}
 tar xJf ${CACHE_DIR}/${PRU_ARCHIVE}
+# MUON: the archive's directories are read-only, and on a self-hosted
+# runner the next checkout's clean can't remove them (EACCES).
+chmod -R u+w ${BUILD_DIR}
 
 
 ######################################################################
@@ -60,6 +63,9 @@ if [ ! -f ${CACHE_DIR}/${OR1K_ARCHIVE} ]; then
 fi
 cd ${BUILD_DIR}
 tar xJf ${CACHE_DIR}/${OR1K_ARCHIVE}
+# MUON: the archive's directories are read-only, and on a self-hosted
+# runner the next checkout's clean can't remove them (EACCES).
+chmod -R u+w ${BUILD_DIR}
 
 
 ######################################################################
