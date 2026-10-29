@@ -144,6 +144,11 @@ start_test bed_removal "Test bed_removal_detector pauses only in the print phase
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 
+# MUON: the unlock retract without FORCE_MOVE, which is off (KAN-380).
+start_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
+$PYTHON test/cold_retract/test_cold_retract.py
+finish_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
