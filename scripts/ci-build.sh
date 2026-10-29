@@ -139,6 +139,11 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
+start_test homing_scope "Test homing_scope"
+$PYTHON test/homing_scope/test_homing_scope.py
+finish_test homing_scope "Test homing_scope"
+
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
