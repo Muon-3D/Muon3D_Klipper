@@ -20,8 +20,16 @@ echo -e "\n\n=============== Install system dependencies\n\n"
 PKGS="virtualenv libffi-dev build-essential"
 PKGS="${PKGS} gcc-avr avr-libc"
 PKGS="${PKGS} libnewlib-arm-none-eabi gcc-arm-none-eabi binutils-arm-none-eabi"
-sudo apt-get update
-sudo apt-get install ${PKGS}
+# MUON: the self-hosted runner has no sudo, so its host carries these
+# already; only a host that lacks one needs apt (and sudo).
+MISSING=""
+for pkg in ${PKGS}; do
+    dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null         | grep -q "install ok installed" || MISSING="${MISSING} ${pkg}"
+done
+if [ -n "${MISSING}" ]; then
+    sudo apt-get update
+    sudo apt-get install ${MISSING}
+fi
 
 
 ######################################################################
