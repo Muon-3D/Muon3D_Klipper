@@ -16,9 +16,24 @@ on:
     branches: [master]
   pull_request:
 
+# A newer commit on the same pull request cancels the run it supersedes.
+concurrency:
+  group: build-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # MUON: runs-on is the bigbox pool (`vars.LINUX_RUNS_ON`, else the
+    # `muon-ci` labels): Muon runs no CI on GitHub-hosted runners, public
+    # repositories included (Jack, 28 Oct). As in Moonraker's test-code.yaml,
+    # the job runs only for a push here or a pull request from a branch of
+    # this repository. That `if` is not the security boundary, because a
+    # fork's pull request runs the workflow file from its own branch: the
+    # repository's "Require approval for all external contributors" setting
+    # is, and it must be on before bigbox serves this repository. The runner
+    # has no sudo, so ci-install.sh needs its apt packages on the host.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.LINUX_RUNS_ON || '["self-hosted","muon-ci"]') }}
     steps:
     - uses: actions/checkout@v3
       with:
