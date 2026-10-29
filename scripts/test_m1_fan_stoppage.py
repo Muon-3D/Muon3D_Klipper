@@ -38,12 +38,6 @@ class FanTripsOnce(_M1TestCase):
             self.fans[macro] = status = {'speed': 0.5, 'rpm': 0.0}
             self.m1.printer.add_object(obj, Status(status))
 
-    def tearDown(self):
-        # The warnings are what is being counted, not failures
-        self.m1.responses[:] = [r for r in self.m1.responses
-                                if 'WARNING' not in r]
-        super().tearDown()
-
     def trips(self, name):
         return [line for line in self.m1.timeline
                 if line.startswith('FAN_STOPPAGE_ROUTINE')
@@ -52,7 +46,10 @@ class FanTripsOnce(_M1TestCase):
     def warnings(self, macro):
         word = {'CPU_FAN_CHECK': 'CPU fan', 'MD_FAN_CHECK': 'Motor-drivers',
                 'PSU_FAN_CHECK': 'PSU fan'}[macro]
-        return [r for r in self.m1.responses if 'WARNING' in r and word in r]
+        # M118 is a recorded stub in M1, so the warnings are in the timeline
+        return [line for line in self.m1.timeline
+                if line.startswith('M118') and 'WARNING' in line
+                and word in line]
 
     def check_one(self, macro, counter, name):
         status = self.fans[macro]
@@ -66,7 +63,7 @@ class FanTripsOnce(_M1TestCase):
                                                   len(self.trips(name))))
         self.assertEqual(self.m1.macro_vars(macro)[counter], MAX_STOPS)
         self.assertEqual(len(self.warnings(macro)), MAX_STOPS,
-                         self.m1.responses)
+                         self.m1.timeline)
         # Healthy again: the counter re-arms, and a new episode trips again
         status['rpm'] = 4000.0
         self.m1.run(macro)
