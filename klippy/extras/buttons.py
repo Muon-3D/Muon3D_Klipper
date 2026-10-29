@@ -40,7 +40,10 @@ class MCU_buttons:
         self._reset_state()
         # Configuration can yield long enough for an init query to report
         # before reconnect handlers run. Start sampling only after config.
-        self.query_cmd.send(self._query_params())
+        # build_config builds no query for an MCU without buttons; there is
+        # nothing to sample then.
+        if self.query_cmd is not None:
+            self.query_cmd.send(self._query_params())
     def _reset_state(self):
         # MCU-side counters reset on reconnect - keep host-side counters aligned.
         self.ack_count = 0
