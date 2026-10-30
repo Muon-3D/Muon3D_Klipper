@@ -41,8 +41,16 @@ jobs:
         # and the default shallow clone has no history to find one in.
         fetch-depth: 0
 
-    - name: Setup cache
-      uses: actions/cache@v3
+    - name: Setup cache on master
+      if: github.ref == 'refs/heads/master'
+      uses: actions/cache@v4
+      with:
+        path: ci_cache
+        key: ${{ runner.os }}-build-${{ hashFiles('scripts/ci-install.sh') }}
+
+    - name: Restore cache outside master
+      if: github.ref != 'refs/heads/master'
+      uses: actions/cache/restore@v4
       with:
         path: ci_cache
         key: ${{ runner.os }}-build-${{ hashFiles('scripts/ci-install.sh') }}
@@ -52,9 +60,3 @@ jobs:
 
     - name: Test
       run: ./scripts/ci-build.sh 2>&1
-
-    - name: Upload micro-controller data dictionaries
-      uses: actions/upload-artifact@v4
-      with:
-        name: data-dict
-        path: ci_build/dict
