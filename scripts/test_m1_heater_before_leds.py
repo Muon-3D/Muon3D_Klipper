@@ -22,7 +22,9 @@
 import logging
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_m1_led_modes import (  # noqa: E402
@@ -30,7 +32,8 @@ from test_m1_led_modes import (  # noqa: E402
     _parse_leds)
 import configfile  # noqa: E402
 import gcode  # noqa: E402
-from extras import delayed_gcode, gcode_macro  # noqa: E402
+from extras import (delayed_gcode, gcode_macro, hotend_fan_latch,
+                    print_end_park, save_variables)  # noqa: E402
 
 INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
             'toolhead.cfg', 'bed.cfg', 'filament.cfg', 'calibration.cfg')
@@ -42,10 +45,11 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
-         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION', 'PID_CALIBRATE')
+         'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION',
+         'SET_BED_REMOVAL_DETECTOR')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
-           'PROBE_CALIBRATE')
+           'PID_CALIBRATE', 'PROBE_CALIBRATE')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
 
 # The prompt a hot-end fan fault puts on the panel and in Fluidd.
@@ -87,7 +91,7 @@ class FailingLedEffect:
 
 
 class M1:
-    def __init__(self):
+    def __init__(self, variables_file, restore_startup=True, latched=False):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
         self.gcode = gcode.GCodeDispatch(printer)
@@ -97,6 +101,22 @@ class M1:
         self.macro = gcode_macro.PrinterGCodeMacro(FakeConfig(
             printer, None, 'gcode_macro'))
         printer.add_object('gcode_macro', self.macro)
+        self.saved = save_variables.SaveVariables(FakeConfig(
+            printer, None, 'save_variables', {'filename': variables_file}))
+        printer.add_object('save_variables', self.saved)
+        self.latch_status = {
+            'latched': bool(latched or self.saved.allVariables.get(
+                'hotend_fan_fault', 0))}
+        printer.add_object('hotend_fan_latch', Status(self.latch_status))
+        self.gcode.register_command('HOTEND_FAN_LATCH_SET',
+                                    self._latch_set)
+        self.gcode.register_command('_HOTEND_FAN_LATCH_CONFIRM',
+                                    self._latch_confirm)
+        # Put a recording/failure-injection shim around Klipper's real
+        # SAVE_VARIABLE command.  Successful calls still write and reload the
+        # actual file, which lets tests create a second M1 as a restart.
+        self.gcode.register_command('SAVE_VARIABLE', None)
+        self.gcode.register_command('SAVE_VARIABLE', self._save_variable)
         printer.add_object('toolhead', Status({
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
@@ -130,10 +150,17 @@ class M1:
                            Status(self.fan_air))
         printer.add_object('mcu toolhead',
                            Status({'non_critical_disconnected': False}))
-        self.bed_detector = {'bedRemoved': False, 'restoreTarget': 60.0}
+        # removedWhilePrinting: bed_removal_detector's own decision that the
+        # latest removal came while a file was printing (KAN-272).
+        self.bed_detector = {'bedRemoved': False, 'restoreTarget': 60.0,
+                             'removedWhilePrinting': True,
+                             'printEnding': False}
         printer.add_object('bed_removal_detector', Status(self.bed_detector))
+        self.sdcard = {'is_active': False}
+        printer.add_object('virtual_sdcard', Status(self.sdcard))
         # Names of stubbed commands a test wants to raise.
         self.raising = set()
+        self.raising_lines = set()
 
         self.timeline = []
         for name in STUBS + RENAMED:
@@ -154,6 +181,8 @@ class M1:
                 if name.upper() in STUBS:
                     continue
                 obj = gcode_macro.GCodeMacro(config)
+            elif kind == 'print_end_park':
+                obj = print_end_park.load_config(config)
             elif kind == 'delayed_gcode':
                 obj = delayed_gcode.DelayedGcode(config)
             elif kind == 'led_effect':
@@ -163,13 +192,35 @@ class M1:
             printer.add_object(section, obj)
         printer.send_event('klippy:connect')
         printer.send_event('klippy:ready')
+        if restore_startup:
+            self.restore_startup_fault()
         self.responses.clear()
+
+    def restore_startup_fault(self):
+        # CHECK_ALL_FANS also starts at one second, but this focused harness
+        # intentionally has no CPU/MD/PSU fan objects. Leave it parked while
+        # firing the two-second persistent-fault restore timer.
+        for timer in self.reactor.timers:
+            if timer[0] == 1.:
+                timer[0] = self.reactor.NEVER
+        self.reactor.advance(2.)
+
+    def _latch_set(self, gcmd):
+        self.latch_status['latched'] = True
+
+    def _latch_confirm(self, gcmd):
+        temp = self.heatsink['temperature']
+        if temp >= 51. or temp <= -10.:
+            raise gcmd.error('Fan fault not cleared: heatsink sensor %.1fC'
+                             % (temp,))
+        self.latch_status['latched'] = False
 
     def _record(self, gcmd):
         line = gcmd.get_commandline()
         self.timeline.append(line)
         name = line.split()[0].upper()
-        if name in self.raising:
+        if (name in self.raising or any(
+                line.startswith(prefix) for prefix in self.raising_lines)):
             raise gcmd.error("%s: failing on purpose" % (name,))
         # As pause_resume and virtual_sdcard do: a pause while idle sets
         # is_paused and leaves print_stats alone.
@@ -185,14 +236,23 @@ class M1:
         elif name == 'CLEAR_PAUSE':
             self.pause_resume['is_paused'] = False
 
-    def _m104(self, gcmd):
+    def _save_variable(self, gcmd):
         self.timeline.append(gcmd.get_commandline())
+        if 'SAVE_VARIABLE' in self.raising:
+            raise gcmd.error("SAVE_VARIABLE: failing on purpose")
+        self.saved.cmd_SAVE_VARIABLE(gcmd)
+
+    def _m104(self, gcmd):
+        line = gcmd.get_commandline()
+        self.timeline.append(line.replace('M104.1', 'M104', 1))
         if 'M104' in self.raising:
             raise gcmd.error("M104: failing on purpose")
         self.extruder['target'] = gcmd.get_float('S', 0.)
 
     def _set_heater(self, gcmd):
-        self.timeline.append(gcmd.get_commandline())
+        line = gcmd.get_commandline()
+        self.timeline.append(line.replace('SET_HEATER_TEMPERATURE_BASE',
+                                          'SET_HEATER_TEMPERATURE', 1))
         if gcmd.get('HEATER') == 'extruder':
             self.extruder['target'] = gcmd.get_float('TARGET', 0.)
 
@@ -249,7 +309,12 @@ class _M1TestCase(unittest.TestCase):
         self.log = _ErrorLog()
         logging.getLogger().addHandler(self.log)
         self.addCleanup(logging.getLogger().removeHandler, self.log)
-        self.m1 = M1()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.variables_file = os.path.join(self.tempdir.name, 'variables.cfg')
+        with open(self.variables_file, 'w') as f:
+            f.write('[Variables]\nhotend_fan_fault = 0\n')
+        self.m1 = M1(self.variables_file)
 
     def tearDown(self):
         self.assertEqual([r for r in self.m1.responses if r.startswith('!!')
@@ -615,9 +680,11 @@ class SensorLatchHolds(_FanCheckTestCase):
     def test_a_preheat_with_the_sensor_still_open_is_cut(self):
         self.m1.extruder['temperature'] = 95.
         self.check()
-        self.m1.run('M104 S215')
-        self.check()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('M104 S215')
         self.assertEqual(self.m1.extruder['target'], 0.)
+        self.m1.responses.clear()
+        self.log.records.clear()
 
 
 class LatchedFaultCutsHeat(_FanCheckTestCase):
@@ -642,10 +709,9 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
         # A new print: PRINT_START's M104 S{PREHEAT_EXTRUDER_TEMP}.
         self.m1.print_stats['state'] = 'printing'
         self.m1.timeline.clear()
-        self.m1.run('M104 S215')
-        self.assert_cut()
-        # And the new print is paused.
-        self.assertIn('PAUSE_BASE', self.m1.names())
+        self.refused('M104 S215', 'M104')
+        # The direct request is rejected before it can heat or pause.
+        self.assertNotIn('PAUSE_BASE', self.m1.names())
 
     def refused(self, script, what):
         self.m1.timeline.clear()
@@ -674,18 +740,23 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
 
     def test_hotend_heating_calibration_refused(self):
         self.refused('CALIBRATE_HEATING_HOTEND', 'Calibration')
-        self.assertNotIn('PID_CALIBRATE', self.m1.names())
+        self.assertNotIn('PID_CALIBRATE_BASE', self.m1.names())
+
+    def test_direct_hotend_pid_calibration_refused(self):
+        self.refused('PID_CALIBRATE HEATER=extruder TARGET=220',
+                     'PID_CALIBRATE')
 
     def test_hotend_heating_calibration_runs_once_cleared(self):
         self.m1.heatsink.update(temperature=40.0, speed=0.3)
         self.m1.run('HOTEND_FAN_FAULT_CLEAR')
         self.m1.timeline.clear()
         self.m1.run('CALIBRATE_HEATING_HOTEND')
-        self.assertIn('PID_CALIBRATE HEATER=extruder TARGET=220',
+        self.assertIn('PID_CALIBRATE_BASE HEATER=extruder TARGET=220',
                       self.m1.timeline)
 
     def test_m109_refused(self):
         self.refused('M109 S215', 'M109')
+        self.refused('M109 R215', 'M109')
 
     def test_m109_to_zero_and_after_a_clear(self):
         self.m1.run('M109 S0')
@@ -699,8 +770,16 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
         for command in ('M104 S215',
                         'SET_HEATER_TEMPERATURE HEATER=extruder TARGET=215'):
             with self.subTest(command=command):
-                self.m1.run(command)
-                self.assert_cut()
+                self.m1.extruder['target'] = 0.
+                self.refused(command, command.split()[0])
+
+    def test_direct_heater_zero_always_works(self):
+        self.m1.extruder['target'] = 215.
+        self.m1.run('M104 S0')
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.m1.extruder['target'] = 215.
+        self.m1.run('SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0')
+        self.assertEqual(self.m1.extruder['target'], 0.)
 
     def test_unlock_release(self):
         # The press saved 215 and the fault came during the hold. The
@@ -721,8 +800,7 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
         self.check(5)
         self.assertEqual(self.counts()[0], 0)
         self.assertEqual(self.fault(), 1)
-        self.m1.run('M104 S215')
-        self.assert_cut()
+        self.refused('M104 S215', 'M104')
 
     def test_heat_is_not_cut_once_the_fault_is_cleared(self):
         self.m1.heatsink.update(temperature=40.0, speed=0.3)
@@ -827,6 +905,472 @@ class StickyFanFault(_FanCheckTestCase):
         self.log.records.clear()
 
 
+class Heatsink(Status):
+    """temperature_fan as the latch reads it: a status, and the print time
+    of its last real sample, which stays 0. until the sensor first reports
+    (KAN-992)."""
+
+    def __init__(self, status, last_temp_time=100.):
+        Status.__init__(self, status)
+        self.last_temp_time = last_temp_time
+
+
+class FakeMCU:
+    """Print time runs 100s ahead of the fake reactor, whose clock starts
+    at 0., so a Heatsink sampled at 100. is fresh."""
+
+    def estimated_print_time(self, eventtime):
+        return eventtime + 100.
+
+
+class PythonHeaterLatch(unittest.TestCase):
+    """The Python gate, unlike macro renames/variables, is unavoidable."""
+
+    class Heater:
+        def __init__(self):
+            self.target_temp = 0.
+
+        def set_temp(self, value):
+            self.target_temp = value
+
+        def alter_target(self, value):
+            self.target_temp = value
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.state_file = os.path.join(self.tempdir.name, 'latch.state')
+        self.variables_file = os.path.join(self.tempdir.name, 'variables.cfg')
+        with open(self.variables_file, 'w') as f:
+            f.write('[Variables]\nmuon_led = \'party\'\nmesh_valid = 1\n')
+        self.printer = FakePrinter(FakeReactor())
+        self.gcode = gcode.GCodeDispatch(self.printer)
+        self.printer.add_object('gcode', self.gcode)
+        self.heater = self.Heater()
+        self.printer.add_object('extruder', self.heater)
+        self.heatsink = Heatsink({'temperature': 40.})
+        self.printer.add_object('temperature_fan toolhead_heatsink',
+                                self.heatsink)
+        self.printer.add_object('mcu', FakeMCU())
+        self.latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            self.printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        self.printer.add_object('hotend_fan_latch', self.latch)
+        self.printer.send_event('klippy:connect')
+        self.printer.send_event('klippy:ready')
+
+    def trip(self):
+        # D-018: a fresh latch with no state file is clear, so tests of the
+        # latched behaviour trip it first, as a fan fault would.
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assertTrue(self.latch.latched)
+
+    def start_latch(self):
+        """A fresh klippy start reading self.state_file; returns the latch,
+        its heater and the lines it sent to the console."""
+        printer = FakePrinter(FakeReactor())
+        dispatch = gcode.GCodeDispatch(printer)
+        printer.add_object('gcode', dispatch)
+        heater = self.Heater()
+        printer.add_object('extruder', heater)
+        printer.add_object('temperature_fan toolhead_heatsink',
+                           Heatsink({'temperature': 40.}))
+        printer.add_object('mcu', FakeMCU())
+        console = []
+        dispatch.respond_info = lambda msg, log=True: (
+            console.append(msg) if 'fan fault' in msg else None)
+        latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        printer.send_event('klippy:connect')
+        printer.send_event('klippy:ready')
+        return latch, heater, console
+
+    def assert_refused(self, setter):
+        with self.assertRaises(gcode.CommandError):
+            setter(215.)
+        self.assertEqual(self.heater.target_temp, 0.)
+
+    def assert_restart_is_latched(self):
+        printer = FakePrinter(FakeReactor())
+        dispatch = gcode.GCodeDispatch(printer)
+        printer.add_object('gcode', dispatch)
+        heater = self.Heater()
+        printer.add_object('extruder', heater)
+        printer.add_object('temperature_fan toolhead_heatsink',
+                           Heatsink({'temperature': 40.}))
+        printer.add_object('mcu', FakeMCU())
+        latch = hotend_fan_latch.HotendFanLatch(FakeConfig(
+            printer, None, 'hotend_fan_latch',
+            {'state_file': self.state_file}))
+        printer.send_event('klippy:connect')
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def trip_with_failure_then_assert_restart_latched(self, patcher):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        marker = self.state_file + '.trip'
+        if os.path.exists(marker):
+            os.unlink(marker)
+        with patcher:
+            # The latch closes in memory and the call still returns, so the
+            # macro can go on to show the prompt; the failure is reported.
+            self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assertTrue(self.latch.latched)
+        self.assert_restart_is_latched()
+
+    def test_all_renamed_command_bypasses_reach_the_python_gate(self):
+        # These setters model M104.1/M109.1, SET_HEATER_TEMPERATURE_BASE,
+        # PID_CALIBRATE_BASE and remote/API callers respectively: all of them
+        # ultimately reach one of the heater's two target-setting methods.
+        self.trip()
+        routes = {
+            'M104.1': self.heater.set_temp,
+            'M109.1': self.heater.set_temp,
+            'SET_HEATER_TEMPERATURE_BASE': self.heater.set_temp,
+            'PID_CALIBRATE_BASE': self.heater.set_temp,
+            'remote set_temp': self.heater.set_temp,
+            'internal alter_target': self.heater.alter_target,
+        }
+        for name, setter in routes.items():
+            with self.subTest(route=name):
+                self.assert_refused(setter)
+
+    def test_macro_and_saved_variable_edits_cannot_clear_latch(self):
+        # SET_GCODE_VARIABLE and SAVE_VARIABLE can mutate these decoys, but
+        # the Python-owned state remains closed.
+        # Real mutations: rewrite the saved-variables file to say no fault,
+        # delete it, and restart.  The latch must come back closed each time.
+        self.trip()
+        for content in ('[Variables]\nhotend_fan_fault = 0\n', None):
+            if content is None:
+                os.unlink(self.variables_file)
+            else:
+                with open(self.variables_file, 'w') as f:
+                    f.write(content)
+            self.assert_refused(self.heater.set_temp)
+            self.assert_restart_is_latched()
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        self.assert_refused(self.heater.alter_target)
+
+    def test_zero_and_cooling_targets_always_work(self):
+        self.heater.set_temp(0.)
+        self.heater.alter_target(0.)
+        self.assertEqual(self.heater.target_temp, 0.)
+
+    def test_confirm_is_the_only_open_path_and_checks_sensor(self):
+        self.trip()
+        self.heatsink.status['temperature'] = 55.
+        with self.assertRaises(gcode.CommandError):
+            self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assert_refused(self.heater.set_temp)
+        self.heatsink.status['temperature'] = 40.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.heater.set_temp(215.)
+        self.assertEqual(self.heater.target_temp, 215.)
+
+    def assert_clear_refused(self, message):
+        with self.assertRaises(gcode.CommandError) as caught:
+            self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertIn(message, str(caught.exception))
+        self.assertTrue(self.latch.latched)
+        self.assert_refused(self.heater.set_temp)
+
+    def test_clear_waits_for_the_first_heatsink_sample(self):
+        # KAN-992, as found on the bench: Klipper restarted and Fan checked
+        # sent about 1s after ready, while temperature_fan still held its
+        # 0.0C placeholder.  0.0 is inside the clear window (-10 to 51), so
+        # the clear went through on no reading at all.
+        self.trip()
+        self.heatsink.status['temperature'] = 0.
+        self.heatsink.last_temp_time = 0.
+        self.assert_clear_refused('not available yet')
+        # The first real sample arrives, and the clear works as before.
+        self.heatsink.status['temperature'] = 31.
+        self.heatsink.last_temp_time = 100.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+        self.heater.set_temp(215.)
+        self.assertEqual(self.heater.target_temp, 215.)
+
+    def test_a_real_zero_degree_reading_still_clears(self):
+        # A cold room is not the placeholder: what matters is the sample.
+        self.trip()
+        self.heatsink.status['temperature'] = 0.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+
+    def test_clear_refuses_a_stale_sample(self):
+        self.trip()
+        self.heatsink.last_temp_time = 100. - 6.
+        self.assert_clear_refused('last reported 6s ago')
+        self.heatsink.last_temp_time = 100. - 4.
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertFalse(self.latch.latched)
+
+    def test_clear_refuses_a_status_without_a_temperature(self):
+        # This used to read as 0.0 through .get('temperature', 0.).
+        self.trip()
+        del self.heatsink.status['temperature']
+        self.assert_clear_refused('not available')
+
+    def test_clear_refuses_a_sensor_that_cannot_say_when_it_read(self):
+        self.trip()
+        self.printer.add_object('temperature_fan toolhead_heatsink',
+                                Status({'temperature': 40.}))
+        self.assert_clear_refused('does not report when it last read')
+
+    def test_restart_then_immediate_clear_is_refused(self):
+        # The bench sequence end to end: a corrupt state file latches the
+        # fresh start, and the heatsink has not sampled yet.
+        with open(self.state_file, 'w') as f:
+            f.write('garbage')
+        latch, heater, _ = self.start_latch()
+        self.assertTrue(latch.latched)
+        heatsink = latch.printer.lookup_object(
+            'temperature_fan toolhead_heatsink')
+        heatsink.status['temperature'] = 0.
+        heatsink.last_temp_time = 0.
+        dispatch = latch.printer.lookup_object('gcode')
+        with self.assertRaises(gcode.CommandError):
+            dispatch.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def test_temperature_fan_records_when_it_sampled(self):
+        # The field the latch reads.  Upstream declares it and never sets it.
+        # Imported here: temperature_fan needs numpy, which CI installs
+        # (klippy-requirements.txt) and an offline run of the rest of this
+        # file does not.
+        try:
+            from extras import temperature_fan
+        except ImportError as e:
+            self.skipTest('temperature_fan needs %s' % (e.name,))
+        tf = temperature_fan.TemperatureFan.__new__(
+            temperature_fan.TemperatureFan)
+        tf.last_temp = tf.last_temp_time = 0.
+        tf.control = mock.Mock()
+        tf.temperature_callback(12.5, 38.)
+        self.assertEqual((tf.last_temp, tf.last_temp_time), (38., 12.5))
+        tf.control.temperature_callback.assert_called_once_with(12.5, 38.)
+
+    def test_public_python_confirm_command_is_not_registered(self):
+        self.assertNotIn('HOTEND_FAN_LATCH_CONFIRM',
+                         self.gcode.ready_gcode_handlers)
+
+    def test_marker_survives_marker_write_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'write', side_effect=OSError('write')))
+
+    def test_marker_survives_state_replace_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'replace', side_effect=OSError('replace')))
+
+    def test_marker_survives_fsync_failure_and_restart(self):
+        self.trip_with_failure_then_assert_restart_latched(
+            mock.patch.object(os, 'fsync', side_effect=OSError('fsync')))
+
+    def test_corrupt_latch_fails_closed_without_touching_saved_variables(self):
+        with open(self.state_file, 'w') as f:
+            f.write('not a latch state')
+        with open(self.variables_file) as f:
+            before = f.read()
+        self.assertTrue(self.latch._read_state())
+        with open(self.variables_file) as f:
+            self.assertEqual(f.read(), before)
+
+
+    # D-018 (Jack, 20 Oct 2026): absent file = clear, corrupt file = latched.
+    def test_d018_absent_file_is_clear_and_heating_is_allowed(self):
+        self.assertFalse(os.path.exists(self.state_file))
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        self.assertEqual(heater.target_temp, 215.)
+        self.assertEqual(console, [])
+
+    def test_exists_only_treats_enoent_as_absent(self):
+        import errno
+        self.assertFalse(self.latch._exists(self.state_file))
+        for code in (errno.EACCES, errno.ENOTDIR, errno.EIO):
+            with self.subTest(errno=code):
+                with mock.patch.object(os, 'lstat',
+                                       side_effect=OSError(code, 'x')):
+                    with self.assertRaises(OSError):
+                        self.latch._exists(self.state_file)
+                    # ...and a restart on that error is latched, not clear.
+                    latch, heater, console = self.start_latch()
+                    self.assertTrue(latch.latched)
+
+    def test_marker_is_fsynced(self):
+        opened, synced = [], []
+        real_open, real_fsync = os.open, os.fsync
+
+        def spy_open(path, *a, **k):
+            fd = real_open(path, *a, **k)
+            if str(path).endswith('.trip'):
+                opened.append(fd)
+            return fd
+
+        def spy_fsync(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+        with mock.patch.object(os, 'open', spy_open), \
+                mock.patch.object(os, 'fsync', spy_fsync):
+            self.latch._create_trip_marker()
+        self.assertEqual(len(opened), 1)
+        self.assertIn(opened[0], synced)
+
+    def test_missing_state_directory_is_created_and_clear(self):
+        self.state_file = os.path.join(self.tempdir.name, 'cal', 'latch.state')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(os.path.isdir(os.path.dirname(self.state_file)))
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        # A trip now persists, so a restart is latched.
+        latch.cmd_latch(mock.Mock())
+        latch2, heater2, console2 = self.start_latch()
+        self.assertTrue(latch2.latched)
+
+    def test_uncreatable_state_directory_is_latched_with_a_message(self):
+        blocker = os.path.join(self.tempdir.name, 'afile')
+        with open(blocker, 'w') as f:
+            f.write('x')
+        self.state_file = os.path.join(blocker, 'latch.state')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.assertEqual(len(console), 1)
+        self.assertIn('cannot be created', console[0])
+
+    def test_persistence_failure_still_latches_and_warns(self):
+        cmd = mock.Mock()
+        with mock.patch.object(os, 'replace', side_effect=OSError('replace')), \
+                mock.patch.object(os, 'write', side_effect=OSError('write')):
+            self.latch.cmd_latch(cmd)
+        self.assertTrue(self.latch.latched)
+        self.assert_refused(self.heater.set_temp)
+        self.assertIn('could NOT be saved', cmd.respond_info.call_args[0][0])
+
+    def test_d018_absent_file_but_trip_marker_is_latched(self):
+        with open(self.state_file + '.trip', 'w') as f:
+            f.write('latched\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+
+    def test_d018_file_without_the_fault_key_is_corrupt(self):
+        # Not a latch file at all (e.g. a variables.cfg pointed at by
+        # mistake): present but unparseable, so latched.
+        with open(self.state_file, 'w') as f:
+            f.write('[Variables]\nmesh_valid = 1\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+
+    def test_d018_corrupt_files_are_latched_and_say_why(self):
+        for name, content in (('garbage', 'not a latch state'),
+                              ('empty', ''), ('binary', '\x00\x01\x02')):
+            with self.subTest(content=name):
+                with open(self.state_file, 'w') as f:
+                    f.write(content)
+                latch, heater, console = self.start_latch()
+                self.assertTrue(latch.latched)
+                with self.assertRaises(gcode.CommandError):
+                    heater.set_temp(215.)
+                self.assertEqual(heater.target_temp, 0.)
+                self.assertEqual(len(console), 1)
+                self.assertIn('corrupt or unreadable', console[0])
+                self.assertIn('Fan checked', console[0])
+
+    def test_d018_unreadable_file_is_latched_not_absent(self):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        real_open = open
+
+        def deny(path, *args, **kwargs):
+            if path == self.state_file:
+                raise PermissionError(13, 'Permission denied')
+            return real_open(path, *args, **kwargs)
+        with mock.patch('builtins.open', side_effect=deny):
+            latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.assertEqual(len(console), 1)
+
+    def test_d018_directory_or_dangling_symlink_is_latched(self):
+        os.mkdir(self.state_file)
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        os.rmdir(self.state_file)
+        try:
+            os.symlink(os.path.join(self.tempdir.name, 'nowhere'),
+                       self.state_file)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlinks unavailable here')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+
+    def test_d018_valid_file_fault_1_is_latched(self):
+        with open(self.state_file, 'w') as f:
+            f.write('latched\n')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        with self.assertRaises(gcode.CommandError):
+            heater.set_temp(215.)
+        self.assertEqual(console, [])
+
+    def test_d018_valid_file_fault_0_is_clear(self):
+        with open(self.state_file, 'w') as f:
+            f.write('unlatched\n')
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
+        heater.set_temp(215.)
+        self.assertEqual(heater.target_temp, 215.)
+
+    def test_d018_trip_then_restart_is_latched_until_cleared(self):
+        self.gcode.run_script('HOTEND_FAN_LATCH_SET')
+        latch, heater, console = self.start_latch()
+        self.assertTrue(latch.latched)
+        self.gcode.run_script('_HOTEND_FAN_LATCH_CONFIRM')
+        latch, heater, console = self.start_latch()
+        self.assertFalse(latch.latched)
+
+
+class ClearAfterRestart(_FanCheckTestCase):
+    """The macro variable fault_latched is 0 after every restart, the Python
+    latch is not: Fan checked must still reach _HOTEND_FAN_LATCH_CONFIRM."""
+
+    def restart_latched(self):
+        self.m1 = M1(self.variables_file, latched=True)
+        self.assertEqual(self.m1.macro_vars('HOTEND_FAN_CHECK')
+                         ['fault_latched'], 0)
+
+    def test_fan_checked_clears_after_a_restart(self):
+        self.restart_latched()
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertFalse(self.m1.latch_status['latched'])
+        self.assertFalse([r for r in self.m1.responses
+                          if 'No hot-end fan fault' in r])
+
+    def test_fan_checked_still_refuses_while_the_heatsink_is_hot(self):
+        self.restart_latched()
+        self.m1.heatsink['temperature'] = 55.
+        self.m1.latch_status['latched'] = True
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertTrue(self.m1.latch_status['latched'])
+        self.assertTrue(any('51C or more' in r for r in self.m1.responses))
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+    def test_nothing_latched_anywhere_says_so(self):
+        self.m1.run('HOTEND_FAN_FAULT_CLEAR')
+        self.assertTrue([r for r in self.m1.responses
+                         if 'No hot-end fan fault' in r])
+
+
 class UnlockReleaseRestoresOnce(_FanCheckTestCase):
     """Jack, 17 Oct: the unlock release turns the heater back on, but only
     once, only while no fan fault stands, and not after a stall, a cancel
@@ -869,8 +1413,9 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
     def test_no_reheat_while_the_fault_is_latched(self):
         # Counters below 3, the sticky fault alone standing.
         self.press()
+        self.m1.run('HOTEND_FAN_LATCH_SET')
         self.m1.run('SET_GCODE_VARIABLE MACRO=HOTEND_FAN_CHECK '
-                    'VARIABLE=fault_latched VALUE=1')
+                    'VARIABLE=fault_latched VALUE=0')
         self.assertNotIn('M104 S215.0', self.release())
         self.assertEqual(self.m1.extruder['target'], 0.)
         self.m1.responses.clear()
@@ -995,6 +1540,120 @@ class ButtonSim:
 
     def reconnect(self):
         self.printer.send('toolhead:reconnect')
+
+
+
+class CancelParkTests(_M1TestCase):
+    # A refused XY park used to abort PRINT_END before state/LED/unlock
+    # cleanup. Exercise the actual CANCEL_PRINT -> PRINT_END macro chain.
+    def test_cancel_continues_after_park_refusal(self):
+        m = self.m1
+        unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        unlock.update(e_was_enabled=1, changed_hotend_target=1)
+        m.raising_lines.add('G0 X195 Y10')
+        m.run('CANCEL_PRINT')
+        names = m.names()
+        self.assertEqual(m.print_stats['state'], 'cancelled')
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertIn('M84', names)
+        self.assertIn('RESTORE_GCODE_STATE NAME=STATE_PRINT_END', m.timeline)
+        self.assertIsNotNone(m.first_led())
+        self.assertLess(names.index('TURN_OFF_HEATERS'), names.index('G0'))
+        self.assertNotIn('CUT_FILAMENT', names)
+        self.assertEqual(names.count('G0'), 2)  # lift, then refused XY
+        self.assertEqual([r for r in m.responses if r.startswith('!!')],
+                         ['!! G0: failing on purpose'])
+        m.responses[:] = [r for r in m.responses if not r.startswith('!!')]
+        self.assertTrue(any('parking skipped' in r for r in m.responses),
+                        m.responses)
+        unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        self.assertEqual(unlock['e_was_enabled'], 0)
+        self.assertEqual(unlock['changed_hotend_target'], 0)
+
+
+
+class BedRemovedOutsideThePrintPhase(_M1TestCase):
+    """KAN-272: BED_REMOVED pauses only on bed_removal_detector's word that
+    a file was printing, whatever idle_timeout and print_stats read."""
+
+    def removed(self, while_printing):
+        m = self.m1
+        m.bed_detector.update(bedRemoved=True,
+                              removedWhilePrinting=while_printing)
+        m.timeline.clear()
+        m.run('BED_REMOVED')
+        return m.names()
+
+    def test_idle_with_startup_moves_does_not_pause(self):
+        # walnut, 2026-10-01: idle_timeout "Printing", nothing loaded.
+        m = self.m1
+        m.print_stats['state'] = 'standby'
+        names = self.removed(False)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines(), [])
+        # The non-pause actions still happen.
+        self.assertIn('_BED_MESH_INVALIDATE', names)
+        self.assertIn('RESPOND TYPE=command MSG="action:prompt_end"',
+                      m.timeline)
+        self.assertIn('SET_LED_EFFECT', names)
+
+    def test_print_end_tail_does_not_pause(self):
+        # print_stats still "printing" and the file still being read:
+        # PRINT_END is a line of it.
+        m = self.m1
+        m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        m.bed_detector['printEnding'] = True
+        names = self.removed(False)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertEqual(m.print_stats['state'], 'printing')
+        self.assertEqual(m.prompt_lines(), [])
+
+    def test_mid_print_pauses_and_says_so(self):
+        # KAN-79, unchanged. print_stats may already read "paused" by the
+        # time BED_REMOVED renders, because the detector paused the file.
+        m = self.m1
+        m.print_stats['state'] = 'paused'
+        names = self.removed(True)
+        self.assertIn('PAUSE_BASE', names)
+        self.assertTrue(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines()[0],
+                         'action:prompt_begin Bed Detached')
+
+    def test_resumed_before_this_rendered_pauses(self):
+        # Review of #KAN-272: plate pulled during RESUME's hot-end reheat
+        # wait. The print read "paused", so the detector sent nothing, and
+        # RESUME then restarted the file before BED_REMOVED got the mutex.
+        m = self.m1
+        m.print_stats['state'] = 'printing'
+        m.sdcard['is_active'] = True
+        names = self.removed(False)
+        self.assertIn('PAUSE_BASE', names)
+        self.assertTrue(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines()[0],
+                         'action:prompt_begin Bed Detached')
+
+    def test_cancelled_before_this_rendered_does_not_pause(self):
+        # The detector paused a printing file, but a CANCEL_PRINT already
+        # queued for the mutex ran first and ended the print.
+        m = self.m1
+        m.print_stats['state'] = 'cancelled'
+        names = self.removed(True)
+        self.assertNotIn('PAUSE_BASE', names)
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertEqual(m.prompt_lines(), [])
+
+    def test_print_end_marks_the_tail_after_the_heaters(self):
+        m = self.m1
+        m.timeline.clear()
+        m.run('PRINT_END')
+        names = m.names()
+        mark = m.timeline.index('SET_BED_REMOVAL_DETECTOR PRINT_ENDING=1')
+        self.assertLess(names.index('TURN_OFF_HEATERS'), mark)
+        self.assertLess(names.index('M107'), mark)
+        # Before the park, which is the window the ticket is about.
+        self.assertLess(mark, names.index('G0'))
 
 
 if __name__ == '__main__':
