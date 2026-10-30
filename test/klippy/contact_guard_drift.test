@@ -1,0 +1,24 @@
+# Drift with nothing touching.  Toward unloading it is followed without
+# limit (60 s, and out 540000 and back).  Toward pressing it is followed up
+# to max_absorbed_counts since the last real zero; past that it reads as
+# contact (review #86 R3-b: creep must not be absorbed without limit).
+# That is a nuisance, not a lockout: a 1 mm Z lift clears it (unit tests;
+# batch samples do not cover motion) and so does a Z home, shown here.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=60 DRIFT=9000
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=4 DRIFT=-9000
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=30 DRIFT=-9000
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+G28 Z
+G1 Z20 F600
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X100 Y50 F6000
