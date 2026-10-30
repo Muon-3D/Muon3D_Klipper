@@ -139,6 +139,12 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: the toolhead filament switch must keep its automatic insert hook,
+# suppress it mid-print, and pause before executing the runout script.
+start_test filament_sensor "Test filament insert and runout event policy"
+$PYTHON test/filament_sensor/test_runout_helper.py
+finish_test filament_sensor "Test filament insert and runout event policy"
+
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
