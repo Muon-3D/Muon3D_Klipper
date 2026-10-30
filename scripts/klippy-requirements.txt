@@ -10,8 +10,11 @@ greenlet==3.1.1 ; python_version >= '3.12'
 cffi==1.14.6 ; python_version < '3.12'
 cffi==1.17.1 ; python_version >= '3.12'
 # Jinja2 is used by gcode_macro.py
-Jinja2==2.11.3
-markupsafe==1.1.1       # Needed by Jinja2
+# MUON (KAN-124): 2.11.3 / markupsafe 1.1.1 were the Python 2-era pins, end of
+# life and missing the 3.1.x sandbox fixes. 3.1.6 needs Python 3.7 or later;
+# markupsafe 2.1.5 is the last release that still supports 3.7 and 3.8.
+Jinja2==3.1.6
+markupsafe==2.1.5       # Needed by Jinja2
 # pyserial is used by serialhdl.py (for USB and UART mcu connections)
 pyserial==3.4
 # python-can is used by serialhdl.py (for canbus mcu connections)
