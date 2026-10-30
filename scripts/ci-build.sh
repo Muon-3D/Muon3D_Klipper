@@ -149,6 +149,12 @@ start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
 finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 
+# MUON: host-side probe motion-path regression tests.  Put the CI virtualenv
+# first so run.sh's python3 has numpy (via scipy in tests-requirements.txt).
+start_test tap_path "Test probe tap motion paths"
+PATH=$(dirname "$PYTHON"):$PATH test/tap_path/run.sh
+finish_test tap_path "Test probe tap motion paths"
+
 # MUON: the Python 2 tests are removed. This fork is Python 3 only -- the
 # image builds klippy into a `python3 -m venv` and klippy carries 36
 # f-strings across 12 files, which Python 2 cannot parse at all. The tests
