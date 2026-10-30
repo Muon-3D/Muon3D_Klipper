@@ -1,0 +1,66 @@
+# User-selectable LED modes (KAN-480)
+DICTIONARY linuxprocess.dict
+CONFIG led_modes.cfg
+
+# Every mode renders through the parametrized led_effect (or LED_RESUME /
+# STOP_LED_EFFECTS for status/off); an unknown MODE responds, not fails.
+LED_MODE MODE=solid H=30 BRIGHT=80
+LED_MODE MODE=gradient H=30 H2=210 BRIGHT=60
+LED_MODE MODE=rainbow SPEED=90
+LED_MODE MODE=breathe H=120 SPEED=20
+LED_MODE MODE=chase H=0 H2=180 SPEED=60
+LED_MODE MODE=off
+LED_MODE MODE=status
+LED_MODE MODE=bogus
+LED_MODE
+LED_MODE MODE=solid H=420 BRIGHT=200 SPEED=2
+
+# Restore path: muon_led is saved, mode reset, restore re-reads it.
+LED_MODE MODE=rainbow H=200 SPEED=75
+SET_GCODE_VARIABLE MACRO=LED_MODE VARIABLE=mode VALUE="'status'"
+UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE DURATION=0
+
+# LED_READY honours the saved user mode instead of the ready effect.
+LED_MODE MODE=breathe H=90
+LED_READY
+LED_MODE MODE=status
+LED_READY
+
+# Review findings on #61, the parts with no timer in them. The timed
+# return after LED_COMPLETE is in scripts/test_m1_led_modes.py.
+# This config has no print_stats, so no print is running: a mode chosen
+# while a print's effect is left lit shows now (KAN-568). Deferral
+# during a running print is in scripts/test_m1_led_modes.py.
+LED_PRINTING
+LED_MODE MODE=solid H=30
+ASSERT_LED_STATE STATE=LED_READY
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+ASSERT_LED EFFECT=progress_left ENABLED=0
+LED_INFO
+LED_MODE MODE=solid H=30
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+ASSERT_LED EFFECT=info ENABLED=0
+
+# LED_READY records READY with a user mode too, so going back to
+# 'status' shows ready, not the info effect from before.
+LED_INFO
+LED_READY
+ASSERT_LED_STATE STATE=LED_READY
+LED_MODE MODE=status
+ASSERT_LED EFFECT=ready ENABLED=1
+ASSERT_LED EFFECT=info ENABLED=0
+
+# The LED timeout covers a user mode: M=0 turns it off.
+LED_MODE MODE=solid H=30
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+LED_TIMEOUT_SET M=0
+ASSERT_LED EFFECT=muon_mode ENABLED=0
+LED_TIMEOUT_SET M=-1
+ASSERT_LED EFFECT=muon_mode ENABLED=1
+
+# The end of a print shows the glow first; a mode change then shows now.
+LED_COMPLETE
+ASSERT_LED EFFECT=complete ENABLED=1
+LED_MODE MODE=status
+ASSERT_LED EFFECT=ready ENABLED=1
+ASSERT_LED EFFECT=complete ENABLED=0
