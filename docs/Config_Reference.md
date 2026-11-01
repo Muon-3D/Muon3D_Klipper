@@ -1970,6 +1970,123 @@ Support for LIS3DH accelerometers.
 #   See the "adxl345" section for information on this parameter.
 ```
 
+### [adxl345_probe]
+
+X/Y virtual endstops (and an optional Z probe) driven by an
+accelerometer's tap interrupt. The toolhead is driven into the frame and
+the impact, detected by the chip, is wired to an MCU pin that acts as the
+endstop. The chip is an [adxl345](#adxl345) or a [lis2dw](#lis2dw)
+(LIS2DW12 only, on SPI) section; the backend follows from the section
+`chip` names. See [Accelerometer tap homing](Accel_Tap_Homing.md) for
+how the settings map onto each chip's registers.
+
+```
+[adxl345_probe]
+#chip: adxl345
+#   Name of the accelerometer config section: an adxl345 section or a
+#   lis2dw section. The default is "adxl345".
+probe_pin:
+#   MCU pin the chip's interrupt output is wired to. This parameter must
+#   be provided.
+int_pin:
+#   Chip interrupt output that is wired to probe_pin: int1 or int2,
+#   prefixed with "!" if the interrupt should be active low. The
+#   LIS2DW12 can route tap and wake-up events to INT1 only. This
+#   parameter must be provided.
+#tap_thresh: 5000
+#   Tap threshold in mm/s^2 (9806.65 mm/s^2 = 1g). The chip quantises
+#   it: ADXL345 62.5mg steps (rounded down). LIS2DW12 single_tap uses
+#   full_scale/32 steps (125mg at +-4g), wake_up full_scale/64 steps
+#   (62.5mg at +-4g), rounded to the nearest step, from 1 step to 31
+#   (single_tap) or 63 (wake_up) steps. The value the chip uses is
+#   reported by SET_ACCEL_PROBE and in the status as
+#   tap_thresh_effective.
+#tap_dur: 0.01
+#   Longest time, in seconds, an impact may stay above tap_thresh and
+#   still count as a tap. ADXL345: 0.625ms steps, up to 0.1s. LIS2DW12
+#   single_tap: the SHOCK window, which is 4/ODR, 8/ODR, 16/ODR or
+#   24/ODR (2.5, 5, 10 or 15ms at 1600Hz); the shortest window at least
+#   tap_dur is used, and a tap_dur longer than 24/ODR is a config error.
+#   Not used by the LIS2DW12 wake_up event.
+#tap_axes: xyz
+#   Printer axes whose taps the Z profile reacts to. ADXL345: written
+#   to TAP_AXES unchanged, where "x" enables the chip's Z axis and "z"
+#   its X axis (the A1 tuning was done that way). LIS2DW12: printer
+#   axes, translated to chip axes through the lis2dw section's axes_map.
+#   Not enforceable with the LIS2DW12 wake_up event, which fires on any
+#   axis.
+#x_tap_thresh:
+#x_tap_dur:
+#x_tap_axes: x
+#y_tap_thresh:
+#y_tap_dur:
+#y_tap_axes: y
+#z_tap_thresh:
+#z_tap_dur:
+#z_tap_axes:
+#   Per-axis profile overrides. The thresh and dur defaults are
+#   tap_thresh and tap_dur; x_tap_axes defaults to "x", y_tap_axes to
+#   "y" and z_tap_axes to tap_axes.
+#homing_tap_arm_delay: 0.030
+#x_homing_tap_arm_delay:
+#y_homing_tap_arm_delay:
+#z_homing_tap_arm_delay:
+#   Seconds after the start of a homing move before the interrupt is
+#   armed, so the start of the move is not taken for the impact. Armed
+#   at the move's print_time on the chip's MCU clock.
+#tap_confirm_samples: 1
+#   Agreeing taps required before an X/Y home is accepted. Above 1, the
+#   axis backs off tap_confirm_retract_dist and re-approaches until that
+#   many consecutive taps land within tap_confirm_tolerance.
+#tap_confirm_tolerance: 0.2
+#   Largest distance (mm) between consecutive agreeing taps.
+#tap_confirm_retries: 2
+#   Disagreements allowed before the home fails.
+#tap_confirm_retract_dist: 3
+#   Back-off distance (mm) between confirmation taps. Must exceed
+#   homing_speed * homing_tap_arm_delay.
+#tap_confirm_retract_speed:
+#   Default is the rail's homing_retract_speed.
+#tap_confirm_speed:
+#   Re-approach speed. Default is the rail's homing_speed.
+#tap_confirm_seek_retries: 1
+#   Times the seek resumes after a tap is judged spurious (no contact
+#   within 2 * tap_confirm_retract_dist).
+#tap_confirm_max_seek_dist:
+#   Travel budget (mm) for resumed seeks. Default is the axis travel.
+#   Every tap_confirm_ option also accepts an x_ or y_ prefix.
+#lis2dw_tap_event: single_tap
+#   LIS2DW12 only. "single_tap" uses the tap engine (per-axis enables,
+#   tap_dur as the SHOCK window). "wake_up" uses the wake-up engine: it
+#   fires as soon as the high-pass filtered acceleration exceeds the
+#   threshold on any axis, with no duration limit and no per-axis
+#   selection.
+#lis2dw_odr: 1600
+#   LIS2DW12 only. Output data rate while tap detection is set up: 400,
+#   800 or 1600 (Hz). Sets the timing resolution of the trigger and the
+#   SHOCK window steps.
+#lis2dw_full_scale: 4
+#   LIS2DW12 only. Full scale in g: 2, 4, 8 or 16. Thresholds are
+#   relative to it. Streaming (lis2dw.py, resonance testing) runs at
+#   1600Hz +-16g and rewrites both registers; tap detection restores its
+#   own on the next homing move, and refuses to run during a stream
+#   unless lis2dw_odr is 1600 and lis2dw_full_scale is 16.
+#enable_z_probe: False
+#   Register a [probe] that uses the Z profile and z_virtual_endstop.
+#z_offset:
+#   Required when enable_z_probe is True.
+#activate_gcode:
+#deactivate_gcode:
+#   G-Code run before and after each Z probing move.
+#disable_fans:
+#   Comma separated fan objects switched off while Z probing.
+```
+
+The pins are `adxl345_probe:x_virtual_endstop`,
+`adxl345_probe:y_virtual_endstop` and (with enable_z_probe)
+`adxl345_probe:z_virtual_endstop`. The X and Y rails take their
+`position_endstop` from their stepper sections.
+
 ### [bmi160]
 
 BMI160 accelerometer. This sensor can be queried via I2C or SPI bus.
@@ -3057,6 +3174,73 @@ sensor_pin:
 #   The above parameters control the sensor parameters of MAX31865
 #   chips. The defaults for each parameter are next to the parameter
 #   name in the above list.
+```
+
+### Muon B1 hotend sensor (muon_hotend)
+
+The Muon B1 toolhead reads its hotend sensor through the shared
+`[muon_ads1220]` chip (see the load cell section). The hotend may carry a
+100k NTC (ATC Semitec 104NT-4-R025H42G) or a PT1000. Which one is fitted is
+detected every time the toolhead connects, with the heater held off
+throughout, and heating is refused until it is known:
+
+1. The sensor is measured in PT1000 mode (100uA IDAC, safe for both). An
+   IDAC at compliance, or a resistance outside 800-3000 ohm, can only be
+   an NTC.
+2. Inside that band the resistance is watched for a few seconds: rising
+   means a hot NTC cooling, falling a hot PT1000 cooling, steady a PT1000
+   at ambient (confirmed against `heatsink_sensor`).
+3. An NTC is then switched to its divider excitation and checked once
+   settled.
+
+The detected hotend's `max_temp`, PID and mcu range check are then applied.
+An open or shorted sensor shuts the toolhead mcu down from the mcu side; on
+a non-critical toolhead that is a toolhead disconnect.
+
+```
+sensor_type: muon_hotend
+muon_ads1220:
+#   The name of the [muon_ads1220] section. This parameter must be
+#   provided.
+#heatsink_sensor:
+#   A temperature object (e.g. "temperature_fan toolhead_heatsink") used
+#   to confirm a PT1000 at ambient during detection.
+#hotend_type: auto
+#   auto, ntc or pt1000. A fixed type skips the detection (not the
+#   settling time).
+#ntc_max_temp: 265
+#pt1000_max_temp: 350
+#   max_temp applied for each hotend type. Each must be at or below the
+#   heater's own max_temp, which should therefore be set to the higher of
+#   the two.
+#ntc_pid_Kp:
+#ntc_pid_Ki:
+#ntc_pid_Kd:
+#pt1000_pid_Kp:
+#pt1000_pid_Ki:
+#pt1000_pid_Kd:
+#   Optional PID parameters applied for each hotend type (control: pid
+#   only). When not set the heater's own pid_Kp etc. are kept.
+#ntc_temperature1: 25
+#ntc_resistance1: 100000
+#ntc_temperature2: 160
+#ntc_resistance2: 1074
+#ntc_temperature3: 300
+#ntc_resistance3: 82.78
+#   NTC Steinhart-Hart points. The defaults are the Semitec 104NT-4.
+#range_check_count: 4
+#   Consecutive out of range readings before the mcu shuts down.
+#detect_min_resistance: 800
+#detect_max_resistance: 3000
+#   The band in which a PT1000 and a hot NTC cannot be told apart from
+#   one reading.
+#detect_steady_rate: 1.0
+#   Resistance change (ohm/s) below which the reading counts as steady.
+#detect_watch_time: 3.0
+#detect_settle_time: 1.5
+#ntc_settle_time: 1.0
+#detect_timeout: 30
+#detect_heatsink_tolerance: 15
 ```
 
 ### BMP180/BMP280/BME280/BMP388/BME680 temperature sensor
@@ -5589,6 +5773,98 @@ cs_pin:
 #vref:
 #   The selected voltage reference. Valid values are: 'internal', 'REF0', 'REF1'
 #   and 'analog_supply'. Default is 'internal'.
+```
+
+#### Muon B1 shared ADS1220 (muon_ads1220)
+The Muon B1 toolhead has one ADS1220 that measures both the load cell and
+the hotend temperature sensor, and its DRDY pin is not connected. The chip
+is configured once in a `[muon_ads1220]` section; the load cell and the
+hotend heater each refer to it by name. See also the `muon_hotend`
+temperature sensor.
+
+The mcu reads RDATA at 2.2 times the nominal conversion rate. A changed
+value is a new conversion; an unchanged value is reported again only once
+a conversion must have completed since the last one, so a conversion that
+happens to repeat the previous 24-bit code is not lost. Each conversion
+is reported once, within one read interval (230us at 2000SPS) of
+completing. Every `temperature_interval` the input multiplexer is switched
+to the hotend sensor for one or two fully settled conversions (about 1.7ms
+for an NTC and 2.8ms for a PT1000 at 2000SPS) and back. Those slices are
+paused while a load cell probe trigger is armed, and the heater is held
+off from the tare to the end of each tap. The mcu range checks the hotend
+reading itself, and checks the chip's configuration registers on every
+temperature read.
+
+The rate reported to the load cell (1977 for sample_rate 2000, i.e.
+4.096MHz / 2072) is the chip's nominal conversion rate, which is what a
+probe's filters see: temperature reads pause while it is armed. Outside
+probing, `LOAD_CELL_DIAGNOSTIC` measures less: the temperature slices take
+about 1.3% of the samples with a PT1000 (or while detection is failing,
+which leaves the chip in PT1000 mode) and 0.7% with an NTC, and the
+internal oscillator may be up to 2% slow. `MUON_ADC_STATS` reports the
+two separately.
+
+```
+[muon_ads1220 toolhead]
+cs_pin:
+#   The pin connected to the ADS1220 chip select line. This parameter
+#   must be provided.
+#spi_speed: 4000000
+#   The SPI speed (in hz). The mcu reads the chip ~4400 times a second
+#   at 2000SPS, so this should stay fast. The default is 4000000.
+#spi_bus:
+#spi_software_sclk_pin:
+#spi_software_mosi_pin:
+#spi_software_miso_pin:
+#   See the "common SPI settings" section for a description of the
+#   above parameters.
+high_side_pin:
+#   The pin that switches 3.3V onto the hotend sensor for an NTC (B1:
+#   !toolhead:gpio2, a P-FET that is on when the pin is low). It is off
+#   for a PT1000, which is excited by the chip's IDAC instead. This
+#   parameter must be provided.
+#gain: 64
+#sample_rate: 2000
+#   Load cell gain and turbo mode sample rate (40, 90, 180, 350, 660,
+#   1200 or 2000). The reference is always the analog supply.
+#input_mux: AIN0_AIN1
+#pga_bypass: False
+#   Load cell input pair and PGA setting, as for the ads1220 sensor.
+#reference_resistor: 4700
+#   The resistor from AIN3 (TEMP_SENSOR_LO) to ground (B1: R43).
+#pt1000_idac_current: 100
+#   IDAC current in uA for a PT1000 (50, 100 or 250). The IDAC is routed
+#   to REFP0. The default is 100.
+#pt1000_gain: 4
+#   Gain (1, 2 or 4, PGA bypassed) for both PT1000 readings.
+#analog_supply_voltage: 3.3
+#   Only used to predict the reference resistor reading during hotend
+#   detection.
+#temperature_interval: 0.200
+#   Time between hotend temperature reads (0.100 to 0.250 seconds).
+#temperature_settle_conversions: 2
+#   Conversions to wait after switching the multiplexer to the hotend
+#   sensor before reading. The first conversion after a register write
+#   is already fully settled; the second adds margin for the inputs.
+#max_temperature_pause: 4.0
+#   How long temperature reads may pause for an armed probe. Past this
+#   the mcu takes a temperature read anyway (logged as a warning). The
+#   heater is held off for the whole tap, so this only bounds how stale
+#   the reported temperature can get.
+#stall_conversions: 64
+#   An unsaturated load cell reading that repeats for this many
+#   conversions means the chip stopped converting; an armed probe then
+#   fails with an error.
+```
+
+To use the chip as a load cell, set `sensor_type: muon_ads1220` and
+`muon_ads1220: <name>` in a `[load_cell]` or `[load_cell_probe]` section:
+```
+[load_cell_probe]
+sensor_type: muon_ads1220
+muon_ads1220: toolhead
+#   The name of the [muon_ads1220] section. This parameter must be
+#   provided.
 ```
 
 ### [load_cell_probe]

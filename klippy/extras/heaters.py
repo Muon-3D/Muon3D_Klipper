@@ -55,6 +55,9 @@ class Heater:
         # pwm caching
         self.next_pwm_time = 0.
         self.last_pwm_value = 0.
+        self.last_pwm_time = 0.
+        # Named holds that force the heater off (see hold_pwm)
+        self.pwm_holds = {}
         # Setup control algorithm sub-class
         # algos = {'watermark': ControlBangBang, 'pid': ControlPID}
         # algo = config.getchoice('control', algos)
@@ -145,13 +148,15 @@ class Heater:
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
     def set_pwm(self, read_time, value):
-        if self.target_temp <= 0. or read_time > self.verify_mainthread_time:
+        if (self.target_temp <= 0. or read_time > self.verify_mainthread_time
+                or self.pwm_holds):
             value = 0.
         if ((read_time < self.next_pwm_time or not self.last_pwm_value)
             and abs(value - self.last_pwm_value) < 0.05):
             # No significant change in value - can suppress update
             return
-        pwm_time = read_time + self.pwm_delay
+        pwm_time = max(read_time + self.pwm_delay, self.last_pwm_time)
+        self.last_pwm_time = pwm_time
         self.next_pwm_time = (pwm_time + MAX_HEAT_TIME
                               - (3. * self.pwm_delay + 0.001))
         self.last_pwm_value = value
@@ -184,6 +189,30 @@ class Heater:
         #logging.debug("temp: %.3f %f = %f", read_time, temp)
     def _handle_shutdown(self):
         self.verify_mainthread_time = -999.
+    # MUON: a hold forces the heater off from print_time until it is
+    # released, without changing target_temp, so control resumes where it
+    # was. A sensor uses it to keep heater switching out of a measurement,
+    # or (with refuse_msg) to refuse heating while it cannot be trusted.
+    # print_time=None only records the hold: for a heater whose mcu is
+    # gone and so has already turned the pin off itself.
+    def hold_pwm(self, name, print_time=None, refuse_msg=None):
+        with self.lock:
+            self.pwm_holds[name] = refuse_msg
+            if print_time is None:
+                self.last_pwm_value = 0.
+                return
+            if not self.last_pwm_value:
+                return
+            pwm_time = max(print_time, self.last_pwm_time)
+            self.last_pwm_time = pwm_time
+            self.last_pwm_value = 0.
+            self.next_pwm_time = 0.
+            self.mcu_pwm.set_pwm(pwm_time, 0.)
+    def release_pwm(self, name):
+        with self.lock:
+            self.pwm_holds.pop(name, None)
+    def get_pwm_holds(self):
+        return dict(self.pwm_holds)
     # External commands
     def get_name(self):
         return self.name
@@ -198,6 +227,10 @@ class Heater:
             raise self.printer.command_error(
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
+        if degrees:
+            for refuse_msg in self.pwm_holds.values():
+                if refuse_msg:
+                    raise self.printer.command_error(refuse_msg)
         with self.lock:
             if degrees != 0.0 and hasattr(self.control, "check_valid"):
                 self.control.check_valid()
