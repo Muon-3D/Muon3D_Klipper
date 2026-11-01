@@ -146,6 +146,10 @@ finish_test z_power "Test z_power decisions"
 start_test heater_supply "Test heater_supply and MPC on a simulated bed"
 $PYTHON test/heater_supply/test_heater_supply.py
 finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
+# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
+start_test fan_modes "Test fan_modes speed table mapping"
+$PYTHON test/fan_modes/test_fan_modes.py
+finish_test fan_modes "Test fan_modes speed table mapping"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
