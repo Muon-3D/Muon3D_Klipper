@@ -4660,8 +4660,13 @@ fan can be run at a fraction of what stock filament profiles ask for
 without editing every profile. `SET_PART_FAN SPEED=<0..1>` carries the
 commanded speed (an M106 macro calls it), and `SET_PRINT_MODE MODE=<mode>`
 selects the mode and re-applies the commanded speed under the new curve.
-The status object reports `mode`, `modes`, `commanded_speed` and
-`output_speed`.
+With a `speed_table`, each curve maps the command to a target fan speed
+in rpm instead of a duty, and the table converts that speed to a duty.
+This suits a fan whose speed is far from proportional to its duty, or
+that does not start at small duties: a curve in rpm gives an even step of
+air per step of command. It is open loop; the tachometer is not read.
+The status object reports `mode`, `modes`, `commanded_speed`,
+`target_rpm` (None without a `speed_table`) and `output_speed` (the duty).
 
 ```
 [fan_modes]
@@ -4670,9 +4675,16 @@ The status object reports `mode`, `modes`, `commanded_speed` and
 #modes: normal, quiet, turbo
 #   The available modes. Each needs a <mode>_curve.
 #normal_curve:
-#   Comma separated commanded:output pairs, both 0..1, commanded
-#   increasing from 0 to 1, interpolated linearly. For example
-#   "0:0, 1:0.30" runs the fan at 30% when 100% is commanded.
+#   Comma separated commanded:output pairs, commanded increasing from
+#   0 to 1, interpolated linearly. Without a speed_table the output is
+#   a duty (0..1): "0:0, 1:0.30" runs the fan at 30% duty when 100% is
+#   commanded. With a speed_table the output is a target speed in rpm,
+#   up to the table's highest rpm: "0:0, 0.01:3400, 1:18300".
+#speed_table:
+#   Optional. Comma separated rpm:duty pairs measured on the fan, both
+#   increasing, interpolated linearly. The first pair is the lowest
+#   speed at which the fan follows its duty: a target above 0 rpm but
+#   below it runs at that pair's duty, and 0 rpm is off.
 #default_mode: normal
 #   The mode at startup.
 #normal_speed_factor:

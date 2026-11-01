@@ -126,6 +126,11 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
+start_test fan_modes "Test fan_modes speed table mapping"
+$PYTHON test/fan_modes/test_fan_modes.py
+finish_test fan_modes "Test fan_modes speed table mapping"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
