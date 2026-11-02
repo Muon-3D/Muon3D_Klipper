@@ -68,6 +68,9 @@ $PYTHON scripts/test_m1_purge_line.py
 $PYTHON scripts/test_m1_print_start_first_tap.py
 # KAN-205: a bad CPU, motor-driver or PSU fan trips once per episode.
 $PYTHON scripts/test_m1_fan_stoppage.py
+# KAN-742: the unlock press reports the contact_guard offset its retract
+# leaves, moves nothing, and never uses REZERO FORCE.
+$PYTHON scripts/test_m1_unlock_guard_offset.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
