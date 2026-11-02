@@ -41,7 +41,7 @@ INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
 # Commands the macros under test send that these files don't define, plus
 # CUT_FILAMENT and LOAD_FILAMENT (filament.cfg's, which only move).
 STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
-         'M118', 'RESPOND', 'FORCE_MOVE', 'SET_STEPPER_ENABLE',
+         'M118', 'RESPOND', 'COLD_RETRACT', 'SET_STEPPER_ENABLE',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
@@ -514,7 +514,7 @@ class HeaterOffBeforeAnything(_M1TestCase):
 
     def test_unlock_press_when_the_retract_raises(self):
         self.arm_unlock()
-        self.m1.raising.add('FORCE_MOVE')
+        self.m1.raising.add('COLD_RETRACT')
         self.run_failing_stub('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assertEqual(self.m1.extruder['target'], 0.)
         # And RELEASE still knows to put the heat back.
