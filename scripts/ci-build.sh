@@ -71,6 +71,8 @@ $PYTHON scripts/test_m1_fan_stoppage.py
 # KAN-742: the unlock press reports the contact_guard offset its retract
 # leaves, moves nothing, and never uses REZERO FORCE.
 $PYTHON scripts/test_m1_unlock_guard_offset.py
+# KAN-747: [boot_id] reads the Linux boot id, and an unreadable one is unknown.
+$PYTHON scripts/test_boot_id.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
