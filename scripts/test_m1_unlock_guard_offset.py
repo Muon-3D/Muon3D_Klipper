@@ -42,7 +42,7 @@ class UnlockReportsGuardOffset(_M1TestCase):
 
     def after_retract(self):
         names = self.m1.names()
-        return names[names.index('FORCE_MOVE') + 1:]
+        return names[names.index('COLD_RETRACT') + 1:]
 
     def test_no_motion_in_any_state(self):
         for state in ('paused', 'standby', 'printing', 'complete'):
@@ -62,7 +62,7 @@ class UnlockReportsGuardOffset(_M1TestCase):
         self.assertEqual(rezero, ['SET_CONTACT_GUARD REZERO=1 TRY=1'])
         names = self.m1.names()
         at = names.index('SET_CONTACT_GUARD')
-        self.assertLess(names.index('FORCE_MOVE'), at)
+        self.assertLess(names.index('COLD_RETRACT'), at)
         self.assertLess(self.m1.heater_off_index(), at)
         self.assertLess(self.m1.first_led(), at)
 
