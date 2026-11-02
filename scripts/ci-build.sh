@@ -66,6 +66,8 @@ $PYTHON scripts/test_m1_heater_before_leds.py
 $PYTHON scripts/test_m1_purge_line.py
 # KAN-234: PRINT_START's first tap is made below the ooze floor.
 $PYTHON scripts/test_m1_print_start_first_tap.py
+# KAN-205: a bad CPU, motor-driver or PSU fan trips once per episode.
+$PYTHON scripts/test_m1_fan_stoppage.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
