@@ -4,8 +4,17 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os, re, logging, collections, shlex, operator
+import greenlet
 
 class CommandError(Exception):
+    pass
+
+# Raised inside an abortable script once request_abort() has been called
+# (Muon: cancelling a print while a long macro such as PRINT_START runs).
+# A CommandError so that every existing "except command_error" cleanup path
+# still runs, and "gcode:command_error" is still sent so probes end their
+# sessions.  It is not reported as an error: nothing failed.
+class CommandAbort(CommandError):
     pass
 
 # Custom "tuple" class for coordinates - add easy access to x, y, z components
@@ -98,6 +107,7 @@ class GCodeCommand:
 # Parse and dispatch G-Code commands
 class GCodeDispatch:
     error = CommandError
+    abort_error = CommandAbort
     Coord = Coord
     def __init__(self, printer):
         self.printer = printer
@@ -109,6 +119,10 @@ class GCodeDispatch:
         # Command handling
         self.is_printer_ready = False
         self.mutex = printer.get_reactor().mutex()
+        # Abort scope, see run_abortable_script()
+        self._abort_owner = None
+        self._abort_msg = None
+        self._abort_hold = 0
         self.output_callbacks = []
         self.base_gcode_handlers = self.gcode_handlers = {}
         self.ready_gcode_handlers = {}
@@ -220,7 +234,15 @@ class GCodeDispatch:
             # Invoke handler for command
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
             try:
+                self.check_abort()
                 handler(gcmd)
+            except CommandAbort as e:
+                # Unwinds every macro level back to run_abortable_script().
+                # Reported once there, not once per level as an error.
+                self.printer.send_event("gcode:command_error")
+                if not need_ack:
+                    raise
+                self.respond_info(str(e))
             except self.error as e:
                 self._respond_error(str(e))
                 self.printer.send_event("gcode:command_error")
@@ -234,11 +256,55 @@ class GCodeDispatch:
                 if not need_ack:
                     raise
             gcmd.ack()
-    def run_script_from_command(self, script):
-        self._process_commands(script.split('\n'), need_ack=False)
+    def run_script_from_command(self, script, abortable=False):
+        # See run_abortable_script().  A python command running gcode of its
+        # own (SHAPER_CALIBRATE restoring SET_VELOCITY_LIMIT, a homing
+        # override template) must run all of it, so everything beneath it
+        # is held non-abortable.  Only a gcode_macro with abortable: True
+        # passes abortable, and it too is held inside a non-abortable one.
+        hold = not abortable and greenlet.getcurrent() is self._abort_owner
+        if hold:
+            self._abort_hold += 1
+        try:
+            self._process_commands(script.split('\n'), need_ack=False)
+        finally:
+            if hold:
+                self._abort_hold -= 1
     def run_script(self, script):
         with self.mutex:
             self._process_commands(script.split('\n'), need_ack=False)
+    # Abortable scripts.  A script holds the gcode mutex until it returns, so
+    # a request queued behind it (CANCEL_PRINT from the webhook) waits for the
+    # whole of it -- for a PRINT_START macro that is minutes.  A script run
+    # here can instead be stopped by request_abort() from another greenlet:
+    # CommandAbort is raised between the lines of the script itself and of
+    # any macro declared abortable: True (PRINT_START), and at check_abort()
+    # inside a long wait (TEMPERATURE_WAIT, M109, NOZZLE_WIPE_SMART) that
+    # such a line calls.  Never inside gcode that a python command runs
+    # itself, nor inside an ordinary macro, so no command and no macro is
+    # left half done.  Only the greenlet running the script is
+    # affected, so a timer running its own commands meanwhile is not.  Moves
+    # already queued are not stopped; the caller follows up with something
+    # that waits for them (PRINT_END's M400).
+    def run_abortable_script(self, script):
+        with self.mutex:
+            self._abort_owner = greenlet.getcurrent()
+            self._abort_msg = None
+            self._abort_hold = 0
+            try:
+                self._process_commands(script.split('\n'), need_ack=False)
+            finally:
+                self._abort_owner = None
+                self._abort_msg = None
+    def request_abort(self, msg):
+        if self._abort_owner is None:
+            return False
+        self._abort_msg = msg
+        return True
+    def check_abort(self):
+        if (self._abort_msg is not None and not self._abort_hold
+                and greenlet.getcurrent() is self._abort_owner):
+            raise CommandAbort(self._abort_msg)
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):
