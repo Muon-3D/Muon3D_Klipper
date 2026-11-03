@@ -153,6 +153,12 @@ start_test homing_scope "Test homing_scope"
 $PYTHON test/homing_scope/test_homing_scope.py
 finish_test homing_scope "Test homing_scope"
 
+# MUON: Y homing current is a setting and always put back (KAN-1361).
+start_test homing_y "Test Y homing current and restore"
+$PYTHON test/homing_scope/test_homing_y_current.py
+$PYTHON test/tap_path/test_tap_compare_log.py
+finish_test homing_y "Test Y homing current and restore"
+
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py

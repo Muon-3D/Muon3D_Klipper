@@ -43,6 +43,12 @@ class FakeReactor:
 class FakeGCode:
     def __init__(self):
         self.commands = {}
+        self.scripts = []
+        self.script_error = None
+    def run_script_from_command(self, text):
+        self.scripts.append(text)
+        if self.script_error is not None:
+            raise self.script_error
     def register_command(self, name, func, desc=None):
         if func is None:
             return self.commands.pop(name, None)
@@ -96,10 +102,11 @@ def check(cond, what):
     print("ok  " + what)
 
 
-def rig(g28):
+def rig(g28, cleanup=None):
     p = FakePrinter()
     p.gcode.register_command('G28', g28)
-    scope = homing_scope.load_config(FakeConfig(p))
+    values = {'cleanup_gcode': cleanup} if cleanup else None
+    scope = homing_scope.load_config(FakeConfig(p, values))
     p.send_event("klippy:ready")
     return p, scope
 
@@ -149,6 +156,64 @@ def test_nested_g28():
     p.gcode.run('G28', 'outer')
     check(depth == [1, 2], "nested G28 nests the scope")
     check(not scope.in_scope, "scope closes after the outer G28")
+
+
+def test_cleanup_runs_after_a_good_g28():
+    def g28(gcmd):
+        p.gcode.scripts.append("<g28>")
+    p, scope = rig(g28, cleanup="RESTORE")
+    p.gcode.run('G28')
+    check(p.gcode.scripts == ["<g28>", "RESTORE"], "cleanup follows the G28")
+
+
+def test_cleanup_runs_after_a_failed_g28():
+    # KAN-1361: an error in G28.1 skips the rest of the macro; the driver
+    # settings it changed are put back here
+    def g28(gcmd):
+        p.gcode.scripts.append("<g28>")
+        raise CommandError("taps disagree")
+    p, scope = rig(g28, cleanup="RESTORE")
+    try:
+        p.gcode.run('G28')
+    except CommandError as e:
+        check("disagree" in str(e), "the G28 error still reaches the caller")
+    else:
+        raise AssertionError("G28 error swallowed")
+    check(p.gcode.scripts == ["<g28>", "RESTORE"], "cleanup ran on failure")
+    check(p.toolhead.kin.cleared == ["xyz"], "homing state still cleared")
+
+
+def test_cleanup_failure_does_not_hide_the_g28_error():
+    def g28(gcmd):
+        raise CommandError("taps disagree")
+    p, scope = rig(g28, cleanup="RESTORE")
+    p.gcode.script_error = CommandError("Klipper in shutdown")
+    try:
+        p.gcode.run('G28')
+    except CommandError as e:
+        check("disagree" in str(e), "the G28 error wins over the cleanup error")
+    else:
+        raise AssertionError("G28 error swallowed")
+    check(p.toolhead.kin.cleared == ["xyz"],
+          "homing state is cleared even though the cleanup failed")
+
+
+def test_cleanup_runs_once_for_nested_g28():
+    def g28(gcmd):
+        if gcmd == 'outer':
+            p.gcode.run('G28', 'inner')
+            check(p.gcode.scripts == [], "no cleanup while the outer G28 runs")
+    p, scope = rig(g28, cleanup="RESTORE")
+    p.gcode.run('G28', 'outer')
+    check(p.gcode.scripts == ["RESTORE"], "one cleanup for the outermost G28")
+
+
+def test_no_cleanup_gcode_by_default():
+    def g28(gcmd):
+        pass
+    p, scope = rig(g28)
+    p.gcode.run('G28')
+    check(p.gcode.scripts == [], "nothing runs without cleanup_gcode")
 
 
 def test_requires_the_command():

@@ -22,6 +22,22 @@ TAP_TEST_SAMPLE_COUNT = 4
 TAP_TEST_REST_TIME = .001
 
 
+def format_tap_comparison(axis, prev, new, step_dists, spread,
+                          speed=0., approach_dist=0., travelled=0.):
+    """One log line for a confirmation comparison: both trigger positions
+    in mm (raw MCU step position * step distance, per stepper), the spread,
+    and how the new tap was approached (speed, distance offered, distance
+    actually travelled).  Logged for every comparison, agreeing or not, so
+    a slip of one electrical cycle shows its sign (KAN-1361)."""
+    def mm(trig):
+        return ' '.join('%s=%.3f' % (n, trig[n] * sd)
+                        for n, sd in sorted(step_dists.items()))
+    return ("adxl345_probe: %s tap compare: prev %s mm, new %s mm,"
+            " spread %.3fmm, approach %.1fmm/s over %.2fmm, travelled"
+            " %.3fmm" % (axis, mm(prev), mm(new), spread, speed,
+                         approach_dist, travelled))
+
+
 class _FileOutputRegs:
     # Stand-in for the adxl345 register interface when klippy runs in
     # file-output (regression test) mode and SPI reads return nothing.
@@ -723,6 +739,9 @@ class ADXL345Probe:
                 accepted = [trig]
                 continue
             spread = spread_mm(accepted[-1], trig)
+            logging.info("%s", format_tap_comparison(
+                axis, accepted[-1], trig, step_dists, spread, speed,
+                retract_dist * 2., travelled))
             if spread <= cfg['tolerance']:
                 accepted.append(trig)
                 continue
@@ -873,7 +892,10 @@ class ADXL345Probe:
     cmd_SET_ACCEL_PROBE_help = (
         "Configure ADXL345 tap profiles for X/Y endstops and optional Z probe. "
         "Params: AXIS=<X|Y|Z|ALL> TAP_THRESH=<mm/s^2> TAP_DUR=<s> "
-        "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s>"
+        "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s> "
+        "CONFIRM_SPEED=<mm/s, 0 = homing speed> "
+        "CONFIRM_RETRACT_DIST=<mm> CONFIRM_RETRACT_SPEED=<mm/s, 0 = homing"
+        " retract speed> (X/Y tap confirmation, KAN-1361)"
     )
 
     cmd_ADXL_TEST_TAP_help = (
@@ -891,8 +913,18 @@ class ADXL345Probe:
         has_dur = 'TAP_DUR' in params
         has_axes = 'TAP_AXES' in params
         has_homing_arm_delay = 'HOMING_TAP_ARM_DELAY' in params
+        confirm = {}
+        for param, key, kw in (
+                ('CONFIRM_SPEED', 'speed', {'minval': 0.}),
+                ('CONFIRM_RETRACT_DIST', 'retract_dist', {'above': 0.}),
+                ('CONFIRM_RETRACT_SPEED', 'retract_speed', {'minval': 0.})):
+            if param in params:
+                val = gcmd.get_float(param, maxval=1000., **kw)
+                # 0 clears speed overrides: use the rail's homing speed
+                confirm[key] = val or None
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
-                                           or has_homing_arm_delay):
+                                           or has_homing_arm_delay
+                                           or confirm):
             raise gcmd.error(
                 "Can not update tap settings while homing/probing move is active")
 
@@ -923,6 +955,8 @@ class ADXL345Probe:
                 profile['tap_axes_mask'] = new_axes_mask
             if new_homing_arm_delay is not None:
                 self.axis_homing_arm_delay[target] = new_homing_arm_delay
+            if target in self.tap_confirm:
+                self.tap_confirm[target].update(confirm)
 
         lines = []
         for a in 'xyz':
@@ -933,6 +967,15 @@ class ADXL345Probe:
                 % (a.upper(), p['tap_thresh'], p['tap_dur'],
                    self._mask_to_axes(p['tap_axes_mask']),
                    self.axis_homing_arm_delay.get(a, 0.)))
+        for a in 'xy':
+            cfg = self.tap_confirm[a]
+            lines.append(
+                "ADXL345 tap confirm %s: samples=%d tolerance=%.3f"
+                " retries=%d retract_dist=%.2f retract_speed=%s speed=%s"
+                % (a.upper(), cfg['samples'], cfg['tolerance'],
+                   cfg['retries'], cfg['retract_dist'],
+                   cfg['retract_speed'] or 'homing',
+                   cfg['speed'] or 'homing'))
         gcmd.respond_info("\n".join(lines))
 
     def cmd_ADXL_TEST_TAP(self, gcmd):
