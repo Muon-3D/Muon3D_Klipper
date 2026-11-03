@@ -25,6 +25,10 @@
 # restore would leave the driver that way.  The
 # optional cleanup_gcode runs once when the outermost G28 ends, whether it
 # succeeded or failed, so a macro gets its try/finally from it.
+#
+# cleanup_gcode must not move anything.  It runs inside the scope, so
+# contact_guard stands down for it (the homing exemption), and after a
+# failed G28 the homed state is unknown.  Driver settings only.
 import logging
 
 

@@ -904,6 +904,37 @@ class ADXL345Probe:
         "[TAP_THRESH=<mm/s^2> TAP_DUR=<s> TAP_AXES=<xyz>]"
     )
 
+    # Upper bounds for the runtime confirm knobs: a speed above the rail's
+    # homing speed was never tested, and a long retract overshoots the stop
+    # when a tap is missed.
+    MAX_CONFIRM_RETRACT_DIST = 20.
+
+    def _homing_speed(self, axis):
+        toolhead = self.printer.lookup_object('toolhead')
+        rails = getattr(toolhead.get_kinematics(), 'rails', None)
+        if not rails:
+            return None
+        return rails['xyz'.index(axis)].get_homing_info().speed
+
+    def _check_confirm_limits(self, gcmd, confirm, axes):
+        dist = confirm.get('retract_dist')
+        if dist is not None and dist > self.MAX_CONFIRM_RETRACT_DIST:
+            raise gcmd.error(
+                "CONFIRM_RETRACT_DIST %.2f exceeds the %.0fmm limit"
+                % (dist, self.MAX_CONFIRM_RETRACT_DIST))
+        for a in axes:
+            limit = self._homing_speed(a)
+            if limit is None:
+                raise gcmd.error(
+                    "Can not check CONFIRM_*SPEED: no homing speed for %s"
+                    % (a.upper(),))
+            for key, param in (('speed', 'CONFIRM_SPEED'),
+                               ('retract_speed', 'CONFIRM_RETRACT_SPEED')):
+                if confirm.get(key) is not None and confirm[key] > limit:
+                    raise gcmd.error(
+                        "%s %.1f exceeds the %s homing_speed (%.1fmm/s)"
+                        % (param, confirm[key], a.upper(), limit))
+
     def cmd_SET_ACCEL_PROBE(self, gcmd):
         axis = gcmd.get('AXIS', 'ALL').lower()
         if axis not in ('x', 'y', 'z', 'all'):
@@ -919,7 +950,7 @@ class ADXL345Probe:
                 ('CONFIRM_RETRACT_DIST', 'retract_dist', {'above': 0.}),
                 ('CONFIRM_RETRACT_SPEED', 'retract_speed', {'minval': 0.})):
             if param in params:
-                val = gcmd.get_float(param, maxval=1000., **kw)
+                val = gcmd.get_float(param, **kw)
                 # 0 clears speed overrides: use the rail's homing speed
                 confirm[key] = val or None
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
@@ -929,6 +960,13 @@ class ADXL345Probe:
                 "Can not update tap settings while homing/probing move is active")
 
         targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
+        if confirm:
+            if axis == 'z':
+                raise gcmd.error(
+                    "CONFIRM_* apply to the X/Y home tap confirmation,"
+                    " not AXIS=Z")
+            self._check_confirm_limits(gcmd, confirm,
+                                       [a for a in targets if a != 'z'])
         new_thresh = None
         new_dur = None
         new_axes_mask = None
