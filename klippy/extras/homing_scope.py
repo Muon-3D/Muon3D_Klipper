@@ -21,8 +21,8 @@
 # and G28's own Z lift overwrites a homed Z with a fake position.
 #
 # The same gap affects driver settings a helper changes only for the home
-# (a lower current, SpreadCycle instead of StealthChop, KAN-1361): an error
-# between the change and its restore would leave the driver that way.  The
+# (a lower stepper current, KAN-1361): an error between the change and its
+# restore would leave the driver that way.  The
 # optional cleanup_gcode runs once when the outermost G28 ends, whether it
 # succeeded or failed, so a macro gets its try/finally from it.
 import logging

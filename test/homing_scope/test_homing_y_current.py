@@ -1,12 +1,12 @@
-"""KAN-1361: the M1's Y home runs in SpreadCycle, and always puts the driver back.
+"""KAN-1361: the M1's Y homing current is a setting, and always put back.
 
 Runs the real macros from core/M1/macros/homing.cfg (rendered with Klipper's
 single-brace Jinja environment, as klippy/extras/gcode_macro.py builds it)
 through a small G-code interpreter, and the real HomingScope around G28.
 Nothing here moves a motor; it asserts the order of the commands the macros
-emit around G28.1 Y and what is left behind when G28.1 raises.
+emit around G28.1 Y/X and what is left behind when G28.1 raises.
 
-    python3 test/homing_scope/test_homing_y_spreadcycle.py
+    python3 test/homing_scope/test_homing_y_current.py
 """
 import ast
 import configparser
@@ -41,8 +41,7 @@ class Failure(Exception):
 class Rig:
     """The M1 homing macros, a printer-status stub and a command recorder."""
 
-    def __init__(self, homed='', y_spreadcycle=None, y_current=None,
-                 fail_on=None):
+    def __init__(self, homed='', y_current=None, fail_on=None):
         self.parser = load_sections()
         self.env = jinja2.Environment('{%', '%}', '{', '}')
         self.log = []                 # (command, params) in execution order
@@ -56,14 +55,11 @@ class Rig:
                 if key.startswith('variable_'):
                     state[key[len('variable_'):]] = ast.literal_eval(val)
             self.vars[sect] = state
-        if y_spreadcycle is not None:
-            self.vars['gcode_macro _HOMING_CFG'][
-                'y_homing_spreadcycle'] = y_spreadcycle
         if y_current is not None:
             self.vars['gcode_macro _HOMING_CFG'][
                 'y_homing_current'] = y_current
         self.homed = homed
-        self.driver = {'en_pwm_mode': 1, 'x': 0.8, 'y': 0.8}
+        self.driver = {'x': 0.8, 'y': 0.8}
 
     def status(self):
         printer = {
@@ -116,9 +112,7 @@ class Rig:
                 ast.literal_eval(kv['VALUE']))
             return
         self.log.append((name, rest))
-        if name == 'SET_TMC_FIELD' and 'FIELD=en_pwm_mode' in rest:
-            self.driver['en_pwm_mode'] = int(rest.split('VALUE=')[1])
-        elif name == 'SET_TMC_CURRENT':
+        if name == 'SET_TMC_CURRENT':
             kv = dict(p.split('=', 1) for p in rest.split())
             self.driver[kv['STEPPER'][-1]] = float(kv['CURRENT'])
 
@@ -150,26 +144,23 @@ def g28_rig(rig):
     return p, scope
 
 
-def test_home_y_spreadcycle_surrounds_the_tap():
+def test_home_y_lowers_then_restores_the_current():
     rig = Rig()
     rig.run(rig.macro_text('_HOME_Y'))
     c = rig.cmds()
-    off = index(c, 'SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode VALUE=0')
-    tap = index(c, 'G28.1 Y')
-    on = index(c, 'SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode VALUE=1')
     cur = index(c, 'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6')
-    ths.check(cur < off < tap < on,
-              "Y current, then SpreadCycle on, G28.1 Y, then StealthChop back")
+    tap = index(c, 'G28.1 Y')
+    back = index(c, 'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8', tap)
+    ths.check(cur < tap < back, "Y current, G28.1 Y, then run current back")
     ths.check(c.count('G28.1 Y') == 1, "one G28.1 Y")
-    ths.check(rig.driver == {'en_pwm_mode': 1, 'x': 0.8, 'y': 0.8},
-              "after a good home: StealthChop and run currents are back")
+    ths.check(not any('SET_TMC_FIELD' in x for x in c),
+              "the driver mode is not touched (the SpreadCycle test failed)")
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8}, "run currents are back")
     ths.check(rig.vars['gcode_macro _HOMING_RESTORE']['pending'] == 0,
               "restore is no longer pending")
-    ths.check(c.count('SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode'
-                      ' VALUE=1') == 1, "restored once")
 
 
-def test_failed_tap_without_cleanup_leaves_the_driver_changed():
+def test_failed_tap_without_cleanup_leaves_the_current_low():
     # Why homing_scope's cleanup_gcode exists: the macro stops at G28.1
     rig = Rig(fail_on='G28.1 Y')
     try:
@@ -178,8 +169,7 @@ def test_failed_tap_without_cleanup_leaves_the_driver_changed():
         pass
     else:
         raise AssertionError("G28.1 Y did not raise")
-    ths.check(rig.driver['en_pwm_mode'] == 0 and rig.driver['y'] == 0.6,
-              "a bare macro leaves SpreadCycle and 0.6 A behind")
+    ths.check(rig.driver['y'] == 0.6, "a bare macro leaves 0.6 A behind")
     ths.check(rig.vars['gcode_macro _HOMING_RESTORE']['pending'] == 1,
               "and records that a restore is owed")
 
@@ -195,11 +185,9 @@ def test_failed_tap_is_restored_by_the_scope():
         raise AssertionError("G28 Y did not raise")
     c = rig.cmds()
     tap = index(c, 'G28.1 Y')
-    on = index(c, 'SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode VALUE=1',
-               tap)
-    ths.check(tap < on, "StealthChop is restored after the failed G28.1 Y")
-    ths.check(rig.driver == {'en_pwm_mode': 1, 'x': 0.8, 'y': 0.8},
-              "driver mode and both currents are back after the failure")
+    index(c, 'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8', tap)
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8},
+              "both currents are back after the failed G28.1 Y")
     ths.check(p.toolhead.kin.cleared == ["xyz"],
               "the scope still clears the homed state")
     ths.check(not scope.in_scope, "out of scope")
@@ -210,18 +198,8 @@ def test_good_g28_y_restores_once_through_the_scope():
     p, scope = g28_rig(rig)
     p.gcode.run('G28', 'Y')
     ths.check(rig.cmds().count(
-        'SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode VALUE=1') == 1,
+        'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8') == 1,
         "a good G28 Y writes the restore once (the cleanup finds it done)")
-    ths.check(rig.driver['en_pwm_mode'] == 1, "StealthChop on")
-
-
-def test_switches_off():
-    rig = Rig(y_spreadcycle=False)
-    rig.run(rig.macro_text('_HOME_Y'))
-    c = rig.cmds()
-    ths.check('SET_TMC_FIELD STEPPER=stepper_y FIELD=en_pwm_mode VALUE=0'
-              not in c, "y_homing_spreadcycle False: no SpreadCycle switch")
-    ths.check('G28.1 Y' in c, "still homes")
 
 
 def test_current_is_parametrised_for_y_only():
@@ -238,17 +216,21 @@ def test_current_is_parametrised_for_y_only():
     ths.check(rig.driver['y'] == 0.8, "run current restored")
 
 
-def test_home_x_uses_y_current_and_keeps_stealthchop():
+def test_default_current_is_unchanged():
+    rig = Rig()
+    rig.run(rig.macro_text('_HOME_Y'))
+    ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6' in rig.cmds(),
+              "default y_homing_current 0.6 A, as before")
+
+
+def test_home_x_uses_the_y_current():
     rig = Rig(homed='xyz', y_current=0.7)
     rig.run(rig.macro_text('_HOME_X'))
     c = rig.cmds()
     tap = index(c, 'G28.1 X')
     ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.7' in c[:tap],
               "_HOME_X sets stepper_y from y_homing_current")
-    ths.check(not any('FIELD=en_pwm_mode VALUE=0' in x for x in c),
-              "_HOME_X does not switch the driver mode off")
-    ths.check(rig.driver == {'en_pwm_mode': 1, 'x': 0.8, 'y': 0.8},
-              "restored after X")
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8}, "restored after X")
 
 
 def test_failed_x_tap_restores_currents():
@@ -260,7 +242,7 @@ def test_failed_x_tap_restores_currents():
         pass
     else:
         raise AssertionError("G28 X did not raise")
-    ths.check(rig.driver == {'en_pwm_mode': 1, 'x': 0.8, 'y': 0.8},
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8},
               "currents are back after a failed X home too")
 
 
@@ -269,8 +251,8 @@ def test_config_wires_the_cleanup():
     ths.check(parser.get('homing_scope', 'cleanup_gcode') == '_HOMING_RESTORE',
               "[homing_scope] cleanup_gcode names _HOMING_RESTORE")
     cfg = parser['gcode_macro _HOMING_CFG']
-    ths.check(cfg['variable_y_homing_spreadcycle'] == 'True',
-              "y_homing_spreadcycle defaults to True")
+    ths.check('variable_y_homing_spreadcycle' not in cfg,
+              "no SpreadCycle switch")
     ths.check(cfg['variable_y_homing_current'] == '0.6',
               "y_homing_current defaults to 0.6")
 
@@ -281,7 +263,7 @@ def main():
     for t in tests:
         print("== " + t.__name__)
         t()
-    print("All %d homing y-spreadcycle tests passed" % len(tests))
+    print("All %d homing y-current tests passed" % len(tests))
 
 
 if __name__ == '__main__':
