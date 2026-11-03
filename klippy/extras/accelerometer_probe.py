@@ -518,8 +518,16 @@ class AccelerometerProbe:
         toolhead = self.printer.lookup_object('toolhead')
         try:
             self._cancel_tap_enable_timer()
-            toolhead.dwell(ADXL345_REST_TIME)
-            print_time = toolhead.get_last_move_time()
+            # The disarm is an SPI transfer that waits for its print_time.
+            # dwell()/get_last_move_time() prime that BUFFER_TIME_START
+            # (0.25 s) out on a drained queue, which left the toolhead still
+            # for ~0.35 s after every tap move. The drip lead (toolhead.py,
+            # as homing.py uses it) is 0.1 s; fall back where it is absent.
+            drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
+            start_time = getattr(toolhead, 'get_drip_start_time',
+                                 toolhead.get_last_move_time)
+            drip_dwell(ADXL345_REST_TIME)
+            print_time = start_time()
             clock = chip.mcu.print_time_to_clock(print_time)
             chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
             if not self._tap_was_measuring:
