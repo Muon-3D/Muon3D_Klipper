@@ -720,13 +720,18 @@ class AccelerometerProbe:
         # speed * interrupt latency beyond the one before (0.35-0.45 mm at
         # 20 mm/s, about 1 mm at 60 mm/s on the M1 B1) while the axis stops in
         # the same place, and absolute trigger positions never agree. The
-        # travel from a fixed retract does not carry that creep. The seek tap
-        # came from far away, so it is not one of the samples: `samples`
-        # retract-and-tap confirmations must agree with each other.
-        taps = []   # (trigger mcu positions, travel in mm)
+        # travel from a fixed retract does not carry that creep.
+        #
+        # `samples` counts every tap, the seek tap included. The seek tap came
+        # from far away and has no comparable travel, so samples=2 is the seek
+        # tap and one confirmation: it proves the stop is there (a spurious
+        # seek tap finds nothing within 2 * retract_dist) and sets the
+        # position, with nothing to compare. From samples=3 the confirmations
+        # must also agree with each other by travel.
+        taps = []   # confirmation taps: (trigger mcu positions, travel mm)
         retries_left = cfg['retries']
         seek_left = cfg['seek_retries']
-        while len(taps) < cfg['samples']:
+        while len(taps) < cfg['samples'] - 1:
             # Back off, then re-approach over twice the retract distance.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
@@ -773,8 +778,8 @@ class AccelerometerProbe:
                     continue
             taps.append((trig, travelled))
         homing_state.trigger_mcu_pos.update(taps[-1][0])
-        logging.info("accelerometer_probe: %s home confirmed with %d agreeing"
-                     " taps (travel %s mm)", axis, len(taps),
+        logging.info("accelerometer_probe: %s home confirmed with %d taps"
+                     " (confirmation travel %s mm)", axis, len(taps) + 1,
                      ", ".join("%.3f" % (t,) for _, t in taps))
 
     def _handle_command_error(self):
