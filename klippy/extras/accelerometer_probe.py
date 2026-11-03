@@ -226,6 +226,15 @@ class AccelerometerProbe:
         self._tap_enable_minclock = 0
         self._tap_enable_timer = self.reactor.register_timer(
             self._handle_tap_enable_timer, self.reactor.NEVER)
+        # The delayed arm (a reactor timer) and a tap setup or teardown can
+        # otherwise run their SPI sequences at the same time: their
+        # transfers on the one chip lose each other's responses, and the
+        # arm can land after the disarm. Every chip sequence holds this.
+        self._tap_mutex = self.reactor.mutex()
+        # Bumped by every _start_tap; a delayed arm scheduled in an earlier
+        # tap session is stale and must not arm this one.
+        self._tap_session = 0
+        self._tap_enable_session = 0
         self._active_axis_homing_wrappers = []
         self._active_axis_homing_arm_delay = 0.
         self._active_axis_homing_arm_print_time = 0.
@@ -416,6 +425,7 @@ class AccelerometerProbe:
         return now + max(0., print_time - est_print_time)
 
     def _schedule_tap_enable(self, mode, arm_print_time):
+        self._tap_enable_session = self._tap_session
         self._tap_enable_pending = True
         self._tap_enable_mode = mode
         self._tap_enable_minclock = self._adxl_mcu.print_time_to_clock(
@@ -455,20 +465,23 @@ class AccelerometerProbe:
         minclock = self._tap_enable_minclock
         self._tap_enable_mode = None
         self._tap_enable_minclock = 0
-        if self._tap_mode != mode:
-            return self.reactor.NEVER
-        chip = self.adxl345
-        try:
-            # Drop startup motion events that happened during arm delay.
-            chip.read_reg(REG_INT_SOURCE, minclock=minclock)
-            if not self._try_clear_tap(minclock=minclock):
-                raise self.printer.command_error(
-                    "ADXL345 tap active before delayed arm")
-            chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=minclock)
-        except Exception as e:
-            logging.exception("Failed delayed ADXL345 tap arm")
-            self.printer.invoke_shutdown(
-                "ADXL345 delayed tap arm failed: %s" % (str(e),))
+        session = self._tap_enable_session
+        with self._tap_mutex:
+            if self._tap_mode != mode or self._tap_session != session:
+                # Stopped, or a newer tap set up, while this waited.
+                return self.reactor.NEVER
+            chip = self.adxl345
+            try:
+                # Drop startup motion events that happened during arm delay.
+                chip.read_reg(REG_INT_SOURCE, minclock=minclock)
+                if not self._try_clear_tap(minclock=minclock):
+                    raise self.printer.command_error(
+                        "ADXL345 tap active before delayed arm")
+                chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=minclock)
+            except Exception as e:
+                logging.exception("Failed delayed ADXL345 tap arm")
+                self.printer.invoke_shutdown(
+                    "ADXL345 delayed tap arm failed: %s" % (str(e),))
         return self.reactor.NEVER
 
     def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
@@ -478,87 +491,95 @@ class AccelerometerProbe:
         chip = self.adxl345
         chip.check_connected()
         toolhead = self.printer.lookup_object('toolhead')
-        was_measuring = True
-        queued_time = self._queued_tap_print_time
-        self._queued_tap_print_time = None
-        try:
-            if queued_time is None:
-                toolhead.flush_step_generation()
-                toolhead.dwell(ADXL345_REST_TIME)
-                print_time = toolhead.get_last_move_time()
-            else:
-                # Confirmation: the retract is already queued and this
-                # time is past the rest after the last impact, so the chip
-                # is set up while the carriage retracts.
-                print_time = queued_time
-            clock = chip.mcu.print_time_to_clock(print_time)
-            chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-            chip.read_reg(REG_INT_SOURCE)
-            self._set_profile_regs(profile, minclock=clock)
-            was_measuring = chip.read_reg(adxl345.REG_POWER_CTL) == 0x08
-            if not was_measuring:
-                chip.set_reg(adxl345.REG_POWER_CTL, 0x08, minclock=clock)
-            if not self._try_clear_tap():
-                raise self.printer.command_error(
-                    "ADXL345 tap triggered before move, reduce sensitivity.")
-            self._cancel_tap_enable_timer()
-            if defer_arm:
-                pass
-            elif arm_delay > 0.:
-                self._tap_enable_pending = True
-                self._tap_enable_mode = mode
-                self.reactor.update_timer(self._tap_enable_timer,
-                                          self.reactor.monotonic() + arm_delay)
-            else:
-                chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=clock)
-        except Exception:
-            self._cancel_tap_enable_timer()
+        with self._tap_mutex:
+            self._tap_session += 1
+            was_measuring = True
+            queued_time = self._queued_tap_print_time
+            self._queued_tap_print_time = None
             try:
-                chip.set_reg(REG_INT_ENABLE, 0x00)
+                if queued_time is None:
+                    toolhead.flush_step_generation()
+                    toolhead.dwell(ADXL345_REST_TIME)
+                    print_time = toolhead.get_last_move_time()
+                else:
+                    # Confirmation: the retract is already queued and this
+                    # time is past the rest after the last impact, so the chip
+                    # is set up while the carriage retracts.
+                    print_time = queued_time
+                clock = chip.mcu.print_time_to_clock(print_time)
+                chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
+                chip.read_reg(REG_INT_SOURCE)
+                self._set_profile_regs(profile, minclock=clock)
+                was_measuring = chip.read_reg(adxl345.REG_POWER_CTL) == 0x08
+                if not was_measuring:
+                    chip.set_reg(adxl345.REG_POWER_CTL, 0x08, minclock=clock)
+                if not self._try_clear_tap():
+                    raise self.printer.command_error(
+                        "ADXL345 tap triggered before move, reduce"
+                        " sensitivity.")
+                self._cancel_tap_enable_timer()
+                if defer_arm:
+                    pass
+                elif arm_delay > 0.:
+                    self._tap_enable_session = self._tap_session
+                    self._tap_enable_pending = True
+                    self._tap_enable_mode = mode
+                    self.reactor.update_timer(
+                        self._tap_enable_timer,
+                        self.reactor.monotonic() + arm_delay)
+                else:
+                    chip.set_reg(REG_INT_ENABLE, INT_SINGLE_TAP, minclock=clock)
             except Exception:
-                logging.exception("Unable to disable ADXL345 interrupt")
-            if not was_measuring:
+                self._cancel_tap_enable_timer()
                 try:
-                    chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
+                    chip.set_reg(REG_INT_ENABLE, 0x00)
                 except Exception:
-                    logging.exception("Unable to restore ADXL345 power state")
-            raise
-        self._tap_was_measuring = was_measuring
-        self._tap_mode = mode
+                    logging.exception("Unable to disable ADXL345 interrupt")
+                if not was_measuring:
+                    try:
+                        chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
+                    except Exception:
+                        logging.exception(
+                            "Unable to restore ADXL345 power state")
+                raise
+            self._tap_was_measuring = was_measuring
+            self._tap_mode = mode
 
     def _stop_tap(self, mode):
         if self._tap_mode is None:
             return
         if mode is not None and self._tap_mode != mode:
             return
-        chip = self.adxl345
-        toolhead = self.printer.lookup_object('toolhead')
-        try:
-            self._cancel_tap_enable_timer()
-            # The disarm is an SPI transfer that waits for its print_time.
-            # dwell()/get_last_move_time() prime that BUFFER_TIME_START
-            # (0.25 s) out on a drained queue, which left the toolhead still
-            # for ~0.35 s after every tap move. The drip lead (toolhead.py,
-            # as homing.py uses it) is 0.1 s; fall back where it is absent.
-            drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
-            start_time = getattr(toolhead, 'get_drip_start_time',
-                                 toolhead.get_last_move_time)
-            # The rest lets an impact ring down before the tap flag is
-            # checked. A move that ended without a tap (a protected
-            # back-off that met nothing) has no impact to wait out.
-            if self._tap_fired_in_move():
-                drip_dwell(ADXL345_REST_TIME)
-            print_time = start_time()
-            clock = chip.mcu.print_time_to_clock(print_time)
-            chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-            if not self._tap_was_measuring:
-                chip.set_reg(adxl345.REG_POWER_CTL, 0x00, minclock=clock)
-            if not self._try_clear_tap():
-                raise self.printer.command_error(
-                    "ADXL345 tap still active after move, reduce sensitivity.")
-        finally:
-            self._tap_mode = None
-            self._tap_was_measuring = False
+        with self._tap_mutex:
+            chip = self.adxl345
+            toolhead = self.printer.lookup_object('toolhead')
+            try:
+                self._cancel_tap_enable_timer()
+                # The disarm is an SPI transfer that waits for its print_time.
+                # dwell()/get_last_move_time() prime that BUFFER_TIME_START
+                # (0.25 s) out on a drained queue, which left the toolhead still
+                # for ~0.35 s after every tap move. The drip lead (toolhead.py,
+                # as homing.py uses it) is 0.1 s; fall back where it is absent.
+                drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
+                start_time = getattr(toolhead, 'get_drip_start_time',
+                                     toolhead.get_last_move_time)
+                # The rest lets an impact ring down before the tap flag is
+                # checked. A move that ended without a tap (a protected
+                # back-off that met nothing) has no impact to wait out.
+                if self._tap_fired_in_move():
+                    drip_dwell(ADXL345_REST_TIME)
+                print_time = start_time()
+                clock = chip.mcu.print_time_to_clock(print_time)
+                chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
+                if not self._tap_was_measuring:
+                    chip.set_reg(adxl345.REG_POWER_CTL, 0x00, minclock=clock)
+                if not self._try_clear_tap():
+                    raise self.printer.command_error(
+                        "ADXL345 tap still active after move, reduce"
+                        " sensitivity.")
+            finally:
+                self._tap_mode = None
+                self._tap_was_measuring = False
 
     def _tap_fired_in_move(self):
         # Whether a tap endstop of the homing move just ended triggered.
@@ -576,20 +597,21 @@ class AccelerometerProbe:
         # the rest), while a retract queued before this call moves.
         if self._tap_mode is None:
             return
-        chip = self.adxl345
-        try:
-            self._cancel_tap_enable_timer()
-            clock = chip.mcu.print_time_to_clock(print_time)
-            chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
-            if not self._tap_was_measuring:
-                chip.set_reg(adxl345.REG_POWER_CTL, 0x00, minclock=clock)
-            if not self._try_clear_tap(minclock=clock):
-                raise self.printer.command_error(
-                    "ADXL345 tap still active after move, reduce"
-                    " sensitivity.")
-        finally:
-            self._tap_mode = None
-            self._tap_was_measuring = False
+        with self._tap_mutex:
+            chip = self.adxl345
+            try:
+                self._cancel_tap_enable_timer()
+                clock = chip.mcu.print_time_to_clock(print_time)
+                chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
+                if not self._tap_was_measuring:
+                    chip.set_reg(adxl345.REG_POWER_CTL, 0x00, minclock=clock)
+                if not self._try_clear_tap(minclock=clock):
+                    raise self.printer.command_error(
+                        "ADXL345 tap still active after move, reduce"
+                        " sensitivity.")
+            finally:
+                self._tap_mode = None
+                self._tap_was_measuring = False
 
     def _set_fan_disabled(self, disable):
         if not self.disable_fans:
