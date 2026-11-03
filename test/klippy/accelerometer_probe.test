@@ -1,5 +1,5 @@
-# Test case for adxl345_probe X/Y tap homing with tap confirmation
-CONFIG adxl345_probe.cfg
+# Test case for accelerometer_probe X/Y tap homing with tap confirmation
+CONFIG accelerometer_probe.cfg
 DICTIONARY linuxprocess.dict
 
 # Home each tap axis separately, then all together

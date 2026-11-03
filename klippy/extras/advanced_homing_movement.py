@@ -2,7 +2,7 @@
 #
 # Axis-agnostic parking/protected-move helper using either:
 # - TMC virtual endstops (sensorless stall), or
-# - The axis' configured endstop (for example adxl345_probe:x/y_virtual_endstop)
+# - The axis' configured endstop (for example accelerometer_probe:x/y_virtual_endstop)
 #
 # License: GPLv3 (same as Klipper)
 from . import homing as homing_mod
