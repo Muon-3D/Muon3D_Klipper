@@ -543,7 +543,11 @@ class AccelerometerProbe:
             drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
             start_time = getattr(toolhead, 'get_drip_start_time',
                                  toolhead.get_last_move_time)
-            drip_dwell(ADXL345_REST_TIME)
+            # The rest lets an impact ring down before the tap flag is
+            # checked. A move that ended without a tap (a protected
+            # back-off that met nothing) has no impact to wait out.
+            if self._tap_fired_in_move():
+                drip_dwell(ADXL345_REST_TIME)
             print_time = start_time()
             clock = chip.mcu.print_time_to_clock(print_time)
             chip.set_reg(REG_INT_ENABLE, 0x00, minclock=clock)
@@ -555,6 +559,16 @@ class AccelerometerProbe:
         finally:
             self._tap_mode = None
             self._tap_was_measuring = False
+
+    def _tap_fired_in_move(self):
+        # Whether a tap endstop of the homing move just ended triggered.
+        # home_wait() leaves last_trigger_time at the trigger, or 0 (or -1)
+        # when the move ended without one. Outside an axis homing move
+        # (tap test, Z probe) assume an impact.
+        wrappers = self._active_axis_homing_wrappers
+        if not wrappers:
+            return True
+        return any(w.last_trigger_time > 0. for w in wrappers)
 
     def _stop_tap_queued(self, print_time):
         # _stop_tap timed on the motion clock instead of a host dwell: the
