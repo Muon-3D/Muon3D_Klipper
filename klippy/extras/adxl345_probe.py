@@ -22,6 +22,18 @@ TAP_TEST_SAMPLE_COUNT = 4
 TAP_TEST_REST_TIME = .001
 
 
+def format_tap_comparison(axis, prev, new, step_dists, spread):
+    """One log line for a confirmation comparison: both trigger positions
+    in mm (raw MCU step position * step distance, per stepper) and the
+    spread.  Logged for every comparison, agreeing or not, so a slip of
+    one electrical cycle shows its sign (KAN-1361)."""
+    def mm(trig):
+        return ' '.join('%s=%.3f' % (n, trig[n] * sd)
+                        for n, sd in sorted(step_dists.items()))
+    return ("adxl345_probe: %s tap compare: prev %s mm, new %s mm,"
+            " spread %.3fmm" % (axis, mm(prev), mm(new), spread))
+
+
 class _FileOutputRegs:
     # Stand-in for the adxl345 register interface when klippy runs in
     # file-output (regression test) mode and SPI reads return nothing.
@@ -723,6 +735,8 @@ class ADXL345Probe:
                 accepted = [trig]
                 continue
             spread = spread_mm(accepted[-1], trig)
+            logging.info("%s", format_tap_comparison(
+                axis, accepted[-1], trig, step_dists, spread))
             if spread <= cfg['tolerance']:
                 accepted.append(trig)
                 continue

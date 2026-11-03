@@ -19,6 +19,12 @@
 # so that a failure clears the homing state of every axis.  After a failed
 # G28 no axis's homed flag can be trusted: the helpers fake unhomed axes,
 # and G28's own Z lift overwrites a homed Z with a fake position.
+#
+# The same gap affects driver settings a helper changes only for the home
+# (a lower current, SpreadCycle instead of StealthChop, KAN-1361): an error
+# between the change and its restore would leave the driver that way.  The
+# optional cleanup_gcode runs once when the outermost G28 ends, whether it
+# succeeded or failed, so a macro gets its try/finally from it.
 import logging
 
 
@@ -29,6 +35,7 @@ class HomingScope:
         # as is; an extended command's handler would need re-parsing here.
         self.command = 'G28'
         self.depth = 0
+        self.cleanup_gcode = config.get('cleanup_gcode', None)
         self.orig_cmd = None
         # At ready: gcode_macro renames commands (rename_existing) at
         # klippy:connect, in config order, so only at ready is it certain
@@ -55,10 +62,26 @@ class HomingScope:
         try:
             self.orig_cmd(gcmd)
         except Exception:
+            self._run_cleanup()
             self._clear_homing_state()
             raise
+        else:
+            self._run_cleanup()
         finally:
             self.depth -= 1
+
+    def _run_cleanup(self):
+        # Only the outermost G28: a nested one (HOMING_GATE callback) ends
+        # while the outer is still homing.  A cleanup that itself fails
+        # must not hide the G28 error, so it is logged and dropped; a
+        # shutdown makes it fail, and the drivers reset on restart anyway.
+        if not self.cleanup_gcode or self.depth > 1:
+            return
+        gcode = self.printer.lookup_object('gcode')
+        try:
+            gcode.run_script_from_command(self.cleanup_gcode)
+        except Exception:
+            logging.exception("homing_scope: cleanup_gcode failed")
 
     def _clear_homing_state(self):
         toolhead = self.printer.lookup_object('toolhead')
