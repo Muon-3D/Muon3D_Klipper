@@ -1,4 +1,5 @@
 import logging
+import math
 import pins
 from . import probe, adxl345, homing
 
@@ -951,13 +952,18 @@ class ADXL345Probe:
                 ('CONFIRM_RETRACT_SPEED', 'retract_speed', {'minval': 0.})):
             if param in params:
                 val = gcmd.get_float(param, **kw)
+                # NaN fails every comparison, so minval/above/maxval and
+                # the limits below would all let it through
+                if not math.isfinite(val):
+                    raise gcmd.error("%s must be a finite number" % (param,))
                 # 0 clears speed overrides: use the rail's homing speed
                 confirm[key] = val or None
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
                                            or has_homing_arm_delay
                                            or confirm):
             raise gcmd.error(
-                "Can not update tap settings while homing/probing move is active")
+                "Can not update tap settings while homing/probing move is"
+                " active")
 
         targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
         if confirm:
