@@ -662,13 +662,8 @@ class ADXL345Probe:
         step_dists = {s.get_name(): s.get_step_dist() for s in steppers}
 
         # Like HomingMove.check_no_movement(): the debug harness has no
-        # physical stop, so trigger positions never agree there.
+        # physical stop, so tap travels never agree there.
         is_debug = self.printer.get_start_args().get('debuginput') is not None
-
-        def spread_mm(a, b):
-            if is_debug:
-                return 0.
-            return max([abs(a[n] - b[n]) * sd for n, sd in step_dists.items()])
 
         def run_homing_move(start_dist, move_speed):
             # Pretend to be start_dist away from the endstop so the move
@@ -690,10 +685,20 @@ class ADXL345Probe:
                              for sp in hmove.stepper_positions])
             return trig, travelled
 
-        accepted = [dict(homing_state.trigger_mcu_pos)]
+        # Confirmation taps are compared by how far each one travelled from
+        # its retract point, not by where it triggered. Driven into the stop,
+        # the steppers keep stepping until the tap interrupt fires, and those
+        # steps are lost against the stop. So each tap triggers about
+        # speed * interrupt latency beyond the one before (0.35-0.45 mm at
+        # 20 mm/s, about 1 mm at 60 mm/s on the M1 B1) while the axis stops in
+        # the same place, and absolute trigger positions never agree. The
+        # travel from a fixed retract does not carry that creep. The seek tap
+        # came from far away, so it is not one of the samples: `samples`
+        # retract-and-tap confirmations must agree with each other.
+        taps = []   # (trigger mcu positions, travel in mm)
         retries_left = cfg['retries']
         seek_left = cfg['seek_retries']
-        while len(accepted) < cfg['samples']:
+        while len(taps) < cfg['samples']:
             # Back off, then re-approach over twice the retract distance.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
@@ -720,24 +725,28 @@ class ADXL345Probe:
                     raise cmderr(
                         "adxl345_probe: %s home failed; no tap within"
                         " %.1fmm of resumed seek" % (axis, seek_dist))
-                accepted = [trig]
+                # A new seek tap: confirmation starts again from it.
+                taps = []
                 continue
-            spread = spread_mm(accepted[-1], trig)
-            if spread <= cfg['tolerance']:
-                accepted.append(trig)
-                continue
-            if retries_left <= 0:
-                raise cmderr(
-                    "adxl345_probe: %s home taps disagree by %.3fmm"
-                    " (tolerance %.3fmm) after %d retries"
-                    % (axis, spread, cfg['tolerance'], cfg['retries']))
-            retries_left -= 1
-            logging.info("adxl345_probe: %s taps disagree by %.3fmm,"
-                         " retrying confirmation", axis, spread)
-            accepted = [trig]
-        homing_state.trigger_mcu_pos.update(accepted[-1])
+            if taps:
+                spread = 0. if is_debug else abs(travelled - taps[-1][1])
+                if spread > cfg['tolerance']:
+                    if retries_left <= 0:
+                        raise cmderr(
+                            "adxl345_probe: %s home taps disagree by %.3fmm"
+                            " (tolerance %.3fmm) after %d retries"
+                            % (axis, spread, cfg['tolerance'],
+                               cfg['retries']))
+                    retries_left -= 1
+                    logging.info("adxl345_probe: %s taps disagree by %.3fmm,"
+                                 " retrying confirmation", axis, spread)
+                    taps = [(trig, travelled)]
+                    continue
+            taps.append((trig, travelled))
+        homing_state.trigger_mcu_pos.update(taps[-1][0])
         logging.info("adxl345_probe: %s home confirmed with %d agreeing"
-                     " taps", axis, len(accepted))
+                     " taps (travel %s mm)", axis, len(taps),
+                     ", ".join("%.3f" % (t,) for _, t in taps))
 
     def _handle_command_error(self):
         if self._tap_mode == 'axis_homing':
