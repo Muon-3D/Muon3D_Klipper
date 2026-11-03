@@ -86,8 +86,11 @@ class Rig:
 
     def run(self, text, rawparams=''):
         tmpl = self.env.from_string(text)
+        def raise_error(msg):
+            raise Failure(msg)
         out = tmpl.render(printer=self.status(), rawparams=rawparams,
                           params={},
+                          action_raise_error=raise_error,
                           action_respond_info=lambda m: "")
         for line in out.splitlines():
             line = line.strip()
@@ -203,12 +206,12 @@ def test_good_g28_y_restores_once_through_the_scope():
 
 
 def test_current_is_parametrised_for_y_only():
-    rig = Rig(y_current=0.9)
+    rig = Rig(y_current=0.7)
     rig.run(rig.macro_text('_HOME_Y'))
     c = rig.cmds()
     tap = index(c, 'G28.1 Y')
-    ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.9' in c[:tap],
-              "y_homing_current 0.9 is applied to stepper_y before the tap")
+    ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.7' in c[:tap],
+              "y_homing_current 0.7 is applied to stepper_y before the tap")
     ths.check('SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6' in c[:tap],
               "stepper_x keeps its own 0.6 A")
     ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6' not in c,
@@ -244,6 +247,82 @@ def test_failed_x_tap_restores_currents():
         raise AssertionError("G28 X did not raise")
     ths.check(rig.driver == {'x': 0.8, 'y': 0.8},
               "currents are back after a failed X home too")
+
+
+def test_home_x_uses_the_y_current():
+    rig = Rig(homed='xyz', y_current=0.5)
+    rig.run(rig.macro_text('_HOME_X'))
+    c = rig.cmds()
+    tap = index(c, 'G28.1 X')
+    ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.5' in c[:tap],
+              "_HOME_X sets stepper_y from y_homing_current")
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8}, "restored after X")
+
+
+def test_failed_x_tap_restores_currents():
+    rig = Rig(homed='xyz', fail_on='G28.1 X')
+    p, scope = g28_rig(rig)
+    try:
+        p.gcode.run('G28', 'X')
+    except Failure:
+        pass
+    else:
+        raise AssertionError("G28 X did not raise")
+    ths.check(rig.driver == {'x': 0.8, 'y': 0.8},
+              "currents are back after a failed X home too")
+
+
+MOTION_OR_DRIVER = ('SET_TMC_CURRENT', 'G28.1', 'AXIS_PROTECTED_MOVE', 'G1',
+                    'SET_KINEMATIC_POSITION')
+
+
+def refused(value, macro='_HOME_Y'):
+    rig = Rig(homed='xyz', y_current=value)
+    try:
+        rig.run(rig.macro_text(macro))
+    except Failure as e:
+        ths.check("0.3 A to 0.80 A" in str(e),
+                  "%r refused in %s, naming the range" % (value, macro))
+    else:
+        raise AssertionError("%r was accepted by %s" % (value, macro))
+    ths.check(not any(n in MOTION_OR_DRIVER for n, _ in rig.log),
+              "nothing moved or was set before the refusal")
+
+
+def test_y_homing_current_bounds():
+    for ok in (0.3, 0.5, 0.8):
+        for macro in ('_HOME_Y', '_HOME_X'):
+            rig = Rig(homed='xyz', y_current=ok)
+            rig.run(rig.macro_text(macro))
+            ths.check('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=%s' % ok
+                      in rig.cmds(), "%s A accepted by %s" % (ok, macro))
+    for bad in (0.29, 0.0, -0.5, 0.81, 1.5, 'abc', '0.5', float('nan'),
+                float('inf'), True):
+        refused(bad)
+    refused(0.9, '_HOME_X')
+    refused('abc', '_HOME_X')
+
+
+def test_g28_refuses_a_bad_current_before_the_z_lift():
+    for bad in (0.9, 'abc'):
+        for arg in ('Y', 'X', ''):
+            rig = Rig(homed='', y_current=bad)
+            p, scope = g28_rig(rig)
+            try:
+                p.gcode.run('G28', arg)
+            except Failure as e:
+                ths.check("allowed range" in str(e),
+                          "G28 %s refuses %r" % (arg, bad))
+            else:
+                raise AssertionError("G28 accepted %r" % (bad,))
+            ths.check(not any(n in MOTION_OR_DRIVER for n, _ in rig.log),
+                      "no Z lift or motion before the refusal")
+
+
+def test_z_only_g28_does_not_check_the_y_current():
+    rig = Rig(homed='xy', y_current='abc')
+    rig.run(rig.macro_text('G28'), rawparams='Z')
+    ths.check('_HOMING_CHECK' not in rig.cmds(), "G28 Z skips the Y check")
 
 
 def test_config_wires_the_cleanup():

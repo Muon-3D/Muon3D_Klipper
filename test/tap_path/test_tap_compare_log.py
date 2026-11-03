@@ -90,7 +90,10 @@ class FakeGcmd:
     def get_float(self, name, default=None, minval=None, maxval=None,
                   above=None):
         v = float(self.params[name])
-        if minval is not None and v < minval or                 above is not None and v <= above or                 maxval is not None and v > maxval:
+        bad = ((minval is not None and v < minval)
+               or (above is not None and v <= above)
+               or (maxval is not None and v > maxval))
+        if bad:
             raise self.error("%s out of range" % name)
         return v
 
@@ -110,6 +113,7 @@ def test_set_accel_probe_confirm_knobs(mod):
     probe.tap_profiles = {'x': dict(prof), 'y': dict(prof), 'z': dict(prof)}
     probe.axis_homing_arm_delay = {'x': 0., 'y': 0.1, 'z': 0.}
     probe._mask_to_axes = lambda m: 'y'
+    probe._homing_speed = lambda a: 60.
     conf = {'samples': 2, 'tolerance': 0.2, 'retries': 2,
             'retract_dist': 8., 'retract_speed': None, 'speed': None,
             'seek_retries': 1, 'max_seek_dist': None}
@@ -130,6 +134,42 @@ def test_set_accel_probe_confirm_knobs(mod):
     probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Y', TAP_DUR=0.01))
     check(probe.tap_confirm['y']['retract_dist'] == 12.,
           "other SET_ACCEL_PROBE calls keep the confirm settings")
+    probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Y', CONFIRM_SPEED=60,
+                                       CONFIRM_RETRACT_SPEED=60,
+                                       CONFIRM_RETRACT_DIST=20))
+    y = probe.tap_confirm['y']
+    check((y['speed'], y['retract_speed'], y['retract_dist']) ==
+          (60., 60., 20.), "the limits themselves are accepted")
+    for kw, what in (({'CONFIRM_SPEED': 60.1}, "speed above homing_speed"),
+                     ({'CONFIRM_RETRACT_SPEED': 60.1},
+                      "retract speed above homing_speed"),
+                     ({'CONFIRM_RETRACT_DIST': 20.01},
+                      "retract distance above 20 mm"),
+                     ({'CONFIRM_RETRACT_DIST': 0},
+                      "retract distance of 0"),
+                     ({'CONFIRM_SPEED': -1}, "negative speed")):
+        before = dict(probe.tap_confirm['y'])
+        try:
+            probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Y', **kw))
+        except RuntimeError:
+            check(probe.tap_confirm['y'] == before,
+                  "%s refused and nothing changed" % what)
+        else:
+            raise AssertionError("%s accepted" % what)
+    try:
+        probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='ALL', CONFIRM_SPEED=61))
+    except RuntimeError:
+        check(probe.tap_confirm['x']['speed'] is None,
+              "AXIS=ALL checks every axis before changing any")
+    else:
+        raise AssertionError("AXIS=ALL accepted 61 mm/s")
+    for kw in ({'CONFIRM_SPEED': 30}, {'CONFIRM_RETRACT_DIST': 5}):
+        try:
+            probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Z', **kw))
+        except RuntimeError as e:
+            check("AXIS=Z" in str(e), "AXIS=Z with CONFIRM_* is an error")
+        else:
+            raise AssertionError("AXIS=Z silently ignored %r" % (kw,))
     probe._tap_mode = 'axis_homing'
     try:
         probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Y', CONFIRM_SPEED=10))
