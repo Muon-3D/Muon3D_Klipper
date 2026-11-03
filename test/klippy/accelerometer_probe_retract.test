@@ -1,0 +1,4 @@
+# A confirmed tap axis with homing_retract_dist set must refuse to start
+CONFIG accelerometer_probe_retract.cfg
+DICTIONARY linuxprocess.dict
+SHOULD_FAIL

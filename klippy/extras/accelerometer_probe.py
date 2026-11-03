@@ -1,3 +1,8 @@
+# Accelerometer tap endstops and probe
+#
+# X/Y (and optionally Z) endstops from the tap interrupt of a toolhead
+# accelerometer. Named accelerometer_probe until the M1 B1 moved to a
+# LIS2DW12; that name still loads this module (accelerometer_probe.py).
 import logging
 import pins
 from . import probe, adxl345, homing
@@ -38,7 +43,7 @@ class _FileOutputRegs:
         pass
 
 
-class ADXL345TapEndstop:
+class AccelTapEndstop:
     def __init__(self, owner, axis, mcu_endstop, position_endstop=None):
         self._owner = owner
         self._axis = axis
@@ -93,12 +98,12 @@ class ADXL345TapEndstop:
     def get_position_endstop(self):
         if self._position_endstop is None:
             raise self._owner.printer.command_error(
-                "adxl345_probe:%s_virtual_endstop does not define"
+                "accelerometer_probe:%s_virtual_endstop does not define"
                 " position_endstop" % (self._axis,))
         return self._position_endstop
 
 
-class ADXL345Probe:
+class AccelerometerProbe:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
@@ -167,6 +172,9 @@ class ADXL345Probe:
             'x': self._load_confirm_profile(config, 'x'),
             'y': self._load_confirm_profile(config, 'y'),
         }
+        for axis, cfg in self.tap_confirm.items():
+            if cfg['samples'] > 1:
+                self._check_no_homing_retract(config, axis)
 
         if self.enable_z_probe:
             self.position_endstop = config.getfloat('z_offset')
@@ -181,7 +189,7 @@ class ADXL345Probe:
         }
 
         # Setup three logical endstops on the same physical INT pin.
-        share_type = "adxl345_probe:%s" % (config.get_name(),)
+        share_type = "accelerometer_probe:%s" % (config.get_name(),)
         ppins = self.printer.lookup_object('pins')
         self._mcu_endstops = {}
         for axis in ('x', 'y', 'z'):
@@ -191,13 +199,13 @@ class ADXL345Probe:
             mcu = pin_params['chip']
             self._mcu_endstops[axis] = mcu.setup_pin('endstop', pin_params)
 
-        self._z_wrapper = ADXL345TapEndstop(
+        self._z_wrapper = AccelTapEndstop(
             self, 'z', self._mcu_endstops['z'], self.position_endstop)
         self._axis_wrappers = {
-            'x': ADXL345TapEndstop(
+            'x': AccelTapEndstop(
                 self, 'x', self._mcu_endstops['x'],
                 self.axis_position_endstops['x']),
-            'y': ADXL345TapEndstop(
+            'y': AccelTapEndstop(
                 self, 'y', self._mcu_endstops['y'],
                 self.axis_position_endstops['y']),
         }
@@ -309,6 +317,22 @@ class ADXL345Probe:
             'tap_axes_mask': tap_axes_mask,
         }
 
+    def _check_no_homing_retract(self, config, axis):
+        # The confirmation does its own retract and re-tap. Klipper's second
+        # home (homing_retract_dist, 5 mm by default) would run first and
+        # double the taps, so a confirmed axis must have it off.
+        section = 'stepper_%s' % (axis,)
+        if not config.has_section(section):
+            return
+        retract = config.getsection(section).getfloat(
+            'homing_retract_dist', 5., minval=0.)
+        if retract:
+            raise config.error(
+                "accelerometer_probe: %s tap confirmation needs"
+                " homing_retract_dist: 0 in [%s] (it is %g); the"
+                " confirmation does its own retract and re-tap"
+                % (axis, section, retract))
+
     def _load_confirm_profile(self, config, axis):
         def opt(name, getter, default, **kw):
             base = getter('tap_confirm_%s' % (name,), default, **kw)
@@ -331,7 +355,7 @@ class ADXL345Probe:
         stepper_name = 'stepper_%s' % (axis,)
         if not config.has_section(stepper_name):
             raise config.error(
-                "Missing [%s] for adxl345_probe:%s_virtual_endstop"
+                "Missing [%s] for accelerometer_probe:%s_virtual_endstop"
                 % (stepper_name, axis))
         return config.getsection(stepper_name).getfloat('position_endstop')
 
@@ -572,9 +596,11 @@ class ADXL345Probe:
 
     def setup_pin(self, pin_type, pin_params):
         if pin_type != 'endstop':
-            raise pins.error("adxl345_probe virtual pins are only endstops")
+            raise pins.error(
+                "accelerometer_probe virtual pins are only endstops")
         if pin_params['invert'] or pin_params['pullup']:
-            raise pins.error("adxl345_probe virtual pins may not invert/pullup")
+            raise pins.error(
+                "accelerometer_probe virtual pins may not invert/pullup")
         pin_name = pin_params['pin']
         if pin_name == 'x_virtual_endstop':
             return self._axis_wrappers['x']
@@ -582,10 +608,11 @@ class ADXL345Probe:
             return self._axis_wrappers['y']
         if pin_name == 'z_virtual_endstop':
             if not self.enable_z_probe:
-                raise pins.error("enable_z_probe must be true for z_virtual_endstop")
+                raise pins.error(
+                    "enable_z_probe must be true for z_virtual_endstop")
             return self._z_wrapper
         raise pins.error(
-            "Unknown adxl345_probe virtual pin '%s' (expected"
+            "Unknown accelerometer_probe virtual pin '%s' (expected"
             " x_virtual_endstop, y_virtual_endstop, or z_virtual_endstop)"
             % (pin_name,))
 
@@ -607,7 +634,8 @@ class ADXL345Probe:
         if not self._active_axis_homing_wrappers:
             return
         hmove_endstops = hmove.get_mcu_endstops()
-        if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
+        if not any(w in hmove_endstops
+                   for w in self._active_axis_homing_wrappers):
             return
         try:
             self._stop_tap('axis_homing')
@@ -625,7 +653,7 @@ class ADXL345Probe:
         if not matches:
             return
         if len(matches) > 1:
-            logging.warning("adxl345_probe: tap confirmation skipped for"
+            logging.warning("accelerometer_probe: tap confirmation skipped for"
                             " simultaneous multi-axis home")
             return
         rail, wrapper = matches[0]
@@ -649,7 +677,7 @@ class ADXL345Probe:
         arm_delay = self.axis_homing_arm_delay.get(axis, 0.)
         if retract_dist <= speed * arm_delay:
             raise cmderr(
-                "adxl345_probe: %s_tap_confirm_retract_dist (%.2fmm) must"
+                "accelerometer_probe: %s_tap_confirm_retract_dist (%.2fmm) must"
                 " exceed the distance covered during the tap arm delay"
                 " (%.1fmm/s * %.3fs = %.2fmm)"
                 % (axis, retract_dist, speed, arm_delay, speed * arm_delay))
@@ -710,20 +738,20 @@ class ADXL345Probe:
                 seek_budget -= travelled
                 if seek_left <= 0 or seek_budget <= 0.:
                     raise cmderr(
-                        "adxl345_probe: %s home tap not confirmed; no"
+                        "accelerometer_probe: %s home tap not confirmed; no"
                         " contact within %.1fmm of the reported tap"
                         " and seek retries exhausted"
                         % (axis, retract_dist))
                 seek_left -= 1
                 seek_dist = seek_budget
-                logging.info("adxl345_probe: %s tap judged spurious,"
+                logging.info("accelerometer_probe: %s tap judged spurious,"
                              " resuming seek for up to %.1fmm",
                              axis, seek_dist)
                 trig, travelled = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:
                     raise cmderr(
-                        "adxl345_probe: %s home failed; no tap within"
+                        "accelerometer_probe: %s home failed; no tap within"
                         " %.1fmm of resumed seek" % (axis, seek_dist))
                 # A new seek tap: confirmation starts again from it.
                 taps = []
@@ -733,18 +761,19 @@ class ADXL345Probe:
                 if spread > cfg['tolerance']:
                     if retries_left <= 0:
                         raise cmderr(
-                            "adxl345_probe: %s home taps disagree by %.3fmm"
-                            " (tolerance %.3fmm) after %d retries"
+                            "accelerometer_probe: %s home taps disagree by"
+                            " %.3fmm (tolerance %.3fmm) after %d retries"
                             % (axis, spread, cfg['tolerance'],
                                cfg['retries']))
                     retries_left -= 1
-                    logging.info("adxl345_probe: %s taps disagree by %.3fmm,"
-                                 " retrying confirmation", axis, spread)
+                    logging.info("accelerometer_probe: %s taps disagree by"
+                                 " %.3fmm, retrying confirmation",
+                                 axis, spread)
                     taps = [(trig, travelled)]
                     continue
             taps.append((trig, travelled))
         homing_state.trigger_mcu_pos.update(taps[-1][0])
-        logging.info("adxl345_probe: %s home confirmed with %d agreeing"
+        logging.info("accelerometer_probe: %s home confirmed with %d agreeing"
                      " taps (travel %s mm)", axis, len(taps),
                      ", ".join("%.3f" % (t,) for _, t in taps))
 
@@ -776,10 +805,11 @@ class ADXL345Probe:
         self.phoming = self.printer.lookup_object('homing')
         chip = self.adxl345
         if (getattr(self._adxl_mcu, 'is_non_critical', False)
-                and getattr(self._adxl_mcu, 'non_critical_disconnected', False)):
+                and getattr(self._adxl_mcu, 'non_critical_disconnected',
+                            False)):
             self._adxl_initialized = False
-            logging.info("ADXL345 probe init deferred: MCU '%s' is disconnected",
-                         self._adxl_mcu.get_name())
+            logging.info("accelerometer probe init deferred: MCU '%s' is"
+                         " disconnected", self._adxl_mcu.get_name())
             return
         chip.check_connected()
         chip.set_reg(adxl345.REG_POWER_CTL, 0x00)
@@ -809,7 +839,7 @@ class ADXL345Probe:
     def _require_z_probe(self):
         if not self.enable_z_probe:
             raise self.printer.command_error(
-                "Z probe interface disabled in [adxl345_probe]")
+                "Z probe interface disabled in [accelerometer_probe]")
 
     def multi_probe_begin(self):
         self._require_z_probe()
@@ -903,7 +933,8 @@ class ADXL345Probe:
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
                                            or has_homing_arm_delay):
             raise gcmd.error(
-                "Can not update tap settings while homing/probing move is active")
+                "Can not update tap settings while homing/probing move is"
+                " active")
 
         targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
         new_thresh = None
@@ -992,8 +1023,8 @@ class ADXL345Probe:
 
 
 def load_config(config):
-    return ADXL345Probe(config)
+    return AccelerometerProbe(config)
 
 
 def load_config_prefix(config):
-    return ADXL345Probe(config)
+    return AccelerometerProbe(config)
