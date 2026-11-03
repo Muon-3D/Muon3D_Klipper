@@ -214,6 +214,13 @@ class AccelerometerProbe:
         self._active_axis_homing_arm_scheduled = False
         self._in_multi_probe = False
         self._adxl_initialized = False
+        # Set from homing:home_rails_begin when the home will be confirmed:
+        # its tap moves then keep the tap set up past their end, and the
+        # confirmation tears it down on the motion clock (_stop_tap_queued).
+        self._defer_tap_stop = False
+        # A print_time for the next _start_tap to use instead of a host
+        # flush, dwell and re-primed move time (consumed once).
+        self._queued_tap_print_time = None
 
         self._register_mux_commands(config)
         self.printer.register_event_handler('klippy:connect', self.init_adxl)
@@ -228,6 +235,8 @@ class AccelerometerProbe:
             'homing:homing_move_begin', self._handle_homing_move_begin)
         self.printer.register_event_handler(
             'homing:homing_move_end', self._handle_homing_move_end)
+        self.printer.register_event_handler(
+            'homing:home_rails_begin', self._handle_home_rails_begin)
         self.printer.register_event_handler(
             'homing:home_rails_end', self._handle_home_rails_end)
         self.printer.register_event_handler(
@@ -455,10 +464,18 @@ class AccelerometerProbe:
         chip = self.tap_chip
         toolhead = self.printer.lookup_object('toolhead')
         was_measuring = True
+        queued_time = self._queued_tap_print_time
+        self._queued_tap_print_time = None
         try:
-            toolhead.flush_step_generation()
-            toolhead.dwell(ADXL345_REST_TIME)
-            print_time = toolhead.get_last_move_time()
+            if queued_time is None:
+                toolhead.flush_step_generation()
+                toolhead.dwell(ADXL345_REST_TIME)
+                print_time = toolhead.get_last_move_time()
+            else:
+                # Confirmation: the retract is already queued and this
+                # time is past the rest after the last impact, so the chip
+                # is set up while the carriage retracts.
+                print_time = queued_time
             clock = self._adxl_mcu.print_time_to_clock(print_time)
             chip.disarm(minclock=clock)
             chip.read_source()
@@ -511,12 +528,46 @@ class AccelerometerProbe:
             drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
             start_time = getattr(toolhead, 'get_drip_start_time',
                                  toolhead.get_last_move_time)
-            drip_dwell(ADXL345_REST_TIME)
+            # The rest lets an impact ring down before the tap flag is
+            # checked. A move that ended without a tap (a protected
+            # back-off that met nothing) has no impact to wait out.
+            if self._tap_fired_in_move():
+                drip_dwell(ADXL345_REST_TIME)
             print_time = start_time()
             clock = self._adxl_mcu.print_time_to_clock(print_time)
             chip.disarm(minclock=clock)
             chip.power_restore(self._tap_was_measuring, minclock=clock)
             if not self._try_clear_tap():
+                raise self.printer.command_error(
+                    "%s tap still active after move, reduce sensitivity."
+                    % (self.chip_name,))
+        finally:
+            self._tap_mode = None
+            self._tap_was_measuring = False
+
+    def _tap_fired_in_move(self):
+        # Whether a tap endstop of the homing move just ended triggered.
+        # home_wait() leaves last_trigger_time at the trigger, or 0 (or -1)
+        # when the move ended without one. Outside an axis homing move
+        # (tap test, Z probe) assume an impact.
+        wrappers = self._active_axis_homing_wrappers
+        if not wrappers:
+            return True
+        return any(w.last_trigger_time > 0. for w in wrappers)
+
+    def _stop_tap_queued(self, print_time):
+        # _stop_tap timed on the motion clock instead of a host dwell: the
+        # disarm and the tap-flag check run at print_time (the impact plus
+        # the rest), while a retract queued before this call moves.
+        if self._tap_mode is None:
+            return
+        chip = self.tap_chip
+        try:
+            self._cancel_tap_enable_timer()
+            clock = self._adxl_mcu.print_time_to_clock(print_time)
+            chip.disarm(minclock=clock)
+            chip.power_restore(self._tap_was_measuring, minclock=clock)
+            if not self._try_clear_tap(minclock=clock):
                 raise self.printer.command_error(
                     "%s tap still active after move, reduce sensitivity."
                     % (self.chip_name,))
@@ -627,9 +678,28 @@ class AccelerometerProbe:
         if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
             return
         try:
-            self._stop_tap('axis_homing')
+            if not (self._defer_tap_stop
+                    and self._tap_mode == 'axis_homing'):
+                self._stop_tap('axis_homing')
         finally:
             self._reset_axis_homing_state()
+
+    def _confirmed_tap_wrapper(self, rails):
+        # The wrapper of a single-axis tap home that is confirmed, or None.
+        matches = []
+        for rail in rails:
+            for es, name in rail.get_endstops():
+                if es in self._axis_wrappers.values():
+                    matches.append(es)
+        if len(matches) != 1:
+            return None
+        if self.tap_confirm[matches[0].get_axis()]['samples'] <= 1:
+            return None
+        return matches[0]
+
+    def _handle_home_rails_begin(self, homing_state, rails):
+        self._defer_tap_stop = self._confirmed_tap_wrapper(rails) is not None
+        self._queued_tap_print_time = None
 
     def _handle_home_rails_end(self, homing_state, rails):
         # Confirm an X/Y tap home with further agreeing taps before the
@@ -650,7 +720,15 @@ class AccelerometerProbe:
         cfg = self.tap_confirm[axis]
         if cfg['samples'] <= 1:
             return
-        self._confirm_axis_home(homing_state, rail, wrapper, cfg)
+        try:
+            self._confirm_axis_home(homing_state, rail, wrapper, cfg)
+        finally:
+            self._defer_tap_stop = False
+            self._queued_tap_print_time = None
+            if self._tap_mode == 'axis_homing':
+                # The last tap: its teardown, at the rest after its impact.
+                self._stop_tap_queued(
+                    wrapper.last_trigger_time + ADXL345_REST_TIME)
 
     def _confirm_axis_home(self, homing_state, rail, wrapper, cfg):
         toolhead = self.printer.lookup_object('toolhead')
@@ -724,15 +802,26 @@ class AccelerometerProbe:
             # Back off, then re-approach over twice the retract distance.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
-            # The homing move above ended with a set_position(), so the
-            # queue is drained and a plain move() would be primed
-            # BUFFER_TIME_START (0.25 s) out: the carriage sat on the stop
-            # ~0.5 s per tap. short_prime_move (toolhead.py, for exactly
-            # this probe retract) primes it with the 0.1 s drip lead.
+            # Retract first (as probe.py's LIFTLAST lifts before it
+            # reports): the homing move ended with a set_position(), so a
+            # plain move() would be primed BUFFER_TIME_START (0.25 s) out;
+            # short_prime_move (toolhead.py, for exactly this retract)
+            # primes it with the 0.1 s drip lead, and get_drip_start_time()
+            # flushes it now. Only then the tap teardown and the next setup,
+            # at the impact plus the rest on the motion clock, so they run
+            # while the carriage retracts instead of with it on the stop.
             getattr(toolhead, 'short_prime_move', toolhead.move)(
                 retractpos, retract_speed)
+            getattr(toolhead, 'get_drip_start_time',
+                    toolhead.get_last_move_time)()
+            tap_time = wrapper.last_trigger_time + ADXL345_REST_TIME
+            self._stop_tap_queued(tap_time)
+            self._queued_tap_print_time = tap_time
             trig, travelled = run_homing_move(retract_dist * 2., speed)
             if trig is None:
+                # No tap: the move ended with the tap still set up.
+                self._stop_tap('axis_homing')
+                self._queued_tap_print_time = None
                 # Nothing within reach: the previous tap was spurious.
                 # Resume the seek from here within the travel budget.
                 seek_budget -= travelled
@@ -750,6 +839,7 @@ class AccelerometerProbe:
                 trig, travelled = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:
+                    self._stop_tap('axis_homing')
                     raise cmderr(
                         "accelerometer_probe: %s home failed; no tap within"
                         " %.1fmm of resumed seek" % (axis, seek_dist))
@@ -777,6 +867,8 @@ class AccelerometerProbe:
                      ", ".join("%.3f" % (t,) for _, t in taps))
 
     def _handle_command_error(self):
+        self._defer_tap_stop = False
+        self._queued_tap_print_time = None
         if self._tap_mode == 'axis_homing':
             try:
                 self._stop_tap('axis_homing')
