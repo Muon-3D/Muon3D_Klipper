@@ -163,6 +163,18 @@ def test_set_accel_probe_confirm_knobs(mod):
               "AXIS=ALL checks every axis before changing any")
     else:
         raise AssertionError("AXIS=ALL accepted 61 mm/s")
+    for param in ('CONFIRM_SPEED', 'CONFIRM_RETRACT_SPEED',
+                  'CONFIRM_RETRACT_DIST'):
+        for bad in ('nan', '-nan', 'inf', '-inf'):
+            before = dict(probe.tap_confirm['y'])
+            try:
+                probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Y', **{param: bad}))
+            except RuntimeError as e:
+                check(("finite" in str(e) or "range" in str(e)) and
+                      probe.tap_confirm['y'] == before,
+                      "%s=%s refused, nothing changed" % (param, bad))
+            else:
+                raise AssertionError("%s=%s accepted" % (param, bad))
     for kw in ({'CONFIRM_SPEED': 30}, {'CONFIRM_RETRACT_DIST': 5}):
         try:
             probe.cmd_SET_ACCEL_PROBE(FakeGcmd(AXIS='Z', **kw))
