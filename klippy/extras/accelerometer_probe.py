@@ -724,7 +724,13 @@ class AccelerometerProbe:
             # Back off, then re-approach over twice the retract distance.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
-            toolhead.move(retractpos, retract_speed)
+            # The homing move above ended with a set_position(), so the
+            # queue is drained and a plain move() would be primed
+            # BUFFER_TIME_START (0.25 s) out: the carriage sat on the stop
+            # ~0.5 s per tap. short_prime_move (toolhead.py, for exactly
+            # this probe retract) primes it with the 0.1 s drip lead.
+            getattr(toolhead, 'short_prime_move', toolhead.move)(
+                retractpos, retract_speed)
             trig, travelled = run_homing_move(retract_dist * 2., speed)
             if trig is None:
                 # Nothing within reach: the previous tap was spurious.
