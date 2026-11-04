@@ -49,7 +49,8 @@ STUB_COMMANDS = ('SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'M400', 'G92',
                  '_SAVE_CONFIG_IF_PENDING', 'M106', 'M140',
                  'MACHINE_WAIT_READY', 'MACHINE_REQUIRE',
                  'MACHINE_HEAT_WAIT', 'MACHINE_PAUSED',
-                 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED', 'MACHINE_PLATE_CLEAR')
+                 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
+                 'MACHINE_PLATE_CLEAR')
 
 # What PRINT_END must always reach: heaters, part fan, motors off.
 SHUTDOWN = ('TURN_OFF_HEATERS', 'M107', 'M84')

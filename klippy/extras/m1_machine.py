@@ -29,10 +29,10 @@
 #   * MACHINE_HEAT_WAIT is a heater wait that ends with an error when the thing
 #     it heats goes away (plate pulled, column unlocked, toolhead pulled,
 #     target zeroed), where TEMPERATURE_WAIT and M190 would wait forever.
-#   * While a print is paused it owns the part fan: on at pause_cool_fan
-#     until the hot end, which PAUSE turned off, is below pause_cool_temp,
-#     so the nozzle stops oozing sooner, then off. RESUME puts back the
-#     print's own speed.
+#   * While a print is paused it owns the part fan. A fan that was on stays
+#     at the print's speed until the hot end, which PAUSE turned off, is
+#     below pause_cool_temp, so the nozzle stops oozing sooner, then goes
+#     off. RESUME puts back the print's own speed.
 #   * MACHINE_TOOLHEAD_CONNECTED tells TOOLHEAD_CONNECT whether a connect is
 #     a toolhead plugged in (load the filament it carries) or the toolhead
 #     MCU coming up at a Klipper start (do nothing).
@@ -228,13 +228,13 @@ class M1Machine:
         self.pause_bed_off_time = config.getfloat('pause_bed_off_time',
                                                   1800., minval=0.)
         # The pause cool-down (Harry, 2026-11-04): PAUSE turns the hot end
-        # off, and the part fan runs at pause_cool_fan (0 to 1) until the
-        # nozzle is below pause_cool_temp, where filament no longer flows
-        # out of it, or for pause_cool_max_time at most. 0 disables it.
-        self.pause_cool_temp = config.getfloat('pause_cool_temp', 140.,
-                                               minval=0.)
-        self.pause_cool_fan = config.getfloat('pause_cool_fan', 1.,
-                                              minval=0., maxval=1.)
+        # off, and a part fan that was on keeps the print's speed (it is not
+        # spun up) until the nozzle is below pause_cool_temp, where filament
+        # no longer flows out of it, or for pause_cool_max_time at most.
+        # The default is the nozzle wipe's fan_off_temp, the same ooze point
+        # PRINT_START's wipe uses. 0 disables it.
+        self.pause_cool_temp = config.getfloat(
+            'pause_cool_temp', self._wipe_fan_off_temp(config), minval=0.)
         self.pause_cool_max_time = config.getfloat('pause_cool_max_time',
                                                    600., minval=0.)
         # The toolhead MCU is non critical, so it is deferred and then
@@ -292,6 +292,16 @@ class M1Machine:
             self.gcode.register_command(name, func,
                                         desc=getattr(self, 'cmd_%s_help'
                                                      % (name,)))
+
+    @staticmethod
+    def _wipe_fan_off_temp(config):
+        try:
+            if config.has_section('nozzle_wipe_smart'):
+                return config.getsection('nozzle_wipe_smart').getfloat(
+                    'fan_off_temp', 160., note_valid=False)
+        except Exception:
+            logging.exception("m1_machine: nozzle_wipe_smart fan_off_temp")
+        return 160.
 
     def _connect(self):
         lo = self.printer.lookup_object
@@ -503,18 +513,18 @@ class M1Machine:
 
     # --- The pause cool-down -------------------------------------------------
     def _cool_start(self, eventtime):
-        """From MACHINE_PAUSED, inside PAUSE: the part fan on to cool the
-        nozzle PAUSE just turned off, or off if there is nothing to cool."""
-        fan_on = False
+        """From MACHINE_PAUSED, inside PAUSE: a part fan that is on is left
+        running to cool the nozzle PAUSE just turned off. It is never spun
+        up. Off at once when it was off or there is nothing to cool."""
+        keep = False
         heater = self._heater(self.hotend_name)
-        if (self.pause_cool_temp and self.pause_cool_fan and heater is not None
+        if (self.pause_cool_temp and self.saved_fan > 0.
+                and heater is not None
                 and not getattr(self.toolhead_mcu,
                                 'non_critical_disconnected', False)):
-            fan_on = heater.get_temp(eventtime)[0] >= self.pause_cool_temp
-        if fan_on:
+            keep = heater.get_temp(eventtime)[0] >= self.pause_cool_temp
+        if keep:
             self.cooling = eventtime
-            self._script_from_command(
-                "M106 S%d" % (round(self.pause_cool_fan * 255.),))
         else:
             self.cooling = None
             self._script_from_command("M107")

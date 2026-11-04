@@ -319,6 +319,12 @@ class FakeConfig:
     def getboolean(self, name, default=None):
         return bool(self.values.get(name, default))
 
+    def has_section(self, name):
+        return name in self.values.get('sections', {})
+
+    def getsection(self, name):
+        return FakeConfig(self.printer, self.values['sections'][name])
+
 
 class Machine:
     """An M1 that is ready to print, with every source m1_machine reads."""
@@ -652,10 +658,11 @@ class TestPauseAndResume(unittest.TestCase):
 
 
 class TestPauseCoolDown(unittest.TestCase):
-    """Harry, 2026-11-04: PAUSE turns the hot end off, and the part fan runs
-    until the nozzle is below the ooze point, then stops."""
+    """Harry, 2026-11-04: PAUSE turns the hot end off. A part fan that was
+    on stays at the print's speed (never spun up) until the nozzle is below
+    the ooze point, then stops."""
 
-    def paused(self, temp=215., **kw):
+    def paused(self, temp=215., fan=0.4, **kw):
         m = Machine(**kw)
         he = m.heaters.heaters['extruder']
         he.temp, he.target = temp, 215.
@@ -664,17 +671,18 @@ class TestPauseCoolDown(unittest.TestCase):
         m.pr.is_paused = True
         m.ps.status['state'] = 'paused'
         he.target = 0.          # PAUSE's M104 S0
-        m.run('MACHINE_PAUSED', REASON='user', FAN=0.4)
+        m.run('MACHINE_PAUSED', REASON='user', FAN=fan)
         return m, he
 
     def fan_off_times(self, m):
         return [t for t, s in m.gcode.run if s == 'M107']
 
-    def test_fan_runs_until_the_nozzle_is_cool(self):
+    def test_fan_keeps_its_speed_until_the_nozzle_is_cool(self):
         m, he = self.paused()
-        self.assertEqual(m.gcode.scripts[-1], 'M106 S255')
+        # Nothing sent: the fan carries on at the print's speed.
+        self.assertEqual(m.gcode.scripts, [])
         self.assertTrue(m.m1.get_status(0)['cooling'])
-        he.temp = 160.
+        he.temp = 161.
         m.poll()
         self.assertEqual(self.fan_off_times(m), [])
         he.temp = 139.
@@ -685,6 +693,18 @@ class TestPauseCoolDown(unittest.TestCase):
         self.assertEqual(len(self.fan_off_times(m)), 1)
         # The print's own speed is still what RESUME puts back.
         self.assertEqual(m.m1.saved_fan, 0.4)
+
+    def test_a_fan_that_was_off_is_not_turned_on(self):
+        m, he = self.paused(fan=0.)
+        self.assertEqual(m.gcode.scripts, ['M107'])
+        self.assertFalse(m.m1.get_status(0)['cooling'])
+
+    def test_the_ooze_point_is_the_nozzle_wipes(self):
+        # One number for "the nozzle no longer oozes": the wipe's.
+        m, he = self.paused(sections={'nozzle_wipe_smart':
+                                      {'fan_off_temp': 150.}})
+        self.assertEqual(m.m1.pause_cool_temp, 150.)
+        self.assertEqual(Machine().m1.pause_cool_temp, 160.)
 
     def test_a_cool_nozzle_turns_the_fan_off_at_once(self):
         m, he = self.paused(temp=100.)
@@ -697,8 +717,8 @@ class TestPauseCoolDown(unittest.TestCase):
         m.start_print()
         m.pr.is_paused = True
         m.mcu.non_critical_disconnected = True
-        m.run('MACHINE_PAUSED', REASON='toolhead_disconnected')
-        self.assertNotIn('M106 S255', m.gcode.scripts)
+        m.run('MACHINE_PAUSED', REASON='toolhead_disconnected', FAN=0.4)
+        self.assertFalse(m.m1.get_status(0)['cooling'])
 
     def test_waits_for_the_gcode_lock(self):
         m, he = self.paused()

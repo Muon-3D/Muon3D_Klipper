@@ -1820,8 +1820,8 @@ for the hot end the toolhead, its sensor, or the fan.
 #### MACHINE_PAUSED
 `MACHINE_PAUSED REASON=<code> [FAN=<0..1>]`: Called by PAUSE. Records a new
 pause, its reason and the part-fan speed to restore, and starts the
-cool-down: the part fan at `pause_cool_fan` while the hot end is above
-`pause_cool_temp`, otherwise off. On a pause already recorded it only
+cool-down: a part fan that was on stays at that speed while the hot end is
+above `pause_cool_temp`, otherwise it goes off. On a pause already recorded it only
 replaces a `user` reason.
 
 #### MACHINE_PAUSE_REASON

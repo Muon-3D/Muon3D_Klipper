@@ -1713,13 +1713,12 @@ class PauseResumeSymmetry(_M1TestCase):
         self.assertNotIn('G1', names)
         self.assertIn('MACHINE_PAUSED REASON=plate_removed', self.m1.timeline)
 
-    def test_pause_lifts_5mm_and_parks_front_right(self):
-        # Harry, 2026-11-04: lift 5 mm, park at the front right (Y min is
-        # the front; Y max is the homing corner at the back).
+    def test_pause_lifts_5mm_and_parks_back_right(self):
+        # Harry, 2026-11-04: lift 5 mm, park at X and Y max less 5 mm.
         self.pause()
         tl = self.m1.timeline
         self.assertIn('G1 Z5.0 F900', tl)
-        self.assertIn('G1 X195.0 Y0.0 F6000', tl)
+        self.assertIn('G1 X195.0 Y175.0 F6000', tl)
 
     def test_pause_lift_stops_at_the_top_of_z(self):
         # 2 mm below the top of Z: lift 2 mm, not 5 into the end of the axis.
@@ -1741,11 +1740,12 @@ class PauseResumeSymmetry(_M1TestCase):
         self.assertEqual(self.m1.macro_vars('PAUSE')['saved_hotend_target'],
                          215.0)
 
-    def test_column_unlocked_pause_does_not_lift_z(self):
-        # F6.
+    def test_column_unlocked_pause_lifts_z_too(self):
+        # Harry, 2026-11-04: the lever only stops the column wobbling; the Z
+        # motor still moves the carriage. (The audit's F6 assumed it did
+        # not.)
         self.pause('PAUSE REASON=column_unlocked')
-        self.assertFalse(any(line.startswith('G1 Z')
-                             for line in self.m1.timeline), self.m1.timeline)
+        self.assertIn('G1 Z5.0 F900', self.m1.timeline)
         self.assertTrue(any(line.startswith('G1 X')
                             for line in self.m1.timeline))
 

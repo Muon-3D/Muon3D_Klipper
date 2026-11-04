@@ -4919,8 +4919,8 @@ what each action needs. It reads `[z_power]` (column, bed power path),
 `[bed_removal_detector]` (plate), the `toolhead` MCU, `muon_hotend`, the
 toolhead filament switch, `[hotend_fan_latch]`, `print_stats` and
 `pause_resume`, each optional, and moves nothing itself. While a print is
-paused it runs the part fan until the hot end has cooled below
-`pause_cool_temp`, then turns it off. The status object
+paused it leaves a running part fan at the print's speed until the hot
+end has cooled below `pause_cool_temp`, then turns it off. The status object
 reports `activity` (`idle`, `busy`, `waiting`, `preparing`, `printing`,
 `paused`, `complete`, `cancelled`, `error`, `fault`), `conditions`,
 `missing` and `ready` per action (`print`, `resume`, `home_z`, `home_xy`;
@@ -4944,12 +4944,12 @@ file as printing, not toolhead motion.
 #require_plate_cleared: True
 #   After a print that printed something, refuse the next print until the
 #   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR).
-#pause_cool_temp: 140
-#   On a pause, the part fan runs until the hot end is below this
-#   temperature, where filament no longer oozes from the nozzle. 0 disables
-#   the cool-down: the fan is turned off at once.
-#pause_cool_fan: 1.0
-#   The part-fan speed (0 to 1) for the cool-down.
+#pause_cool_temp:
+#   On a pause, a part fan that was on keeps running at the print's speed
+#   until the hot end is below this temperature, where filament no longer
+#   oozes from the nozzle. The default is [nozzle_wipe_smart]'s
+#   fan_off_temp, or 160. 0 disables the cool-down: the fan is turned off
+#   at once.
 #pause_cool_max_time: 600
 #   The longest the cool-down runs, in seconds (0 for no limit).
 #toolhead_startup_grace: 15
