@@ -47,7 +47,7 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
          'G4', 'M300', 'G28', 'SET_KINEMATIC_POSITION',
          'SET_BED_REMOVAL_DETECTOR', 'Z_POWER_WAIT', 'Z_POWER_REQUIRE',
-         'SET_PART_FAN')
+         'SET_PART_FAN', 'SAVE_CONFIG')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
            'PID_CALIBRATE', 'PROBE_CALIBRATE')

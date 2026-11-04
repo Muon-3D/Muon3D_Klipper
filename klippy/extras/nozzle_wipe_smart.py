@@ -284,6 +284,10 @@ class NozzleWipeSmart:
                     self.phase = "IDLE"
                     gcmd.respond_info("NOZZLE_WIPE_SMART: stop requested")
                     return
+                # A cancelled print, see gcode.run_abortable_script(). The
+                # HEAT_WAIT phase alone polls for 20-40 s with no command
+                # boundary for the abort to land on.
+                self.gcode.check_abort()
                 if self.iter >= params["max_iter"]:
                     temp, target = self._get_temp(extruder)
                     self._abort_outputs(extruder)
@@ -342,6 +346,13 @@ class NozzleWipeSmart:
                     self.active = False
                     raise gcmd.error(
                         "NOZZLE_WIPE_SMART: unknown phase %s" % (self.phase,))
+        except self.gcode.abort_error:
+            # Treated as a stop, not a failure: outputs off, phase IDLE.
+            self.active = False
+            if not self.printer.is_shutdown():
+                self._abort_outputs(extruder)
+            self.phase = "IDLE"
+            raise
         except Exception as e:
             self.last_error = str(e)
             self.active = False
