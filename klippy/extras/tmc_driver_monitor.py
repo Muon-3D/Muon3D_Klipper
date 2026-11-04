@@ -26,6 +26,12 @@
 # Status object "tmc_driver_monitor":
 #   {"stepper_x": {"temperature": 31.2, "supply_voltage": 45.09}, ...,
 #    "max_temperature": 31.2, "min_supply_voltage": 45.06}
+#
+# A driver on a hot-pluggable (non-critical) MCU, such as the M1 toolhead's
+# extruder, reads None while that MCU is disconnected, and is reported on
+# its own but left out of max_temperature and min_supply_voltage: its supply
+# is measured after the umbilical, which drops under load, and heater_supply
+# takes the bed's rail from min_supply_voltage.
 import logging
 from . import tmc2240, tmc2241
 
@@ -74,11 +80,20 @@ class DriverMonitor:
         val = drv.mcu_tmc.get_register(vs_reg)
         volts = fields.get_field("adc_vsupply", val) * VSUPPLY_LSB[type(drv)]
         return round(temp, 2), round(volts, 3)
+    def _hot_plugged(self, drv):
+        return bool(getattr(drv.mcu_tmc.get_mcu(), 'is_non_critical', False))
     def _poll(self, eventtime):
         for stepper_name, drv in self.drivers.items():
+            mcu = drv.mcu_tmc.get_mcu()
+            if getattr(mcu, 'non_critical_disconnected', False):
+                self.readings[stepper_name] = None
+                continue
             try:
                 temp, volts = self._read(drv)
-            except self.printer.command_error as e:
+            except Exception as e:
+                # Any failure (a toolhead pulled mid-read raises more than
+                # command_error) costs this driver one reading, never the
+                # timer and with it every other driver.
                 logging.info("tmc_driver_monitor: %s read failed: %s",
                              stepper_name, e)
                 self.readings[stepper_name] = None
@@ -92,12 +107,14 @@ class DriverMonitor:
     def get_status(self, eventtime):
         status = {}
         temps, volts = [], []
-        for name in self.drivers:
+        for name, drv in self.drivers.items():
             r = self.readings.get(name)
             if r is None:
                 status[name] = {"temperature": None, "supply_voltage": None}
                 continue
             status[name] = {"temperature": r[0], "supply_voltage": r[1]}
+            if drv is not None and self._hot_plugged(drv):
+                continue
             temps.append(r[0])
             volts.append(r[1])
         status["max_temperature"] = max(temps) if temps else None

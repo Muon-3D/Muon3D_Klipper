@@ -4973,7 +4973,10 @@ while the motor is enabled). Adding this section registers the
 `tmc_driver` temperature sensor type, so it must appear before any section
 that uses it. The `tmc_driver_monitor` status object reports each monitored
 driver's `temperature` and `supply_voltage`, plus `max_temperature` and
-`min_supply_voltage` across them.
+`min_supply_voltage` across them. A driver on a hot-pluggable
+(non-critical) MCU reads None while it is disconnected and is left out of
+`max_temperature` and `min_supply_voltage`, since its supply is measured
+at the end of its cable.
 
 ```
 [tmc_driver_monitor]
