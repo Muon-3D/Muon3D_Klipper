@@ -532,16 +532,28 @@ DETECT_INTERVAL = 0.25
 # Klipper's [thermistor ATC Semitec 104NT-4-R025H42G] (temperature_sensors.cfg,
 # from ATC Semitec's NT-4 glass NTC datasheet).
 NTC_104NT = ((25., 100000.), (160., 1074.), (300., 82.78))
-# The NT-4 series is rated -50 to +300 C. max_temp is the shutdown line, so
-# it sits 10 C under the rating: an overshoot or a reading just under the
-# trip never takes the sensor past 300 C, and prints to ~280 C still fit.
+# The NT-4 series is rated -50 to +300 C. A target may be set up to
+# NTC_MAX_TEMP; a reading above NTC_SHUTDOWN_TEMP shuts the printer down.
+# The trip stays under the rating, and the gap above the highest target
+# leaves room for a normal overshoot.
 NTC_MAX_TEMP = 290.
+NTC_SHUTDOWN_TEMP = 298.
 
 class HotendProfile:
-    def __init__(self, config, prefix, max_temp, heater_max):
+    # max_temp: the highest target that may be set. shutdown_temp: the
+    # reading that shuts the printer down (the chip's range check), at or
+    # above max_temp; by default the same as max_temp.
+    def __init__(self, config, prefix, max_temp, heater_max,
+                 shutdown_temp=None):
         self.name = prefix
         self.max_temp = config.getfloat(prefix + '_max_temp', max_temp,
                                         above=0., maxval=heater_max)
+        if shutdown_temp is None:
+            shutdown_temp = self.max_temp
+        self.shutdown_temp = config.getfloat(
+            prefix + '_shutdown_temp',
+            max(self.max_temp, min(shutdown_temp, heater_max)),
+            minval=self.max_temp, maxval=heater_max)
         pid = [config.getfloat(prefix + '_pid_' + k, None)
                for k in ('Kp', 'Ki', 'Kd')]
         if any(v is not None for v in pid) and None in pid:
@@ -572,7 +584,7 @@ class MuonHotend:
         heater_max = config.getfloat('max_temp')
         self.profiles = {
             'ntc': HotendProfile(config, 'ntc', min(NTC_MAX_TEMP, heater_max),
-                                 heater_max),
+                                 heater_max, NTC_SHUTDOWN_TEMP),
             'pt1000': HotendProfile(config, 'pt1000', min(350., heater_max),
                                     heater_max),
         }
@@ -784,9 +796,9 @@ class MuonHotend:
                 return eventtime + DETECT_INTERVAL
             temp = self._temperature(ntc[-1][1], ntc[-1][2], MODE_NTC)
             prof = self.profiles['ntc']
-            if not (self.min_temp < temp < prof.max_temp):
+            if not (self.min_temp < temp < prof.shutdown_temp):
                 msg = "NTC reads %.1fC after switching, outside %.0f:%.0f" % (
-                    temp, self.min_temp, prof.max_temp)
+                    temp, self.min_temp, prof.shutdown_temp)
                 self._respond("Hotend sensor fault: %s. Heating is refused."
                               % (msg,))
                 self._refuse(msg)
@@ -821,8 +833,11 @@ class MuonHotend:
         prof = self.profiles[hotend_type]
         heater = self._get_heater()
         mode = MODE_NTC if hotend_type == 'ntc' else MODE_PT1000
+        # Targets are limited to max_temp; the chip's range check (a
+        # shutdown) trips above shutdown_temp.
         max_temp = min(prof.max_temp, self.max_temp)
-        lo, hi, ref_lo, ref_hi = self._mcu_range(hotend_type, max_temp)
+        shutdown_temp = min(prof.shutdown_temp, self.max_temp)
+        lo, hi, ref_lo, ref_hi = self._mcu_range(hotend_type, shutdown_temp)
         self.chip.set_range(lo, hi, ref_lo, ref_hi, self.range_check_count)
         heater.max_temp = max_temp
         if prof.pid is not None:
@@ -847,9 +862,10 @@ class MuonHotend:
             self.active_mode = mode
         self._set_state(hotend_type, self.detect_reason)
         heater.release_pwm(HOLD_DETECT)
-        self._respond("Hotend detected: %s (max_temp %.0fC). %s" % (
-            'NTC' if hotend_type == 'ntc' else 'PT1000', max_temp,
-            self.message))
+        self._respond("Hotend detected: %s (max_temp %.0fC, shutdown above"
+                      " %.0fC). %s" % (
+                          'NTC' if hotend_type == 'ntc' else 'PT1000',
+                          max_temp, shutdown_temp, self.message))
 
     # Probe windows
     def hold_for_tap(self):
@@ -870,6 +886,8 @@ class MuonHotend:
                            else round(self.last_resistance, 1)),
             'max_temp': (self.profiles[self.hotend_type].max_temp
                          if self.hotend_type else None),
+            'shutdown_temp': (self.profiles[self.hotend_type].shutdown_temp
+                              if self.hotend_type else None),
         }
 
     cmd_MUON_HOTEND_DETECT_help = "Re-run hotend type detection"

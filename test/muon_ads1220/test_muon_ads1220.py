@@ -349,14 +349,15 @@ def test_range_pt1000():
 
 def test_range_ntc():
     hotend = make_hotend()[0]
-    rng = hotend._mcu_range('ntc', m.NTC_MAX_TEMP)
+    rng = hotend._mcu_range('ntc', m.NTC_SHUTDOWN_TEMP)
     def counts(temp):
         r = ntc_resistance(hotend, temp)
         return int(R_REF / (r + R_REF) * (1 << 23))
     def ok(c):
         return mcu_range_ok(m.MODE_NTC, rng, c, 0)
-    assert ok(counts(25.)) and ok(counts(285.)) and ok(counts(-60.))
-    assert not ok(counts(295.))
+    # A target may go to 290 C; only a reading above 298 C is out of range.
+    assert ok(counts(25.)) and ok(counts(295.)) and ok(counts(-60.))
+    assert not ok(counts(300.))
     assert not ok(0) and not ok(-200)            # open: no current
     assert not ok(m.ADC_MAX)                     # short: full scale
 
@@ -444,6 +445,7 @@ def test_state_machine_ntc():
     assert chip.modes == [m.MODE_NTC], chip.modes
     assert hotend.hotend_type == 'ntc', (hotend.state, hotend.message)
     assert heater.max_temp == 290.
+    assert hotend.get_status(0.)['shutdown_temp'] == 298.
     assert abs(heater.control.Kp * heaters.PID_PARAM_BASE - 20.) < 1e-9
     assert not heater.pwm_holds
     assert temps and abs(temps[-1][1] - 25.) < 0.5, temps[-1:]

@@ -3093,8 +3093,14 @@ muon_ads1220:
 #   settling time).
 #ntc_max_temp: 290
 #pt1000_max_temp: 350
-#   max_temp applied for each hotend type. The NTC default is 10 C under
-#   the 300 C rating of the Semitec 104NT-4-R025H42G. Each must be at or below the
+#   The highest target that may be set for each hotend type.
+#ntc_shutdown_temp: 298
+#pt1000_shutdown_temp:
+#   A reading above this shuts the printer down (the ADS1220 range
+#   check). At or above the type's max_temp; the PT1000 default is its
+#   max_temp. The NTC defaults keep the trip under the 300 C rating of
+#   the Semitec 104NT-4-R025H42G and leave room for an overshoot above
+#   the highest target. Each must be at or below the
 #   heater's own max_temp, which should therefore be set to the higher of
 #   the two.
 #ntc_pid_Kp:
