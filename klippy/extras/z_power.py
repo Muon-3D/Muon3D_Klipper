@@ -16,6 +16,12 @@
 # eFuse PGOOD (digital) and IMON (ADC, current). Output: the eFuse enable.
 # The bed heater refuses a target unless the path is READY, and a PGOOD drop
 # or a current fault latches the path off until Z_POWER_RESET.
+#
+# It also gates X/Y motion on the column: folded, the Z axis sits in the
+# path of the X/Y gantry, so a G-code move in X or Y is refused unless the
+# column is plugged in (locked or not). Z needs no lock to move (the lift
+# before an X/Y home, the park at the top); only Z homing, which macros gate
+# on the lock, and anything that trusts a Z position need it locked.
 import logging
 
 POLL_INTERVAL = 0.1
@@ -72,6 +78,13 @@ def decide(z_band, plate_present, fault, inhibited):
     if not plate_present:
         return NO_PLATE, REASONS[NO_PLATE], False
     return POWERING, REASONS[POWERING], True
+
+
+def xy_allowed(z_band, required=True):
+    """Whether X/Y may move: the Z column plugged in, locked or not. An
+    unrecognised or not yet read column refuses, so the gate fails closed.
+    """
+    return (not required) or z_band in (UNLOCKED, 'locked')
 
 
 def classify_band(ratio, bands):
@@ -181,6 +194,12 @@ class ZPower:
             config, 'z_change_gcode', '')
         self.last_band = None
         self.band_seen = False
+        # Production: no X/Y move without the column (see the top). A
+        # development unit run without a column sets this False.
+        self.xy_requires_column = config.getboolean('xy_requires_column',
+                                                    True)
+        self.next_transform = None
+        self.last_position = [0., 0., 0., 0.]
         printer.register_event_handler('klippy:connect', self._handle_connect)
         printer.register_event_handler('klippy:ready', self._handle_ready)
         printer.register_event_handler('klippy:shutdown',
@@ -224,6 +243,28 @@ class ZPower:
         self.heater.set_temp = guarded_set_temp
     def _handle_ready(self):
         self.reactor.register_timer(self._poll, self.reactor.NOW)
+        # A gcode_move transform, as contact_guard is, so jogs, typed G1 and
+        # macros are all checked; homing and FORCE_MOVE drive the toolhead
+        # directly and are gated by the homing macros instead.
+        gcode_move = self.printer.lookup_object('gcode_move')
+        self.next_transform = gcode_move.set_move_transform(self, force=True)
+        gcode_move.reset_last_position()
+    # Move transform interface: refuse X/Y without the Z column
+    def get_position(self):
+        self.last_position = list(self.next_transform.get_position())
+        return list(self.last_position)
+    def move(self, newpos, speed):
+        last = self.last_position
+        moves_xy = (abs(newpos[0] - last[0]) > 1e-6
+                    or abs(newpos[1] - last[1]) > 1e-6)
+        if moves_xy and not xy_allowed(self.z_band.value,
+                                       self.xy_requires_column):
+            band = self.z_band.value
+            reason = REASONS[ABSENT if band == ABSENT else UNKNOWN]
+            raise self.printer.command_error(
+                "Cannot move X or Y: %s" % (reason,))
+        self.next_transform.move(newpos, speed)
+        self.last_position = list(newpos)
     def _handle_shutdown(self):
         # The MCU drops the enable itself (shutdown value 0).
         self.enabled = False
@@ -374,6 +415,8 @@ class ZPower:
         return {'state': self.state,
                 'reason': self.reason,
                 'z': self.z_band.value,
+                'xy_allowed': xy_allowed(self.z_band.value,
+                                         self.xy_requires_column),
                 'plate_present': self.detector.plate_present(),
                 'enabled': self.enabled,
                 'power_good': self.power_good,
