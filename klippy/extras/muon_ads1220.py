@@ -528,7 +528,14 @@ HOLD_DETECT = "muon_hotend detect"
 HOLD_TAP = "muon_hotend tap"
 PIN_MIN_TIME = 0.100
 DETECT_INTERVAL = 0.25
+# ATC Semitec 104NT-4-R025H42G, the B1 hotend NTC: the same three points as
+# Klipper's [thermistor ATC Semitec 104NT-4-R025H42G] (temperature_sensors.cfg,
+# from ATC Semitec's NT-4 glass NTC datasheet).
 NTC_104NT = ((25., 100000.), (160., 1074.), (300., 82.78))
+# The NT-4 series is rated -50 to +300 C. max_temp is the shutdown line, so
+# it sits 10 C under the rating: an overshoot or a reading just under the
+# trip never takes the sensor past 300 C, and prints to ~280 C still fit.
+NTC_MAX_TEMP = 290.
 
 class HotendProfile:
     def __init__(self, config, prefix, max_temp, heater_max):
@@ -564,7 +571,7 @@ class MuonHotend:
         self.ntc.setup_coefficients(*pts, name=config.get_name())
         heater_max = config.getfloat('max_temp')
         self.profiles = {
-            'ntc': HotendProfile(config, 'ntc', min(265., heater_max),
+            'ntc': HotendProfile(config, 'ntc', min(NTC_MAX_TEMP, heater_max),
                                  heater_max),
             'pt1000': HotendProfile(config, 'pt1000', min(350., heater_max),
                                     heater_max),
