@@ -168,6 +168,10 @@ finish_test fan_modes "Test fan_modes speed table mapping"
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+# MUON: M1 machine state, start/resume gates and heat waits (m1_machine).
+start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
+$PYTHON test/m1_machine/test_m1_machine.py
+finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"

@@ -72,8 +72,16 @@ class RunoutHelper:
             return
         # Determine "printing" status
         now = self.reactor.monotonic()
-        idle_timeout = self.printer.lookup_object("idle_timeout")
-        is_printing = idle_timeout.get_status(now)["state"] == "Printing"
+        # Muon: on the M1, m1_machine says whether a print file is printing.
+        # idle_timeout "Printing" is any toolhead motion, so an unload or a
+        # jog that pulled the filament past the switch was handled as a
+        # runout mid-print, and an insert during one was ignored.
+        m1 = self.printer.lookup_object("m1_machine", None)
+        if m1 is not None:
+            is_printing = m1.file_printing(now)
+        else:
+            idle_timeout = self.printer.lookup_object("idle_timeout")
+            is_printing = idle_timeout.get_status(now)["state"] == "Printing"
         # Perform filament action associated with status change (if any)
         if is_filament_present:
             if not is_printing and self.insert_gcode is not None:
