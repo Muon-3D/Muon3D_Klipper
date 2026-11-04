@@ -65,6 +65,11 @@ class TemperatureFan:
         self.fan.set_speed(value, speed_time)
     def temperature_callback(self, read_time, temp):
         self.last_temp = temp
+        # MUON (KAN-992): last_temp_time was declared and never set, so
+        # nothing could tell a real sample from the 0.0 placeholder that
+        # last_temp holds until the sensor first reports.  heaters.Heater
+        # records it the same way.
+        self.last_temp_time = read_time
         self.control.temperature_callback(read_time, temp)
     def get_temp(self, eventtime):
         return self.last_temp, self.target_temp
