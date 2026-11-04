@@ -21,7 +21,7 @@ from extras.m1_machine import missing, activity  # noqa: E402
 
 READY = {'column': 'locked', 'bed_power': 'ready', 'plate': 'present',
          'toolhead': 'connected', 'hotend': 'ntc', 'filament': 'present',
-         'fan_fault': False, 'plate_cleared': True, 'job_hotend': None}
+         'fan_fault': False, 'plate_cleared': True}
 
 
 def cond(**kw):
@@ -71,11 +71,10 @@ class TestMissing(unittest.TestCase):
         self.assertEqual(missing('print', cond(hotend='failed')),
                          ['hotend_failed'])
 
-    def test_resume_needs_the_same_hotend_type(self):
-        c = cond(job_hotend='ntc', hotend='pt1000')
-        self.assertEqual(missing('resume', c), ['hotend_changed'])
-        self.assertEqual(missing('print', c), [])
-        self.assertEqual(missing('resume', cond(job_hotend='ntc')), [])
+    def test_resume_takes_either_hotend_type(self):
+        # Harry, 2026-11-04: nobody changes a hot end mid-print, and
+        # muon_hotend re-detects the type itself. No same-type check.
+        self.assertEqual(missing('resume', cond(hotend='pt1000')), [])
 
     def test_plate_cleared_is_for_a_new_print_only(self):
         c = cond(plate_cleared=False)
@@ -176,8 +175,11 @@ class FakeGcode:
     def __init__(self):
         self.commands = {}
         self.out = []
-        self.scripts = []
+        self.scripts = []      # run_script_from_command (inside a command)
+        self.run = []          # (time, script) from run_script (a timer)
         self.abort = None
+        self.busy = False      # another command holds the gcode lock
+        self.reactor = None
 
     def register_command(self, name, fn, desc=None):
         self.commands[name] = fn
@@ -190,6 +192,17 @@ class FakeGcode:
 
     def run_script_from_command(self, script):
         self.scripts.append(script)
+
+    def run_script(self, script):
+        self.run.append((self.reactor.now, script))
+
+    def get_mutex(self):
+        gcode = self
+
+        class Mutex:
+            def test(self):
+                return gcode.busy
+        return Mutex()
 
     def check_abort(self):
         if self.abort:
@@ -313,6 +326,7 @@ class Machine:
     def __init__(self, **cfg):
         self.reactor = FakeReactor()
         self.gcode = FakeGcode()
+        self.gcode.reactor = self.reactor
         self.printer = p = FakePrinter(self.reactor, self.gcode)
         self.zp = Status(z='locked', state='ready', reason='')
         self.detector = FakeDetector()
@@ -337,6 +351,7 @@ class Machine:
         self.m1 = m1_machine.M1Machine(FakeConfig(p, cfg))
         p.objects['m1_machine'] = self.m1
         p.handlers['klippy:connect']()
+        p.handlers['klippy:ready']()
 
     def run(self, name, **params):
         return self.gcode.commands[name](FakeGcmd(self.gcode, params))
@@ -369,7 +384,6 @@ class TestStartGate(unittest.TestCase):
         m.run('MACHINE_WAIT_READY', ACTION='print')
         self.assertEqual(m.reactor.pauses, 0)
         self.assertEqual(m.prompts(), [])
-        self.assertEqual(m.m1.job_hotend, 'ntc')
 
     def test_waits_with_the_checklist_then_continues_by_itself(self):
         m = Machine(settle_time=3.)
@@ -587,7 +601,7 @@ class TestPauseAndResume(unittest.TestCase):
         m.reactor.schedule(1., lambda: m.zp.status.update(state='ready'))
         m.run('MACHINE_REQUIRE', ACTION='resume', WAIT=3)
 
-    def test_resume_refuses_a_different_hotend(self):
+    def test_resume_after_a_toolhead_swap(self):
         m = Machine()
         m.start_print()
         m.run('MACHINE_WAIT_READY', ACTION='print')
@@ -595,9 +609,7 @@ class TestPauseAndResume(unittest.TestCase):
         m.pr.is_paused = True
         m.run('MACHINE_PAUSED', REASON='toolhead_disconnected')
         m.hotend.status['state'] = 'pt1000'
-        with self.assertRaises(CommandError) as e:
-            m.run('MACHINE_REQUIRE', ACTION='resume')
-        self.assertIn('hot end the print started with', str(e.exception))
+        m.run('MACHINE_REQUIRE', ACTION='resume')
 
     def test_a_second_pause_keeps_the_first_reason_and_fan(self):
         m = self.paused('plate_removed')
@@ -637,6 +649,146 @@ class TestPauseAndResume(unittest.TestCase):
         m.poll()
         self.assertIsNone(m.m1.pause_reason)
         self.assertEqual(m.prompts()[-1], '// action:prompt_end')
+
+
+class TestPauseCoolDown(unittest.TestCase):
+    """Harry, 2026-11-04: PAUSE turns the hot end off, and the part fan runs
+    until the nozzle is below the ooze point, then stops."""
+
+    def paused(self, temp=215., **kw):
+        m = Machine(**kw)
+        he = m.heaters.heaters['extruder']
+        he.temp, he.target = temp, 215.
+        m.start_print()
+        m.poll()
+        m.pr.is_paused = True
+        m.ps.status['state'] = 'paused'
+        he.target = 0.          # PAUSE's M104 S0
+        m.run('MACHINE_PAUSED', REASON='user', FAN=0.4)
+        return m, he
+
+    def fan_off_times(self, m):
+        return [t for t, s in m.gcode.run if s == 'M107']
+
+    def test_fan_runs_until_the_nozzle_is_cool(self):
+        m, he = self.paused()
+        self.assertEqual(m.gcode.scripts[-1], 'M106 S255')
+        self.assertTrue(m.m1.get_status(0)['cooling'])
+        he.temp = 160.
+        m.poll()
+        self.assertEqual(self.fan_off_times(m), [])
+        he.temp = 139.
+        m.poll()
+        self.assertEqual(len(self.fan_off_times(m)), 1)
+        self.assertFalse(m.m1.get_status(0)['cooling'])
+        m.poll()
+        self.assertEqual(len(self.fan_off_times(m)), 1)
+        # The print's own speed is still what RESUME puts back.
+        self.assertEqual(m.m1.saved_fan, 0.4)
+
+    def test_a_cool_nozzle_turns_the_fan_off_at_once(self):
+        m, he = self.paused(temp=100.)
+        self.assertEqual(m.gcode.scripts[-1], 'M107')
+        self.assertFalse(m.m1.get_status(0)['cooling'])
+
+    def test_no_fan_with_the_toolhead_gone(self):
+        m = Machine()
+        m.heaters.heaters['extruder'].temp = 215.
+        m.start_print()
+        m.pr.is_paused = True
+        m.mcu.non_critical_disconnected = True
+        m.run('MACHINE_PAUSED', REASON='toolhead_disconnected')
+        self.assertNotIn('M106 S255', m.gcode.scripts)
+
+    def test_waits_for_the_gcode_lock(self):
+        m, he = self.paused()
+        he.temp = 100.
+        m.gcode.busy = True
+        m.poll()
+        self.assertEqual(self.fan_off_times(m), [])
+        m.gcode.busy = False
+        m.poll()
+        self.assertEqual(len(self.fan_off_times(m)), 1)
+
+    def test_ends_when_the_hot_end_is_heated_again(self):
+        # A filament load or a purge while paused: the fan must not fight it.
+        m, he = self.paused()
+        he.target = 230.
+        m.poll()
+        self.assertEqual(len(self.fan_off_times(m)), 1)
+
+    def test_ends_after_the_longest_time(self):
+        m, he = self.paused(pause_cool_max_time=600.)
+        m.reactor.now += 599.
+        m.poll()
+        self.assertEqual(self.fan_off_times(m), [])
+        m.reactor.now += 2.
+        m.poll()
+        self.assertEqual(len(self.fan_off_times(m)), 1)
+
+    def test_resume_takes_the_fan_back(self):
+        # RESUME sets the print's speed itself; a later poll must not stop it.
+        m, he = self.paused()
+        m.run('MACHINE_RESUMED')
+        m.pr.is_paused = False
+        he.temp = 100.
+        m.poll()
+        self.assertEqual(self.fan_off_times(m), [])
+
+    def test_can_be_disabled(self):
+        m, he = self.paused(pause_cool_temp=0.)
+        self.assertEqual(m.gcode.scripts[-1], 'M107')
+
+    def test_a_second_pause_does_not_restart_it(self):
+        m, he = self.paused()
+        n = len(m.gcode.scripts)
+        m.run('MACHINE_PAUSED', REASON='plate_removed')
+        self.assertEqual(len(m.gcode.scripts), n)
+
+
+class TestToolheadHotplug(unittest.TestCase):
+    """Is a toolhead connect a toolhead plugged in (load its filament) or
+    the toolhead MCU coming up at a Klipper start (do nothing)?"""
+
+    def connect(self, m):
+        m.run('MACHINE_TOOLHEAD_CONNECTED')
+        return m.m1.get_status(0)['toolhead_hotplug']
+
+    def test_the_connect_at_a_klipper_start(self):
+        m = Machine()
+        m.mcu.non_critical_disconnected = True      # deferred
+        m.poll()
+        m.reactor.now += 2.
+        m.mcu.non_critical_disconnected = False
+        self.assertFalse(self.connect(m))
+
+    def test_unplugged_and_plugged_back_in(self):
+        m = Machine()
+        self.assertFalse(self.connect(m))
+        m.reactor.now += 100.
+        m.mcu.non_critical_disconnected = True
+        m.poll()
+        m.reactor.now += 30.
+        m.mcu.non_critical_disconnected = False
+        self.assertTrue(self.connect(m))
+
+    def test_first_plugged_in_after_the_start(self):
+        # Booted with no toolhead; it is plugged in a minute later.
+        m = Machine(toolhead_startup_grace=15.)
+        m.mcu.non_critical_disconnected = True
+        m.poll()
+        m.reactor.now += 60.
+        m.mcu.non_critical_disconnected = False
+        self.assertTrue(self.connect(m))
+
+    def test_once_per_plug_in(self):
+        m = Machine()
+        self.connect(m)
+        m.mcu.non_critical_disconnected = True
+        m.poll()
+        m.mcu.non_critical_disconnected = False
+        self.assertTrue(self.connect(m))
+        self.assertFalse(self.connect(m))
 
 
 class TestHeatWait(unittest.TestCase):
@@ -720,7 +872,7 @@ class TestStatus(unittest.TestCase):
         for code in ('column_absent', 'column_unlocked', 'column_unknown',
                      'column_reading', 'plate_absent', 'plate_unknown',
                      'toolhead_disconnected', 'hotend_detecting',
-                     'hotend_failed', 'hotend_changed', 'filament_absent',
+                     'hotend_failed', 'filament_absent',
                      'bed_power_starting', 'bed_power_inhibited',
                      'bed_power_fault', 'fan_fault', 'plate_not_cleared'):
             self.assertIn(code, m1_machine.REASONS)

@@ -4918,13 +4918,17 @@ Muon M1 machine state: the one owner of what the printer is doing and of
 what each action needs. It reads `[z_power]` (column, bed power path),
 `[bed_removal_detector]` (plate), the `toolhead` MCU, `muon_hotend`, the
 toolhead filament switch, `[hotend_fan_latch]`, `print_stats` and
-`pause_resume`, each optional, and moves nothing itself. The status object
+`pause_resume`, each optional, and moves nothing itself. While a print is
+paused it runs the part fan until the hot end has cooled below
+`pause_cool_temp`, then turns it off. The status object
 reports `activity` (`idle`, `busy`, `waiting`, `preparing`, `printing`,
 `paused`, `complete`, `cancelled`, `error`, `fault`), `conditions`,
 `missing` and `ready` per action (`print`, `resume`, `home_z`, `home_xy`;
 the missing items are reason codes), `faults`, `pause_reason`,
-`plate_cleared`, `job_hotend`, `job_targets` (the last non-zero bed and
-hot-end targets the print set), `saved_fan` and `gate`. With this section
+`plate_cleared`, `job_targets` (the last non-zero bed and hot-end targets
+the print set), `saved_fan`, `cooling` (the pause cool-down is running),
+`toolhead_hotplug` (the last toolhead connect was a toolhead plugged in,
+not a Klipper start) and `gate`. With this section
 loaded, `[filament_switch_sensor]` treats only a running, unpaused print
 file as printing, not toolhead motion.
 
@@ -4940,6 +4944,17 @@ file as printing, not toolhead motion.
 #require_plate_cleared: True
 #   After a print that printed something, refuse the next print until the
 #   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR).
+#pause_cool_temp: 140
+#   On a pause, the part fan runs until the hot end is below this
+#   temperature, where filament no longer oozes from the nozzle. 0 disables
+#   the cool-down: the fan is turned off at once.
+#pause_cool_fan: 1.0
+#   The part-fan speed (0 to 1) for the cool-down.
+#pause_cool_max_time: 600
+#   The longest the cool-down runs, in seconds (0 for no limit).
+#toolhead_startup_grace: 15
+#   A first toolhead connect later than this many seconds after Klipper is
+#   ready counts as a toolhead plugged in, as any reconnect does.
 #poll_time: 0.5
 #toolhead_mcu: toolhead
 #filament_sensor: filament_sensor_toolhead

@@ -49,8 +49,10 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'SET_BED_REMOVAL_DETECTOR', 'Z_POWER_WAIT', 'Z_POWER_REQUIRE',
          'SET_PART_FAN', 'SAVE_CONFIG', 'M140',
          # m1_machine's (klippy/extras/m1_machine.py, its own tests).
-         'MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT', 'MACHINE_PAUSED',
-         'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED', 'MACHINE_PLATE_CLEAR')
+         'MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
+         'MACHINE_PAUSED',
+         'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED', 'MACHINE_PLATE_CLEAR',
+         'MACHINE_TOOLHEAD_CONNECTED')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
            'PID_CALIBRATE', 'PROBE_CALIBRATE')
@@ -121,10 +123,12 @@ class M1:
         # actual file, which lets tests create a second M1 as a restart.
         self.gcode.register_command('SAVE_VARIABLE', None)
         self.gcode.register_command('SAVE_VARIABLE', self._save_variable)
-        printer.add_object('toolhead', Status({
+        self.toolhead = {
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
-            'homed_axes': 'xyz', 'estimated_print_time': 0.}))
+            'axis_minimum': {'x': 0., 'y': -10., 'z': -4., 'e': 0.},
+            'homed_axes': 'xyz', 'estimated_print_time': 0.}
+        printer.add_object('toolhead', Status(self.toolhead))
         self.extruder = {'can_extrude': True, 'target': 215.,
                          'temperature': 215.}
         printer.add_object('extruder', Status(self.extruder))
@@ -142,7 +146,7 @@ class M1:
         # m1_machine: what RESUME reads back (the bed target the print set,
         # the part-fan speed PAUSE saved), and the bed heater it compares.
         self.m1_machine = {'job_targets': {'bed': 0.0, 'hotend': 0.0},
-                           'saved_fan': 0.0}
+                           'saved_fan': 0.0, 'toolhead_hotplug': False}
         printer.add_object('m1_machine', Status(self.m1_machine))
         self.heater_bed = {'target': 0.0, 'temperature': 25.0}
         printer.add_object('heater_bed', Status(self.heater_bed))
@@ -434,8 +438,10 @@ class FanStallInAnyState(_M1TestCase):
     """#73 review B1: a fan stall turns the hot end off while paused too."""
 
     def test_fan_stall_while_paused_by_hand(self):
+        # PAUSE turns the hot end off itself (Harry, 2026-11-04).
         self.m1.run('PAUSE')
-        self.assertEqual(self.m1.extruder['target'], 215.)
+        self.assertEqual(self.m1.extruder['target'], 0.)
+        self.m1.pause_resume['is_paused'] = True
         self.m1.run('FAN_STOPPAGE_ROUTINE FAN_NAME="Hotend"')
         self.assertEqual(self.m1.extruder['target'], 0.)
         # The manual pause's target is still what RESUME would put back.
@@ -1707,6 +1713,34 @@ class PauseResumeSymmetry(_M1TestCase):
         self.assertNotIn('G1', names)
         self.assertIn('MACHINE_PAUSED REASON=plate_removed', self.m1.timeline)
 
+    def test_pause_lifts_5mm_and_parks_front_right(self):
+        # Harry, 2026-11-04: lift 5 mm, park at the front right (Y min is
+        # the front; Y max is the homing corner at the back).
+        self.pause()
+        tl = self.m1.timeline
+        self.assertIn('G1 Z5.0 F900', tl)
+        self.assertIn('G1 X195.0 Y0.0 F6000', tl)
+
+    def test_pause_lift_stops_at_the_top_of_z(self):
+        # 2 mm below the top of Z: lift 2 mm, not 5 into the end of the axis.
+        self.m1.toolhead['position']['z'] = 178.
+        self.pause()
+        self.assertIn('G1 Z2.0 F900', self.m1.timeline)
+
+    def test_pause_at_the_top_of_z_does_not_lift(self):
+        self.m1.toolhead['position']['z'] = 180.
+        self.pause()
+        self.assertFalse(any(line.startswith('G1 Z')
+                             for line in self.m1.timeline), self.m1.timeline)
+
+    def test_pause_turns_the_hot_end_off_after_the_retract(self):
+        self.pause()
+        tl = self.m1.timeline
+        self.assertIn('M104 S0', tl)
+        self.assertLess(tl.index('G1 E-1.0 F2100'), tl.index('M104 S0'))
+        self.assertEqual(self.m1.macro_vars('PAUSE')['saved_hotend_target'],
+                         215.0)
+
     def test_column_unlocked_pause_does_not_lift_z(self):
         # F6.
         self.pause('PAUSE REASON=column_unlocked')
@@ -1721,11 +1755,12 @@ class PauseResumeSymmetry(_M1TestCase):
                             for line in self.m1.timeline))
         self.assertIn('SET_LED_EFFECT info', self.m1.timeline)
 
-    def test_pause_turns_the_part_fan_off_and_saves_it(self):
-        # F21.
+    def test_pause_hands_the_part_fan_to_m1_machine(self):
+        # F21. PAUSE saves the speed; m1_machine runs the cool-down and then
+        # turns the fan off (test/m1_machine), so PAUSE itself leaves it.
         self.pause()
-        self.assertIn('M107', self.m1.timeline)
         self.assertIn('MACHINE_PAUSED REASON=user FAN=0.5', self.m1.timeline)
+        self.assertNotIn('M107', self.m1.timeline)
 
     def test_resume_restores_bed_and_fan(self):
         # F7: the bed zeroed during the pause is put back and waited for,
@@ -1742,10 +1777,19 @@ class PauseResumeSymmetry(_M1TestCase):
         # Through M106, as S128 of 255.
         self.assertIn('SET_PART_FAN SPEED=%r' % (128 / 255.,), tl)
         names = self.m1.names()
+        self.assertLess(names.index('SET_PART_FAN'),
+                        names.index('MACHINE_RESUMED'))
         self.assertLess(names.index('MACHINE_REQUIRE'),
                         names.index('M140'))
         self.assertLess(names.index('MACHINE_RESUMED'),
                         names.index('RESUME_BASE'))
+
+    def test_resume_stops_the_cool_down_fan_when_the_print_had_none(self):
+        self.pause()
+        self.m1.m1_machine['saved_fan'] = 0.0
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertIn('M107', self.m1.timeline)
 
     def test_resume_keeps_a_hotter_bed(self):
         self.pause()
@@ -1767,37 +1811,56 @@ class PauseResumeSymmetry(_M1TestCase):
             for line in self.m1.timeline))
 
 
-class ToolheadConnectAtBoot(_M1TestCase):
-    """Decision 9: no filament auto-load when the toolhead MCU connects at a
-    Klipper start, only after an unlock press retracted it."""
+class ToolheadConnectAutoLoad(_M1TestCase):
+    """Harry, 2026-11-04: a toolhead plugged in with filament in it loads
+    the filament. The toolhead MCU coming up at a Klipper start does not
+    (audit F1). m1_machine decides which a connect is (toolhead_hotplug,
+    test/m1_machine); this is what the macros do with it."""
 
-    def connect(self):
+    def connect(self, hotplug, filament=True):
+        self.m1.printer.lookup_object(
+            'filament_switch_sensor filament_sensor_toolhead') \
+            .get_status(0)['filament_detected'] = filament
+        self.m1.m1_machine['toolhead_hotplug'] = hotplug
+        if not self.m1.pause_resume['is_paused']:
+            self.m1.print_stats['state'] = 'standby'
         self.m1.timeline.clear()
         self.m1.run('TOOLHEAD_CONNECT')
         return self.m1.names()
 
-    def test_no_load_at_start(self):
-        self.m1.printer.lookup_object(
-            'filament_switch_sensor filament_sensor_toolhead') \
-            .get_status(0)['filament_detected'] = True
-        self.assertNotIn('LOAD_FILAMENT', self.connect())
+    def test_no_load_at_a_klipper_start(self):
+        names = self.connect(hotplug=False)
+        self.assertIn('MACHINE_TOOLHEAD_CONNECTED', names)
+        self.assertNotIn('LOAD_FILAMENT', names)
 
-    def test_load_after_an_unlock_press(self):
-        self.m1.printer.lookup_object(
-            'filament_switch_sensor filament_sensor_toolhead') \
-            .get_status(0)['filament_detected'] = True
-        self.arm_unlock()
-        self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
-        self.assertIn('LOAD_FILAMENT', self.connect())
-        # Once only.
-        self.assertNotIn('LOAD_FILAMENT', self.connect())
+    def test_plugged_in_with_filament_loads_it(self):
+        names = self.connect(hotplug=True)
+        self.assertLess(names.index('MACHINE_TOOLHEAD_CONNECTED'),
+                        names.index('LOAD_FILAMENT'))
+
+    def test_plugged_in_without_filament_waits_for_the_insert(self):
+        # The sensor's insert_gcode loads it when filament goes in.
+        self.assertNotIn('LOAD_FILAMENT', self.connect(hotplug=True,
+                                                       filament=False))
+
+    def test_never_mid_print(self):
+        self.m1.print_stats['state'] = 'printing'
+        self.m1.m1_machine['toolhead_hotplug'] = True
+        self.m1.timeline.clear()
+        self.m1.run('TOOLHEAD_CONNECT')
+        self.assertNotIn('LOAD_FILAMENT', self.m1.names())
+
+    def test_plugged_back_in_while_paused_loads(self):
+        self.m1.print_stats['state'] = 'paused'
+        self.m1.pause_resume['is_paused'] = True
+        self.assertIn('LOAD_FILAMENT', self.connect(hotplug=True))
 
     def test_no_fan_on_reconnect_while_paused(self):
         # F10.
         self.m1.run('SET_GCODE_VARIABLE MACRO=TOOLHEAD_DISCONNECT'
                     ' VARIABLE=last_partfan_s VALUE=128')
         self.m1.pause_resume['is_paused'] = True
-        self.assertNotIn('SET_PART_FAN', self.connect())
+        self.assertNotIn('SET_PART_FAN', self.connect(hotplug=False))
 
 
 if __name__ == '__main__':

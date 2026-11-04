@@ -29,6 +29,13 @@
 #   * MACHINE_HEAT_WAIT is a heater wait that ends with an error when the thing
 #     it heats goes away (plate pulled, column unlocked, toolhead pulled,
 #     target zeroed), where TEMPERATURE_WAIT and M190 would wait forever.
+#   * While a print is paused it owns the part fan: on at pause_cool_fan
+#     until the hot end, which PAUSE turned off, is below pause_cool_temp,
+#     so the nozzle stops oozing sooner, then off. RESUME puts back the
+#     print's own speed.
+#   * MACHINE_TOOLHEAD_CONNECTED tells TOOLHEAD_CONNECT whether a connect is
+#     a toolhead plugged in (load the filament it carries) or the toolhead
+#     MCU coming up at a Klipper start (do nothing).
 #   * It never moves anything and never starts, pauses or cancels a print
 #     by itself. Pausing stays with PAUSE (pause_resume), printing with
 #     virtual_sdcard, heater safety with heaters/verify_heater, the bed
@@ -59,7 +66,6 @@ REASONS = {
     'toolhead_disconnected': "Connect the toolhead",
     'hotend_detecting': "Detecting the hot end",
     'hotend_failed': "The hot end sensor is faulty (see MUON_HOTEND_STATUS)",
-    'hotend_changed': "Fit the hot end the print started with",
     'filament_absent': "Load filament: insert it into the toolhead",
     'bed_power_starting': "Bed power is starting",
     'bed_power_inhibited': "Bed power is held off (Z_POWER_INHIBIT ENABLE=0)",
@@ -88,7 +94,7 @@ REQUIRES = {
     'print': ('column_locked', 'plate', 'toolhead', 'hotend', 'filament',
               'bed_power', 'fan', 'plate_cleared'),
     'resume': ('column_locked', 'plate', 'toolhead', 'hotend',
-               'hotend_same', 'filament', 'bed_power', 'fan'),
+               'filament', 'bed_power', 'fan'),
     'home_z': ('column_locked', 'plate', 'toolhead'),
     'home_xy': ('column_fitted', 'toolhead'),
 }
@@ -154,11 +160,6 @@ def missing(action, c):
                 continue
             out.append('hotend_failed' if h == 'failed'
                        else 'hotend_detecting')
-        elif check == 'hotend_same':
-            job = c.get('job_hotend')
-            h = c.get('hotend', 'none')
-            if job and h in ('ntc', 'pt1000') and h != job:
-                out.append('hotend_changed')
         elif check == 'filament':
             if (c.get('toolhead') != 'disconnected'
                     and c.get('filament') == 'absent'):
@@ -223,9 +224,24 @@ class M1Machine:
         self.settle_time = config.getfloat('settle_time', 3., minval=0.)
         self.gate_timeout = config.getfloat('gate_timeout', 1800., minval=0.)
         # A paused print's bed stays at target this long, then goes off
-        # (audit 6.3). The hot end is [idle_timeout]'s, at 10 minutes.
+        # (audit 6.3). The hot end goes off at the pause itself (PAUSE).
         self.pause_bed_off_time = config.getfloat('pause_bed_off_time',
                                                   1800., minval=0.)
+        # The pause cool-down (Harry, 2026-11-04): PAUSE turns the hot end
+        # off, and the part fan runs at pause_cool_fan (0 to 1) until the
+        # nozzle is below pause_cool_temp, where filament no longer flows
+        # out of it, or for pause_cool_max_time at most. 0 disables it.
+        self.pause_cool_temp = config.getfloat('pause_cool_temp', 140.,
+                                               minval=0.)
+        self.pause_cool_fan = config.getfloat('pause_cool_fan', 1.,
+                                              minval=0., maxval=1.)
+        self.pause_cool_max_time = config.getfloat('pause_cool_max_time',
+                                                   600., minval=0.)
+        # The toolhead MCU is non critical, so it is deferred and then
+        # connects a moment after every Klipper start. A first connect later
+        # than this after ready is a toolhead plugged in, not a start.
+        self.toolhead_startup_grace = config.getfloat(
+            'toolhead_startup_grace', 15., minval=0.)
         self.require_plate_cleared = config.getboolean(
             'require_plate_cleared', True)
         # Klipper's batch mode (an output file, as the klippy tests run)
@@ -247,12 +263,16 @@ class M1Machine:
         self.plate_cleared = True      # see _track_plate
         self.plate_off_since_end = False
         self.last_plate = None
-        self.job_hotend = None         # hot-end type the job started with
         self.job_targets = {'bed': 0., 'hotend': 0.}
         self.pause_reason = None
         self.paused_at = None
         self.saved_fan = 0.
         self.bed_off_done = False
+        self.cooling = None            # when the pause cool-down began
+        self.ready_time = None
+        self.toolhead_connects = 0     # MACHINE_TOOLHEAD_CONNECTED calls
+        self.toolhead_dropped = False  # disconnected since the last one
+        self.toolhead_hotplug = False  # the last connect was a plug-in
         self.gate = None               # {'action', 'missing', 'since'}
         self.prompt = None             # what this module last showed
         self.resume_refused = False    # MACHINE_REQUIRE showed the checklist
@@ -266,6 +286,8 @@ class M1Machine:
                 ('MACHINE_PAUSE_REASON', self.cmd_MACHINE_PAUSE_REASON),
                 ('MACHINE_RESUMED', self.cmd_MACHINE_RESUMED),
                 ('MACHINE_PLATE_CLEAR', self.cmd_MACHINE_PLATE_CLEAR),
+                ('MACHINE_TOOLHEAD_CONNECTED',
+                 self.cmd_MACHINE_TOOLHEAD_CONNECTED),
                 ('MACHINE_STATUS', self.cmd_MACHINE_STATUS)):
             self.gcode.register_command(name, func,
                                         desc=getattr(self, 'cmd_%s_help'
@@ -288,6 +310,7 @@ class M1Machine:
         self.start_mark = lo('gcode_macro _PRINT_START_MARK', None)
 
     def _ready(self):
+        self.ready_time = self.reactor.monotonic()
         self.reactor.register_timer(self._poll, self.reactor.NOW)
 
     # --- Reading the machine ------------------------------------------------
@@ -364,7 +387,6 @@ class M1Machine:
                               and getattr(self.fan_latch, 'latched', False))
         c['plate_cleared'] = (self.plate_cleared
                               or not self.require_plate_cleared)
-        c['job_hotend'] = self.job_hotend
         return c
 
     def faults(self, c):
@@ -425,6 +447,10 @@ class M1Machine:
                 if t > 0.:
                     self.job_targets[key] = t
         self._track_plate(c['plate'])
+        if c['toolhead'] == 'disconnected' and self.toolhead_connects:
+            # Not before the first connect: at a Klipper start the deferred
+            # MCU reads disconnected until it comes up.
+            self.toolhead_dropped = True
         if paused:
             self._paused_tick(eventtime)
             self._show_pause_prompt(c)
@@ -441,7 +467,6 @@ class M1Machine:
                 # Whatever it printed is on the plate (B-1, decision 3).
                 self.plate_cleared = False
                 self.plate_off_since_end = False
-            self.job_hotend = None
             self._clear_pause()
             self._end_prompt('pause')
             self._end_prompt('gate')
@@ -474,12 +499,67 @@ class M1Machine:
                 except Exception:
                     logging.exception("m1_machine: bed off failed")
             self.bed_off_done = True
+        self._cool_tick(eventtime)
+
+    # --- The pause cool-down -------------------------------------------------
+    def _cool_start(self, eventtime):
+        """From MACHINE_PAUSED, inside PAUSE: the part fan on to cool the
+        nozzle PAUSE just turned off, or off if there is nothing to cool."""
+        fan_on = False
+        heater = self._heater(self.hotend_name)
+        if (self.pause_cool_temp and self.pause_cool_fan and heater is not None
+                and not getattr(self.toolhead_mcu,
+                                'non_critical_disconnected', False)):
+            fan_on = heater.get_temp(eventtime)[0] >= self.pause_cool_temp
+        if fan_on:
+            self.cooling = eventtime
+            self._script_from_command(
+                "M106 S%d" % (round(self.pause_cool_fan * 255.),))
+        else:
+            self.cooling = None
+            self._script_from_command("M107")
+
+    def _cool_tick(self, eventtime):
+        if self.cooling is None:
+            return
+        if getattr(self.toolhead_mcu, 'non_critical_disconnected', False):
+            # The fan went with the toolhead; TOOLHEAD_CONNECT leaves it off.
+            self.cooling = None
+            return
+        heater = self._heater(self.hotend_name)
+        if heater is not None:
+            temp, target = heater.get_temp(eventtime)
+        else:
+            temp, target = 0., 0.
+        # Cool, or someone heats it again (a filament load, a purge), or
+        # long enough. Not otherwise.
+        if (temp >= self.pause_cool_temp and target <= 0.
+                and (not self.pause_cool_max_time or eventtime - self.cooling
+                     < self.pause_cool_max_time)):
+            return
+        # A command running (a load, RESUME) holds the gcode lock: try again
+        # at the next poll rather than queue behind it, as idle_timeout does.
+        mutex = getattr(self.gcode, 'get_mutex', None)
+        if mutex is not None and mutex().test():
+            return
+        self.cooling = None
+        try:
+            self.gcode.run_script("M107")
+        except Exception:
+            logging.exception("m1_machine: pause cool-down fan off failed")
+
+    def _script_from_command(self, script):
+        try:
+            self.gcode.run_script_from_command(script)
+        except self.printer.command_error:
+            logging.exception("m1_machine: %s failed", script)
 
     def _clear_pause(self):
         self.pause_reason = None
         self.paused_at = None
         self.bed_off_done = False
         self.resume_refused = False
+        self.cooling = None
 
     # --- Prompts -------------------------------------------------------------
     # One prompt at a time, owned by a reason (B-8). This module only ever
@@ -534,8 +614,9 @@ class M1Machine:
                              % (", ".join(sorted(REQUIRES)),))
         return action
 
-    cmd_MACHINE_WAIT_READY_help = ("Wait until the machine is ready for ACTION"
-                              " (print), with a live checklist")
+    cmd_MACHINE_WAIT_READY_help = (
+        "Wait until the machine is ready for ACTION (print), with a live"
+        " checklist")
     def cmd_MACHINE_WAIT_READY(self, gcmd):
         action = self._action(gcmd)
         timeout = gcmd.get_float('TIMEOUT', self.gate_timeout, minval=0.)
@@ -547,8 +628,6 @@ class M1Machine:
         c = self.conditions(eventtime)
         miss = missing(action, c)
         if not miss:
-            if action == 'print':
-                self.job_hotend = self._hotend_type(c)
             return
         self._refuse_latched(gcmd, action, miss)
         # Run by hand from the console there is no job to be cancelled.
@@ -602,13 +681,7 @@ class M1Machine:
         finally:
             self.gate = None
             self._end_prompt('gate')
-        if action == 'print':
-            self.job_hotend = self._hotend_type(c)
         gcmd.respond_info("Ready to %s" % (action,))
-
-    def _hotend_type(self, c):
-        h = c.get('hotend')
-        return h if h in ('ntc', 'pt1000') else None
 
     def _refuse_latched(self, gcmd, action, miss):
         latched = [m for m in miss if m in REFUSE]
@@ -624,8 +697,9 @@ class M1Machine:
         except self.printer.command_error:
             logging.exception("m1_machine: %s failed", macro)
 
-    cmd_MACHINE_REQUIRE_help = ("Refuse unless the machine is ready for ACTION;"
-                           " WAIT=s first waits that long")
+    cmd_MACHINE_REQUIRE_help = (
+        "Refuse unless the machine is ready for ACTION; WAIT=s first waits"
+        " that long")
     def cmd_MACHINE_REQUIRE(self, gcmd):
         action = self._action(gcmd)
         wait = gcmd.get_float('WAIT', 0., minval=0., maxval=10.)
@@ -646,8 +720,9 @@ class M1Machine:
         raise gcmd.error("Cannot %s: %s" % (
             action, "; ".join(checklist_lines(miss))))
 
-    cmd_MACHINE_HEAT_WAIT_help = ("Wait for HEATER to reach MINIMUM, ending with"
-                             " an error if what it heats goes away")
+    cmd_MACHINE_HEAT_WAIT_help = (
+        "Wait for HEATER to reach MINIMUM, ending with an error if what it"
+        " heats goes away")
     def cmd_MACHINE_HEAT_WAIT(self, gcmd):
         name = gcmd.get('HEATER')
         minimum = gcmd.get_float('MINIMUM')
@@ -679,15 +754,17 @@ class M1Machine:
             eventtime = self.reactor.pause(eventtime + 1.)
         raise gcmd.error("Shutdown while waiting for %s" % (name,))
 
-    cmd_MACHINE_PAUSED_help = ("(PAUSE) record a new pause, its REASON and the"
-                          " part-fan speed FAN to restore")
+    cmd_MACHINE_PAUSED_help = (
+        "(PAUSE) record a new pause, its REASON and the part-fan speed FAN"
+        " to restore; start the cool-down")
     def cmd_MACHINE_PAUSED(self, gcmd):
         reason = gcmd.get('REASON', 'user').lower()
         if self.paused_at is None:
-            self.paused_at = self.reactor.monotonic()
+            self.paused_at = now = self.reactor.monotonic()
             self.bed_off_done = False
             self.saved_fan = gcmd.get_float('FAN', 0., minval=0., maxval=1.)
             self.pause_reason = reason
+            self._cool_start(now)
         elif self.pause_reason in (None, 'user') and reason != 'user':
             self.pause_reason = reason
         self._after_reason()
@@ -709,13 +786,28 @@ class M1Machine:
         self._end_prompt('pause')
         self._clear_pause()
 
-    cmd_MACHINE_PLATE_CLEAR_help = ("Say the plate is clear of the last print"
-                               " (at the machine)")
+    cmd_MACHINE_PLATE_CLEAR_help = (
+        "Say the plate is clear of the last print (at the machine)")
     def cmd_MACHINE_PLATE_CLEAR(self, gcmd):
         self.plate_cleared = True
         gcmd.respond_info("Plate marked clear")
 
-    cmd_MACHINE_STATUS_help = "Report the machine state and what each action needs"
+    cmd_MACHINE_TOOLHEAD_CONNECTED_help = (
+        "(TOOLHEAD_CONNECT) note a toolhead connect: plugged in, or a"
+        " Klipper start")
+    def cmd_MACHINE_TOOLHEAD_CONNECTED(self, gcmd):
+        # Read back as toolhead_hotplug by the macro TOOLHEAD_CONNECT runs
+        # next, which loads the filament a plugged-in toolhead carries.
+        now = self.reactor.monotonic()
+        first = self.toolhead_connects == 0
+        late = (self.ready_time is not None
+                and now - self.ready_time > self.toolhead_startup_grace)
+        self.toolhead_hotplug = self.toolhead_dropped or (first and late)
+        self.toolhead_connects += 1
+        self.toolhead_dropped = False
+
+    cmd_MACHINE_STATUS_help = (
+        "Report the machine state and what each action needs")
     def cmd_MACHINE_STATUS(self, gcmd):
         st = self.get_status(self.reactor.monotonic())
         lines = ["M1: %s%s" % (st['activity'], (" (%s)" % st['pause_reason'])
@@ -739,7 +831,8 @@ class M1Machine:
             'faults': self.faults(c),
             'pause_reason': self.pause_reason,
             'plate_cleared': c['plate_cleared'],
-            'job_hotend': self.job_hotend,
+            'toolhead_hotplug': self.toolhead_hotplug,
+            'cooling': self.cooling is not None,
             'job_targets': dict(self.job_targets),
             'saved_fan': self.saved_fan,
             'gate': (None if self.gate is None else
