@@ -69,6 +69,23 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(z_power.decide('absent', False, 'x', True)[0], FAULT)
 
 
+class TestXyAllowed(unittest.TestCase):
+    """X/Y may move only with the Z column plugged in (locked or not)."""
+    def test_column_plugged_in(self):
+        self.assertTrue(z_power.xy_allowed('locked'))
+        self.assertTrue(z_power.xy_allowed('unlocked'))
+
+    def test_absent_unknown_and_unread_refuse(self):
+        # Folded, the Z axis is in the gantry's path; an unrecognised or
+        # not yet read column fails closed.
+        for band in ('absent', None, 'something_else'):
+            self.assertFalse(z_power.xy_allowed(band), band)
+
+    def test_development_override(self):
+        for band in ('absent', None, 'locked'):
+            self.assertTrue(z_power.xy_allowed(band, required=False), band)
+
+
 class TestBandsAndDebounce(unittest.TestCase):
     def test_classify(self):
         self.assertEqual(z_power.classify_band(0.99, BANDS), 'absent')

@@ -127,6 +127,9 @@ class ContactGuard:
                                                       None)
         self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode_io = self.printer.lookup_object('gcode_io', None)
+        # Plate presence ([bed_removal_detector] owns it); see _may_refuse.
+        self.bed_detector = self.printer.lookup_object(
+            'bed_removal_detector', None)
 
     def _handle_ready(self):
         # Registered at ready, after every klippy:connect transform
@@ -259,6 +262,12 @@ class ContactGuard:
         if not self.enabled or self.probe is None:
             return False
         if self._is_homing() or self._job_active(eventtime):
+            return False
+        # With no plate fitted there is nothing to drag the nozzle across,
+        # and an uncalibrated or drifting cell must not hold X/Y hostage.
+        # Unknown (startup) keeps the guard on.
+        plate_present = getattr(self.bed_detector, 'plate_present', None)
+        if plate_present is not None and plate_present() is False:
             return False
         return not getattr(self.nozzle_wipe, 'active', False)
 

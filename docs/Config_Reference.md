@@ -4713,6 +4713,12 @@ present_locked_range:
 #   plate being removed (bed_removal_detector handles that) or a fault.
 #fault_gcode:
 #   G-Code run when a fault latches.
+#xy_requires_column: True
+#   Refuse any G-code X/Y move (and the homing macros refuse an X/Y
+#   home) unless the Z column is plugged in, locked or not: folded,
+#   the Z axis is in the gantry's path. Set False only on a
+#   development unit run without a column. The status object reports
+#   the result as `xy_allowed`.
 ```
 
 ### [fan_modes]
