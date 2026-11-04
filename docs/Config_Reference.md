@@ -3208,9 +3208,10 @@ muon_ads1220:
 #hotend_type: auto
 #   auto, ntc or pt1000. A fixed type skips the detection (not the
 #   settling time).
-#ntc_max_temp: 265
+#ntc_max_temp: 290
 #pt1000_max_temp: 350
-#   max_temp applied for each hotend type. Each must be at or below the
+#   max_temp applied for each hotend type. The NTC default is 10 C under
+#   the 300 C rating of the Semitec 104NT-4-R025H42G. Each must be at or below the
 #   heater's own max_temp, which should therefore be set to the higher of
 #   the two.
 #ntc_pid_Kp:
