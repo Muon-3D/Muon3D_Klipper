@@ -2676,6 +2676,14 @@ endstop_pin:
 #   of zero will result in no acceleration. This value will be used if
 #   EXTRUDER_HOMING_MOVE does not specify an ACCEL parameter. The
 #   default is zero.
+#blank_distance: 0
+#   Ignore the endstop for this many mm at the start of each move. A
+#   StallGuard virtual endstop can report a stall while the motor is
+#   still slow, early in the acceleration, or while the drive gears
+#   first grip the filament. Keep it shorter than the shortest distance
+#   at which a real stop can happen. This value will be used if
+#   EXTRUDER_HOMING_MOVE does not specify a BLANK parameter. The
+#   default is 0, which watches the endstop from the start.
 #min_extrude_temp_override:
 #   Override the normal extruder `min_extrude_temp` safety check for
 #   EXTRUDER_HOMING_MOVE only. If set, the command is allowed once the

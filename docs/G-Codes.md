@@ -1112,7 +1112,7 @@ is enabled.
 #### EXTRUDER_HOMING_MOVE
 `EXTRUDER_HOMING_MOVE EXTRUDER=config_name DISTANCE=<distance>
 [SPEED=<speed>] [ACCEL=<accel>] [STOP_ON_ENDSTOP=[1|2|-1|-2]]
-[SET_POSITION=<pos>]`: This command runs a bounded move on the
+[SET_POSITION=<pos>] [BLANK=<mm>]`: This command runs a bounded move on the
 configured extruder stepper. The move will stop early if the endstop
 reports the requested state. Use `STOP_ON_ENDSTOP=1` to stop on a
 triggered endstop and raise an error if it never triggers. Use
@@ -1120,7 +1120,9 @@ triggered endstop and raise an error if it never triggers. Use
 to complete without error if it never triggers. Use `-1` or `-2` to
 stop when the endstop reports "not triggered". The optional
 `SET_POSITION` parameter updates the logical extruder position after
-the move completes, which is useful for homing-style workflows. This
+the move completes, which is useful for homing-style workflows. The
+optional `BLANK` parameter ignores the endstop for that many mm at the
+start of the move (default: the section's `blank_distance`). This
 command always waits for the move to finish before continuing. If the
 corresponding `[extruder_homing]` section sets
 `min_extrude_temp_override`, that lower threshold applies to this
