@@ -50,7 +50,26 @@ class HomingScope:
     def in_scope(self):
         return self.depth > 0
 
+    def _reset_lift_flag(self):
+        # The G28 macro sets z_lifted_once=1 when it lifts Z, to stop a
+        # second lift when HOMING_GATE CALLBACK re-invokes G28 inside the
+        # same call, and resets it only after a successful home.  A failed
+        # G28 left it at 1, so the next G28 skipped the lift (the scope has
+        # cleared Z, so the macro's other lift condition is false too) and
+        # its moves could drag the nozzle across the plate.  The flag only
+        # spans one outermost G28, so every outermost G28 starts it at 0.
+        # Same copy-and-replace as SET_GCODE_VARIABLE.
+        macro = self.printer.lookup_object('gcode_macro ' + self.command,
+                                           None)
+        variables = getattr(macro, 'variables', None)
+        if variables is not None and variables.get('z_lifted_once'):
+            v = dict(variables)
+            v['z_lifted_once'] = 0
+            macro.variables = v
+
     def _cmd_scoped(self, gcmd):
+        if self.depth == 0:
+            self._reset_lift_flag()
         self.depth += 1
         try:
             self.orig_cmd(gcmd)

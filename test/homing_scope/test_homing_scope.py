@@ -71,13 +71,21 @@ class FakeToolhead:
         return self.kin
 
 
+class FakeMacro:
+    # The G28 gcode_macro: only its variables dict matters here
+    def __init__(self):
+        self.variables = {'z_lifted_once': 0}
+
+
 class FakePrinter:
     config_error = ConfigError
     def __init__(self):
+        self.macro = FakeMacro()
         self.reactor = FakeReactor()
         self.gcode = FakeGCode()
         self.toolhead = FakeToolhead()
-        self.objects = {'gcode': self.gcode, 'toolhead': self.toolhead}
+        self.objects = {'gcode': self.gcode, 'toolhead': self.toolhead,
+                        'gcode_macro G28': self.macro}
         self.handlers = {}
     def get_reactor(self):
         return self.reactor
@@ -149,6 +157,49 @@ def test_nested_g28():
     p.gcode.run('G28', 'outer')
     check(depth == [1, 2], "nested G28 nests the scope")
     check(not scope.in_scope, "scope closes after the outer G28")
+
+
+def test_g28_after_a_failed_g28_lifts_again():
+    # The G28 macro sets z_lifted_once=1 when it lifts Z and resets it
+    # only after a successful home.  A G28 that fails between the two (the
+    # load cell Z home near the plate) left it at 1; the retry then skipped
+    # the lift, and with Z cleared by the scope nothing else lifted it, so
+    # _HOME_X/_HOME_Z dragged the nozzle across the plate.
+    lifts = []
+    def g28(gcmd):
+        # the macro's lift condition: z_lifted_once == 0 and any axis homed
+        if p.macro.variables['z_lifted_once'] == 0:
+            lifts.append(gcmd)
+            p.macro.variables['z_lifted_once'] = 1
+        if gcmd == 'first':
+            raise CommandError("Z home failed")
+        p.macro.variables['z_lifted_once'] = 0   # success reset
+    p, scope = rig(g28)
+    try:
+        p.gcode.run('G28', 'first')
+    except CommandError:
+        pass
+    check(p.macro.variables['z_lifted_once'] == 1,
+          "the failed G28 left the macro flag set (macro side unchanged)")
+    p.gcode.run('G28', 'retry')
+    check(lifts == ['first', 'retry'], "the G28 after a failed G28 lifts")
+
+
+def test_nested_g28_does_not_reset_the_lift_flag():
+    # HOMING_GATE CALLBACK re-invokes G28 inside the outer call: the flag
+    # set by the outer call must survive so the lift is not done twice
+    seen = []
+    def g28(gcmd):
+        seen.append((gcmd, p.macro.variables['z_lifted_once']))
+        if gcmd == 'outer':
+            p.macro.variables['z_lifted_once'] = 1
+            p.gcode.run('G28', 'inner')
+        else:
+            p.macro.variables['z_lifted_once'] = 0
+    p, scope = rig(g28)
+    p.gcode.run('G28', 'outer')
+    check(seen == [('outer', 0), ('inner', 1)],
+          "the inner G28 still sees the outer call's flag")
 
 
 def test_requires_the_command():
