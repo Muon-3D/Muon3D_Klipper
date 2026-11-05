@@ -1512,6 +1512,38 @@ def test_g28_lift_rezero_survives_home_y():
     check(r.status()['contact'], 'a real touch afterwards still latches')
 
 
+def test_g28_lift_rezero_settles_inside_homing_scope():
+    # KAN-742: #92 makes the whole G28 one homing_scope, so every sample
+    # is anchor_only.  The lift re-zero (#98) was only fed past that
+    # return, so it stayed pending ("no samples after the lift") and the
+    # latch never released: contact:true at ~200k while parked.
+    r = Rig(z=20.)
+    trapq = replay_motion(r)
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check(r.status()['contact'], 'latched before the G28')
+    r.printer.homing_scope.in_scope = True   # G28 begins
+    r.printer.toolhead.homed_axes = ''
+    r.set_position()                         # SKP Z placeholder
+    hm = FakeHomingMove('z', -10.)           # AXIS_PROTECTED_MOVE Z+10
+    r.printer.send_event("homing:homing_move_begin", hm)
+    trapq.add_move(r.t, 1., dz=10.)
+    r.feed(200000, 1.)                       # inside the move: ignored
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(200000, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+    check(r.guard.lift_zero is None,
+          'the lift re-zero completes inside the homing scope')
+    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
+          'contact releases once the re-zero is done')
+    # Between homing moves, still in scope: a jump is not judged
+    r.feed(200000 + 300000, 0.3)
+    check(not r.status()['contact'],
+          'contact is still not judged inside the homing scope')
+    r.printer.homing_scope.in_scope = False
+
+
 def test_nothing_is_judged_inside_a_homing_script():
     # Inside homing_override the readings only anchor the next probe's
     # re-zero: no relock or drift following happens there, so a probe that
