@@ -4,6 +4,13 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
+from . import buttons as buttons_mod
+
+# Muon: how long a switch on a non-critical MCU stays quiet after that MCU
+# reconnects. The MCU reports the pin within a query period and the host
+# debounces it, so a reading inside this window is the state the switch was
+# already in, not someone inserting or pulling filament.
+RECONNECT_SETTLE = 1.0
 
 
 class RunoutHelper:
@@ -118,12 +125,40 @@ class SwitchSensor:
         printer = config.get_printer()
         buttons = printer.load_object(config, 'buttons')
         switch_pin = config.get('switch_pin')
-        buttons.register_debounce_button(switch_pin, self._button_handler
-                                         , config)
+        self.debounce = buttons_mod.DebounceButton(config,
+                                                   self._button_handler)
+        buttons.register_buttons([switch_pin], self.debounce.button_handler)
         self.runout_helper = RunoutHelper(config)
         self.get_status = self.runout_helper.get_status
+        # Muon: a switch on a non-critical MCU (the M1 toolhead). While that
+        # MCU is away nothing reads the pin, and when it comes back it only
+        # reports the pin if it differs from the released state. Without a
+        # reset, filament pulled out while the toolhead was unplugged stayed
+        # "detected" after the replug, and the plug-in auto-load ran with no
+        # filament there (Harry, 2026-11-05).
+        mcu = printer.lookup_object('pins').parse_pin(
+            switch_pin, can_invert=True, can_pullup=True)['chip']
+        if getattr(mcu, 'is_non_critical', False):
+            printer.register_event_handler(
+                mcu.get_non_critical_disconnect_event_name(),
+                self._mcu_disconnected)
+            printer.register_event_handler(
+                mcu.get_non_critical_reconnect_event_name(),
+                self._mcu_reconnected)
     def _button_handler(self, eventtime, state):
         self.runout_helper.note_filament_present(eventtime, state)
+    def _mcu_disconnected(self):
+        # Released, which is where the MCU starts after a reconnect, so the
+        # first report it sends is a real change. Silently: no runout and no
+        # insert, because nobody touched the filament.
+        self.debounce.logical_state = self.debounce.physical_state = 0
+        helper = self.runout_helper
+        helper.filament_present = False
+        helper.min_event_systime = helper.reactor.NEVER
+    def _mcu_reconnected(self):
+        helper = self.runout_helper
+        helper.min_event_systime = (helper.reactor.monotonic()
+                                    + RECONNECT_SETTLE)
 
 def load_config_prefix(config):
     return SwitchSensor(config)

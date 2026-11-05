@@ -146,7 +146,8 @@ class M1:
         # m1_machine: what RESUME reads back (the bed target the print set,
         # the part-fan speed PAUSE saved), and the bed heater it compares.
         self.m1_machine = {'job_targets': {'bed': 0.0, 'hotend': 0.0},
-                           'saved_fan': 0.0, 'toolhead_hotplug': False}
+                           'saved_fan': 0.0, 'toolhead_hotplug': False,
+                           'conditions': {'toolhead': 'connected'}}
         printer.add_object('m1_machine', Status(self.m1_machine))
         self.heater_bed = {'target': 0.0, 'temperature': 25.0}
         printer.add_object('heater_bed', Status(self.heater_bed))
@@ -1826,6 +1827,9 @@ class ToolheadConnectAutoLoad(_M1TestCase):
             self.m1.print_stats['state'] = 'standby'
         self.m1.timeline.clear()
         self.m1.run('TOOLHEAD_CONNECT')
+        # The auto-load waits for the filament sensor to settle.
+        self.assertNotIn('LOAD_FILAMENT', self.m1.names())
+        self.m1.reactor.advance(2.)
         return self.m1.names()
 
     def test_no_load_at_a_klipper_start(self):
@@ -1848,6 +1852,16 @@ class ToolheadConnectAutoLoad(_M1TestCase):
         self.m1.m1_machine['toolhead_hotplug'] = True
         self.m1.timeline.clear()
         self.m1.run('TOOLHEAD_CONNECT')
+        self.m1.reactor.advance(2.)
+        self.assertNotIn('LOAD_FILAMENT', self.m1.names())
+
+    def test_unplugged_again_before_it_settles_loads_nothing(self):
+        self.m1.print_stats['state'] = 'standby'
+        self.m1.m1_machine['toolhead_hotplug'] = True
+        self.m1.timeline.clear()
+        self.m1.run('TOOLHEAD_CONNECT')
+        self.m1.run('TOOLHEAD_DISCONNECT')
+        self.m1.reactor.advance(2.)
         self.assertNotIn('LOAD_FILAMENT', self.m1.names())
 
     def test_plugged_back_in_while_paused_loads(self):
