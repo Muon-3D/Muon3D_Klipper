@@ -407,8 +407,10 @@ class ContactGuard:
         # homing move, which would drop it, and its later G1 Y10 is then
         # refused part way through homing (KAN-573: falsely homed).  The
         # evidence stays "just after the lift, before any XY travel".
-        # Called from homing_move_end, where homing_moves has already been
-        # decremented, so the samples that arrive while pausing are used.
+        # Called from homing_move_end.  The samples that arrive while
+        # pausing reach _process_sample even though G28's homing_scope
+        # makes them anchor_only; only the lift re-zero is fed from there
+        # (KAN-742), contact is not judged.
         mcu = self.load_cell.sensor.get_mcu()
         if mcu.is_fileoutput():
             return
@@ -767,6 +769,13 @@ class ContactGuard:
         while self.recent and self.recent[0][0] < t - ANCHOR_TIME:
             self.recent.popleft()
         if anchor_only:
+            # Not judged, but a pending lift re-zero must still settle:
+            # G28 is one homing_scope, so every sample in it is
+            # anchor_only (KAN-742: otherwise it stays pending and the
+            # held latch never releases)
+            if (self.lift_zero is not None and t > self.lift_zero['after']
+                    and self._lift_zero_sample(t, counts, sign)):
+                self.load = sign * (counts - self.baseline)
             return
         if self.baseline is None:
             self.baseline = float(counts)
