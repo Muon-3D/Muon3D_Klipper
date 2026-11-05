@@ -64,6 +64,8 @@ $PYTHON scripts/test_m1_led_modes.py
 $PYTHON scripts/test_m1_heater_before_leds.py
 # KAN-990: the start purge is drawn only where the bed mesh probed.
 $PYTHON scripts/test_m1_purge_line.py
+# KAN-747: [boot_id] reads the Linux boot id, and an unreadable one is unknown.
+$PYTHON scripts/test_boot_id.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
