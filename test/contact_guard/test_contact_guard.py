@@ -161,6 +161,7 @@ class FakePrinter:
         self.print_stats = FakePrintStats()
         self.toolhead = FakeToolhead()
         self.homing_override = Flag('in_script')
+        self.homing_scope = Flag('in_scope')
         self.nozzle_wipe = Flag('active')
         self.gcode_io = FakeGCodeIO()
         self.objects = {
@@ -168,6 +169,7 @@ class FakePrinter:
             'print_stats': self.print_stats, 'toolhead': self.toolhead,
             'gcode_move': FakeGCodeMove(self.toolhead),
             'homing_override': self.homing_override,
+            'homing_scope': self.homing_scope,
             'nozzle_wipe_smart': self.nozzle_wipe,
             'gcode_io': self.gcode_io,
         }
@@ -290,6 +292,13 @@ def test_inactive_states():
     r.printer.homing_override.in_script = True
     check(not r.status()['active'], "inactive inside homing_override")
     r.printer.homing_override.in_script = False
+    r.printer.homing_scope.in_scope = True
+    check(not r.status()['active'], "inactive inside the G28 homing scope")
+    check(r.refused(50, 40, 5) is None,
+          "a Y back-off inside G28 is allowed in contact (KAN-573)")
+    r.printer.homing_scope.in_scope = False
+    check(r.refused(50, 30, 5) == REFUSAL,
+          "refused again once the G28 scope ends")
     r.printer.nozzle_wipe.active = True
     check(not r.status()['active'], "inactive during NOZZLE_WIPE_SMART")
     r.printer.nozzle_wipe.active = False
