@@ -147,6 +147,11 @@ start_test homing_scope "Test homing_scope"
 $PYTHON test/homing_scope/test_homing_scope.py
 finish_test homing_scope "Test homing_scope"
 
+# MUON: M600 with no print only prompts; PAUSE restores absolute mode (KAN-1699).
+start_test m600 "Test M600 with no print only prompts"
+$PYTHON test/m600/test_m600_no_print.py
+finish_test m600 "Test M600 with no print only prompts"
+
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
