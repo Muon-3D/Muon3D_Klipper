@@ -1,4 +1,5 @@
 import logging
+import math
 import pins
 from . import probe, adxl345, homing
 
@@ -20,6 +21,22 @@ ADXL345_REST_TIME = .1
 TAP_TEST_SAMPLE_TIME = .000015
 TAP_TEST_SAMPLE_COUNT = 4
 TAP_TEST_REST_TIME = .001
+
+
+def format_tap_comparison(axis, prev, new, step_dists, spread,
+                          speed=0., approach_dist=0., travelled=0.):
+    """One log line for a confirmation comparison: both trigger positions
+    in mm (raw MCU step position * step distance, per stepper), the spread,
+    and how the new tap was approached (speed, distance offered, distance
+    actually travelled).  Logged for every comparison, agreeing or not, so
+    a slip of one electrical cycle shows its sign (KAN-1361)."""
+    def mm(trig):
+        return ' '.join('%s=%.3f' % (n, trig[n] * sd)
+                        for n, sd in sorted(step_dists.items()))
+    return ("adxl345_probe: %s tap compare: prev %s mm, new %s mm,"
+            " spread %.3fmm, approach %.1fmm/s over %.2fmm, travelled"
+            " %.3fmm" % (axis, mm(prev), mm(new), spread, speed,
+                         approach_dist, travelled))
 
 
 class _FileOutputRegs:
@@ -723,6 +740,9 @@ class ADXL345Probe:
                 accepted = [trig]
                 continue
             spread = spread_mm(accepted[-1], trig)
+            logging.info("%s", format_tap_comparison(
+                axis, accepted[-1], trig, step_dists, spread, speed,
+                retract_dist * 2., travelled))
             if spread <= cfg['tolerance']:
                 accepted.append(trig)
                 continue
@@ -873,7 +893,10 @@ class ADXL345Probe:
     cmd_SET_ACCEL_PROBE_help = (
         "Configure ADXL345 tap profiles for X/Y endstops and optional Z probe. "
         "Params: AXIS=<X|Y|Z|ALL> TAP_THRESH=<mm/s^2> TAP_DUR=<s> "
-        "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s>"
+        "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s> "
+        "CONFIRM_SPEED=<mm/s, 0 = homing speed> "
+        "CONFIRM_RETRACT_DIST=<mm> CONFIRM_RETRACT_SPEED=<mm/s, 0 = homing"
+        " retract speed> (X/Y tap confirmation, KAN-1361)"
     )
 
     cmd_ADXL_TEST_TAP_help = (
@@ -881,6 +904,37 @@ class ADXL345Probe:
         "Params: AXIS=<X|Y|Z> TAPS=<count> TIMEOUT=<s> QUIET_TIME=<s> "
         "[TAP_THRESH=<mm/s^2> TAP_DUR=<s> TAP_AXES=<xyz>]"
     )
+
+    # Upper bounds for the runtime confirm knobs: a speed above the rail's
+    # homing speed was never tested, and a long retract overshoots the stop
+    # when a tap is missed.
+    MAX_CONFIRM_RETRACT_DIST = 20.
+
+    def _homing_speed(self, axis):
+        toolhead = self.printer.lookup_object('toolhead')
+        rails = getattr(toolhead.get_kinematics(), 'rails', None)
+        if not rails:
+            return None
+        return rails['xyz'.index(axis)].get_homing_info().speed
+
+    def _check_confirm_limits(self, gcmd, confirm, axes):
+        dist = confirm.get('retract_dist')
+        if dist is not None and dist > self.MAX_CONFIRM_RETRACT_DIST:
+            raise gcmd.error(
+                "CONFIRM_RETRACT_DIST %.2f exceeds the %.0fmm limit"
+                % (dist, self.MAX_CONFIRM_RETRACT_DIST))
+        for a in axes:
+            limit = self._homing_speed(a)
+            if limit is None:
+                raise gcmd.error(
+                    "Can not check CONFIRM_*SPEED: no homing speed for %s"
+                    % (a.upper(),))
+            for key, param in (('speed', 'CONFIRM_SPEED'),
+                               ('retract_speed', 'CONFIRM_RETRACT_SPEED')):
+                if confirm.get(key) is not None and confirm[key] > limit:
+                    raise gcmd.error(
+                        "%s %.1f exceeds the %s homing_speed (%.1fmm/s)"
+                        % (param, confirm[key], a.upper(), limit))
 
     def cmd_SET_ACCEL_PROBE(self, gcmd):
         axis = gcmd.get('AXIS', 'ALL').lower()
@@ -891,12 +945,34 @@ class ADXL345Probe:
         has_dur = 'TAP_DUR' in params
         has_axes = 'TAP_AXES' in params
         has_homing_arm_delay = 'HOMING_TAP_ARM_DELAY' in params
+        confirm = {}
+        for param, key, kw in (
+                ('CONFIRM_SPEED', 'speed', {'minval': 0.}),
+                ('CONFIRM_RETRACT_DIST', 'retract_dist', {'above': 0.}),
+                ('CONFIRM_RETRACT_SPEED', 'retract_speed', {'minval': 0.})):
+            if param in params:
+                val = gcmd.get_float(param, **kw)
+                # NaN fails every comparison, so minval/above/maxval and
+                # the limits below would all let it through
+                if not math.isfinite(val):
+                    raise gcmd.error("%s must be a finite number" % (param,))
+                # 0 clears speed overrides: use the rail's homing speed
+                confirm[key] = val or None
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
-                                           or has_homing_arm_delay):
+                                           or has_homing_arm_delay
+                                           or confirm):
             raise gcmd.error(
-                "Can not update tap settings while homing/probing move is active")
+                "Can not update tap settings while homing/probing move is"
+                " active")
 
         targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
+        if confirm:
+            if axis == 'z':
+                raise gcmd.error(
+                    "CONFIRM_* apply to the X/Y home tap confirmation,"
+                    " not AXIS=Z")
+            self._check_confirm_limits(gcmd, confirm,
+                                       [a for a in targets if a != 'z'])
         new_thresh = None
         new_dur = None
         new_axes_mask = None
@@ -923,6 +999,8 @@ class ADXL345Probe:
                 profile['tap_axes_mask'] = new_axes_mask
             if new_homing_arm_delay is not None:
                 self.axis_homing_arm_delay[target] = new_homing_arm_delay
+            if target in self.tap_confirm:
+                self.tap_confirm[target].update(confirm)
 
         lines = []
         for a in 'xyz':
@@ -933,6 +1011,15 @@ class ADXL345Probe:
                 % (a.upper(), p['tap_thresh'], p['tap_dur'],
                    self._mask_to_axes(p['tap_axes_mask']),
                    self.axis_homing_arm_delay.get(a, 0.)))
+        for a in 'xy':
+            cfg = self.tap_confirm[a]
+            lines.append(
+                "ADXL345 tap confirm %s: samples=%d tolerance=%.3f"
+                " retries=%d retract_dist=%.2f retract_speed=%s speed=%s"
+                % (a.upper(), cfg['samples'], cfg['tolerance'],
+                   cfg['retries'], cfg['retract_dist'],
+                   cfg['retract_speed'] or 'homing',
+                   cfg['speed'] or 'homing'))
         gcmd.respond_info("\n".join(lines))
 
     def cmd_ADXL_TEST_TAP(self, gcmd):
