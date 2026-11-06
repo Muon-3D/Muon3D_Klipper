@@ -22,6 +22,16 @@
 # column is plugged in (locked or not). Z needs no lock to move (the lift
 # before an X/Y home, the park at the top); only Z homing, which macros gate
 # on the lock, and anything that trusts a Z position need it locked.
+#
+# The eFuse is a TPS16630 (TI SLVSET9G). The enable output drives its SHDN#
+# pin: high turns the FET on with the dVdT ramp, low turns it off and resets
+# a latched fault. PGOOD is open drain and goes high once the FET's gate is
+# fully enhanced, after an 11.5 ms deglitch (13 ms max). It goes low (10 ms
+# deglitch) when the FET turns off: overload past the current limit, thermal
+# shutdown, UVLO, OVP or SHDN#. FLT# is not wired to the MCU, so a PGOOD that
+# never rises or drops is all this module can see; the IMON current at that
+# moment is logged with the fault to tell a short (current at the limit) from
+# an input-window or enable fault (no current).
 import logging
 
 POLL_INTERVAL = 0.1
@@ -29,6 +39,19 @@ ADC_SAMPLE_TIME = 0.001
 ADC_SAMPLE_COUNT = 8
 ADC_REPORT_TIME = 0.100
 PIN_MIN_TIME = 0.100
+
+# PGOOD after SHDN# goes high, from the TPS16630 datasheet: the output ramp
+# (20.8e3 * Vin * C_dVdT seconds), then the 13 ms PGOOD deglitch. Into a
+# large capacitance the eFuse holds the start-up in thermal regulation for up
+# to t(Treg_timeout), 1.5 s max, before it gives up itself. The timeout must
+# not declare a start-up failed while the eFuse is still allowed to finish it.
+POWER_GOOD_TIMEOUT = 2.0
+# The bed thermistor is wired through the Z column. With the column out the
+# input floats (45 to 58 C on sloe, 2026-11-06), which reads as a plate. A
+# plate reading counts only once the column has been connected this long,
+# so the detector has fresh samples from the column (the thermistor reports
+# every 0.3 s and the detector averages two).
+PLATE_SETTLE_TIME = 2.0
 
 # States, in the order the path comes up
 ABSENT = 'absent'           # no Z column on the connector
@@ -167,14 +190,20 @@ class ZPower:
                                                  minval=0.)
         self.supply_voltage = config.getfloat('supply_voltage', 45., above=0.)
         self.over_since = self.idle_over_since = None
+        # Highest current seen while waiting for PGOOD, for the fault text
+        self.start_peak = 0.
         # Plate presence comes from [bed_removal_detector], which owns that
         # judgement (and BED_REMOVED / BED_ATTACHED and the resume target).
         self.heater_name = config.get('heater', 'heater_bed')
         self.heater = None
         self.detector = None
-        # Power-up confirmation
-        self.power_good_timeout = config.getfloat('power_good_timeout', 0.5,
-                                                  above=0.)
+        self.plate_settle_time = config.getfloat(
+            'plate_settle_time', PLATE_SETTLE_TIME, minval=0.)
+        self.column_since = None
+        self.plate = None
+        # Power-up confirmation, timed from when the enable pin changes
+        self.power_good_timeout = config.getfloat(
+            'power_good_timeout', POWER_GOOD_TIMEOUT, above=0.)
         self.powering_since = None
         # State
         self.state = UNKNOWN
@@ -287,17 +316,28 @@ class ZPower:
                 self.current_offset += (raw - self.current_offset) * 0.1
         self.current = max(0., raw - (self.current_offset or 0.))
     # Main loop
-    def _plate_present(self):
+    def _plate_present(self, band, eventtime):
+        """The detector's plate judgement, or None while it means nothing:
+        the column out (the thermistor input floats) or only just in."""
+        if band not in (UNLOCKED, 'locked'):
+            self.column_since = None
+            return None
+        if self.column_since is None:
+            self.column_since = eventtime
+        if eventtime - self.column_since < self.plate_settle_time:
+            return None
         return self.detector.plate_present()
     def _set_enable(self, value, eventtime):
+        """Schedule the enable pin; return the reactor time it changes."""
         if value == self.enabled:
-            return
-        print_time = max(self.enable_mcu.estimated_print_time(eventtime)
-                         + PIN_MIN_TIME, self.last_enable_time + 0.010)
+            return eventtime
+        est = self.enable_mcu.estimated_print_time(eventtime)
+        print_time = max(est + PIN_MIN_TIME, self.last_enable_time + 0.010)
         self.mcu_enable.set_digital(print_time, 1 if value else 0)
         self.last_enable_time = print_time
         self.enabled = value
         logging.info("%s: 48V_Z %s", self.name, "on" if value else "off")
+        return eventtime + (print_time - est)
     def _latch_fault(self, reason, eventtime):
         if self.fault:
             return
@@ -334,7 +374,7 @@ class ZPower:
             band = self.z_band.update(classify_band(self.present_ratio,
                                                     self.bands))
             self._check_z_change(band)
-        plate = self._plate_present()
+        self.plate = plate = self._plate_present(band, eventtime)
         self._update_current()
         if self.enabled:
             self._check_current(eventtime)
@@ -342,21 +382,34 @@ class ZPower:
                                        self.inhibited)
         if enable:
             if not self.enabled:
-                self.powering_since = eventtime
+                self.powering_since = self._set_enable(True, eventtime)
+                self.start_peak = 0.
             elif self.power_good:
                 state, reason = READY, "bed power is on"
                 self.powering_since = None
             elif self.powering_since is None:
-                # PGOOD dropped after the path was up: the eFuse tripped.
-                self._latch_fault("PGOOD dropped (eFuse tripped)", eventtime)
+                # PGOOD dropped after the path was up: the eFuse turned its
+                # FET off (overload, thermal, UVLO or OVP).
+                self._latch_fault("PGOOD dropped (eFuse tripped, %s A)"
+                                  % (self._amps(self.current),), eventtime)
                 state, reason, enable = FAULT, self.fault, False
-            elif eventtime - self.powering_since > self.power_good_timeout:
-                self._latch_fault("PGOOD did not rise within %.2fs"
-                                  % (self.power_good_timeout,), eventtime)
-                state, reason, enable = FAULT, self.fault, False
+            else:
+                if self.current is not None:
+                    self.start_peak = max(self.start_peak, self.current)
+                if eventtime - self.powering_since > self.power_good_timeout:
+                    self._latch_fault(
+                        "PGOOD did not rise within %.2fs (%s A peak)"
+                        % (self.power_good_timeout,
+                           self._amps(self.start_peak
+                                      if self.current is not None
+                                      else None)), eventtime)
+                    state, reason, enable = FAULT, self.fault, False
         self._set_enable(enable, eventtime)
         self._transition(state, reason, eventtime)
         return eventtime + POLL_INTERVAL
+    @staticmethod
+    def _amps(current):
+        return "?" if current is None else "%.2f" % (current,)
     def _check_z_change(self, band):
         if band == self.last_band or (band is None and not self.band_seen):
             return
@@ -414,7 +467,7 @@ class ZPower:
                 'z': self.z_band.value,
                 'xy_allowed': xy_allowed(self.z_band.value,
                                          self.xy_requires_column),
-                'plate_present': self.detector.plate_present(),
+                'plate_present': self.plate,
                 'enabled': self.enabled,
                 'power_good': self.power_good,
                 'present_ratio': self.present_ratio,

@@ -4661,7 +4661,9 @@ locked (`present_pin`, a resistor divider read in three bands) and
 `[bed_removal_detector]` reports a plate, and off as soon as either stops
 being true. Plate presence is the detector's judgement alone (it is
 unknown, and the feed stays off, until the detector has measured), so a
-`[bed_removal_detector]` section is required.
+`[bed_removal_detector]` section is required. The bed thermistor is wired
+through the Z column, so that judgement only counts once the column has
+been plugged in for `plate_settle_time`.
 The bed heater refuses a target unless the path is `ready`. The eFuse PGOOD
 must rise within `power_good_timeout` of enabling, and a later PGOOD drop,
 a current above `max_current`, or current drawn with the bed heater off
@@ -4706,8 +4708,14 @@ present_locked_range:
 #   reading is available.
 #heater: heater_bed
 #   The heater whose target is gated.
-#power_good_timeout: 0.5
-#   Seconds PGOOD has to rise after the enable is set.
+#power_good_timeout: 2.0
+#   Seconds PGOOD has to rise after the enable pin changes. The default
+#   outlasts the TPS16630's own start-up limit (thermal regulation up to
+#   1.5 s, then a 13 ms PGOOD deglitch). The fault text gives the highest
+#   IMON current seen while waiting.
+#plate_settle_time: 2.0
+#   Seconds the Z column must be plugged in before the plate reading
+#   counts. The bed thermistor input floats while the column is out.
 #lost_gcode:
 #   G-Code run when a READY path goes down for any reason other than the
 #   plate being removed (bed_removal_detector handles that) or a fault.
