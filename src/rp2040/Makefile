@@ -39,7 +39,7 @@ $(OUT)stage2.o: lib/pico-sdk/$(MCU)/boot_stage2/$(STAGE2_FILE) $(OUT)autoconf.h
 	$(Q)$(CC) $(CFLAGS) -Ilib/pico-sdk/$(MCU)/boot_stage2 -Ilib/pico-sdk/$(MCU)/boot_stage2/asminclude -DPICO_FLASH_SPI_CLKDIV=$(CONFIG_RP2040_STAGE2_CLKDIV) -c $< -o $(OUT)stage2raw1.o
 	$(Q)$(LD) $(OUT)stage2raw1.o --script=lib/pico-sdk/$(MCU)/boot_stage2/boot_stage2.ld -o $(OUT)stage2raw.o
 	$(Q)$(OBJCOPY) -O binary $(OUT)stage2raw.o $(OUT)stage2raw.bin
-	$(Q)lib/pico-sdk/$(MCU)/boot_stage2/pad_checksum -s 0xffffffff $(OUT)stage2raw.bin $(OUT)stage2.S
+	$(Q)$(PYTHON) lib/pico-sdk/$(MCU)/boot_stage2/pad_checksum -s 0xffffffff $(OUT)stage2raw.bin $(OUT)stage2.S
 	$(Q)$(CC) $(CFLAGS) -c $(OUT)stage2.S -o $(OUT)stage2.o
 
 # Binary output file rules when using stage2
