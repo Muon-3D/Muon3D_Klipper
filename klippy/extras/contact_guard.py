@@ -12,6 +12,11 @@
 import logging, collections, sys
 
 REFUSAL = "Nozzle is touching the plate: lift Z before moving X or Y"
+# With Z not homed Z cannot be jogged and REZERO needs Z homed: the only
+# way out is a full home, whose end-of-G28 zero re-zeroes the guard
+REFUSAL_Z_UNHOMED = ("Nozzle is touching the plate and Z is not homed (Z"
+                     " cannot be jogged or re-zeroed): run a full home"
+                     " (G28) to re-zero the guard")
 # Fail closed: near the plate, or while the last state was contact, an XY
 # move with no load cell data covering its start is refused too
 NO_DATA = ("contact_guard: no current load cell data, so contact cannot"
@@ -281,6 +286,9 @@ class ContactGuard:
         if self.contact and self.is_active(eventtime):
             logging.info("contact_guard: refused move %s -> %s, load %d",
                          last[:3], list(newpos[:3]), self.load)
+            kin = self.toolhead.get_kinematics().get_status(eventtime)
+            if 'z' not in kin['homed_axes']:
+                raise self._own_error(REFUSAL_Z_UNHOMED)
             raise self._own_error(REFUSAL)
 
     def _stale(self, eventtime):
@@ -422,8 +430,9 @@ class ContactGuard:
 
     def _trusted_zero_refusal(self):
         # Why this G28 gets no trusted zero, or None.  Only a G28 whose
-        # own Z homing is closed-loop (the load cell probe) and that left
-        # the toolhead clear of the plate vouches for the load it reads.
+        # own Z homing is probe-homed (the load cell probe) and that was
+        # commanded to park clear of the plate vouches for the load it
+        # reads.  The park is the COMMANDED Z, not a measured one.
         if not self.enabled or self.probe is None:
             return "the guard is disabled"
         if not self.g28_z_homed or self.g28_z0 is None:
@@ -432,7 +441,7 @@ class ContactGuard:
             return "Z is no longer trusted"
         z = self.toolhead.get_position()[2]
         if z < self.g28_z0 + self.clearance_lift - MOVE_EPSILON:
-            return ("the toolhead is not parked %.3f mm above Z0 %.3f (Z %.3f)"
+            return ("no commanded park %.3f mm above Z0 %.3f (Z %.3f)"
                     % (self.clearance_lift, self.g28_z0, z))
         return None
 
@@ -485,7 +494,7 @@ class ContactGuard:
         # end of a G28 that homed Z ('trusted'): the first ANCHOR_TIME of
         # steady, in-range readings becomes the zero.  The lift is checked
         # only by step counts, so its zero is refused at contact level; the
-        # trusted one follows a closed-loop Z home and a verified park.
+        # trusted one follows a probe-homed Z and a commanded park.
         lz = self.lift_zero
         kind = lz['kind']
         if lz['start'] is None:
@@ -512,7 +521,7 @@ class ContactGuard:
             logging.info(
                 "contact_guard: trusted end-of-G28 zero won: baseline"
                 " %d -> %d (pending_zero %s, lift zero %s); Z homed by"
-                " probe, parked at Z %.3f over Z0 %.3f, steady over"
+                " probe, commanded park at Z %.3f over Z0 %.3f, steady over"
                 " %d samples", self.baseline, mean,
                 "%d" % self.pending_zero if self.pending_zero is not None
                 else "none",

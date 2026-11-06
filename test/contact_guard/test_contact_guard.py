@@ -1587,7 +1587,8 @@ def test_upward_homing_lift_clears_false_latch():
     r.homing_move('z', -10.)         # AXIS_PROTECTED_MOVE AXIS=Z DIST=10
     # _HOME_X's first XY move comes before any sample: it waits for them
     r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
-    check(r.refused(50, 10, 20.) == REFUSAL and r.status()['contact'],
+    check(r.refused(50, 10, 20.) == contact_guard.REFUSAL_Z_UNHOMED
+          and r.status()['contact'],
           'a contact-level load after the open-loop lift is not absorbed')
     # A sub-threshold offset after the lift is (the G28 macro XY move)
     r = Rig(z=20.)
@@ -1928,6 +1929,98 @@ def test_lift_zero_with_no_baseline_yet():
     r.printer.homing_scope.in_scope = False
     r.feed(0, 0.1)
     check(not r.status()['contact'], 'and nothing is latched')
+
+def test_refusal_text_tells_how_to_recover_when_z_is_unhomed():
+    # Opus re-review: with Z not homed nothing but a full G28 can clear
+    # the latch (no Z jog, no REZERO), so the refusal must say so
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(200000, 0.5)
+    r.printer.toolhead.homed_axes = ''
+    err = r.refused(60, 50, 20.)
+    check(err == contact_guard.REFUSAL_Z_UNHOMED and 'G28' in err
+          and 'not homed' in err, 'Z unhomed: the refusal names a full home')
+    r.printer.toolhead.homed_axes = 'xyz'
+    check(r.refused(60, 50, 20.) == REFUSAL,
+          'Z homed: the existing wording')
+
+
+def test_trusted_zero_needs_probe_homed_z_in_this_g28():
+    # Park high enough, Z trusted from an earlier G28, but this G28 did not
+    # probe Z: no trusted zero (g28_z_homed alone decides)
+    r = Rig(z=20.)
+    r.home_z()
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    r.printer.toolhead.homed_axes = 'xyz'
+    r.printer.toolhead.position[2] = 10.
+    r.guard.g28_z0 = 0.
+    r.guard.z_trusted = True
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'park high, Z not probed this G28: latched')
+
+
+def test_trusted_zero_needs_z_still_trusted():
+    # Probe-homed and parked high, but Z trust was lost before the end
+    # (Z motor off): no trusted zero (z_trusted alone decides)
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0)
+    r.printer.toolhead.position[2] = 10.
+    r.guard.z_trusted = False
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'probe-homed, parked, trust lost: latched')
+
+
+def test_park_just_below_clearance_lift_gets_no_trusted_zero():
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0, z0=0.)
+    r.printer.toolhead.position[2] = 0.99
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'probe-homed, park 0.99 mm up: latched')
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0, z0=0.)
+    r.printer.toolhead.position[2] = 1.0
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    check(not r.status()['contact'], 'park exactly clearance_lift: zeroed')
+
+
+def test_command_error_in_scope_cleans_up():
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0)
+    r.printer.toolhead.position[2] = 10.
+    r.feed(200000, 0.3)
+    r.printer.send_event("gcode:command_error")    # the G28 fails; no end
+    g = r.guard
+    check(not g.g28_z_homed and g.pending_zero is None
+          and g.lift_zero is None and not g.z_trusted,
+          'a command error resets the G28 state')
+    r.printer.homing_scope.in_scope = False
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'no trusted zero after a failed G28')
+    r.printer.toolhead.print_time = r.t
+    r.printer.send_event("homing_scope:end")        # even a stray end
+    check(g.lift_zero is None, 'and a stray end event starts no window')
 
 
 def main():
