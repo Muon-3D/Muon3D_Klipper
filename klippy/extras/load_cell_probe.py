@@ -950,6 +950,9 @@ class LoadCellPrinterProbe:
     def get_load_cell(self):
         return self._load_cell
 
+    def get_reference_max_load_counts(self):
+        return self._config_helper.get_reference_max_load_counts()
+
     def get_last_trigger_time(self):
         return self._load_cell_probing_move.get_last_trigger_time()
 
