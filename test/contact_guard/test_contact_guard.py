@@ -140,6 +140,8 @@ class FakeToolhead:
         return {'homed_axes': self.homed_axes}
     def wait_moves(self):
         self.waits += 1
+    def get_last_move_time(self):
+        return self.print_time
     def get_position(self):
         return list(self.position)
     def move(self, newpos, speed):
@@ -1477,6 +1479,7 @@ def test_g28_lift_rezero_survives_home_y():
     for load, d in ((240000, .1), (480000, .1), (717295, 1.)):
         r.feed(load, d)                      # unlock tension, latched
     check(r.status()['contact'], 'tension latched')
+    g28_scope_begin(r)       # the whole G28 is one scope (#92)
     r.printer.toolhead.homed_axes = ''       # idle_timeout M84
     r.z_motor(False)
     r.set_position()                         # SKP Z=100 SET_HOMED=Z
@@ -1488,8 +1491,10 @@ def test_g28_lift_rezero_survives_home_y():
     r.printer.reactor.on_pause.append(lambda: r.feed(717295, 0.005))
     r.printer.send_event("homing:homing_move_end", hm)
     r.printer.reactor.on_pause[:] = []
-    check(r.guard.lift_zero is None and not r.status()['contact'],
+    check(r.guard.lift_zero is None,
           'the lift re-zero is decided before homing_move_end returns')
+    check(r.guard.baseline is not None and abs(r.guard.baseline - ZERO) < 1,
+          'and refused: 717295 counts is a contact-level load')
     # _HOME_Y: SKPs, AXIS_PROTECTED_MOVE AXIS=Y, G28.1 Y
     r.set_position()
     hy = FakeHomingMove('y', 5.)
@@ -1507,7 +1512,8 @@ def test_g28_lift_rezero_survives_home_y():
     r.guard.last_position = [50., 50., 110., 0.]
     r.printer.toolhead.print_time = 0.
     check(r.refused(50, 60, 110.) is None,
-          'with _HOME_Y in between, _HOME_X G1 Y10 is allowed')
+          'with _HOME_Y in between, _HOME_X G1 Y10 is allowed (in scope)')
+    r.printer.homing_scope.in_scope = False
     r.feed(717295 + 200000, 0.05)
     check(r.status()['contact'], 'a real touch afterwards still latches')
 
@@ -1522,7 +1528,7 @@ def test_g28_lift_rezero_settles_inside_homing_scope():
     r.feed(0, 0.5)
     r.feed(200000, 1.)
     check(r.status()['contact'], 'latched before the G28')
-    r.printer.homing_scope.in_scope = True   # G28 begins
+    g28_scope_begin(r)                       # G28 begins
     r.printer.toolhead.homed_axes = ''
     r.set_position()                         # SKP Z placeholder
     hm = FakeHomingMove('z', -10.)           # AXIS_PROTECTED_MOVE Z+10
@@ -1534,14 +1540,21 @@ def test_g28_lift_rezero_settles_inside_homing_scope():
     r.printer.send_event("homing:homing_move_end", hm)
     r.printer.reactor.on_pause[:] = []
     check(r.guard.lift_zero is None,
-          'the lift re-zero completes inside the homing scope')
-    check(not r.status()['contact'] and abs(r.status()['load']) < 1000,
-          'contact releases once the re-zero is done')
-    # Between homing moves, still in scope: a jump is not judged
-    r.feed(200000 + 300000, 0.3)
-    check(not r.status()['contact'],
-          'contact is still not judged inside the homing scope')
-    r.printer.homing_scope.in_scope = False
+          'the lift re-zero is decided inside the homing scope')
+    # Opus review 6 Nov: the lift is open loop, so a contact-level steady
+    # load is refused; the release is the trusted end-of-G28 zero
+    check(r.guard.baseline is not None and abs(r.guard.baseline - ZERO) < 1,
+          'the open-loop lift zero refuses a 200k load')
+    r.feed(200000, 0.3)
+    check(r.status()['active'] is False,
+          'contact is not judged inside the homing scope')
+    g28_probe_z(r, 200000)
+    r.printer.toolhead.position[2] = 10.
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    st = r.status()
+    check(st['active'] and not st['contact'] and abs(st['load']) < 1000,
+          'the trusted zero releases the latch once the G28 is done')
 
 
 def test_nothing_is_judged_inside_a_homing_script():
@@ -1574,7 +1587,16 @@ def test_upward_homing_lift_clears_false_latch():
     r.homing_move('z', -10.)         # AXIS_PROTECTED_MOVE AXIS=Z DIST=10
     # _HOME_X's first XY move comes before any sample: it waits for them
     r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
-    check(r.refused(50, 10, 20.) is None and not r.status()['contact'],
+    check(r.refused(50, 10, 20.) == REFUSAL and r.status()['contact'],
+          'a contact-level load after the open-loop lift is not absorbed')
+    # A sub-threshold offset after the lift is (the G28 macro XY move)
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(60000, 0.1)
+    r.printer.toolhead.homed_axes = ''
+    r.homing_move('z', -10.)
+    r.printer.reactor.on_pause.append(lambda: r.feed(60000, 0.005))
+    check(r.refused(50, 10, 20.) is None and abs(r.status()['load']) < 1000,
           'the G28 macro XY move after the lift is allowed')
     # The same lift with the cell at the end of its range is no evidence
     r = Rig(z=20.)
@@ -1713,6 +1735,199 @@ def test_stationary_sub_threshold_offset_still_relocks():
           'a steady 40000-count offset under the threshold re-zeroes')
     r.feed(40000 + 200000, 0.05)
     check(r.status()['contact'], 'contact measured from the new zero')
+
+
+
+def g28_scope_begin(r):
+    r.printer.homing_scope.in_scope = True
+    r.printer.send_event("homing_scope:begin")
+
+
+def g28_scope_end(r, feed_offset):
+    """The outermost G28 returned without error: the scope announces it
+    (with the guard waiting on samples, which keep flowing) and closes."""
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(feed_offset, 0.005))
+    r.printer.send_event("homing_scope:end")
+    r.printer.reactor.on_pause[:] = []
+    r.printer.homing_scope.in_scope = False
+
+
+def g28_lift(r, offset):
+    """AXIS_PROTECTED_MOVE Z+10 with Z unhomed, as the G28 macro starts."""
+    r.printer.toolhead.homed_axes = ''
+    r.set_position()                         # SKP Z placeholder
+    hm = FakeHomingMove('z', -10.)
+    r.printer.send_event("homing:homing_move_begin", hm)
+    r.feed(offset, 0.2)                      # inside the move: ignored
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(offset, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+
+
+def g28_probe_z(r, pre, travel=5., z0=0.):
+    """_HOME_Z on the M1: a homing_override probe from clear travel, then
+    SET_KINEMATIC_POSITION Z from what it measured (Z0 = plate height)."""
+    ho = r.printer.homing_override
+    ho.in_script = True
+    r.set_position()
+    r.feed(pre, 0.3)                         # LOAD_CELL_TARE
+    r.homing_move('z', travel)
+    r.printer.toolhead.position[2] = z0
+    r.set_position()                         # Z from the probe
+    ho.in_script = False
+    r.printer.toolhead.homed_axes = 'xyz'
+
+
+def test_full_g28_trusted_zero_beats_pre_probe_anchor():
+    # KAN-1413 / Opus review 6 Nov, HIGH: the cell reads 200k off after the
+    # probe and the park.  pending_zero (the pre-probe anchor, ~0) was
+    # applied when the scope ended and overwrote the lift zero, so contact
+    # latched in free air ~20 ms after G28.  The status is read OUTSIDE
+    # the scope: inside it get_status masks contact.
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0)
+    check(r.guard.pending_zero is not None, 'the probe left a pending zero')
+    r.printer.toolhead.position[2] = 10.     # parked 10 mm above Z0
+    r.feed(200000, 0.5)                      # offset after probe and park
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    st = r.status()
+    check(st['active'] and not st['contact'], 'outside the scope: no contact')
+    check(abs(st['load']) < 1000, 'and the load reads zero, not 200000')
+    check(r.guard.pending_zero is None, 'the trusted zero superseded it')
+    check(rezero_error(r) is None, 'Z is still trusted afterwards')
+
+
+def test_xy_only_g28_never_rezeroes_from_samples():
+    # B: G28 X Y homes no Z, so nothing closed-loop vouches for the height:
+    # a 200k offset keeps its latch (the documented fail-safe)
+    r = Rig(z=20.)
+    r.home_z()                   # Z trusted from an earlier home
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    r.printer.toolhead.homed_axes = 'z'
+    r.homing_move('y', 5.)
+    r.homing_move('x', 5.)
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    st = r.status()
+    check(st['active'] and st['contact'] and st['load'] == 200000,
+          'G28 X Y: the 200k offset stays latched, nothing re-zeroed')
+    check(r.guard.baseline is not None and abs(r.guard.baseline - ZERO) < 1,
+          'the zero is the old one')
+
+
+def test_lift_zero_refuses_a_contact_level_load():
+    # C: the lift is verified only by step counts (open loop).  A steady
+    # load at contact level after it is not absorbed into the zero; the
+    # latch stays.  Read outside the scope.
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    check(r.status()['contact'], 'latched before the lift')
+    r.printer.toolhead.homed_axes = ''
+    hm = FakeHomingMove('z', -10.)
+    r.printer.send_event("homing:homing_move_begin", hm)
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(200000, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+    check(r.guard.lift_zero is None, 'the lift zero is decided and gone')
+    r.feed(200000, 0.1)
+    st = r.status()
+    check(st['contact'] and st['load'] == 200000,
+          'a steady contact-level load after the lift is refused: latched')
+    # Just under the threshold is still accepted (a real offset)
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_lift(r, 60000)
+    r.feed(60000, 0.1)
+    check(abs(r.status()['load']) < 1000,
+          'a sub-threshold steady offset after the lift is still re-zeroed')
+
+
+def test_failed_z_homing_gets_no_trusted_zero():
+    # A: only when this G28 homed Z.  A probe that fails (or never moved
+    # far enough to prove anything) leaves the old zero, even parked high.
+    for what, travel, fail in (('a probe that raised', 5., True),
+                               ('a probe that triggered at once', .005,
+                                False)):
+        r = Rig(z=20.)
+        r.feed(0, 0.5)
+        g28_scope_begin(r)
+        g28_lift(r, 0)
+        g28_probe_z(r, 0, travel=travel)
+        if fail:
+            r.printer.send_event("gcode:command_error")
+        r.printer.toolhead.position[2] = 10.
+        r.feed(200000, 0.5)
+        g28_scope_end(r, 200000)
+        r.feed(200000, 0.1)
+        st = r.status()
+        check(st['contact'] and st['load'] == 200000,
+              '%s: no trusted zero, the offset latches' % what)
+
+
+def test_unparked_g28_gets_no_trusted_zero():
+    # A: the park must be verified (>= clearance_lift above Z0)
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0, z0=0.)
+    r.printer.toolhead.position[2] = 0.4     # still near the plate
+    r.feed(200000, 0.5)
+    g28_scope_end(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'not parked: no trusted zero, latched')
+
+
+def test_trusted_zero_needs_a_steady_window():
+    # A: no steady window after the park (load changing): the old zero
+    # semantics stand and the offset latches
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    g28_scope_begin(r)
+    g28_lift(r, 0)
+    g28_probe_z(r, 0)
+    r.printer.toolhead.position[2] = 10.
+    r.printer.toolhead.print_time = r.t
+    flip = [0]
+    def jitter():
+        flip[0] += 1
+        r.feed(200000 + 50000 * (flip[0] % 2), 0.005)
+    r.printer.reactor.on_pause.append(jitter)
+    r.printer.send_event("homing_scope:end")
+    r.printer.reactor.on_pause[:] = []
+    r.printer.homing_scope.in_scope = False
+    check(r.guard.lift_zero is None, 'the window gave up')
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'no steady window: not re-zeroed')
+
+
+def test_lift_zero_with_no_baseline_yet():
+    # D: the first samples ever seen arrive inside a G28 while a lift
+    # zero is pending: no baseline to judge against yet (TypeError)
+    r = Rig(z=20.)
+    r.printer.probe.reference_max = ZERO + PRESS * 1920000
+    r.printer.homing_scope.in_scope = True
+    r.printer.toolhead.homed_axes = ''
+    hm = FakeHomingMove('z', -10.)
+    r.printer.send_event("homing:homing_move_begin", hm)
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(0, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+    check(r.guard.baseline is not None, 'a baseline exists after samples')
+    r.printer.homing_scope.in_scope = False
+    r.feed(0, 0.1)
+    check(not r.status()['contact'], 'and nothing is latched')
 
 
 def main():
