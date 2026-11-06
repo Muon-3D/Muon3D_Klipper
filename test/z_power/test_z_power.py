@@ -178,9 +178,14 @@ class Harness(unittest.TestCase):
         zp.idle_current, zp.idle_current_time = 1.0, 2.0
         zp.supply_voltage = 45.
         zp.over_since = zp.idle_over_since = None
+        zp.start_peak = 0.
         zp.heater_name = 'heater_bed'
         zp.heater = StubHeater()
         zp.detector = StubDetector()
+        # The settle has its own tests; elsewhere a plate counts at once.
+        zp.plate_settle_time = 0.
+        zp.column_since = None
+        zp.plate = None
         zp.power_good_timeout = 0.5
         zp.powering_since = None
         zp.state, zp.reason = UNKNOWN, "starting"
@@ -242,6 +247,39 @@ class Harness(unittest.TestCase):
         zp.fault = None
         self.tick(zp, 2.1)
         self.assertEqual(zp.state, POWERING)
+
+    def test_pgood_timeout_counts_from_the_pin_change(self):
+        # The enable pin changes PIN_MIN_TIME after the poll that sets it,
+        # so the eFuse gets the whole timeout.
+        zp = self.make()
+        self.tick(zp, 1.0)
+        self.assertAlmostEqual(zp.mcu_enable.writes[-1][0],
+                               1.0 + z_power.PIN_MIN_TIME)
+        self.tick(zp, 1.0 + z_power.PIN_MIN_TIME + 0.45)
+        self.assertEqual(zp.state, POWERING)
+        self.tick(zp, 1.0 + z_power.PIN_MIN_TIME + 0.55)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_timeout_default_outlasts_the_efuse_start_up(self):
+        # TPS16630 t(Treg_timeout) is 1.5 s max, PGOOD deglitch 13 ms max.
+        self.assertGreater(z_power.POWER_GOOD_TIMEOUT, 1.5 + 0.013)
+
+    def test_timeout_fault_names_the_start_up_current(self):
+        zp = self.make()
+        zp.raw_current, zp.current_offset = 0.1, 0.1
+        self.tick(zp, 1.0)
+        zp.raw_current = 6.1
+        self.tick(zp, 1.2)
+        zp.raw_current = 0.1
+        self.tick(zp, 1.7)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('6.00 A peak', zp.fault)
+
+    def test_timeout_fault_without_imon(self):
+        zp = self.make()
+        self.tick(zp, 1.0)
+        self.tick(zp, 1.7)
+        self.assertIn('? A peak', zp.fault)
 
     def test_pgood_drop_after_ready_latches_fault(self):
         zp = self.make()
@@ -426,3 +464,88 @@ class TestBedRemovalDetector(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestColumnSettle(Harness):
+    """The bed thermistor runs through the Z column: with the column out the
+    input floats and reads as a plate (sloe, 2026-11-06)."""
+    def make(self):
+        zp = Harness.make(self)
+        zp.plate_settle_time = 2.0
+        return zp
+
+    def test_floating_plate_reading_does_not_power_a_new_column(self):
+        zp = self.make()
+        self.tick(zp, 1.0, ratio=0.99)          # column out, reads a plate
+        self.assertFalse(zp.enabled)
+        self.assertIsNone(zp.plate)
+        self.tick(zp, 1.1)                      # column in and locked
+        self.assertEqual(zp.state, NO_PLATE)
+        self.assertFalse(zp.enabled)
+        self.tick(zp, 2.9)
+        self.assertFalse(zp.enabled)
+        # The detector has caught up: no plate.
+        self.tick(zp, 3.2, plate=False)
+        self.assertEqual(zp.state, NO_PLATE)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.mcu_enable.writes, [])
+
+    def test_plate_on_a_new_column_powers_after_the_settle(self):
+        zp = self.make()
+        self.tick(zp, 1.0, ratio=0.99)
+        self.tick(zp, 1.1)
+        self.tick(zp, 3.0)
+        self.assertFalse(zp.enabled)
+        self.tick(zp, 3.2)
+        self.assertEqual(zp.state, POWERING)
+        self.assertTrue(zp.enabled)
+
+    def test_unlocked_column_counts_towards_the_settle(self):
+        # The thermistor is wired once the column is in, lever up or down.
+        zp = self.make()
+        self.tick(zp, 1.0, ratio=0.5)           # in, unlocked
+        self.tick(zp, 3.5)                      # locked
+        self.assertEqual(zp.state, POWERING)
+
+    def test_pulling_the_column_restarts_the_settle(self):
+        zp = self.make()
+        self.tick(zp, 1.0)
+        self.tick(zp, 3.1)
+        zp.power_good = True
+        self.tick(zp, 3.2)
+        self.assertEqual(zp.state, READY)
+        self.tick(zp, 3.3, ratio=0.99)          # pulled
+        zp.power_good = False
+        self.assertFalse(zp.enabled)
+        self.tick(zp, 3.4)                      # back in at once
+        self.assertEqual(zp.state, NO_PLATE)
+        self.assertFalse(zp.enabled)
+        self.tick(zp, 5.5)
+        self.assertEqual(zp.state, POWERING)
+
+
+class TestB1PlateThresholds(unittest.TestCase):
+    """[bed_removal_detector] thresholds in the B1 config against what the
+    bed thermistor reads on sloe, 2026-11-06."""
+    NO_PLATE = (-17.2, -13.3)    # column in, no plate (raw samples)
+
+    def thresholds(self):
+        path = os.path.join(KLIPPY, '..', 'core', 'M1', 'core.cfg')
+        vals, section = {}, None
+        for line in open(path):
+            line = line.split('#')[0].strip()
+            if line.startswith('['):
+                section = line
+            elif section == '[bed_removal_detector]' and ':' in line:
+                key, val = line.split(':', 1)
+                vals[key.strip()] = float(val)
+        return vals['remove_threshold'], vals['attach_threshold']
+
+    def test_no_plate_reads_removed_with_margin(self):
+        remove, attach = self.thresholds()
+        self.assertLess(self.NO_PLATE[1] + 10., remove)
+        self.assertLess(remove, attach)
+
+    def test_a_plate_in_a_cool_room_reads_attached(self):
+        remove, attach = self.thresholds()
+        self.assertLess(attach, 10.)
