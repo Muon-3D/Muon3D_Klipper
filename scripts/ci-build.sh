@@ -142,6 +142,12 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: fail-closed dev-mode check; clients start only allowlisted commands
+# outside dev mode, macros and internal sources are not checked (KAN-1730).
+start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+$PYTHON test/muon_guard/test_muon_guard.py
+finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+
 # MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
 start_test homing_scope "Test homing_scope"
 $PYTHON test/homing_scope/test_homing_scope.py
