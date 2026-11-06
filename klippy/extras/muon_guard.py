@@ -82,10 +82,28 @@ def detect_dev_mode(config_file, dev_config_path):
             type(e).__name__,)
 
 
+RANGE_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$')
+
+
+def _parse_spec(spec, name, error):
+    m = RANGE_RE.match(spec)
+    if m is None:
+        return ('glob', spec.upper())
+    lo, hi = float(m.group(1)), float(m.group(2))
+    if lo > hi:
+        raise error("[muon_guard] client_allow: '%s' has an empty range "
+                    "'%s'" % (name, spec))
+    return ('range', lo, hi)
+
+
 def parse_allowlist(entries, error):
-    """entries: 'NAME' or 'NAME KEY=glob [KEY=glob ...]'. Returns
-    {NAME: [ {KEY: glob}, ... ]}. A {} constraint allows any parameters; a
-    repeated NAME gives alternatives."""
+    """entries: 'NAME' or 'NAME TOKEN ...'. Returns {NAME: [rule, ...]},
+    where a rule is {'cons': {KEY: spec}, 'open': bool}. A bare NAME allows
+    any parameters. With tokens the entry is closed: only the listed KEYs
+    may be sent, each held to its spec (a glob such as G28*, or a numeric
+    range lo..hi), and a key that is left out is simply not sent. The
+    token '-' allows no parameters at all, and '...' lets other parameters
+    through unchecked. A repeated NAME gives alternatives."""
     rules = {}
     for entry in entries:
         entry = entry.strip()
@@ -100,19 +118,47 @@ def parse_allowlist(entries, error):
         if not NAME_RE.match(name):
             raise error("[muon_guard] client_allow: '%s' is not an upper "
                         "case command name" % (name,))
-        constraints = {}
-        for spec in parts[1:]:
-            key, eq, glob = spec.partition('=')
+        rule = {'cons': {}, 'open': len(parts) == 1}
+        for token in parts[1:]:
+            if token == '-':
+                continue
+            if token == '...':
+                rule['open'] = True
+                continue
+            key, eq, spec = token.partition('=')
             key = key.strip()
-            if not eq or not KEY_RE.match(key) or not glob:
+            if not eq or not KEY_RE.match(key) or not spec:
                 raise error("[muon_guard] client_allow: '%s' needs "
-                            "PARAM=pattern, not '%s'" % (name, spec))
-            constraints[key] = glob.upper()
-        rules.setdefault(name, []).append(constraints)
+                            "PARAM=pattern, '-' or '...', not '%s'"
+                            % (name, token))
+            rule['cons'][key] = _parse_spec(spec, name, error)
+        rules.setdefault(name, []).append(rule)
     if not rules:
         raise error("[muon_guard] client_allow is empty: that would refuse "
                     "every client command")
     return rules
+
+
+def _spec_matches(spec, value):
+    value = str(value).strip().lstrip('=').strip()
+    if spec[0] == 'range':
+        try:
+            number = float(value)
+        except ValueError:
+            return False
+        return spec[1] <= number <= spec[2]
+    return fnmatch.fnmatchcase(value.upper(), spec[1])
+
+
+def rule_matches(rule, params):
+    for key, value in params.items():
+        spec = rule['cons'].get(key)
+        if spec is None:
+            if not rule['open']:
+                return False
+        elif not _spec_matches(spec, value):
+            return False
+    return True
 
 
 class MuonGuard:
@@ -161,19 +207,27 @@ class MuonGuard:
                 name = first
         rules = self.rules.get(name)
         if rules is None:
+            # Nothing is registered under this name, so nothing will run:
+            # the dispatcher only says "Unknown command". Refusing it would
+            # stop a print on a slicer comment-command (M205, M486, ...)
+            # that does nothing. A command that exists and is not listed is
+            # refused.
+            if self.gcode.gcode_handlers.get(name) is None:
+                return True, ""
             return False, "'%s' is not on the client allowlist" % (name,)
-        if any(not r for r in rules):
+        if any(r['open'] and not r['cons'] for r in rules):
             return True, ""
         if self.gcode.is_traditional_gcode(name):
-            params = gcmd.get_command_parameters()
+            # the dispatcher also lists the command's own letter and
+            # number (G28 -> {'G': '28'}) among the parameters
+            params = dict((k, v) for k, v
+                          in gcmd.get_command_parameters().items()
+                          if not (k == name[0] and v == name[1:]))
         else:
-            params = self.gcode._get_extended_params(gcmd).\
-                get_command_parameters()
-        for constraints in rules:
-            if all(k in params
-                   and fnmatch.fnmatchcase(str(params[k]).upper(), glob)
-                   for k, glob in constraints.items()):
-                return True, ""
+            gcmd = self.gcode._get_extended_params(gcmd)
+            params = gcmd.get_command_parameters()
+        if any(rule_matches(r, params) for r in rules):
+            return True, ""
         return False, ("'%s' is on the client allowlist only with limited "
                        "parameters, and these are not among them" % (name,))
 

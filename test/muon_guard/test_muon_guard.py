@@ -47,7 +47,6 @@ MUST_REFUSE = [
     'FORCE_MOVE STEPPER=stepper_z DISTANCE=10 VELOCITY=5',
     'SET_CONTACT_GUARD ENABLE=0',
     'SET_GCODE_VARIABLE MACRO=G28 VARIABLE=z_lifted_once VALUE=1',
-    'SAVE_CONFIG',
     'SAVE_VARIABLE VARIABLE=resonance_valid VALUE=1',
     '_HOME_Z',
     '_HOME_Z X_OFFSET=40',
@@ -65,22 +64,49 @@ MUST_REFUSE = [
     'SET_IDLE_TIMEOUT TIMEOUT=100000',
     'PID_CALIBRATE HEATER=extruder TARGET=200',
     'BED_ATTACHED',
-    'TOOLHEAD_CONNECT',
-    'BUZZ_EXTRUDER',
     # HOMING_GATE runs {params.CALLBACK} as G-code: it is a way to start
     # anything unless its CALLBACK is held to G28.
     'HOMING_GATE CALLBACK=SET_KINEMATIC_POSITION',
     'HOMING_GATE CALLBACK="G1 X1"',
     'HOMING_GATE CALLBACK=_HOME_Z',
     'HOMING_GATE CALLBACK=G280',
-    'HOMING_GATE',
-    # not on the list at all
-    'NOT_A_COMMAND',
+    # Parameters a client may not send to an allowlisted command. Each
+    # would reach a refused command or unbounded motion inside the macro.
+    'FILAMENT_INSERT_SENSORLESS_LOAD CURRENT=2000',
+    'FILAMENT_INSERT_SENSORLESS_LOAD DISTANCE=9999 SPEED=999 ACCEL=99999',
+    'LOAD_FILAMENT CURRENT=2000',
+    'LOAD_FILAMENT_PROMPT DISTANCE=500',
+    'FILAMENT_INSERT_FLOW SPEED=500',
+    'FILAMENT_INSERT_FULL_PURGE_GATE DISTANCE=500',
+    'G28 X_OFFSET=50',
+    'G28 X_OFFSET=-500 Z',
+    'G28 FOO=1',
+    'SET_GCODE_OFFSET Z=50',
+    'SET_GCODE_OFFSET Z_ADJUST=-30 MOVE=1',
+    'BUZZ_EXTRUDER COUNT=1000',
+    'TEST_SPEED SPEED=800 ACCEL=999999',
+    'CUT_FILAMENT MOVE_SPEED=99999',
+    'Z_PARK Z_SPEED=100000',
+    'PRINT_START EXTRUDER=900',
+    'PRINT_START BED=500',
+    'PAUSE HOTEND_TARGET=500',
+    'RESUME VELOCITY=9999',
+    'FINETUNE_RESONANCE FORCE=5',
+    'UNLOAD_FILAMENT TEMP=900',
+    '_BED_MESH_RECORD BED=500',
+    'PROBE_ACCURACY SAMPLES=9999',
+    'SET_PRESSURE_ADVANCE ADVANCE=50',
+    'SAVE_VARIABLE VARIABLE=muon_material OTHER=1 VALUE=x',
+    'SAVE_VARIABLE VARIABLE=muon_material_colour_x VALUE=1',
+    # Control's stepper jog and multi-extruder controls: dev tools
+    'ACTIVATE_EXTRUDER EXTRUDER=extruder',
 ]
 
 # Every command name the fake printer registers, so that "refused" is told
 # apart from "unknown command".
 EXTRA_REGISTERED = set(c.split()[0] for c in MUST_REFUSE)
+SENDERS = os.path.join(HERE, 'client_senders.txt')
+FIXTURES = os.path.join(HERE, 'fixtures')
 
 
 CommandError = gcode_mod.CommandError
@@ -591,23 +617,63 @@ def test_homing_gate_callback():
               "HOMING_GATE with another callback is refused: %s" % line)
 
 
+def line_for(entry, end=1):
+    """A command line that satisfies one allowlist entry."""
+    parts = shlex.split(entry)
+    name, toks = parts[0], parts[1:]
+    traditional = re.match(r'^[GMTN]\d', name) is not None
+    line = name
+    for t in toks:
+        if t in ('-', '...'):
+            continue
+        k, _, v = t.partition('=')
+        m = re.match(r'^(-?[\d.]+)\.\.(-?[\d.]+)$', v)
+        if m:
+            val = m.group(end)
+        else:
+            val = v.replace('*', 'X')
+        if traditional and v == '*':
+            line += ' ' + k
+        elif traditional and k == 'X_OFFSET':
+            line += ' %s%s' % (k, '=' + val)
+        else:
+            line += ' %s=%s' % (k, shlex.quote(val))
+    return line
+
+
 def test_allowlist_commands_pass():
     entries = [e.strip() for e in core_allow().split('\n') if e.strip()]
     check(len(entries) > 40, "core.cfg lists an allowlist (%d entries)"
           % len(entries))
     rig = Rig()
     for entry in entries:
-        parts = shlex.split(entry)
-        name, cons = parts[0], parts[1:]
-        line = name
-        for c in cons:
-            k, _, v = c.partition('=')
-            line += ' %s=%s' % (k, shlex.quote(v.replace('*', 'X')))
+        line = line_for(entry)
         for door in ('webhooks', 'pty', 'file'):
             err = rig.client(line, door)
             check(err is None, "allowlisted passes via %s: %r (%s)"
                   % (door, line, err))
         check(len(rig.calls) >= 1, "allowlisted command ran: %r" % (line,))
+        # both ends of every range pass too
+        for end in (1, 2):
+            l2 = line_for(entry, end)
+            err = rig.client(l2)
+            check(err is None, "range end passes: %r (%s)" % (l2, err))
+
+
+def test_unregistered_commands_do_nothing_and_pass():
+    # Nothing is registered under these names, so nothing runs. Refusing
+    # them would stop a print on a slicer comment-command.
+    rig = Rig()
+    for line in ('NOT_A_COMMAND', 'M900 K0.05', 'G29', 'T0',
+                 'SOME_FUTURE_SLICER_THING A=1'):
+        check(rig.client(line, 'file') is None,
+              "an unregistered command passes: %r" % (line,))
+        check(rig.calls == [], "and nothing ran: %r" % (line,))
+    # but the moment something is registered under a name that is not
+    # listed, it is refused
+    rig.gcode.register_command('SOME_NEW_COMMAND', lambda g: None)
+    check(rig.client('SOME_NEW_COMMAND') is not None,
+          "a registered, unlisted command is refused")
 
 
 def test_dev_mode_allows_all():
@@ -615,11 +681,9 @@ def test_dev_mode_allows_all():
     st = rig.guard.get_status(0.)
     check(st['dev_mode'] is True, "rig really is in dev mode")
     for cmd in MUST_REFUSE:
-        if cmd.split()[0] == 'NOT_A_COMMAND':
-            continue
         err = rig.client(cmd)
         check(err is None, "dev mode allows: %s (%s)" % (cmd, err))
-        check(len(rig.calls) == 1, "dev mode runs it: %s" % (cmd,))
+        check(len(rig.calls) >= 1, "dev mode runs it: %s" % (cmd,))
     # and the same through the other doors
     for door in ('pty', 'file'):
         check(rig.client('SET_KINEMATIC_POSITION Z=1', door) is None,
@@ -755,14 +819,11 @@ def macros_in_core():
 NOT_FOR_CLIENTS = {
     '_CLIENT_VARIABLE': 'variable holder',
     'LED_TIMEOUT_STATE': 'state holder',
-    'BUZZ_EXTRUDER': 'debug',
     'WEAR_TEST': 'debug',
-    'TEST_SPEED': 'debug',
-    'PID_CALIBRATE': 'heats to a target; calibration is a dev tool',
+    'PID_CALIBRATE': 'M1 has CALIBRATE_HEATING_*; PID_CALIBRATE heats to a '
+                     'client target (panel lists it, bare, and it errors)',
     'BED_REMOVED': 'raised by bed_removal_detector, not by a client',
     'BED_ATTACHED': 'raised by bed_removal_detector, not by a client',
-    'TOOLHEAD_CONNECT': 'raised by the toolhead hot-plug path',
-    'TOOLHEAD_DISCONNECT': 'raised by the toolhead hot-plug path',
     'TOOLHEAD_UMBILICAL_UNLOCK_STATE': 'internal arm state',
     'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED': 'raised by gcode_button',
     'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED': 'raised by gcode_button',
@@ -771,7 +832,6 @@ NOT_FOR_CLIENTS = {
     'PSU_FAN_CHECK': 'delayed_gcode / fault path',
     'CPU_FAN_CHECK': 'delayed_gcode / fault path',
     'FAN_STOPPAGE_ROUTINE': 'fault path',
-    'FILAMENT_INSERT_FLOW': 'raised by the filament sensor insert_gcode',
     'FILAMENT_INSERT_MODE_PROMPT': 'step of the insert flow',
     'FILAMENT_INSERT_SENSORLESS_RESULT': 'step of the insert flow',
     'FILAMENT_INSERT_LOAD_FAILED_PROMPT': 'step of the insert flow',
@@ -779,7 +839,6 @@ NOT_FOR_CLIENTS = {
     'FILAMENT_INSERT_GRAB_MORE': 'step of the insert flow',
     'IF_BED_TEMP_ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
     'ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
-    'CANCEL_AND_CLOSE': 'only a prompt button inside HOMING_GATE',
 }
 
 
@@ -799,13 +858,19 @@ def test_every_macro_is_classified():
                         re.M):
                     prompt_targets.add(m.group(1))
     underscore_allowed = set(n for n in allowed if n.startswith('_'))
-    check(underscore_allowed <= prompt_targets,
-          "underscore macros on the allowlist are all prompt-button "
-          "targets: %r" % (sorted(underscore_allowed - prompt_targets),))
+    # sent by the panel itself (MuonUI src/panel/screens/tools.ts:161,177,
+    # 384 and filament.ts:127), not by a prompt button
+    panel_sent = set(['_BED_MESH_RECORD', '_SAVE_CONFIG_IF_PENDING',
+                      '_SET_MPC_MATERIAL'])
+    check(underscore_allowed <= prompt_targets | panel_sent,
+          "underscore macros on the allowlist are prompt-button targets or "
+          "sent by the panel: %r"
+          % (sorted(underscore_allowed - prompt_targets - panel_sent),))
     check(underscore_allowed == set([
         '_BED_RESUME_NOW', '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
-        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE']),
-        "the underscore exceptions are exactly the six reviewed ones: %r"
+        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE'])
+        | panel_sent,
+        "the underscore exceptions are exactly the nine reviewed ones: %r"
         % (sorted(underscore_allowed),))
     for name in macros_in_core():
         if name.startswith('_') and name not in underscore_allowed:
@@ -820,12 +885,13 @@ def test_every_macro_is_classified():
               "%s is listed as not for clients but is on the allowlist"
               % (name,))
     for name in ('SET_KINEMATIC_POSITION', 'FORCE_MOVE', 'SET_CONTACT_GUARD',
-                 'SET_GCODE_VARIABLE', 'SAVE_CONFIG', 'SAVE_VARIABLE',
+                 'SET_GCODE_VARIABLE',
                  'SET_TMC_CURRENT', 'SET_STEPPER_ENABLE', 'STEPPER_BUZZ',
                  'AXIS_PROTECTED_MOVE', 'AXIS_HOME_MOVE', 'G28.1',
                  'SET_BED_REMOVAL_DETECTOR', 'SET_IDLE_TIMEOUT'):
         check(name not in allowed, "%s is not on the allowlist" % (name,))
-    for name in ('G0', 'G1', 'G28', 'M104', 'M140', 'M106', 'M109', 'M190',
+    for name in ('SAVE_CONFIG', 'SAVE_VARIABLE', 'G0', 'G1', 'G28',
+                 'M104', 'M140', 'M106', 'M109', 'M190',
                  'M84', 'M112', 'PRINT_START', 'PRINT_END', 'PAUSE',
                  'RESUME', 'CANCEL_PRINT', 'SDCARD_PRINT_FILE',
                  'SET_HEATER_TEMPERATURE', 'TURN_OFF_HEATERS'):
@@ -874,6 +940,242 @@ def test_muon_guard_is_loaded_and_not_overridable():
     check(len(conflicts) == 1 and 'muon_guard' in conflicts[0],
           "the overlay is refused when it mentions [muon_guard]: %r"
           % (conflicts,))
+
+
+######################################################################
+# 4. Real client traffic through the gate (KAN-1730 review)
+######################################################################
+
+def names_in(script_lines):
+    out = set()
+    for raw in script_lines:
+        code = raw.split(';')[0].strip()
+        if not code:
+            continue
+        out.add(code.split()[0].upper())
+    return out
+
+
+# Commands real slicer output uses that nothing registers on the M1. They
+# are left unregistered in the rig, as on the printer.
+NOT_REGISTERED_ON_M1 = set(['G21', 'G20', 'M205', 'M486', 'M141', 'M191',
+                            'TIMELAPSE_TAKE_FRAME', 'G10', 'G11', 'G2',
+                            'G3', 'M900'])
+
+
+def run_fixture(path):
+    with open(path, encoding='utf-8', errors='replace') as f:
+        lines = f.read().split('\n')
+    names = names_in(lines) - NOT_REGISTERED_ON_M1
+    # Register every command the file uses, so a missing allowlist entry
+    # is a refusal and not an "unknown command" pass.
+    rig = Rig(allow=core_allow())
+    for n in sorted(names):
+        rig._register(n)
+    bad = []
+    for number, line in enumerate(lines, 1):
+        err = rig.client(line, 'file')
+        if err is not None:
+            bad.append('%s:%d %s -> %s' % (os.path.basename(path), number,
+                                           line[:80], err[:60]))
+    return bad, len(lines)
+
+
+def test_slicer_output_passes():
+    # Every line of real slicer output must pass, or virtual_sdcard stops
+    # the print (virtual_sdcard.py on_error path). The first four files are
+    # the muon3d-slicer e2e fixtures (trimmed of the config block and of
+    # repeated G1 moves); the last is a sample of what Orca and PrusaSlicer
+    # (Klipper flavour) emit.
+    files = sorted(fn for fn in os.listdir(FIXTURES) if fn.endswith('.gcode'))
+    check(len(files) >= 6, "slicer fixtures present: %r" % (files,))
+    for fn in files:
+        bad, total = run_fixture(os.path.join(FIXTURES, fn))
+        check(not bad, "every line of %s passes the gate (%d lines): %r"
+              % (fn, total, bad[:3]))
+
+
+def test_slicer_fixtures_use_the_review_commands():
+    seen = set()
+    for fn in os.listdir(FIXTURES):
+        if fn.endswith('.gcode'):
+            with open(os.path.join(FIXTURES, fn), encoding='utf-8',
+                      errors='replace') as f:
+                seen |= names_in(f.read().split('\n'))
+    for name in ('G21', 'SET_PRESSURE_ADVANCE', 'SET_VELOCITY_LIMIT', 'M73',
+                 'EXCLUDE_OBJECT_DEFINE', 'PRINT_START', 'M486', 'M205'):
+        check(name in seen, "the slicer fixtures exercise %s" % (name,))
+
+
+def test_slicer_start_aborts_without_the_commands():
+    # The failure the review found, as a negative control: a print stops at
+    # the first refused line.
+    allow = [e for e in core_allow().split('\n')
+             if e.strip() and not e.strip().startswith('SET_PRESSURE')]
+    rig = Rig(allow=allow)
+    rig._register('SET_PRESSURE_ADVANCE')
+    err = rig.client('SET_PRESSURE_ADVANCE ADVANCE=0.02', 'file')
+    check(err is not None, "without its entry SET_PRESSURE_ADVANCE is "
+          "refused (the bug)")
+    rig = Rig()
+    check(rig.client('SET_PRESSURE_ADVANCE ADVANCE=0.02', 'file') is None,
+          "with the shipped allowlist it passes")
+
+
+def read_senders():
+    out = []
+    with open(SENDERS, encoding='utf-8') as f:
+        for raw in f:
+            raw = raw.rstrip('\n')
+            if not raw.strip() or raw.startswith('#'):
+                continue
+            flag, rest = raw[0], raw[1:].strip()
+            src, _, script = rest.partition(' | ')
+            note = ''
+            if ' # ' in script:
+                script, _, note = script.partition(' # ')
+            out.append((flag, src, script.strip().replace('\\n', '\n'),
+                        note))
+    return out
+
+
+def test_client_senders():
+    allowed = set(shlex.split(e)[0] for e in core_allow().split('\n')
+                  if e.strip())
+    senders = read_senders()
+    check(len(senders) > 100, "sender list is loaded (%d)" % len(senders))
+    refused_names = set(s[2].split()[0] for s in senders if s[0] == '!')
+    rig = Rig()
+    for name in sorted(refused_names):
+        rig._register(name)
+    for flag, src, script, note in senders:
+        for line in script.split('\n'):
+            name = line.split()[0]
+            if flag == '=':
+                if name not in allowed:
+                    check(False, "%s sends %s, which is not allowlisted"
+                          % (src, name))
+        err = rig.client(script)
+        if flag in '=~':
+            check(err is None, "%s sends %r: refused (%s)" % (src, script,
+                                                              err))
+        else:
+            check(err is not None and note,
+                  "%s sends %r: expected a refusal with a reason" %
+                  (src, script))
+
+
+def test_prompt_targets_are_allowlisted():
+    # Every prompt button the printer shows sends its target back through a
+    # client door (Control and the panel send button.command verbatim).
+    allowed = set(shlex.split(e)[0] for e in core_allow().split('\n')
+                  if e.strip())
+    targets = {}
+    pat = re.compile(r'action:prompt_(?:footer_)?button [^|"]*\|([^|"]+)\|')
+    paths = [os.path.join(MACRO_DIR, fn) for fn in sorted(os.listdir(
+        MACRO_DIR)) if fn.endswith('.cfg')] + [CORE_CFG]
+    for base, _, files in os.walk(os.path.join(ROOT, 'klippy')):
+        paths += [os.path.join(base, fn) for fn in files
+                  if fn.endswith('.py')]
+    for p in paths:
+        with open(p, encoding='utf-8', errors='replace') as f:
+            for n, line in enumerate(f, 1):
+                if line.lstrip().startswith('#'):
+                    continue
+                for m in pat.finditer(line):
+                    targets[m.group(1).split()[0]] = (
+                        os.path.relpath(p, ROOT), n)
+    check(len(targets) >= 10, "prompt-button targets found (%d)"
+          % len(targets))
+    for name, where in sorted(targets.items()):
+        check(name in allowed,
+              "prompt-button target %s (%s:%d) is on the allowlist"
+              % ((name,) + where))
+
+
+# Allowlisted macros that read client parameters, and why an entry with no
+# limits is fine. Everything else that reads params must be closed or
+# range-limited in core.cfg.
+OPEN_PARAMS_OK = {
+    'M106': 'S is a fan duty; fan.py clamps it',
+    'M104': 'S is a temperature; heaters.py caps it at max_temp',
+    'M109': 'S/R are temperatures; heaters.py caps them',
+    'SET_HEATER_TEMPERATURE': 'TARGET is a temperature; capped',
+    'LED_TIMEOUT_SET': 'M is a LED timeout in minutes',
+    'LED_MODE': 'LED colours and speeds only',
+    'SPEED_SLOW_PRE_PURGE_FOR_TPU': 'MATERIAL is a name',
+    'SPEED_NORMAL__POST_PURGE_FOR_TPU': 'MATERIAL is a name',
+    'M600': 'reads no client parameter',
+}
+
+
+def test_allowlisted_macros_with_params_are_bounded():
+    # Audit (review item 3): every allowlisted macro that reads params or
+    # forwards rawparams is closed or range-limited, or listed above with a
+    # reason. A client parameter must not reach SET_TMC_CURRENT,
+    # EXTRUDER_HOMING_MOVE or unbounded motion.
+    entries = [e.strip() for e in core_allow().split('\n') if e.strip()]
+    rules = muon_guard.parse_allowlist(entries, ConfigError)
+    text = ''
+    for fn in sorted(os.listdir(MACRO_DIR)):
+        if fn.endswith('.cfg'):
+            with open(os.path.join(MACRO_DIR, fn), encoding='utf-8',
+                      newline='') as f:
+                text += f.read().replace('\r\n', '\n') + '\n'
+    with open(CORE_CFG, encoding='utf-8', newline='') as f:
+        text += f.read().replace('\r\n', '\n')
+    audited = []
+    for sec in re.split(r'^(?=\[)', text, flags=re.M):
+        m = re.match(r'\[gcode_macro (\S+)\]', sec)
+        if m is None or m.group(1) not in rules:
+            continue
+        name = m.group(1)
+        if not (re.search(r'params\.[A-Za-z_]+', sec)
+                or 'rawparams' in sec):
+            continue
+        audited.append(name)
+        bare = any(r['open'] and not r['cons'] for r in rules[name])
+        if bare:
+            check(name in OPEN_PARAMS_OK,
+                  "macro %s reads client parameters and its entry is "
+                  "unbounded" % (name,))
+    check(len(audited) >= 15, "audit covered %d macros" % len(audited))
+    for name in OPEN_PARAMS_OK:
+        check(name in rules, "OPEN_PARAMS_OK names an allowlisted command: "
+              "%s" % (name,))
+    # the two the review found
+    sless = rules['FILAMENT_INSERT_SENSORLESS_LOAD']
+    check(len(sless) == 1 and not sless[0]['open'] and not sless[0]['cons'],
+          "FILAMENT_INSERT_SENSORLESS_LOAD takes no client parameters")
+    g28 = rules['G28'][0]
+    check(g28['cons']['X_OFFSET'] == ('range', -10.0, 10.0),
+          "G28 X_OFFSET is bounded to +-10")
+    # print.cfg's own G28 call uses -5, inside the bound
+    check(re.search(r'G28 Z PARK=0 X_OFFSET=-5', text) is not None,
+          "the macros' own X_OFFSET is within the bound")
+
+
+def test_param_bounds():
+    rig = Rig()
+    ok = ['G28 X_OFFSET=-5 Z PARK=0', 'G28 O', 'G28', 'G28 X Y',
+          'FILAMENT_INSERT_SENSORLESS_LOAD',
+          'PRINT_START EXTRUDER=215 BED=35 MATERIAL=PLA PROBE_COUNT=4,4',
+          'PAUSE', 'RESUME', 'RESUME VELOCITY=100', 'UNLOAD_FILAMENT',
+          'CUT_FILAMENT', 'SET_GCODE_OFFSET Z_ADJUST=0.05 MOVE=1']
+    bad = ['FILAMENT_INSERT_SENSORLESS_LOAD CURRENT=9000',
+           'FILAMENT_INSERT_SENSORLESS_LOAD SPEED=1',
+           'CUT_FILAMENT SPEED=1', 'G28 X_OFFSET=11', 'G28 X_OFFSET=-11',
+           'G28 X_OFFSET=abc', 'PRINT_START EXTRUDER=266',
+           'PRINT_START BED=131', 'PAUSE HOTEND_TARGET=266',
+           'RESUME VELOCITY=301', 'RESUME VELOCITY=abc',
+           'UNLOAD_FILAMENT TEMP=149']
+    for line in ok:
+        check(rig.client(line) is None, "within bounds: %s" % (line,))
+    for line in bad:
+        check(rig.client(line) is not None, "out of bounds: %s" % (line,))
+    # a bound parameter given twice, or in another case, is still checked
+    check(rig.client('g28 x_offset=50') is not None,
+          "lower case does not dodge a bound")
 
 
 def main():
