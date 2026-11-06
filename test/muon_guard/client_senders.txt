@@ -122,6 +122,9 @@
 = Control mixins/filament-actions.ts:117 | LOAD_FILAMENT
 = Control mixins/filament-actions.ts:117 | M600
 # Control: sends the allowlist refuses outside dev mode, and why
+! Control components/widgets/toolhead/ToolheadControlCircle.vue:736 | FORCE_MOVE STEPPER=stepper_x DISTANCE=5 VELOCITY=20 ACCEL=100 # Control e5391126: stepper jog test, a dev tool (refused by design)
+! Control components/widgets/toolhead/ToolheadPosition.vue:175 | FORCE_MOVE STEPPER=stepper_y DISTANCE=90 VELOCITY=20 ACCEL=100 # Control e5391126: move-to-position by stepper, a dev tool (refused by design)
+! Control services/control/model.ts:48 | UNLOAD_FILAMENT TEMP=270 # PC unload (Control e5391126, M1PartOptions.vue:285): above the M1 extruder max_temp of 265, so refused here and by heaters.py; the bound follows max_temp
 ! Control components/widgets/toolhead/ToolheadControlCross.vue:259 | FORCE_MOVE STEPPER=stepper_x DISTANCE=5 VELOCITY=20 ACCEL=100 # stepper jog test, a dev tool: it moves a motor with no limit checks
 ! Control components/widgets/toolhead/ToolheadControlBarsStepper.vue:52 | FORCE_MOVE STEPPER="stepper_y" DISTANCE=5 VELOCITY=20 ACCEL=100 # same
 ! Control components/widgets/toolhead/ExtruderStepperSync.vue:56 | SET_STEPPER_ENABLE STEPPER="extruder" ENABLE=0 # motor enable is not a client operation; only shown with extruder_stepper

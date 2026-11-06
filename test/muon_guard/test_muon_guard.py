@@ -236,6 +236,16 @@ class FakeGcodeMove:
         self.homing_position = [0., 0., 0., 0.]
 
 
+class FakeConfigStatus:
+    """printer.configfile: only the max_temp values the guard reads."""
+    def __init__(self, extruder=265., bed=130.):
+        self.settings = {'extruder': {'max_temp': extruder},
+                         'heater_bed': {'max_temp': bed}}
+
+    def get_status(self, eventtime):
+        return {'settings': self.settings}
+
+
 class FakeProbe:
     def __init__(self, z):
         self.z = z
@@ -266,6 +276,8 @@ class Rig:
         self.out = []
         self.gcode.register_output_handler(self.out.append)
         self.calls = []
+        self.cfg = FakeConfigStatus()
+        self.printer.add_object('configfile', self.cfg)
         self.gm = FakeGcodeMove()
         self.printer.add_object('gcode_move', self.gm)
         self.probe = FakeProbe(0.)
@@ -704,9 +716,11 @@ def line_for(entry, end=1):
         if t in ('-', '...'):
             continue
         k, _, v = t.partition('=')
-        m = re.match(r'^(-?[\d.]+)\.\.(-?[\d.]+)$', v)
+        m = re.match(r'^(-?[\d.]+)\.\.(-?[\d.]+|@[a-z_]+)$', v)
         if m:
             val = m.group(end)
+            val = {'@extruder_max_temp': '265',
+                   '@bed_max_temp': '130'}.get(val, val)
         elif v.startswith('~'):
             val = ('PLA' if 'MATERIAL' in k else 'bicubic'
                    if k == 'ALGORITHM' else '+' if k == 'Z' else '1,2')
@@ -1613,6 +1627,58 @@ def test_print_is_blocked_while_the_saved_z_offset_is_invalid():
     rig = Rig()
     del rig.printer.objects['load_cell_probe']
     check(rig.client('PRINT_START') is None, "no probe object: not blocked")
+
+
+def test_temperatures_follow_the_configured_max_temp():
+    # No hard-coded 265: the TEMP/EXTRUDER/BED/HOTEND_TARGET bounds are the
+    # heaters' configured max_temp, so a printer (or a later config) that
+    # allows 270 C accepts it, and max_temp + 1 is refused.
+    for ext in (265., 270., 300.):
+        rig = Rig()
+        rig.cfg.settings['extruder']['max_temp'] = ext
+        cases = [('UNLOAD_FILAMENT TEMP=%g', 'UNLOAD_FILAMENT TEMP=%g'),
+                 ('PAUSE HOTEND_TARGET=%g', 'PAUSE HOTEND_TARGET=%g'),
+                 ('PRINT_START EXTRUDER=%g BED=60', 'PRINT_START EXTRUDER=%g')]
+        for fmt, _ in cases:
+            check(rig.client(fmt % ext) is None,
+                  "max_temp %g allows %s" % (ext, fmt % ext))
+            check(rig.client(fmt % (ext + 1)) is not None,
+                  "max_temp %g refuses %s" % (ext, fmt % (ext + 1)))
+    rig = Rig()
+    rig.cfg.settings['extruder']['max_temp'] = 270.
+    check(rig.client('UNLOAD_FILAMENT TEMP=270') is None,
+          "PC unload at 270 passes when max_temp is 270")
+    check(rig.client('UNLOAD_FILAMENT TEMP=271') is not None,
+          "and 271 is refused")
+    rig.cfg.settings['extruder']['max_temp'] = 265.
+    check(rig.client('UNLOAD_FILAMENT TEMP=270') is not None,
+          "the same 270 is refused when max_temp is 265 (the M1 today)")
+    # the bed follows heater_bed max_temp
+    rig = Rig()
+    rig.cfg.settings['heater_bed']['max_temp'] = 150.
+    check(rig.client('PRINT_START BED=150') is None, "bed 150 of 150")
+    check(rig.client('PRINT_START BED=151') is not None, "bed 151 of 150")
+    check(rig.client('_BED_MESH_RECORD BED=151') is not None,
+          "mesh record bed 151 of 150")
+    # a config that cannot be read refuses
+    rig = Rig()
+    del rig.printer.objects['configfile']
+    check(rig.client('UNLOAD_FILAMENT TEMP=200') is not None,
+          "no configfile to read the limit from: refused")
+    rig = Rig()
+    del rig.cfg.settings['extruder']
+    check(rig.client('UNLOAD_FILAMENT TEMP=200') is not None,
+          "no extruder max_temp: refused")
+    # the shipped numbers are not in the allowlist any more
+    check('..265' not in core_allow() and '..130' not in core_allow(),
+          "core.cfg has no hard-coded heater limits")
+    # unknown limit names are a config error
+    try:
+        muon_guard.parse_allowlist(['X A=0..@nope'], ConfigError)
+        ok = False
+    except ConfigError:
+        ok = True
+    check(ok, "an unknown @limit is a config error")
 
 
 def test_print_start_tokens_cannot_inject():

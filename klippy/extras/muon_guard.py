@@ -86,7 +86,11 @@ def detect_dev_mode(config_file, dev_config_path):
             type(e).__name__,)
 
 
-RANGE_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$')
+# lo..hi, where hi may name a live limit instead of a number: @extruder_max_temp
+# or @bed_max_temp, read from the printer config when the command arrives
+RANGE_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?|@[a-z_]+)$')
+LIMITS = {'@extruder_max_temp': ('extruder', 'max_temp'),
+          '@bed_max_temp': ('heater_bed', 'max_temp')}
 
 
 def _parse_spec(spec, name, error):
@@ -99,7 +103,13 @@ def _parse_spec(spec, name, error):
     m = RANGE_RE.match(spec)
     if m is None:
         return ('glob', spec.upper())
-    lo, hi = float(m.group(1)), float(m.group(2))
+    lo = float(m.group(1))
+    if m.group(2).startswith('@'):
+        if m.group(2) not in LIMITS:
+            raise error("[muon_guard] client_allow: '%s' names an unknown "
+                        "limit '%s'" % (name, m.group(2)))
+        return ('range', lo, m.group(2))
+    hi = float(m.group(2))
     if lo > hi:
         raise error("[muon_guard] client_allow: '%s' has an empty range "
                     "'%s'" % (name, spec))
@@ -150,26 +160,29 @@ def parse_allowlist(entries, error):
     return rules
 
 
-def _spec_matches(spec, value):
+def _spec_matches(spec, value, limit=None):
     value = str(value).strip().lstrip('=').strip()
     if spec[0] == 'range':
         try:
             number = float(value)
         except ValueError:
             return False
-        return spec[1] <= number <= spec[2]
+        hi = spec[2]
+        if isinstance(hi, str):
+            hi = limit(hi)
+        return spec[1] <= number <= hi
     if spec[0] == 'regex':
         return spec[1].fullmatch(value) is not None
     return fnmatch.fnmatchcase(value.upper(), spec[1])
 
 
-def rule_matches(rule, params):
+def rule_matches(rule, params, limit=None):
     for key, value in params.items():
         spec = rule['cons'].get(key)
         if spec is None:
             if not rule['open']:
                 return False
-        elif not _spec_matches(spec, value):
+        elif not _spec_matches(spec, value, limit):
             return False
     return True
 
@@ -248,10 +261,18 @@ class MuonGuard:
         else:
             gcmd = self.gcode._get_extended_params(gcmd)
             params = gcmd.get_command_parameters()
-        if any(rule_matches(r, params) for r in rules):
+        if any(rule_matches(r, params, self._limit) for r in rules):
             return self._check_state(name, params)
         return False, ("'%s' is on the client allowlist only with limited "
                        "parameters, and these are not among them" % (name,))
+
+    def _limit(self, name):
+        # A live limit from the printer config, e.g. the extruder max_temp.
+        # Any failure to read it raises, and the gate refuses.
+        section, option = LIMITS[name]
+        settings = self.printer.lookup_object('configfile').get_status(
+            0.)['settings']
+        return float(settings[section][option])
 
     # Limits on the state a call leaves behind, which a per-call bound on
     # its parameters cannot see: SET_GCODE_OFFSET adds up across calls, and
