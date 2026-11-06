@@ -1,0 +1,7 @@
+# A saved probe z_offset beyond +-2 mm stops klippy at start with a clear
+# error instead of putting the nozzle into the bed (KAN-1730).
+DICTIONARY atmega2560.dict
+CONFIG load_cell_z_offset_range.cfg
+SHOULD_FAIL
+
+G28

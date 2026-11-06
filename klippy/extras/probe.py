@@ -491,10 +491,13 @@ class ProbeSessionHelper:
 
 # Helper to read the xyz probe offsets from the config
 class ProbeOffsetsHelper:
-    def __init__(self, config):
+    def __init__(self, config, z_minval=None, z_maxval=None):
         self.x_offset = config.getfloat('x_offset', 0.)
         self.y_offset = config.getfloat('y_offset', 0.)
-        self.z_offset = config.getfloat('z_offset')
+        # KAN-1730: a saved z_offset is loaded from the calibration overlay,
+        # so a caller that knows the sane range refuses a bad one at start
+        self.z_offset = config.getfloat('z_offset', minval=z_minval,
+                                        maxval=z_maxval)
     def get_offsets(self, gcmd=None):
         return self.x_offset, self.y_offset, self.z_offset
     def create_probe_result(self, test_pos):

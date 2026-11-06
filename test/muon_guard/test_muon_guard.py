@@ -89,6 +89,18 @@ MUST_REFUSE = [
     'Z_PARK Z_SPEED=100000',
     'PRINT_START EXTRUDER=900',
     'PRINT_START BED=500',
+    # a quoted value with a space would add parameters to the macros that
+    # paste it into their command lines (print.cfg:391)
+    'PRINT_START MATERIAL="PLA FOO=1"',
+    'PRINT_START MATERIAL="PLA FOO=1"',
+    'PRINT_START ALGORITHM="bicubic X=1"',
+    'PRINT_START MESH_MIN="1,2 X=3"',
+    'PRINT_START PROBE_COUNT="4,4 Y=1"',
+    'SPEED_SLOW_PRE_PURGE_FOR_TPU MATERIAL="A B"',
+    '_SET_MPC_MATERIAL MATERIAL="PLA X=1"',
+    # homes and throws the toolhead at max velocity and acceleration
+    'TEST_SPEED',
+    'TEST_SPEED SPEED=800',
     'PAUSE HOTEND_TARGET=500',
     'RESUME VELOCITY=9999',
     'FINETUNE_RESONANCE FORCE=5',
@@ -178,6 +190,9 @@ class FakeConfig:
             raise ConfigError("Option '%s' in section 'muon_guard' must be"
                               " specified" % (name,))
         return default
+    def getfloat(self, name, default=configfile.sentinel, minval=None,
+                 maxval=None, above=None):
+        return float(self.get(name, default))
     def getlist(self, name, default=configfile.sentinel, sep=',',
                 count=None):
         value = self.get(name, default)
@@ -205,6 +220,18 @@ def core_allow():
     return read_core_section()['client_allow']
 
 
+class FakeGcodeMove:
+    def __init__(self):
+        self.homing_position = [0., 0., 0., 0.]
+
+
+class FakeProbe:
+    def __init__(self, z):
+        self.z = z
+    def get_offsets(self, gcmd=None):
+        return 0., 0., self.z
+
+
 class Rig:
     """The real dispatch + guard, with fake handlers that record calls."""
     def __init__(self, config_file=OEM_CFG, allow=None, dev=False,
@@ -222,6 +249,12 @@ class Rig:
         self.out = []
         self.gcode.register_output_handler(self.out.append)
         self.calls = []
+        self.gm = FakeGcodeMove()
+        self.printer.add_object('gcode_move', self.gm)
+        self.probe = FakeProbe(0.)
+        self.pending_z = None
+        self.disk_z_offset = 0.       # the z_offset in the saved config
+        self.printer.add_object('load_cell_probe', self.probe)
         opts = {'dev_config_path': self.dev_cfg,
                 'client_allow': core_allow() if allow is None else allow}
         opts.update(values or {})
@@ -245,6 +278,9 @@ class Rig:
         self.gcode.register_command('G28', self._g28)
         # PRINT_START behaves like a start macro that homes and then moves.
         self.gcode.register_command('PRINT_START', self._print_start)
+        self.gcode.register_command('SET_GCODE_OFFSET', self._set_offset)
+        self.gcode.register_command('Z_OFFSET_APPLY_PROBE', self._apply_probe)
+        self.gcode.register_command('SAVE_CONFIG', self._save_config)
         # the dispatcher's own commands would run for real; record instead
         for name in ('M110', 'M112', 'M115', 'STATUS', 'ECHO', 'HELP',
                      'RESTART', 'FIRMWARE_RESTART'):
@@ -265,6 +301,30 @@ class Rig:
             "SET_KINEMATIC_POSITION Z=100 SET_HOMED=Z\n"
             "FORCE_MOVE STEPPER=stepper_z DISTANCE=10 VELOCITY=5\n"
             "_HOME_Z\nG28.1 Z\nAXIS_PROTECTED_MOVE AXIS=Z DIST=10")
+
+    def _set_offset(self, gcmd):
+        # gcode_move.py cmd_SET_GCODE_OFFSET: the axis value wins, an
+        # _ADJUST adds to what is there
+        self.calls.append(gcmd.get_commandline())
+        for i, axis in enumerate('XYZ'):
+            v = gcmd.get_float(axis, None)
+            if v is None:
+                v = gcmd.get_float(axis + '_ADJUST', None)
+                if v is None:
+                    continue
+                v += self.gm.homing_position[i]
+            self.gm.homing_position[i] = v
+
+    def _apply_probe(self, gcmd):
+        self.calls.append(gcmd.get_commandline())
+        # probe.py cmd_Z_OFFSET_APPLY_PROBE: configfile.set, saved later
+        self.pending_z = self.probe.z - self.gm.homing_position[2]
+
+    def _save_config(self, gcmd):
+        self.calls.append(gcmd.get_commandline())
+        if self.pending_z is not None:
+            self.disk_z_offset = self.pending_z
+            self.pending_z = None
 
     def _print_start(self, gcmd):
         self.calls.append(gcmd.get_commandline())
@@ -630,6 +690,9 @@ def line_for(entry, end=1):
         m = re.match(r'^(-?[\d.]+)\.\.(-?[\d.]+)$', v)
         if m:
             val = m.group(end)
+        elif v.startswith('~'):
+            val = 'PLA' if 'MATERIAL' in k else 'bicubic' if (
+                k == 'ALGORITHM') else '1,2'
         else:
             val = v.replace('*', 'X')
         if traditional and v == '*':
@@ -820,6 +883,7 @@ NOT_FOR_CLIENTS = {
     '_CLIENT_VARIABLE': 'variable holder',
     'LED_TIMEOUT_STATE': 'state holder',
     'WEAR_TEST': 'debug',
+    'TEST_SPEED': 'homes and throws the toolhead at max velocity and accel',
     'PID_CALIBRATE': 'M1 has CALIBRATE_HEATING_*; PID_CALIBRATE heats to a '
                      'client target (panel lists it, bare, and it errors)',
     'BED_REMOVED': 'raised by bed_removal_detector, not by a client',
@@ -1176,6 +1240,194 @@ def test_param_bounds():
     # a bound parameter given twice, or in another case, is still checked
     check(rig.client('g28 x_offset=50') is not None,
           "lower case does not dodge a bound")
+
+
+######################################################################
+# 5. State a call leaves behind (re-check HIGH): offsets add up
+######################################################################
+
+def test_gcode_offset_total_is_bounded():
+    # Each SET_GCODE_OFFSET Z_ADJUST is within +-1, but gcode_move adds
+    # them up, and Z_OFFSET_APPLY_PROBE saves the sum as the probe z_offset.
+    rig = Rig()
+    accepted = 0
+    for _ in range(10):
+        if rig.client('SET_GCODE_OFFSET Z_ADJUST=-0.2 MOVE=1') is None:
+            accepted += 1
+    check(accepted == 5, "ten -0.2 nudges: five fit in 1 mm, the rest are "
+          "refused (accepted %d)" % (accepted,))
+    check(abs(rig.gm.homing_position[2] + 1.0) < 1e-9,
+          "and the offset stopped at -1.0 (%r)" % (rig.gm.homing_position,))
+    err = rig.client('SET_GCODE_OFFSET Z_ADJUST=-0.01')
+    check(err is not None and 'offset' in err.lower(),
+          "one more step past the bound is refused, and says why: %r"
+          % (err,))
+    check(rig.client('SET_GCODE_OFFSET Z_ADJUST=0.5') is None,
+          "a step back toward zero still works")
+    # absolute Z, then an adjust that crosses the bound
+    check(rig.client('SET_GCODE_OFFSET Z=0.5') is None, "absolute Z=0.5")
+    check(rig.client('SET_GCODE_OFFSET Z_ADJUST=0.6') is not None,
+          "0.5 + 0.6 is past the bound and is refused")
+    check(rig.client('SET_GCODE_OFFSET Z=0.99') is None,
+          "an absolute value inside the bound passes")
+    check(rig.client('SET_GCODE_OFFSET Z=1.01') is not None,
+          "an absolute value past the bound is refused")
+    check(rig.client('SET_GCODE_OFFSET Z=nan') is not None,
+          "nan is refused")
+    # X and Y add up too
+    rig = Rig()
+    for _ in range(5):
+        check(rig.client('SET_GCODE_OFFSET X_ADJUST=2') is None, "X step")
+    check(rig.client('SET_GCODE_OFFSET X_ADJUST=2') is not None,
+          "the sixth X step passes 10 mm and is refused")
+    # a macro's own offset is not a client's and is not checked
+    rig.gm.homing_position[2] = 0.
+    rig.from_macro('SET_GCODE_OFFSET Z=5')
+    check(rig.gm.homing_position[2] == 5., "an internal offset is not "
+          "bounded")
+    # a gate that cannot read the state refuses
+    rig = Rig()
+    del rig.printer.objects['gcode_move']
+    check(rig.client('SET_GCODE_OFFSET Z=0.1') is not None,
+          "no gcode_move to read: refused")
+    # dev mode allows any
+    rig = Rig(dev=True)
+    check(rig.client('SET_GCODE_OFFSET Z_ADJUST=-50') is None,
+          "dev mode allows a large offset")
+
+
+def test_ten_steps_then_apply_then_save():
+    # The coordinator's case: ten in-limit Z_ADJUST steps, then
+    # Z_OFFSET_APPLY_PROBE, then SAVE_CONFIG. Chosen: BOTH the total gcode
+    # offset is bounded as it builds up (steps past the bound are refused),
+    # AND persistence is bounded (Z_OFFSET_APPLY_PROBE refuses a result past
+    # the limit). Nothing out of range may reach the saved config.
+    rig = Rig()
+    results = [rig.client('SET_GCODE_OFFSET Z_ADJUST=-0.5 MOVE=1')
+               for _ in range(10)]
+    check(results[:2] == [None, None] and all(r is not None
+                                              for r in results[2:]),
+          "ten -0.5 steps: two fit in 1 mm, eight are refused")
+    check(abs(rig.gm.homing_position[2] + 1.0) < 1e-9,
+          "total gcode offset is -1.0, not -5.0: %r"
+          % (rig.gm.homing_position[2],))
+    check(rig.client('Z_OFFSET_APPLY_PROBE') is None,
+          "apply of the bounded total passes")
+    check(rig.client('SAVE_CONFIG') is None, "SAVE_CONFIG passes")
+    check(abs(rig.disk_z_offset) <= 2.0,
+          "saved z_offset is in range: %r" % (rig.disk_z_offset,))
+    # Second layer on its own: an offset already in place from before (a
+    # total the first layer would not have allowed) cannot be persisted.
+    rig = Rig()
+    rig.probe.z = 1.9
+    rig.gm.homing_position[2] = -5.0          # as ten unbounded steps left it
+    err = rig.client('Z_OFFSET_APPLY_PROBE')
+    check(err is not None, "a total of -5 cannot be applied: %r" % (err,))
+    check(rig.client('SAVE_CONFIG') is None, "SAVE_CONFIG itself passes")
+    check(rig.pending_z is None and rig.disk_z_offset == 0.,
+          "and nothing out of range was staged or saved (disk %r)"
+          % (rig.disk_z_offset,))
+    # Negative control: with the dev-mode escape (no guard) it does reach
+    # the saved config, so the assertions above are the guard's doing.
+    rig = Rig(dev=True)
+    rig.probe.z = 1.9
+    rig.gm.homing_position[2] = -5.0
+    rig.client('Z_OFFSET_APPLY_PROBE')
+    rig.client('SAVE_CONFIG')
+    check(abs(rig.disk_z_offset) > 2.0,
+          "negative control: without the guard 6.9 mm is saved (%r)"
+          % (rig.disk_z_offset,))
+
+
+def test_z_offset_apply_probe_is_bounded():
+    rig = Rig()
+    rig.probe.z = 0.
+    rig.gm.homing_position[2] = -0.9
+    check(rig.client('Z_OFFSET_APPLY_PROBE') is None,
+          "apply a -0.9 offset to a 0 z_offset")
+    check(abs(rig.pending_z - 0.9) < 1e-9, "z_offset to save is 0.9")
+    # repeated use walks z_offset toward the bed; refused at the bound
+    rig.probe.z = 1.8
+    rig.gm.homing_position[2] = -0.9
+    err = rig.client('Z_OFFSET_APPLY_PROBE')
+    check(err is not None and 'z_offset' in err,
+          "z_offset 1.8 - (-0.9) = 2.7 is past 2 mm and is refused: %r"
+          % (err,))
+    rig.probe.z = -1.9
+    rig.gm.homing_position[2] = 0.5
+    check(rig.client('Z_OFFSET_APPLY_PROBE') is not None,
+          "and in the other direction")
+    # no probe object: refuse
+    rig = Rig()
+    del rig.printer.objects['load_cell_probe']
+    check(rig.client('Z_OFFSET_APPLY_PROBE') is not None,
+          "no probe to read: refused")
+    rig = Rig(dev=True)
+    rig.probe.z = 1.8
+    rig.gm.homing_position[2] = -0.9
+    check(rig.client('Z_OFFSET_APPLY_PROBE') is None, "dev mode allows it")
+
+
+def test_z_offset_is_bounded_where_it_is_loaded():
+    from extras import probe
+    src_path = os.path.join(ROOT, 'klippy', 'extras', 'load_cell_probe.py')
+    with open(src_path, encoding='utf-8') as f:
+        src = f.read()
+    m = re.search(r'^MAX_Z_OFFSET = ([\d.]+)', src, re.M)
+    check(m is not None, "load_cell_probe.py defines MAX_Z_OFFSET")
+    limit = float(m.group(1))
+    check("probe.ProbeOffsetsHelper(\n            config, -MAX_Z_OFFSET, "
+          "MAX_Z_OFFSET)" in src,
+          "load_cell_probe reads z_offset with the bound")
+    opts = read_core_section()
+    check(float(opts['max_probe_z_offset']) == limit,
+          "the guard's z_offset limit equals the probe's load limit")
+    printer = FakePrinter(OEM_CFG)
+    def load(value):
+        cp = configparser.RawConfigParser()
+        cp.read_string('[load_cell_probe]\nz_offset: %s\n' % (value,))
+        cw = configfile.ConfigWrapper(printer, cp, {}, 'load_cell_probe')
+        return probe.ProbeOffsetsHelper(cw, -limit, limit)
+    for good in ('0', '1.5', '-2', '2'):
+        try:
+            h = load(good)
+            ok = h.z_offset == float(good)
+        except Exception:
+            ok = False
+        check(ok, "a saved z_offset of %s loads" % (good,))
+    for bad in ('2.01', '-2.01', '-50', '3', '1e9'):
+        try:
+            load(bad)
+            ok = False
+        except Exception as e:
+            ok = 'z_offset' in str(e) or 'maximum' in str(e) or \
+                'minimum' in str(e)
+        check(ok, "a saved z_offset of %s is refused at load" % (bad,))
+    # the unbounded form (other probes) is unchanged
+    cp = configparser.RawConfigParser()
+    cp.read_string('[probe]\nz_offset: 7\n')
+    cw = configfile.ConfigWrapper(printer, cp, {}, 'probe')
+    check(probe.ProbeOffsetsHelper(cw).z_offset == 7.,
+          "other probes keep their range")
+
+
+def test_print_start_tokens_cannot_inject():
+    rig = Rig()
+    for line in ('PRINT_START MATERIAL=PLA', 'PRINT_START MATERIAL=PETG-CF',
+                 'PRINT_START MATERIAL=', 'PRINT_START',
+                 'PRINT_START EXTRUDER=215 BED=35 MATERIAL=PLA '
+                 'MESH_MIN=117.126,7 MESH_MAX=142.874,27.8742 '
+                 'PROBE_COUNT=4,4 ALGORITHM=bicubic'):
+        check(rig.client(line) is None, "PRINT_START passes: %s" % (line,))
+    for line in ('PRINT_START MATERIAL="PLA X=1"',
+                 'PRINT_START MATERIAL=PLA;X',
+                 'PRINT_START MATERIAL=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'PRINT_START ALGORITHM=bi_cubic',
+                 'PRINT_START MESH_MAX="1,2 FOO=3"'):
+        if ';' in line:
+            continue
+        check(rig.client(line) is not None,
+              "PRINT_START refused: %s" % (line,))
 
 
 def main():

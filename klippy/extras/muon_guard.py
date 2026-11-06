@@ -86,6 +86,12 @@ RANGE_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$')
 
 
 def _parse_spec(spec, name, error):
+    if spec.startswith('~'):
+        try:
+            return ('regex', re.compile(spec[1:], re.IGNORECASE))
+        except re.error:
+            raise error("[muon_guard] client_allow: '%s' has a bad pattern "
+                        "'%s'" % (name, spec))
     m = RANGE_RE.match(spec)
     if m is None:
         return ('glob', spec.upper())
@@ -100,8 +106,9 @@ def parse_allowlist(entries, error):
     """entries: 'NAME' or 'NAME TOKEN ...'. Returns {NAME: [rule, ...]},
     where a rule is {'cons': {KEY: spec}, 'open': bool}. A bare NAME allows
     any parameters. With tokens the entry is closed: only the listed KEYs
-    may be sent, each held to its spec (a glob such as G28*, or a numeric
-    range lo..hi), and a key that is left out is simply not sent. The
+    may be sent, each held to its spec (a glob such as G28*, a numeric
+    range lo..hi, or a whole-value regex written ~pattern), and a key
+    that is left out is simply not sent. The
     token '-' allows no parameters at all, and '...' lets other parameters
     through unchecked. A repeated NAME gives alternatives."""
     rules = {}
@@ -147,6 +154,8 @@ def _spec_matches(spec, value):
         except ValueError:
             return False
         return spec[1] <= number <= spec[2]
+    if spec[0] == 'regex':
+        return spec[1].fullmatch(value) is not None
     return fnmatch.fnmatchcase(value.upper(), spec[1])
 
 
@@ -167,6 +176,15 @@ class MuonGuard:
         self.gcode = self.printer.lookup_object('gcode')
         self.dev_config_path = config.get('dev_config_path',
                                           DEFAULT_DEV_CONFIG)
+        # Largest total offset a client may leave in place, from repeated
+        # SET_GCODE_OFFSET calls (X, Y, Z in mm), and the largest probe
+        # z_offset Z_OFFSET_APPLY_PROBE may leave to be saved; the probe
+        # itself refuses a larger saved value at start (load_cell_probe.py).
+        xy = config.getfloat('max_gcode_xy_offset', 10., above=0.)
+        self.max_offset = (xy, xy, config.getfloat('max_gcode_z_offset', 1.,
+                                                   above=0.))
+        self.max_probe_z_offset = config.getfloat('max_probe_z_offset', 2.,
+                                                  above=0.)
         entries = config.getlist('client_allow', sep='\n')
         self.rules = parse_allowlist(entries, self.printer.config_error)
         self.refused = 0
@@ -216,7 +234,7 @@ class MuonGuard:
                 return True, ""
             return False, "'%s' is not on the client allowlist" % (name,)
         if any(r['open'] and not r['cons'] for r in rules):
-            return True, ""
+            return self._check_state(name, {})
         if self.gcode.is_traditional_gcode(name):
             # the dispatcher also lists the command's own letter and
             # number (G28 -> {'G': '28'}) among the parameters
@@ -227,9 +245,39 @@ class MuonGuard:
             gcmd = self.gcode._get_extended_params(gcmd)
             params = gcmd.get_command_parameters()
         if any(rule_matches(r, params) for r in rules):
-            return True, ""
+            return self._check_state(name, params)
         return False, ("'%s' is on the client allowlist only with limited "
                        "parameters, and these are not among them" % (name,))
+
+    # Limits on the state a call leaves behind, which a per-call bound on
+    # its parameters cannot see: SET_GCODE_OFFSET adds up across calls, and
+    # Z_OFFSET_APPLY_PROBE turns that sum into the probe's saved z_offset.
+    def _check_state(self, name, params):
+        if name == 'SET_GCODE_OFFSET':
+            home = self.printer.lookup_object('gcode_move').homing_position
+            for i, axis in enumerate('XYZ'):
+                if axis in params:
+                    total = float(params[axis])
+                elif axis + '_ADJUST' in params:
+                    total = home[i] + float(params[axis + '_ADJUST'])
+                else:
+                    continue
+                if not abs(total) <= self.max_offset[i]:
+                    return False, ("that would leave the %s offset at "
+                                   "%.3f mm, past +-%.1f mm"
+                                   % (axis, total, self.max_offset[i]))
+        elif name == 'Z_OFFSET_APPLY_PROBE':
+            home = self.printer.lookup_object('gcode_move').homing_position
+            probe = (self.printer.lookup_object('probe', None)
+                     or self.printer.lookup_object('load_cell_probe', None))
+            if probe is None:
+                return False, "there is no probe to apply the offset to"
+            new = probe.get_offsets()[2] - home[2]
+            if not abs(new) <= self.max_probe_z_offset:
+                return False, ("that would save a probe z_offset of %.3f "
+                               "mm, past +-%.1f mm"
+                               % (new, self.max_probe_z_offset))
+        return True, ""
 
     def _gate(self, origin, gcmd):
         try:

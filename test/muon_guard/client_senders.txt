@@ -25,7 +25,7 @@
 = MuonUI src/panel/screens/peripherals.ts:337 | Z_PARK
 = MuonUI src/panel/screens/peripherals.ts:337 | PARK_PRINTER
 = MuonUI src/panel/screens/peripherals.ts:337 | BUZZ_EXTRUDER
-= MuonUI src/panel/screens/peripherals.ts:337 | TEST_SPEED
+! MuonUI src/panel/screens/peripherals.ts:337 | TEST_SPEED # homes and throws the toolhead at max velocity and accel; dev mode only, the panel lists it
 = MuonUI src/panel/screens/peripherals.ts:337 | TOOLHEAD_CONNECT
 = MuonUI src/panel/screens/peripherals.ts:337 | TOOLHEAD_DISCONNECT
 = MuonUI src/panel/screens/peripherals.ts:337 | HOTEND_FAN_FAULT_CLEAR
