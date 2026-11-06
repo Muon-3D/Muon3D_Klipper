@@ -9,7 +9,7 @@ from . import probe, trigger_analog, load_cell, hx71x, ads1220
 
 np = None  # delay NumPy import until configuration time
 
-# KAN-1730: largest saved probe z_offset the M1 accepts at start (mm)
+# KAN-1730: largest probe z_offset the M1 stages or uses (mm)
 MAX_Z_OFFSET = 2.0
 
 # MCU SOS filter scaled to "fractional grams" for consistent sensor precision
@@ -922,12 +922,15 @@ class LoadCellPrinterProbe:
             config, sensor, sos_filter)
         # Probe Interface
         self._param_helper = probe.ProbeParameterHelper(config)
-        self._cmd_helper = probe.ProbeCommandHelper(config, self)
         # KAN-1730: the nozzle is the probe, so a z_offset beyond this is a
-        # bad calibration (or Z_OFFSET_APPLY_PROBE run in a loop) and would
-        # put the nozzle into the bed. Refuse it at start with a clear error.
-        self._probe_offsets = probe.ProbeOffsetsHelper(
-            config, -MAX_Z_OFFSET, MAX_Z_OFFSET)
+        # bad calibration (or Z_OFFSET_APPLY_PROBE run in a loop). Staging
+        # one is refused; one already saved is ignored at start (Klipper
+        # still starts, homing and calibration work) and printing is blocked
+        # until Z is calibrated again (muon_guard reads z_offset_invalid).
+        self._cmd_helper = probe.ProbeCommandHelper(
+            config, self, z_limit=MAX_Z_OFFSET)
+        self._probe_offsets = probe.ProbeOffsetsHelper(config, MAX_Z_OFFSET)
+        self._cmd_helper.z_offset_invalid =             self._probe_offsets.invalid_z_offset
         load_cell_probing_move = LoadCellProbingMove(config, self._load_cell,
             self._mcu_trigger_analog, self._param_helper,
             continuous_tare_filter_helper, config_helper)

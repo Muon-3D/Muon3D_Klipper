@@ -67,8 +67,12 @@ def calc_probe_z_average(positions, method='average'):
 # Helper to implement common probing commands
 class ProbeCommandHelper:
     def __init__(self, config, probe, query_endstop=None,
-                 can_set_z_offset=True):
+                 can_set_z_offset=True, z_limit=None):
         self.printer = config.get_printer()
+        # KAN-1730: largest z_offset this probe may stage for saving (mm),
+        # and the saved value that was ignored at load, if any
+        self.z_limit = z_limit
+        self.z_offset_invalid = None
         self.probe = probe
         self.query_endstop = query_endstop
         self.name = config.get_name()
@@ -103,7 +107,17 @@ class ProbeCommandHelper:
         return {'name': self.name,
                 'last_query': self.last_state,
                 'last_probe_position': self.last_probe_position,
-                'last_z_result': self.last_z_result}
+                'last_z_result': self.last_z_result,
+                'z_offset_invalid': self.z_offset_invalid is not None,
+                'z_offset_saved': self.z_offset_invalid}
+    def _check_z_offset(self, z_offset):
+        # Refuse to stage a z_offset past the limit (a SAVE_CONFIG or
+        # PRINT_START would persist it); nothing is staged
+        if self.z_limit is not None and not abs(z_offset) <= self.z_limit:
+            raise self.printer.command_error(
+                "%s: z_offset %.3f mm is outside the safe range +-%.1f mm;"
+                " not staged. Check the nozzle height and calibrate again."
+                % (self.name, z_offset, self.z_limit))
     cmd_QUERY_PROBE_help = "Return the status of the z-probe"
     def cmd_QUERY_PROBE(self, gcmd):
         if self.query_endstop is None:
@@ -128,6 +142,7 @@ class ProbeCommandHelper:
             return
         ppos, offsets = self.probe_calibrate_info
         z_offset = offsets[2] - mpresult.bed_z + ppos.bed_z
+        self._check_z_offset(z_offset)
         gcode = self.printer.lookup_object('gcode')
         gcode.respond_info(
             "%s: z_offset: %.3f\n"
@@ -210,6 +225,7 @@ class ProbeCommandHelper:
             return
         z_offset = self.probe.get_offsets(gcmd)[2]
         new_calibrate = z_offset - offset
+        self._check_z_offset(new_calibrate)
         gcmd.respond_info(
             "%s: z_offset: %.3f\n"
             "The SAVE_CONFIG command will update the printer config file\n"
@@ -489,15 +505,38 @@ class ProbeSessionHelper:
         self.results = []
         return res
 
+def invalid_z_offset_message(value, limit):
+    return ("Saved Z offset %.3f mm is outside the safe range \u00b1%.0f mm. "
+            "Recalibrate Z (PROBE_CALIBRATE or the panel's Z calibration) "
+            "before printing." % (value, limit))
+
 # Helper to read the xyz probe offsets from the config
 class ProbeOffsetsHelper:
-    def __init__(self, config, z_minval=None, z_maxval=None):
+    def __init__(self, config, z_limit=None):
+        self.printer = config.get_printer()
         self.x_offset = config.getfloat('x_offset', 0.)
         self.y_offset = config.getfloat('y_offset', 0.)
-        # KAN-1730: a saved z_offset is loaded from the calibration overlay,
-        # so a caller that knows the sane range refuses a bad one at start
-        self.z_offset = config.getfloat('z_offset', minval=z_minval,
-                                        maxval=z_maxval)
+        self.z_offset = config.getfloat('z_offset')
+        # KAN-1730: the saved z_offset comes from the calibration overlay.
+        # Past the limit it is NOT used (0.0, the design value for a probe
+        # that is the nozzle, stands in so homing and calibration still
+        # work) and `invalid_z_offset` keeps the saved value: the status
+        # flag and the print gate in muon_guard read it. Klipper starts.
+        self.invalid_z_offset = None
+        if z_limit is not None and not abs(self.z_offset) <= z_limit:
+            self.invalid_z_offset = self.z_offset
+            self.z_offset = 0.
+            self.z_limit = z_limit
+            logging.error(
+                "SAVED Z OFFSET %.3f mm IS OUTSIDE THE SAFE RANGE +-%.1f mm: "
+                "ignored (0.0 used), printing is blocked until Z is "
+                "calibrated again", self.invalid_z_offset, z_limit)
+            self.printer.register_event_handler(
+                "klippy:ready", self._handle_ready)
+    def _handle_ready(self):
+        gcode = self.printer.lookup_object('gcode')
+        gcode.respond_raw("!! " + invalid_z_offset_message(
+            self.invalid_z_offset, self.z_limit))
     def get_offsets(self, gcmd=None):
         return self.x_offset, self.y_offset, self.z_offset
     def create_probe_result(self, test_pos):

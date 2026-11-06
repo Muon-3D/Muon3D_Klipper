@@ -46,6 +46,10 @@ CACHE_SECONDS = 1.
 # command (gcode.py cmd_default).
 FREE_TEXT_COMMANDS = ('M117', 'M118', 'M23')
 
+# Commands that start or resume a print; blocked while the saved Z offset
+# is out of range (the probe ignores it and reports z_offset_invalid)
+PRINT_STARTS = ('PRINT_START', 'SDCARD_PRINT_FILE', 'M24')
+
 NAME_RE = re.compile(r'^[A-Z0-9_.]+$')
 KEY_RE = re.compile(r'^[A-Z0-9_]+$')
 
@@ -181,7 +185,7 @@ class MuonGuard:
         # z_offset Z_OFFSET_APPLY_PROBE may leave to be saved; the probe
         # itself refuses a larger saved value at start (load_cell_probe.py).
         xy = config.getfloat('max_gcode_xy_offset', 10., above=0.)
-        self.max_offset = (xy, xy, config.getfloat('max_gcode_z_offset', 1.,
+        self.max_offset = (xy, xy, config.getfloat('max_gcode_z_offset', 2.,
                                                    above=0.))
         self.max_probe_z_offset = config.getfloat('max_probe_z_offset', 2.,
                                                   above=0.)
@@ -262,10 +266,24 @@ class MuonGuard:
                     total = home[i] + float(params[axis + '_ADJUST'])
                 else:
                     continue
-                if not abs(total) <= self.max_offset[i]:
+                # Past the limit is refused, except a step toward zero: a
+                # saved offset PRINT_START applied may already be large, and
+                # a babystep back must always work.
+                if (not abs(total) <= self.max_offset[i]
+                        and not abs(total) < abs(home[i])):
                     return False, ("that would leave the %s offset at "
                                    "%.3f mm, past +-%.1f mm"
                                    % (axis, total, self.max_offset[i]))
+        elif name in PRINT_STARTS:
+            for pname in ('probe', 'load_cell_probe'):
+                obj = self.printer.lookup_object(pname, None)
+                if obj is None:
+                    continue
+                status = obj.get_status(0.)
+                if status.get('z_offset_invalid'):
+                    from . import probe
+                    return False, probe.invalid_z_offset_message(
+                        status['z_offset_saved'], self.max_probe_z_offset)
         elif name == 'Z_OFFSET_APPLY_PROBE':
             home = self.printer.lookup_object('gcode_move').homing_position
             probe = (self.printer.lookup_object('probe', None)
@@ -294,6 +312,8 @@ class MuonGuard:
         self.last_refusal = why
         logging.warning("muon_guard: refused %s command: %s (%s)", origin,
                         gcmd.get_commandline(), why)
+        if why.startswith('Saved Z offset'):
+            raise gcmd.error(why)
         raise gcmd.error(
             "Refused: %s. Dev mode is off, so a client may only start the "
             "commands on the printer's allowlist. Turn on dev mode at the "
