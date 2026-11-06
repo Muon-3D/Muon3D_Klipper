@@ -12,6 +12,11 @@
 import logging, collections, sys
 
 REFUSAL = "Nozzle is touching the plate: lift Z before moving X or Y"
+# With Z not homed Z cannot be jogged and REZERO needs Z homed: the only
+# way out is a full home, whose end-of-G28 zero re-zeroes the guard
+REFUSAL_Z_UNHOMED = ("Nozzle is touching the plate and Z is not homed (Z"
+                     " cannot be jogged or re-zeroed): run a full home"
+                     " (G28) to re-zero the guard")
 # Fail closed: near the plate, or while the last state was contact, an XY
 # move with no load cell data covering its start is refused too
 NO_DATA = ("contact_guard: no current load cell data, so contact cannot"
@@ -150,8 +155,16 @@ class ContactGuard:
         self.own_error = None
         self.homing_candidate = None
         self.pending_zero = None  # applied once homing ends without error
-        # After a Z homing move that lifted: re-zero on post-move samples
+        # After a Z homing move that lifted, or at the end of a G28 that
+        # homed Z: re-zero on post-move samples ({'kind': 'lift' or
+        # 'trusted', ...}, see _lift_zero_sample)
         self.lift_zero = None
+        # This G28 (outermost homing_scope) homed Z by a probe that
+        # travelled clear, and the toolhead Z the probe set (Z0)
+        self.g28_z_homed = False
+        self.g28_z0 = None
+        # What the lift re-zero set this G28, for the log
+        self.g28_lift_baseline = None
         # Time of the first sample after the last gap in the stream
         self.resume_time = None
         # Z homed for real since the last position reset, FORCE_MOVE of a
@@ -177,6 +190,10 @@ class ContactGuard:
                                             self._handle_homing_move_begin)
         self.printer.register_event_handler("homing:homing_move_end",
                                             self._handle_homing_move_end)
+        self.printer.register_event_handler("homing_scope:begin",
+                                            self._handle_g28_begin)
+        self.printer.register_event_handler("homing_scope:end",
+                                            self._handle_g28_end)
         self.printer.register_event_handler("homing:home_rails_begin",
                                             self._handle_home_rails_begin)
         self.printer.register_event_handler("homing:home_rails_end",
@@ -269,6 +286,9 @@ class ContactGuard:
         if self.contact and self.is_active(eventtime):
             logging.info("contact_guard: refused move %s -> %s, load %d",
                          last[:3], list(newpos[:3]), self.load)
+            kin = self.toolhead.get_kinematics().get_status(eventtime)
+            if 'z' not in kin['homed_axes']:
+                raise self._own_error(REFUSAL_Z_UNHOMED)
             raise self._own_error(REFUSAL)
 
     def _stale(self, eventtime):
@@ -375,7 +395,7 @@ class ContactGuard:
             # at the end of its range.  This is what lets G28 recover a
             # false latch with Z unhomed, when G1 Z is not allowed.
             self.lift_zero = {'after': self.toolhead.print_time,
-                              'start': None, 'samples': []}
+                              'start': None, 'samples': [], 'kind': 'lift'}
             logging.info("contact_guard: Z homing move lifted %.3f mm;"
                          " re-zeroing on the steady load after it", lifted)
             self._settle_lift_zero()
@@ -388,6 +408,8 @@ class ContactGuard:
             # raises, and the command error takes the trust back.
             self.z_trusted = True
             self.probe_since_reset = True
+            if getattr(self.homing_scope, 'in_scope', False):
+                self.g28_z_homed = True
         if candidate is not None:
             # Applied once the command finishes without error
             self.pending_zero = candidate
@@ -400,6 +422,49 @@ class ContactGuard:
         self.baseline = self.pending_zero
         self.pending_zero = None
         self._real_zero()
+
+    def _handle_g28_begin(self):
+        self.g28_z_homed = False
+        self.g28_z0 = None
+        self.g28_lift_baseline = None
+
+    def _trusted_zero_refusal(self):
+        # Why this G28 gets no trusted zero, or None.  Only a G28 whose
+        # own Z homing is probe-homed (the load cell probe) and that was
+        # commanded to park clear of the plate vouches for the load it
+        # reads.  The park is the COMMANDED Z, not a measured one.
+        if not self.enabled or self.probe is None:
+            return "the guard is disabled"
+        if not self.g28_z_homed or self.g28_z0 is None:
+            return "this G28 did not home Z"
+        if not self.z_trusted:
+            return "Z is no longer trusted"
+        z = self.toolhead.get_position()[2]
+        if z < self.g28_z0 + self.clearance_lift - MOVE_EPSILON:
+            return ("no commanded park %.3f mm above Z0 %.3f (Z %.3f)"
+                    % (self.clearance_lift, self.g28_z0, z))
+        return None
+
+    def _handle_g28_end(self):
+        # The outermost G28 finished without error, scope still open.  Take
+        # a fresh steady window after the park as the zero: it replaces
+        # pending_zero (the anchor from before the probe) and the open-loop
+        # lift zero.  Anything less keeps the zero as it is.
+        reason = self._trusted_zero_refusal()
+        if reason is not None:
+            logging.info("contact_guard: no trusted zero after G28: %s;"
+                         " keeping the existing zero", reason)
+            return
+        mcu = self.load_cell.sensor.get_mcu()
+        if mcu.is_fileoutput():
+            return
+        self.lift_zero = {'after': self.toolhead.get_last_move_time(),
+                          'start': None, 'samples': [], 'kind': 'trusted'}
+        self._settle_lift_zero()
+        if self.lift_zero is not None:
+            self.lift_zero = None
+            logging.info("contact_guard: no samples after the G28 park; no"
+                         " trusted zero, keeping the existing zero")
 
     def _settle_lift_zero(self):
         # Decide the lift re-zero here, before anything else moves: the
@@ -425,15 +490,20 @@ class ContactGuard:
                          " re-zero stays pending")
 
     def _lift_zero_sample(self, t, counts, sign):
-        # After an upward Z homing move: the first ANCHOR_TIME of steady,
-        # in-range readings becomes the zero
+        # After an upward Z homing move ('lift'), or after the park at the
+        # end of a G28 that homed Z ('trusted'): the first ANCHOR_TIME of
+        # steady, in-range readings becomes the zero.  The lift is checked
+        # only by step counts, so its zero is refused at contact level; the
+        # trusted one follows a probe-homed Z and a commanded park.
         lz = self.lift_zero
+        kind = lz['kind']
         if lz['start'] is None:
             lz['start'] = t
         if t - lz['start'] > LIFT_ZERO_WINDOW:
             self.lift_zero = None
-            logging.info("contact_guard: no steady load after the lift;"
-                         " not re-zeroing")
+            logging.info("contact_guard: no steady load after the %s;"
+                         " not re-zeroing", 'park' if kind == 'trusted'
+                         else 'lift')
             return False
         if self._out_of_range(counts, sign):
             lz['samples'] = []
@@ -445,10 +515,37 @@ class ContactGuard:
             return False
         if t - lz['samples'][0][0] < ANCHOR_TIME - TIME_EPSILON:
             return False
-        self.baseline = float(sum(values)) / len(values)
+        mean = float(sum(values)) / len(values)
         self.lift_zero = None
+        if kind == 'trusted':
+            logging.info(
+                "contact_guard: trusted end-of-G28 zero won: baseline"
+                " %d -> %d (pending_zero %s, lift zero %s); Z homed by"
+                " probe, commanded park at Z %.3f over Z0 %.3f, steady over"
+                " %d samples", self.baseline, mean,
+                "%d" % self.pending_zero if self.pending_zero is not None
+                else "none",
+                "%d" % self.g28_lift_baseline
+                if self.g28_lift_baseline is not None else "none",
+                self.toolhead.get_position()[2], self.g28_z0, len(values))
+            self.baseline = mean
+            self.pending_zero = None
+            self._real_zero()
+            return True
+        load = sign * (mean - self.baseline)
+        if abs(load) >= self.threshold:
+            # Open loop: a steady real press (skipped steps, a tall
+            # object) would be absorbed.  Leave the latch as it is.
+            logging.info("contact_guard: lift re-zero refused: the steady"
+                         " load after the lift is %d counts from the zero,"
+                         " at or above the %d contact threshold",
+                         load, self.threshold)
+            return False
+        self.baseline = mean
+        self.g28_lift_baseline = mean
         self._real_zero()
-        logging.info("contact_guard: re-zeroed on the load after a Z lift")
+        logging.info("contact_guard: re-zeroed on the load after a Z lift"
+                     " (%d counts from the old zero)", load)
         return True
 
     def _real_zero(self):
@@ -464,6 +561,9 @@ class ContactGuard:
         self.homing_rails = False
         if 2 in homing_state.get_axes():
             self.z_trusted = True
+            if getattr(self.homing_scope, 'in_scope', False):
+                self.g28_z_homed = True
+                self.g28_z0 = self.toolhead.get_position()[2]
 
     def _trapq_z_before(self, print_time):
         report = self.printer.lookup_object('motion_report', None)
@@ -494,8 +594,11 @@ class ContactGuard:
         if self._override_active() and self.probe_since_reset:
             # Z set from the probe that just triggered
             self.probe_since_reset = False
+            if self.g28_z_homed:
+                self.g28_z0 = new_z
             return
         self.z_trusted = self.probe_since_reset = False
+        self.g28_z_homed = False
 
     def _handle_manual_move(self, stepper):
         # FORCE_MOVE / STEPPER_BUZZ moved a stepper behind the toolhead's
@@ -504,6 +607,7 @@ class ContactGuard:
         self.own_error = None
         if stepper.is_active_axis('z'):
             self.z_trusted = self.probe_since_reset = False
+            self.g28_z_homed = False
 
     def _handle_z_motor(self, print_time, enabled):
         # Off, the axis can be moved by hand; samples either side of an
@@ -512,6 +616,7 @@ class ContactGuard:
         self.position_reset_time = max(self.position_reset_time, print_time)
         if not enabled:
             self.z_trusted = self.probe_since_reset = False
+            self.g28_z_homed = False
 
     def _handle_command_error(self):
         # A failed G28 does not send home_rails_end
@@ -526,6 +631,7 @@ class ContactGuard:
         # A homing or probing move that ended in an error proves nothing
         self.pending_zero = self.lift_zero = None
         self.z_trusted = self.probe_since_reset = False
+        self.g28_z_homed = False
 
     def _is_homing(self):
         if self.homing_moves or self.homing_rails:
@@ -768,6 +874,8 @@ class ContactGuard:
         self.recent.append((t, counts))
         while self.recent and self.recent[0][0] < t - ANCHOR_TIME:
             self.recent.popleft()
+        if self.baseline is None:
+            self.baseline = float(counts)
         if anchor_only:
             # Not judged, but a pending lift re-zero must still settle:
             # G28 is one homing_scope, so every sample in it is
@@ -777,8 +885,6 @@ class ContactGuard:
                     and self._lift_zero_sample(t, counts, sign)):
                 self.load = sign * (counts - self.baseline)
             return
-        if self.baseline is None:
-            self.baseline = float(counts)
         if (self.lift_zero is not None and t > self.lift_zero['after']
                 and self._lift_zero_sample(t, counts, sign)):
             self.load = sign * (counts - self.baseline)

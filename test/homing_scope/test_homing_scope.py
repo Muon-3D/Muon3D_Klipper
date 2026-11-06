@@ -267,6 +267,33 @@ def test_no_cleanup_gcode_by_default():
     check(p.gcode.scripts == [], "nothing runs without cleanup_gcode")
 
 
+def test_events_bracket_the_outermost_successful_g28():
+    # contact_guard takes its trusted zero at homing_scope:end, once, with
+    # the scope still open; a failed G28 sends no end
+    events = []
+    def g28(gcmd):
+        events.append((gcmd, 'run', scope.in_scope))
+        if gcmd == 'outer':
+            p.gcode.run('G28', 'inner')
+        if gcmd == 'bad':
+            raise CommandError("Z home failed")
+    p, scope = rig(g28)
+    p.handlers['homing_scope:begin'] = [
+        lambda: events.append(('begin', scope.in_scope))]
+    p.handlers['homing_scope:end'] = [
+        lambda: events.append(('end', scope.in_scope))]
+    p.gcode.run('G28', 'outer')
+    check(events == [('begin', False), ('outer', 'run', True),
+                     ('inner', 'run', True), ('end', True)],
+          "one begin and one end around the outermost G28, scope open")
+    del events[:]
+    try:
+        p.gcode.run('G28', 'bad')
+    except CommandError:
+        pass
+    check(('end', True) not in events, "a failed G28 sends no end")
+
+
 def test_requires_the_command():
     p = FakePrinter()
     homing_scope.load_config(FakeConfig(p))
