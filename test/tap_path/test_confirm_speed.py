@@ -145,7 +145,8 @@ def load_probe():
     pkg.__path__ = []
     sys.modules['extras'] = pkg
     for name, attrs in (('probe', {}), ('adxl345', {'FREEFALL_ACCEL': 9806.65}),
-                        ('homing', {'HomingMove': HomingMove})):
+                        ('homing', {'HomingMove': HomingMove}),
+                        ('tap_onset', {})):
         m = types.ModuleType('extras.' + name)
         m.__dict__.update(attrs)
         sys.modules['extras.' + name] = m
