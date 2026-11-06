@@ -1692,6 +1692,24 @@ def test_temperatures_follow_the_configured_max_temp():
     check(ok, "an unknown @limit is a config error")
 
 
+def test_save_variable_exact_control_strings():
+    # Control services/control/model.ts:107 and :155 send these exactly,
+    # lower case and with the quotes inside the value.
+    rig = Rig()
+    for door in ('webhooks', 'pty', 'file'):
+        for line in ("SAVE_VARIABLE VARIABLE=muon_material VALUE='\"PLA\"'",
+                     "SAVE_VARIABLE VARIABLE=muon_material_colour "
+                     "VALUE='\"ff8800\"'"):
+            err = rig.client(line, door)
+            check(err is None, "Control's exact string passes via %s: %s (%s)"
+                  % (door, line, err))
+            check(rig.calls == [line], "and ran: %s" % (line,))
+    for line in ("SAVE_VARIABLE VARIABLE=muon_other VALUE='\"x\"'",
+                 "SAVE_VARIABLE VARIABLE=resonance_valid VALUE=1",
+                 "SAVE_VARIABLE VARIABLE=muon_material VALUE=1 EXTRA=2"):
+        check(rig.client(line) is not None, "refused: %s" % (line,))
+
+
 def test_pause_at_layer():
     # Control PauseAtLayerDialog.vue:147,149,155,157. Not a macro in
     # core/M1 or klippy: a user-added one (Control only shows the dialog
