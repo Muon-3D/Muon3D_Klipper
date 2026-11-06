@@ -930,7 +930,8 @@ class LoadCellPrinterProbe:
         self._cmd_helper = probe.ProbeCommandHelper(
             config, self, z_limit=MAX_Z_OFFSET)
         self._probe_offsets = probe.ProbeOffsetsHelper(config, MAX_Z_OFFSET)
-        self._cmd_helper.z_offset_invalid =             self._probe_offsets.invalid_z_offset
+        self._cmd_helper.z_offset_invalid = (
+            self._probe_offsets.invalid_z_offset)
         load_cell_probing_move = LoadCellProbingMove(config, self._load_cell,
             self._mcu_trigger_analog, self._param_helper,
             continuous_tare_filter_helper, config_helper)
