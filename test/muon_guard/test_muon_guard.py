@@ -112,6 +112,15 @@ MUST_REFUSE = [
     'TESTZ Z=5.5',
     'TESTZ Z=+++',
     'TESTZ Z=abc',
+    # Control's pause-at-layer dialog: the MACRO is run by name, so it is
+    # held to PAUSE or M600
+    'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=10 MACRO=SET_KINEMATIC_POSITION',
+    'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=10 "MACRO=PAUSE X=1"',
+    'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=-1 MACRO=PAUSE',
+    'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=99999999 MACRO=PAUSE',
+    'SET_PAUSE_AT_LAYER ENABLE=2',
+    'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=1.5 MACRO=PAUSE',
+    'SET_PAUSE_NEXT_LAYER ENABLE=1 MACRO=_HOME_Z',
     'PAUSE HOTEND_TARGET=500',
     'RESUME VELOCITY=9999',
     'FINETUNE_RESONANCE FORCE=5',
@@ -723,7 +732,9 @@ def line_for(entry, end=1):
                    '@bed_max_temp': '130'}.get(val, val)
         elif v.startswith('~'):
             val = ('PLA' if 'MATERIAL' in k else 'bicubic'
-                   if k == 'ALGORITHM' else '+' if k == 'Z' else '1,2')
+                   if k == 'ALGORITHM' else '+' if k == 'Z' else 'PAUSE'
+                   if k == 'MACRO' else '5'
+                   if k == 'LAYER' else '1,2')
         else:
             val = v.replace('*', 'X')
         if traditional and v == '*':
@@ -1679,6 +1690,25 @@ def test_temperatures_follow_the_configured_max_temp():
     except ConfigError:
         ok = True
     check(ok, "an unknown @limit is a config error")
+
+
+def test_pause_at_layer():
+    # Control PauseAtLayerDialog.vue:147,149,155,157. Not a macro in
+    # core/M1 or klippy: a user-added one (Control only shows the dialog
+    # when the printer has it). It is bounded for when it exists.
+    rig = Rig()
+    for line in ('SET_PAUSE_AT_LAYER ENABLE=0',
+                 'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=25 MACRO="PAUSE"',
+                 'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=0 MACRO="M600"',
+                 'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=10000 MACRO=pause',
+                 'SET_PAUSE_NEXT_LAYER ENABLE=0',
+                 'SET_PAUSE_NEXT_LAYER ENABLE=1 MACRO="M600"'):
+        check(rig.client(line) is None, "passes: %s" % (line,))
+    for line in ('SET_PAUSE_AT_LAYER ENABLE=1 LAYER=10001 MACRO=PAUSE',
+                 'SET_PAUSE_AT_LAYER ENABLE=1 LAYER=5 MACRO=G28',
+                 'SET_PAUSE_AT_LAYER FOO=1',
+                 'SET_PAUSE_NEXT_LAYER ENABLE=1 MACRO=G28'):
+        check(rig.client(line) is not None, "refused: %s" % (line,))
 
 
 def test_print_start_tokens_cannot_inject():

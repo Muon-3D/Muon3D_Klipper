@@ -92,6 +92,10 @@
 = Control components/widgets/outputs/OutputLed.vue:127 | SET_LED LED=Left RED=1 GREEN=0 BLUE=0
 = Control components/control/ControlFilament.vue:210 | SET_FILAMENT_SENSOR SENSOR=filament_sensor_toolhead ENABLE=1
 = Control components/widgets/status/StatusControls.vue:126 | SDCARD_RESET_FILE
+= Control components/widgets/status/PauseAtLayerDialog.vue:149 | SET_PAUSE_NEXT_LAYER ENABLE=1 MACRO="PAUSE"
+= Control components/widgets/status/PauseAtLayerDialog.vue:147 | SET_PAUSE_NEXT_LAYER ENABLE=0
+= Control components/widgets/status/PauseAtLayerDialog.vue:155 | SET_PAUSE_AT_LAYER ENABLE=1 LAYER=25 MACRO="M600"
+= Control components/widgets/status/PauseAtLayerDialog.vue:157 | SET_PAUSE_AT_LAYER ENABLE=0
 = Control components/widgets/thermals/TemperatureTargets.vue:363 | SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=60
 = Control components/widgets/thermals/TemperatureTargets.vue:367 | SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=CPU TARGET=50
 = Control components/widgets/toolhead/PressureAdvanceAdjust.vue:70 | SET_PRESSURE_ADVANCE ADVANCE=0.04 EXTRUDER=extruder
