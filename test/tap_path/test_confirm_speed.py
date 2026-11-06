@@ -211,7 +211,7 @@ check('final position comes from the slow tap (carries the shift)',
       abs(res - (174. + 0.8) / STEP_DIST) <= 1)
 check('every confirm re-approach ran at 10 mm/s', sim.speeds == [10.])
 check('retracts stayed at the rail retract speed (60)',
-      sim.moves == [60., 60.])
+      sim.moves == [60.])
 
 # clean first tap: one slow confirm tap is enough
 sim = Sim(mod, [0.], yprof)
