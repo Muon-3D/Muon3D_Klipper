@@ -1,7 +1,7 @@
 import logging
 import math
 import pins
-from . import probe, adxl345, homing
+from . import probe, adxl345, homing, tap_onset
 
 REG_THRESH_TAP = 0x1D
 REG_DUR = 0x21
@@ -184,6 +184,22 @@ class ADXL345Probe:
             'x': self._load_confirm_profile(config, 'x'),
             'y': self._load_confirm_profile(config, 'y'),
         }
+
+        # KAN-1361: take the recorded tap position from the first
+        # accelerometer sample over the tap threshold, not from the time the
+        # chip's tap logic raised INT.  Off by default.
+        self.tap_trigger_from_samples = config.getboolean(
+            'tap_trigger_from_samples', False)
+        self.tap_onset_window = config.getfloat(
+            'tap_onset_window', 0.06, minval=0.01, maxval=0.5)
+        self._onset_client = None
+        if (self.tap_trigger_from_samples
+                and not self._adxl_mcu.is_fileoutput()):
+            amap = getattr(self.adxl345, 'axes_map', None)
+            if amap is None or [m[0] for m in amap] != [0, 1, 2]:
+                raise config.error(
+                    "tap_trigger_from_samples needs an identity axes_map"
+                    " on the adxl345 chip")
 
         if self.enable_z_probe:
             self.position_endstop = config.getfloat('z_offset')
@@ -618,7 +634,88 @@ class ADXL345Probe:
         self._active_axis_homing_arm_delay = arm_delay
         self._active_axis_homing_arm_print_time = 0.
         self._active_axis_homing_arm_scheduled = False
+        self._start_onset_client(wrappers, profile)
         self._start_tap(profile, 'axis_homing', defer_arm=arm_delay > 0.)
+
+    def _start_onset_client(self, wrappers, profile):
+        # Stream accelerometer samples during the move so the tap onset can
+        # be located afterwards.  The MCU stop still comes from the INT pin.
+        self._onset_client = None
+        if not self.tap_trigger_from_samples or len(wrappers) != 1:
+            return
+        axis = wrappers[0].get_axis()
+        if axis not in ('x', 'y') or self._mask_to_axes(
+                profile['tap_axes_mask']) != axis:
+            return
+        if self._adxl_mcu.is_fileoutput():
+            return
+        try:
+            self._onset_client = self.adxl345.start_internal_client()
+            if self.inverted:
+                # adxl345 measurement start rewrites DATA_FORMAT
+                self.adxl345.set_reg(adxl345.REG_DATA_FORMAT, 0x2B)
+        except Exception:
+            logging.exception("adxl345_probe: tap onset sampling unavailable")
+            self._release_onset_client()
+
+    def _release_onset_client(self):
+        client = self._onset_client
+        self._onset_client = None
+        if client is not None:
+            client.is_finished = True
+
+    def _apply_tap_onset(self, hmove, wrappers):
+        # Replace the stepper trigger positions with those at the onset of
+        # the tap.  Never raises: on any problem the hardware trigger
+        # positions stand.
+        client = self._onset_client
+        if client is None:
+            return
+        try:
+            if len(wrappers) != 1:
+                return
+            wrapper = wrappers[0]
+            axis = wrapper.get_axis()
+            trigger_time = wrapper.last_trigger_time
+            if trigger_time <= 0.:
+                return
+            reactor = self.reactor
+            deadline = reactor.monotonic() + 0.6
+            while not self._samples_cover(client, trigger_time):
+                now = reactor.monotonic()
+                if now >= deadline:
+                    logging.warning("adxl345_probe: %s tap onset: samples"
+                                    " not received in time", axis)
+                    return
+                reactor.pause(now + 0.02)
+            samples = [smp for msg in client.msgs for smp in msg['data']]
+            thresh = self._get_profile(axis)['tap_thresh']
+            onset = tap_onset.find_tap_onset(
+                samples, axis, thresh, trigger_time, self.tap_onset_window)
+            names = [n for es, n in hmove.endstops if es is wrapper]
+            sps = [sp for sp in hmove.stepper_positions
+                   if sp.endstop_name in names]
+            before = [sp.trig_pos for sp in sps]
+            if tap_onset.refine_stepper_positions(sps, onset, trigger_time):
+                logging.info(
+                    "adxl345_probe: %s tap onset %.6f, INT %.6f (%.2fms"
+                    " later); trig_pos %s -> %s", axis, onset, trigger_time,
+                    (trigger_time - onset) * 1000., before,
+                    [sp.trig_pos for sp in sps])
+            else:
+                logging.info("adxl345_probe: %s tap onset not found;"
+                             " keeping the INT trigger time", axis)
+        except Exception:
+            logging.exception("adxl345_probe: tap onset refinement failed")
+        finally:
+            self._release_onset_client()
+
+    @staticmethod
+    def _samples_cover(client, trigger_time):
+        for msg in reversed(client.msgs):
+            if msg['data']:
+                return msg['data'][-1][0] >= trigger_time
+        return False
 
     def _handle_homing_move_end(self, hmove):
         if not self._active_axis_homing_wrappers:
@@ -626,10 +723,15 @@ class ADXL345Probe:
         hmove_endstops = hmove.get_mcu_endstops()
         if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
             return
+        wrappers = list(self._active_axis_homing_wrappers)
         try:
             self._stop_tap('axis_homing')
         finally:
-            self._reset_axis_homing_state()
+            try:
+                self._apply_tap_onset(hmove, wrappers)
+            finally:
+                self._release_onset_client()
+                self._reset_axis_homing_state()
 
     def _handle_home_rails_end(self, homing_state, rails):
         # Confirm an X/Y tap home with further agreeing taps before the
@@ -765,6 +867,7 @@ class ADXL345Probe:
                 self._stop_tap('axis_homing')
             except Exception:
                 logging.exception("ADXL345 axis homing cleanup failed")
+            self._release_onset_client()
             self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
             try:
