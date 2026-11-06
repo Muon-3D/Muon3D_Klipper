@@ -20,7 +20,9 @@ import sys
 import jinja2
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
-MACROS = os.path.join(ROOT, 'core', 'M1', 'macros')
+# M600_MACRO_DIR points the test at a mutated copy, to show it bites.
+MACROS = os.environ.get('M600_MACRO_DIR') or os.path.join(
+    ROOT, 'core', 'M1', 'macros')
 
 
 class Failure(Exception):
@@ -106,9 +108,13 @@ class Rig:
         name, _, rest = line.partition(' ')
         name = name.upper()
         rest = rest.strip()
-        if name == 'RESUME':
-            self.paused = False
-        elif name in ('M600', 'PAUSE', '_CANCEL_M600'):
+        if name == 'RESUME_BASE':
+            # pause_resume refuses when not paused; otherwise it moves back.
+            if self.paused:
+                self.paused = False
+                self.log.append('RESUME_BASE move back')
+        elif name in ('M600', 'PAUSE', '_CANCEL_M600', 'RESUME',
+                      '_RESUME_RESTORE_HOTEND', '_RESUME_UNRETRACT'):
             self.run_macro(name, rest)
         elif name == 'PAUSE_BASE':
             if not self.paused:
@@ -225,6 +231,48 @@ def test_idle_pause_no_motion():
     check(runs(rig, 'PAUSE'), "idle PAUSE succeeds")
     check(rig.log == [], "idle PAUSE moves nothing: %r" % rig.log)
     check(rig.absolute, "absolute mode after an idle PAUSE")
+
+
+def test_idle_pause_then_cancel_then_resume_does_nothing():
+    rig = Rig(state='standby', hot=True)
+    runs(rig, 'PAUSE')
+    check(not rig.paused, "idle PAUSE marks nothing paused")
+    check(runs(rig, '_CANCEL_M600'), "Cancel after an idle PAUSE")
+    check(runs(rig, 'RESUME'), "RESUME after an idle PAUSE")
+    check(rig.log == [], "no motion or extrusion: %r" % rig.log)
+    check(rig.absolute, "absolute mode kept")
+
+
+def test_resume_of_a_print_pause_still_works():
+    rig = Rig(state='printing', hot=True)
+    runs(rig, 'PAUSE')
+    runs(rig, '_CANCEL_M600')
+    check('RESUME_BASE move back' in rig.log and 'G1 E1' in rig.log,
+          "a print pause is resumed: %r" % rig.log)
+
+
+def test_paused_print_m600_only_reshows_prompt():
+    # print_stats "paused" and pause_resume paused: a pause already in force.
+    rig = Rig(state='paused', paused=True, hot=True)
+    check(runs(rig, 'M600'), "M600 on a paused print succeeds")
+    check('PAUSE' not in rig.cmdlog, "no second PAUSE")
+    check(rig.log == [], "no lift or park: %r" % rig.log)
+    check(any('pause the print' in p for p in rig.prompts),
+          "the print prompt is shown again: %r" % rig.prompts)
+
+
+def test_paused_state_without_pause_resume_still_pauses():
+    # print_stats paused counts as a print, so PAUSE does its job.
+    rig = Rig(state='paused', paused=False, hot=True)
+    runs(rig, 'M600')
+    check(rig.paused and 'G1 Z2' in rig.log,
+          "a paused-state print is paused and lifted: %r" % rig.log)
+
+
+def test_second_pause_during_paused_print_does_not_lift():
+    rig = Rig(state='printing', paused=True, hot=True)
+    check(runs(rig, 'PAUSE'), "PAUSE on a paused print succeeds")
+    check(rig.log == [], "no second lift or park: %r" % rig.log)
 
 
 def test_printing_pause_unhomed_stays_absolute():
