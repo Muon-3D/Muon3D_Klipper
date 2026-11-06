@@ -4928,6 +4928,55 @@ present_locked_range:
 #   the result as `xy_allowed`.
 ```
 
+### [m1_machine]
+
+Muon M1 machine state: the one owner of what the printer is doing and of
+what each action needs. It reads `[z_power]` (column, bed power path),
+`[bed_removal_detector]` (plate), the `toolhead` MCU, `muon_hotend`, the
+toolhead filament switch, `[hotend_fan_latch]`, `print_stats` and
+`pause_resume`, each optional, and moves nothing itself. While a print is
+paused it leaves a running part fan at the print's speed until the hot
+end has cooled below `pause_cool_temp`, then turns it off. The status object
+reports `activity` (`idle`, `busy`, `waiting`, `preparing`, `printing`,
+`paused`, `complete`, `cancelled`, `error`, `fault`), `conditions`,
+`missing` and `ready` per action (`print`, `resume`, `home_z`, `home_xy`;
+the missing items are reason codes), `faults`, `pause_reason`,
+`plate_cleared`, `job_targets` (the last non-zero bed and hot-end targets
+the print set), `saved_fan`, `cooling` (the pause cool-down is running),
+`toolhead_hotplug` (the last toolhead connect was a toolhead plugged in,
+not a Klipper start) and `gate`. With this section
+loaded, `[filament_switch_sensor]` treats only a running, unpaused print
+file as printing, not toolhead motion.
+
+```
+[m1_machine]
+#settle_time: 3
+#   Seconds every condition must hold before MACHINE_WAIT_READY continues.
+#gate_timeout: 1800
+#   Seconds MACHINE_WAIT_READY waits before it fails (0 waits for ever).
+#pause_bed_off_time: 1800
+#   Seconds into a pause after which the bed is turned off. RESUME reheats
+#   it to the print's target. 0 keeps it on.
+#require_plate_cleared: True
+#   After a print that printed something, refuse the next print until the
+#   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR).
+#pause_cool_temp:
+#   On a pause, a part fan that was on keeps running at the print's speed
+#   until the hot end is below this temperature, where filament no longer
+#   oozes from the nozzle. The default is [nozzle_wipe_smart]'s
+#   fan_off_temp, or 160. 0 disables the cool-down: the fan is turned off
+#   at once.
+#pause_cool_max_time: 600
+#   The longest the cool-down runs, in seconds (0 for no limit).
+#toolhead_startup_grace: 15
+#   A first toolhead connect later than this many seconds after Klipper is
+#   ready counts as a toolhead plugged in, as any reconnect does.
+#poll_time: 0.5
+#toolhead_mcu: toolhead
+#filament_sensor: filament_sensor_toolhead
+#hotend: extruder
+```
+
 ### [fan_modes]
 
 Print modes for the part fan. The slicer's commanded fan speed is mapped

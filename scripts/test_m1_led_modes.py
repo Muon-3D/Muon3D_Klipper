@@ -46,7 +46,11 @@ STUB_COMMANDS = ('SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'M400', 'G92',
                  'G1', 'G0', 'G90', 'G91', 'M107', 'M84', 'TURN_OFF_HEATERS',
                  'CUT_FILAMENT', 'M104', 'M83', 'G4', 'M300', 'M117',
                  'TEMPERATURE_WAIT', 'RESPOND', 'CLEAR_PAUSE',
-                 '_SAVE_CONFIG_IF_PENDING')
+                 '_SAVE_CONFIG_IF_PENDING', 'M106', 'M140',
+                 'MACHINE_WAIT_READY', 'MACHINE_REQUIRE',
+                 'MACHINE_HEAT_WAIT', 'MACHINE_PAUSED',
+                 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
+                 'MACHINE_PLATE_CLEAR')
 
 # What PRINT_END must always reach: heaters, part fan, motors off.
 SHUTDOWN = ('TURN_OFF_HEATERS', 'M107', 'M84')
@@ -291,6 +295,7 @@ class M1Leds:
         printer.add_object('toolhead', Status({
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
+            'axis_minimum': {'x': 0., 'y': -10., 'z': -4., 'e': 0.},
             'homed_axes': 'xyz', 'estimated_print_time': 0.}))
         printer.add_object('extruder', Status({
             'can_extrude': True, 'target': 0., 'temperature': 215.}))
@@ -303,6 +308,9 @@ class M1Leds:
         printer.add_object('z_power', Status({
             'z': 'locked', 'state': 'ready', 'reason': '',
             'xy_allowed': True}))
+        printer.add_object('m1_machine', Status({
+            'job_targets': {'bed': 0.0, 'hotend': 0.0}, 'saved_fan': 0.0}))
+        printer.add_object('heater_bed', Status({'target': 0.0}))
 
         self.stubbed = []
         for name in STUB_COMMANDS:

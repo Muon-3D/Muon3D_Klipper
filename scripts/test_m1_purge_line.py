@@ -79,7 +79,8 @@ class PurgeLine(_M1TestCase):
         settings['no_go_region_1_max'] = [NOTCH[2], NOTCH[3]]
         # PRINT_START refuses to start without filament at the toolhead.
         self.m1.printer.lookup_object(
-            'filament_switch_sensor filament_sensor_toolhead')             .get_status(0)['filament_detected'] = True
+            'filament_switch_sensor filament_sensor_toolhead') \
+            .get_status(0)['filament_detected'] = True
 
     def tearDown(self):
         self.m1.responses[:] = [r for r in self.m1.responses

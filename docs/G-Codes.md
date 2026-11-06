@@ -1794,6 +1794,58 @@ print.
 Available when a [raise_error config section](Config_Reference.md#raise_error)
 is enabled.
 
+### [m1_machine]
+
+The following commands are available when an
+[m1_machine config section](Config_Reference.md#m1_machine) is enabled.
+
+#### MACHINE_WAIT_READY
+`MACHINE_WAIT_READY [ACTION=print] [TIMEOUT=<seconds>] [SETTLE=<seconds>]`:
+Wait until nothing ACTION needs is missing, showing one prompt that lists
+every missing item and updates as they are fixed. Continues by itself once
+everything has held for SETTLE seconds. Fails at once on a latched fault
+(its acknowledgement is a gcode command that cannot run during the wait),
+after TIMEOUT, or when a print cancel aborts it. PRINT_START runs it first.
+
+#### MACHINE_REQUIRE
+`MACHINE_REQUIRE ACTION=<action> [WAIT=<seconds>]`: Fail unless nothing
+ACTION needs is missing, after waiting up to WAIT seconds (at most 10). For
+`ACTION=resume` on a paused print the checklist prompt then follows the
+machine and offers Resume once it is complete. RESUME runs it first.
+
+#### MACHINE_HEAT_WAIT
+`MACHINE_HEAT_WAIT HEATER=<heater> MINIMUM=<temperature>`: Like
+TEMPERATURE_WAIT, but fails when the heater's target drops below MINIMUM or
+what it heats goes away: for `heater_bed` the plate or the locked column,
+for the hot end the toolhead, its sensor, or the fan.
+
+#### MACHINE_PAUSED
+`MACHINE_PAUSED REASON=<code> [FAN=<0..1>]`: Called by PAUSE. Records a new
+pause, its reason and the part-fan speed to restore, and starts the
+cool-down: a part fan that was on stays at that speed while the hot end is
+above `pause_cool_temp`, otherwise it goes off. On a pause already recorded it only
+replaces a `user` reason.
+
+#### MACHINE_PAUSE_REASON
+`MACHINE_PAUSE_REASON REASON=<code>`: Set why the print is paused.
+
+#### MACHINE_RESUMED
+`MACHINE_RESUMED`: Called by RESUME. Ends the pause record and its prompt.
+
+#### MACHINE_TOOLHEAD_CONNECTED
+`MACHINE_TOOLHEAD_CONNECTED`: Called by TOOLHEAD_CONNECT. Sets the status
+field `toolhead_hotplug`: true after a disconnect, or for a first connect
+more than `toolhead_startup_grace` seconds after Klipper became ready;
+false for the toolhead MCU coming up at a Klipper start.
+
+#### MACHINE_PLATE_CLEAR
+`MACHINE_PLATE_CLEAR`: Say the plate is clear of the last print, so a new
+print may start without the plate being taken off and refitted.
+
+#### MACHINE_STATUS
+`MACHINE_STATUS`: Report the activity, the conditions, and what each action
+is missing.
+
 ### [z_power]
 
 The following commands are available when a
