@@ -17,7 +17,7 @@ def load_module():
     pkg = types.ModuleType('stubpkg')
     pkg.__path__ = []
     sys.modules['stubpkg'] = pkg
-    for name in ('probe', 'adxl345', 'homing'):
+    for name in ('probe', 'adxl345', 'homing', 'tap_onset'):
         mod = types.ModuleType('stubpkg.' + name)
         sys.modules['stubpkg.' + name] = mod
         setattr(pkg, name, mod)
