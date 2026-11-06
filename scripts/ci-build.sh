@@ -64,6 +64,9 @@ $PYTHON scripts/test_m1_led_modes.py
 $PYTHON scripts/test_m1_heater_before_leds.py
 # KAN-990: the start purge is drawn only where the bed mesh probed.
 $PYTHON scripts/test_m1_purge_line.py
+# KAN-1730: PRINT_START refuses a saved Z offset past the safe range, in
+# dev mode too, and applies the probe's live offset, not the raw saved one.
+$PYTHON scripts/test_m1_print_start_z_offset.py
 # KAN-742: the unlock press reports the contact_guard offset its retract
 # leaves, moves nothing, and never uses REZERO FORCE.
 $PYTHON scripts/test_m1_unlock_guard_offset.py

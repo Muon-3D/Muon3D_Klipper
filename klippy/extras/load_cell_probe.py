@@ -984,6 +984,9 @@ class LoadCellPrinterProbe:
         status.update(self._load_cell_probing_move.get_status(eventtime))
         status.update(self._tapping_move.get_status(eventtime))
         status.update({
+            # the effective probe z_offset: the stand-in (0.0) when the
+            # saved one was out of range (z_offset_invalid is then set)
+            'z_offset': self._probe_offsets.z_offset,
             'safety_model': self._config_helper.get_safety_model(),
             'reference_max_load_counts':
                 self._config_helper.get_reference_max_load_counts(),
