@@ -9,8 +9,9 @@ the klippy modules around it stubbed) and the REAL core/M1/core.cfg:
    confirm retract speed unset (falls back to the rail's retract speed, fast),
    y samples 2, retries 2, seek_retries 1, retract 8 mm.
 2. The confirm loop itself, driven through _confirm_axis_home with a
-   simulated wall: a first tap at 60 mm/s that slipped one electrical cycle
-   (0.8 mm late) is out-voted by two agreeing slow taps, every re-approach
+   simulated wall: a first tap at 60 mm/s that slipped the rotor one
+   electrical cycle (the step count shifts by 0.8 mm) is agreed with by a
+   prompt slow tap, which supplies the final position; every re-approach
    runs at the configured confirm speed, and a missed slow tap falls back to
    the fast seek and then confirms slowly again.
 """
@@ -76,7 +77,7 @@ class HomingMove:
         for n in sim.step_names:
             sp = types.SimpleNamespace(
                 stepper_name=n, start_pos=int(round(start / STEP_DIST)),
-                trig_pos=int(round((174. + d * slip) / STEP_DIST)))
+                trig_pos=int(round((174. + d * (slip + sim.offset)) / STEP_DIST)))
             self.stepper_positions.append(sp)
         sim.wrapper.last_trigger_time = 1.
         sim.dist_to_wall = -slip  # head now sits slip mm into the stop
@@ -89,6 +90,10 @@ class Sim:
         self.moves = []
         self.direction = direction
         self.dist_to_wall = 0.
+        # step-count shift left by a slipped rotor: every later tap reports
+        # contact this many mm further along (the rotor no longer matches
+        # the commanded steps)
+        self.offset = 0.
         self.step_names = ['stepper_y']
         sim = self
         pos_endstop = 174.
@@ -132,6 +137,7 @@ class Sim:
     def run(self, first_tap_slip=0.):
         # The first tap (at the homing speed) has already happened.
         self.dist_to_wall = 0.
+        self.offset = first_tap_slip
         start = int(round((174. + self.direction * first_tap_slip)
                           / STEP_DIST))
         state = types.SimpleNamespace(trigger_mcu_pos={'stepper_y': start})
@@ -193,12 +199,17 @@ check('arm delay still fits: retract 8 > 10 mm/s * 0.1 s',
       yprof['retract_dist'] > (yprof['speed'] or 60.) * 0.1)
 
 print('confirm loop at the shipped speed')
-# slipped fast first tap (+0.8 mm), then two agreeing slow taps
-sim = Sim(mod, [0., 0.], yprof)
+# The fast first tap slipped the rotor: the step count is now 0.8 mm
+# ahead of the head, so a prompt slow tap reports contact at the SAME
+# (shifted) step count and agrees. The home passes on that one slow tap and
+# the final position is the slow tap's, which carries the 0.8 mm shift.
+sim = Sim(mod, [0.], yprof)
 res = sim.run(first_tap_slip=0.8)
-check('slipped first tap is out-voted by two agreeing slow taps',
-      abs(res - 174. / STEP_DIST) <= 1)
-check('every confirm re-approach ran at 10 mm/s', sim.speeds == [10., 10.])
+check('slipped fast tap + one prompt slow tap agree (spread ~0)',
+      sim.speeds == [10.])
+check('final position comes from the slow tap (carries the shift)',
+      abs(res - (174. + 0.8) / STEP_DIST) <= 1)
+check('every confirm re-approach ran at 10 mm/s', sim.speeds == [10.])
 check('retracts stayed at the rail retract speed (60)',
       sim.moves == [60., 60.])
 
