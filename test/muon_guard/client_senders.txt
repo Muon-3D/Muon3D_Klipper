@@ -1,0 +1,139 @@
+# Commands the Muon clients send to a printer, with where they send them.
+# Checked by test_client_senders in test_muon_guard.py: a line starting
+#   =   must pass the gate AND name an allowlisted command
+#   ~   passes only because nothing is registered under that name on the M1
+#   !   is refused outside dev mode, with the reason after #
+# A script is one line, with \n between its lines. Sources are file:line at
+# the commit named below. `python3 test/muon_guard/scan_senders.py REPO...`
+# lists the sends in a checkout so this list can be brought up to date; run
+# it when MuonUI or Control change (neither repo runs this test).
+#
+# MuonUI origin/main c8d9d88 (the panel)
+= MuonUI src/moonraker/useMoonraker.ts:113 | G28
+= MuonUI src/moonraker/useMoonraker.ts:116 | SET_HEATER_TEMPERATURE HEATER=extruder TARGET=215
+= MuonUI src/panel/screens/filament.ts:38 | FILAMENT_INSERT_FLOW
+= MuonUI src/panel/screens/filament.ts:45 | UNLOAD_FILAMENT TEMP=215
+= MuonUI src/panel/screens/filament.ts:56 | UNLOAD_FILAMENT TEMP=215\nFILAMENT_INSERT_FLOW
+= MuonUI src/panel/screens/filament.ts:53 | M600
+= MuonUI src/panel/screens/filament.ts:64 | CUT_FILAMENT
+= MuonUI src/panel/screens/filament.ts:124 | SAVE_VARIABLE VARIABLE=muon_material VALUE='"PLA"'
+= MuonUI src/panel/screens/filament.ts:127 | _SET_MPC_MATERIAL MATERIAL=PLA
+= MuonUI src/panel/screens/filament.ts:176 | SAVE_VARIABLE VARIABLE=muon_material_colour VALUE='"e8a53b"'
+= MuonUI src/panel/screens/peripherals.ts:192 | LED_MODE MODE=solid H=120 H2=180 BRIGHT=60 SPEED=50
+= MuonUI src/panel/screens/peripherals.ts:337 | CENTER
+= MuonUI src/panel/screens/peripherals.ts:337 | FRONT
+= MuonUI src/panel/screens/peripherals.ts:337 | Z_PARK
+= MuonUI src/panel/screens/peripherals.ts:337 | PARK_PRINTER
+= MuonUI src/panel/screens/peripherals.ts:337 | BUZZ_EXTRUDER
+! MuonUI src/panel/screens/peripherals.ts:337 | TEST_SPEED # homes and throws the toolhead at max velocity and accel; dev mode only, the panel lists it
+= MuonUI src/panel/screens/peripherals.ts:337 | TOOLHEAD_CONNECT
+= MuonUI src/panel/screens/peripherals.ts:337 | TOOLHEAD_DISCONNECT
+= MuonUI src/panel/screens/peripherals.ts:337 | HOTEND_FAN_FAULT_CLEAR
+= MuonUI src/panel/screens/peripherals.ts:337 | PURGE_LINE
+= MuonUI src/panel/screens/peripherals.ts:337 | M104
+= MuonUI src/panel/screens/peripherals.ts:337 | M109
+= MuonUI src/panel/screens/peripherals.ts:337 | SET_HEATER_TEMPERATURE
+! MuonUI src/panel/screens/peripherals.ts:337 | PID_CALIBRATE # on the Macros list, bare, where it only errors; the M1 uses CALIBRATE_HEATING_*
+= MuonUI src/panel/screens/tools.ts:161 | BED_MESH_CALIBRATE\n_BED_MESH_RECORD BED=60\n_SAVE_CONFIG_IF_PENDING
+= MuonUI src/panel/screens/tools.ts:173 | CALIBRATE_HEATING_HOTEND\n_SAVE_CONFIG_IF_PENDING
+= MuonUI src/panel/screens/tools.ts:175 | CALIBRATE_HEATING_BED\n_SAVE_CONFIG_IF_PENDING
+= MuonUI src/panel/screens/tools.ts:177 | G28\nFINETUNE_RESONANCE FORCE=1\n_SAVE_CONFIG_IF_PENDING
+= MuonUI src/panel/screens/tools.ts:231 | CALIBRATE_PROBE
+= MuonUI src/panel/screens/tools.ts:384 | Z_OFFSET_APPLY_PROBE\n_SAVE_CONFIG_IF_PENDING
+= MuonUI src/panel/screens/tools.ts:475 | BED_MESH_PROFILE LOAD=default
+= MuonUI src/stores/moonrakerStore.ts:438 | SET_GCODE_OFFSET Z=0.150 MOVE=1
+= MuonUI src/stores/moonrakerStore.ts:443 | SET_GCODE_OFFSET Z_ADJUST=-0.050 MOVE=1
+= MuonUI src/stores/moonrakerStore.ts:447 | EXCLUDE_OBJECT NAME=cube_1
+= MuonUI src/stores/moonrakerStore.ts:629 | RESPOND TYPE=command MSG="action:prompt_end"
+= MuonUI src/stores/moonrakerStore.ts:1091 | SAVE_GCODE_STATE NAME=muon_ui_move\nG90\nG1 X10.000000 F6000\nRESTORE_GCODE_STATE NAME=muon_ui_move
+= MuonUI src/stores/moonrakerStore.ts:1103 | M106 S128
+= MuonUI src/stores/moonrakerStore.ts:1103 | M107
+= MuonUI src/stores/moonrakerStore.ts:1108 | M220 S100
+= MuonUI src/stores/moonrakerStore.ts:1114 | M221 S100
+= MuonUI src/stores/moonrakerStore.ts:1121 | M84
+= MuonUI src/stores/moonrakerStore.ts:1124 | SAVE_GCODE_STATE NAME=muon_ui_extrude\nM83\nG1 E5 F300\nM400\nRESTORE_GCODE_STATE NAME=muon_ui_extrude
+# MuonUI prompt buttons (stores/moonrakerStore.ts:633) send the printer's own targets; test_prompt_targets covers them
+#
+# Control: Muon3D_Fluidd origin/develop 2dba0099 (paths under src/)
+= Control components/common/ActionCommandPromptDialog.vue:76 | RESPOND TYPE=command MSG="action:prompt_end"
+= Control components/common/ManualProbeDialog.vue:200 | TESTZ Z=-0.1
+= Control components/common/ManualProbeDialog.vue:219 | ABORT
+= Control components/common/ManualProbeDialog.vue:225 | ACCEPT
+~ Control components/common/BedScrewsAdjustDialog.vue:133 | ADJUSTED # no bed_screws on the M1
+~ Control components/common/ScrewsTiltAdjustDialog.vue:88 | SCREWS_TILT_CALCULATE # no screws_tilt_adjust on the M1
+= Control components/layout/AppBar.vue:617 | SAVE_CONFIG
+~ Control components/layout/AppBar.vue:560 | SET_PIN PIN=caselight VALUE=1 # no output_pin on the M1
+~ Control components/control/ControlSpeed.vue:213 | SET_RETRACTION RETRACT_LENGTH=0.8 # no firmware_retraction on the M1
+= Control components/control/ControlTuning.vue:186 | SET_INPUT_SHAPER SHAPER_TYPE_X=mzv SHAPER_FREQ_X=52.5
+= Control components/control/ControlTuning.vue:197 | SET_INPUT_SHAPER
+= Control components/layout/CommandBar.vue:361 | TURN_OFF_HEATERS
+= Control components/maintenance/MeshProfiles.vue:159 | BED_MESH_PROFILE LOAD="default"
+= Control components/maintenance/MeshProfiles.vue:167 | BED_MESH_PROFILE REMOVE="default"
+= Control components/maintenance/MeshProfiles.vue:175 | BED_MESH_CLEAR
+= Control components/maintenance/MeshProfiles.vue:184 | BED_MESH_PROFILE SAVE="default"
+= Control components/maintenance/ProbeCard.vue:151 | QUERY_PROBE
+= Control components/maintenance/ProbeCard.vue:230 | G28\nG90\nG1 X100 Y90 F6000\nPROBE_ACCURACY
+~ Control components/overview/FirstLayerNudges.vue:231 | FIRST_LAYER_NUDGE DIRECTION=CLOSER # nothing registers it on the M1
+= Control components/widgets/bedmesh/BedMeshCard.vue:207 | BED_MESH_CALIBRATE
+~ Control components/widgets/bedmesh/BedMeshControls.vue:185 | QUAD_GANTRY_LEVEL # not a gantry-levelling printer
+~ Control components/widgets/toolhead/ToolheadControlCircle.vue:719 | Z_TILT_ADJUST # one Z motor
+= Control components/widgets/endstops/EndStopsCard.vue:91 | QUERY_PROBE
+= Control components/widgets/exclude-objects/ExcludeObjectsDialog.vue:76 | EXCLUDE_OBJECT NAME=cube_1
+= Control components/widgets/filesystem/FileSystem.vue:1070 | M104 S215
+= Control components/widgets/filesystem/FileSystem.vue:1073 | M140 S60
+~ Control components/widgets/filesystem/FileSystem.vue:1076 | M141 S0 # no chamber heater
+= Control components/widgets/limits/PrinterLimits.vue:166 | SET_VELOCITY_LIMIT VELOCITY=300
+= Control components/widgets/limits/PrinterLimits.vue:170 | SET_VELOCITY_LIMIT ACCEL=5000
+= Control components/widgets/limits/PrinterLimits.vue:174 | SET_VELOCITY_LIMIT ACCEL_TO_DECEL=2500
+= Control components/widgets/limits/PrinterLimits.vue:178 | SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=0.5
+= Control components/widgets/limits/PrinterLimits.vue:182 | SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5
+= Control components/widgets/outputs/OutputFan.vue:72 | M106 S128
+= Control components/widgets/outputs/OutputFan.vue:76 | SET_FAN_SPEED FAN=chamber SPEED=0.5
+= Control components/widgets/outputs/OutputLed.vue:127 | SET_LED LED=Left RED=1 GREEN=0 BLUE=0
+= Control components/control/ControlFilament.vue:210 | SET_FILAMENT_SENSOR SENSOR=filament_sensor_toolhead ENABLE=1
+= Control components/widgets/status/StatusControls.vue:126 | SDCARD_RESET_FILE
+= Control components/widgets/status/PauseAtLayerDialog.vue:149 | SET_PAUSE_NEXT_LAYER ENABLE=1 MACRO="PAUSE"
+= Control components/widgets/status/PauseAtLayerDialog.vue:147 | SET_PAUSE_NEXT_LAYER ENABLE=0
+= Control components/widgets/status/PauseAtLayerDialog.vue:155 | SET_PAUSE_AT_LAYER ENABLE=1 LAYER=25 MACRO="M600"
+= Control components/widgets/status/PauseAtLayerDialog.vue:157 | SET_PAUSE_AT_LAYER ENABLE=0
+= Control components/widgets/thermals/TemperatureTargets.vue:363 | SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=60
+= Control components/widgets/thermals/TemperatureTargets.vue:367 | SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=CPU TARGET=50
+= Control components/widgets/toolhead/PressureAdvanceAdjust.vue:70 | SET_PRESSURE_ADVANCE ADVANCE=0.04 EXTRUDER=extruder
+= Control components/widgets/toolhead/PressureAdvanceAdjust.vue:72 | SET_PRESSURE_ADVANCE SMOOTH_TIME=0.04
+= Control components/widgets/toolhead/SpeedAndFlowAdjust.vue:54 | M221 S95
+= Control components/widgets/toolhead/SpeedAndFlowAdjust.vue:62 | M220 S110
+= Control components/widgets/toolhead/ToolheadCard.vue:69 | M84
+= Control components/widgets/toolhead/ToolheadControlBars.vue:33 | G28 X Y
+= Control components/widgets/toolhead/ToolheadControlBarsAxis.vue:85 | G28 Z
+= Control components/widgets/toolhead/ToolheadControlCross.vue:74 | G28 X Y
+= Control components/widgets/toolhead/ToolheadPosition.vue:159 | G90
+= Control components/widgets/toolhead/ToolheadPosition.vue:159 | G91
+= Control components/widgets/toolhead/ZHeightAdjust.vue:195 | SET_GCODE_OFFSET Z_ADJUST=+0.05 MOVE=1
+= Control components/widgets/toolhead/ZHeightAdjust.vue:200 | Z_OFFSET_APPLY_PROBE
+= Control services/control/model.ts:107 | SAVE_VARIABLE VARIABLE=muon_material VALUE='"PLA"'
+= Control services/control/model.ts:155 | SAVE_VARIABLE VARIABLE=muon_material_colour VALUE='"e8a53b"'
+= Control services/maintenance/model.ts:150 | G28\nBED_MESH_CALIBRATE
+= Control services/maintenance/model.ts:152 | G28\nPROBE_CALIBRATE
+= Control services/maintenance/model.ts:155 | G28\nSHAPER_CALIBRATE
+= Control services/maintenance/model.ts:158 | CALIBRATE_HEATING_HOTEND
+~ Control services/maintenance/model.ts:153 | Z_ENDSTOP_CALIBRATE # no Z endstop on the M1
+= Control services/control/z-adjust.ts:3 | SET_GCODE_OFFSET Z_ADJUST=-0.05 MOVE=1
+= Control mixins/control.ts:349 | SAVE_GCODE_STATE NAME=_ui_movement\nG90\nG1 X10 Y10 F6000\nRESTORE_GCODE_STATE NAME=_ui_movement
+= Control mixins/control.ts:436 | G28 X Y Z
+= Control mixins/control.ts:514 | SET_PRESSURE_ADVANCE ADVANCE=0.05
+= Control mixins/control.ts:531 | SET_VELOCITY_LIMIT ACCEL=6000
+= Control mixins/filament-actions.ts:117 | UNLOAD_FILAMENT
+= Control mixins/filament-actions.ts:117 | LOAD_FILAMENT
+= Control mixins/filament-actions.ts:117 | M600
+# Control: sends the allowlist refuses outside dev mode, and why
+! Control components/widgets/toolhead/ToolheadControlCircle.vue:736 | FORCE_MOVE STEPPER=stepper_x DISTANCE=5 VELOCITY=20 ACCEL=100 # Control e5391126: stepper jog test, a dev tool (refused by design)
+! Control components/widgets/toolhead/ToolheadPosition.vue:175 | FORCE_MOVE STEPPER=stepper_y DISTANCE=90 VELOCITY=20 ACCEL=100 # Control e5391126: move-to-position by stepper, a dev tool (refused by design)
+! Control services/control/model.ts:48 | UNLOAD_FILAMENT TEMP=270 # PC unload (Control e5391126, M1PartOptions.vue:285): above the M1 extruder max_temp of 265, so refused here and by heaters.py; the bound follows max_temp
+! Control components/widgets/toolhead/ToolheadControlCross.vue:259 | FORCE_MOVE STEPPER=stepper_x DISTANCE=5 VELOCITY=20 ACCEL=100 # stepper jog test, a dev tool: it moves a motor with no limit checks
+! Control components/widgets/toolhead/ToolheadControlBarsStepper.vue:52 | FORCE_MOVE STEPPER="stepper_y" DISTANCE=5 VELOCITY=20 ACCEL=100 # same
+! Control components/widgets/toolhead/ExtruderStepperSync.vue:56 | SET_STEPPER_ENABLE STEPPER="extruder" ENABLE=0 # motor enable is not a client operation; only shown with extruder_stepper
+! Control components/widgets/toolhead/ExtruderSelection.vue:32 | ACTIVATE_EXTRUDER EXTRUDER=extruder # one extruder on the M1, selector hidden
+! Control services/maintenance/model.ts:159 | PID_CALIBRATE HEATER=extruder TARGET=215 # only when CALIBRATE_HEATING_HOTEND is absent, which it is not on the M1
+# Dynamic sends the list cannot hold (macro buttons, the console, Spoolman,
+# prompt buttons, temperature presets): public macros are allowlisted by
+# name in core.cfg; anything else is refused outside dev mode.

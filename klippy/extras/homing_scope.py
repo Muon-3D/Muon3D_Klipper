@@ -70,9 +70,14 @@ class HomingScope:
     def _cmd_scoped(self, gcmd):
         if self.depth == 0:
             self._reset_lift_flag()
+            self.printer.send_event("homing_scope:begin")
         self.depth += 1
         try:
             self.orig_cmd(gcmd)
+            if self.depth == 1:
+                # The outermost G28 returned without error, scope still
+                # open: contact_guard takes its trusted zero here
+                self.printer.send_event("homing_scope:end")
         except Exception:
             self._clear_homing_state()
             raise

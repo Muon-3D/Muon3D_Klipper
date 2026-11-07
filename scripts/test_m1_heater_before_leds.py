@@ -138,6 +138,10 @@ class M1:
             'load_cell_probe': {'z_offset': 0.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
+        # PRINT_START reads the probe's live z_offset (KAN-1730)
+        printer.add_object('load_cell_probe', Status({
+            'z_offset': 0.0, 'z_offset_invalid': False,
+            'z_offset_saved': None}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
         printer.add_object('filament_switch_sensor filament_sensor_toolhead',
                            Status({'filament_detected': False}))
@@ -425,9 +429,14 @@ class FanStallInAnyState(_M1TestCase):
                          215.)
 
     def test_fan_stall_after_m600_while_idle(self):
+        # KAN-1699: an idle PAUSE no longer marks the printer paused. The
+        # safety property is unchanged: a hot-end fan stall cuts the heater
+        # whatever the pause state, so start from a real target.
         self.m1.print_stats['state'] = 'standby'
+        self.m1.run('M104 S200')
+        self.assertEqual(self.m1.extruder['target'], 200.)
         self.m1.run('PAUSE')
-        self.assertTrue(self.m1.pause_resume['is_paused'])
+        self.assertFalse(self.m1.pause_resume['is_paused'])
         self.m1.run('FAN_STOPPAGE_ROUTINE FAN_NAME="Hotend"')
         self.assertEqual(self.m1.extruder['target'], 0.)
 

@@ -270,7 +270,9 @@ class VirtualSD:
                 next_file_position = self.file_position + len(line) + 1
             self.next_file_position = next_file_position
             try:
-                self.gcode.run_script(line)
+                # A file is client content: its lines are checked like a
+                # client's (muon_guard), and a macro a line starts is not.
+                self.gcode.run_client_script(line, 'file')
             except self.gcode.error as e:
                 error_message = str(e)
                 try:
