@@ -145,6 +145,12 @@ start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
+# MUON: B1 shared load cell / hotend ADS1220: the mcu's no-DRDY sampling
+# against a modelled chip, hotend detection, range limits, heater hold.
+start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+$PYTHON test/muon_ads1220/test_muon_ads1220.py
+finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
 # outside dev mode, macros and internal sources are not checked (KAN-1730).
 start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
