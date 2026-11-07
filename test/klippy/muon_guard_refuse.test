@@ -1,0 +1,9 @@
+# muon_guard refuses a client command that is not on the allowlist, even
+# though the same command works inside a macro. Exits with an error.
+DICTIONARY atmega2560.dict
+CONFIG muon_guard.cfg
+SHOULD_FAIL
+
+G28
+CLIENT_MACRO
+SET_GCODE_VARIABLE MACRO=CLIENT_MACRO VARIABLE=x VALUE=2

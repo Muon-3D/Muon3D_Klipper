@@ -64,6 +64,9 @@ $PYTHON scripts/test_m1_led_modes.py
 $PYTHON scripts/test_m1_heater_before_leds.py
 # KAN-990: the start purge is drawn only where the bed mesh probed.
 $PYTHON scripts/test_m1_purge_line.py
+# KAN-1730: PRINT_START refuses a saved Z offset past the safe range, in
+# dev mode too, and applies the probe's live offset, not the raw saved one.
+$PYTHON scripts/test_m1_print_start_z_offset.py
 # KAN-742: the unlock press reports the contact_guard offset its retract
 # leaves, moves nothing, and never uses REZERO FORCE.
 $PYTHON scripts/test_m1_unlock_guard_offset.py
@@ -141,6 +144,12 @@ finish_test load_cell "Test load cell collector is stopped on a failed tap"
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 finish_test contact_guard "Test contact_guard decisions"
+
+# MUON: fail-closed dev-mode check; clients start only allowlisted commands
+# outside dev mode, macros and internal sources are not checked (KAN-1730).
+start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+$PYTHON test/muon_guard/test_muon_guard.py
+finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
 
 # MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
 start_test homing_scope "Test homing_scope"

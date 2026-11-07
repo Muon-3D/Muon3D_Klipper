@@ -138,6 +138,10 @@ class M1:
             'load_cell_probe': {'z_offset': 0.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
+        # PRINT_START reads the probe's live z_offset (KAN-1730)
+        printer.add_object('load_cell_probe', Status({
+            'z_offset': 0.0, 'z_offset_invalid': False,
+            'z_offset_saved': None}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
         printer.add_object('filament_switch_sensor filament_sensor_toolhead',
                            Status({'filament_detected': False}))
