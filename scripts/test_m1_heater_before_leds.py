@@ -158,6 +158,8 @@ class M1:
         printer.add_object('configfile', Status({'settings': {
             'extruder': {'max_temp': 265.0},
             'load_cell_probe': {'z_offset': 0.0},
+            # The anti-ooze temperature PRINT_START holds (nozzle_wipe.cfg).
+            'nozzle_wipe_smart': {'stop_temp': 130.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
@@ -732,7 +734,7 @@ class LatchedFaultCutsHeat(_FanCheckTestCase):
     def test_print_start_after_a_cancel(self):
         self.m1.run('CANCEL_PRINT')
         self.assertFalse(self.m1.pause_resume['is_paused'])
-        # A new print: PRINT_START's M104 S{PREHEAT_EXTRUDER_TEMP}.
+        # A new print: PRINT_START's M104 S{OOZE_TEMP}.
         self.m1.print_stats['state'] = 'printing'
         self.m1.timeline.clear()
         self.refused('M104 S215', 'M104')

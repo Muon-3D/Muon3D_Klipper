@@ -29,10 +29,10 @@ from test_m1_heater_before_leds import _M1TestCase  # noqa: E402
 
 # What PRINT_START calls that M1 doesn't stub. The mesh macros are recorded
 # so the test can read the region they are handed.
-RECORDED = ('_BED_MESH_PLAN', '_BED_MESH_ENSURE', '_HOTEND_RAMP_UNDER_MESH',
+RECORDED = ('_BED_MESH_PLAN', '_BED_MESH_ENSURE', 'BED_MESH_CLEAR',
             'BED_MESH_PROFILE', 'SET_PRINT_STATS_INFO', 'M73', 'M140',
             'NOZZLE_WIPE_SMART', 'FINETUNE_RESONANCE',
-            'IF_BED_TEMP_ANTI_OOZE_NOZZLE_DOCK', 'ANTI_OOZE_NOZZLE_DOCK',
+            'ANTI_OOZE_NOZZLE_DOCK',
             '_SAVE_CONFIG_IF_PENDING', 'SET_GCODE_OFFSET')
 
 # core/M1/core.cfg [bed_mesh].
