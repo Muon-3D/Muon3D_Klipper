@@ -169,6 +169,7 @@ finish_test bed_removal "Test bed_removal_detector pauses only in the print phas
 # MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
 start_test fan_modes "Test fan_modes speed table mapping"
 $PYTHON test/fan_modes/test_fan_modes.py
+$PYTHON test/fan_modes/test_print_modes.py
 finish_test fan_modes "Test fan_modes speed table mapping"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
