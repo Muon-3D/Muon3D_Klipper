@@ -13,6 +13,9 @@ def segment_hits_rect(p0, p1, rect):
     (xmin, ymin, xmax, ymax). Running along an edge does not count."""
     xmin, ymin, xmax, ymax = rect
     (x0, y0), (x1, y1) = p0, p1
+    if ((x0 >= xmax and x1 >= xmax) or (x0 <= xmin and x1 <= xmin)
+            or (y0 >= ymax and y1 >= ymax) or (y0 <= ymin and y1 <= ymin)):
+        return False
     dx, dy = x1 - x0, y1 - y0
     t0, t1 = 0., 1.
     for p, q in ((-dx, x0 - xmin), (dx, xmax - x0),

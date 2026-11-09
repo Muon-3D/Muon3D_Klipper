@@ -150,6 +150,7 @@ finish_test contact_guard "Test contact_guard decisions"
 start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
 $PYTHON test/muon_guard/test_muon_guard.py
 $PYTHON test/muon_guard/test_move_limits.py
+$PYTHON test/muon_guard/test_preflight.py
 finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
 
 # MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
