@@ -734,7 +734,8 @@ def line_for(entry, end=1):
             val = ('PLA' if 'MATERIAL' in k else 'bicubic'
                    if k == 'ALGORITHM' else '+' if k == 'Z' else 'PAUSE'
                    if k == 'MACRO' else '5'
-                   if k == 'LAYER' else '1,2')
+                   if k == 'LAYER' else 'y' if k == 'AXES'
+                   else '1,2')
         else:
             val = v.replace('*', 'X')
         if traditional and v == '*':
