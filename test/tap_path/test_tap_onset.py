@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _paths  # noqa: E402
 
 sys.argv = sys.argv[:1]
-sys.path.insert(0, os.path.dirname(_paths.patched('klippy/extras/tap_onset.py')))
+sys.path.insert(0, os.path.dirname(
+    _paths.patched('klippy/extras/tap_onset.py')))
 import tap_onset  # noqa: E402
 
 RATE = 3200.
