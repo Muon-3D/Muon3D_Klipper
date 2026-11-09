@@ -243,6 +243,17 @@ def core_allow():
 class FakeGcodeMove:
     def __init__(self):
         self.homing_position = [0., 0., 0., 0.]
+        self.base_position = [0., 0., 0., 0.]
+        self.last_position = [0., 0., 0., 0.]
+        self.absolute_coord = True
+
+
+class FakeToolhead:
+    """Not homed: the KAN-1731 move limits apply only once homed."""
+    homed = ''
+
+    def get_status(self, eventtime):
+        return {'homed_axes': self.homed}
 
 
 class FakeConfigStatus:
@@ -289,6 +300,7 @@ class Rig:
         self.printer.add_object('configfile', self.cfg)
         self.gm = FakeGcodeMove()
         self.printer.add_object('gcode_move', self.gm)
+        self.printer.add_object('toolhead', FakeToolhead())
         self.probe = FakeProbe(0.)
         self.pending_z = None
         self.disk_z_offset = 0.       # the z_offset in the saved config

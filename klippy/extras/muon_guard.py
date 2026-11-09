@@ -38,6 +38,8 @@ import re
 import shlex
 import time
 
+from . import move_limits
+
 DEFAULT_DEV_CONFIG = '/home/printer_data/devmode_custom_config/core.cfg'
 CACHE_SECONDS = 1.
 
@@ -49,6 +51,9 @@ FREE_TEXT_COMMANDS = ('M117', 'M118', 'M23')
 # Commands that start or resume a print; blocked while the saved Z offset
 # is out of range (the probe ignores it and reports z_offset_invalid)
 PRINT_STARTS = ('PRINT_START', 'SDCARD_PRINT_FILE', 'M24')
+
+# Moves a client may send, held to the Z floor and the notch (KAN-1731)
+MOVES = ('G0', 'G1', 'G2', 'G3')
 
 NAME_RE = re.compile(r'^[A-Z0-9_.]+$')
 KEY_RE = re.compile(r'^[A-Z0-9_]+$')
@@ -202,6 +207,19 @@ class MuonGuard:
                                                    above=0.))
         self.max_probe_z_offset = config.getfloat('max_probe_z_offset', 2.,
                                                   above=0.)
+        # KAN-1731: once Z is homed a client move may not go below this
+        # plate-side Z (gcode Z without G92 shifts, SET_GCODE_OFFSET kept),
+        # nor cross the notch below its traverse Z (bed_mesh's
+        # no_go_region_1 / no_go_traverse_z; test/muon_guard checks they
+        # agree). Macros -- homing, probing, purge -- are not checked.
+        self.z_floor = config.getfloat('client_z_floor', 0.)
+        rect = [float(v) for v in config.getlist('client_no_go_region',
+                                                 '75, 0, 125, 34')]
+        if len(rect) != 4 or rect[0] >= rect[2] or rect[1] >= rect[3]:
+            raise config.error("client_no_go_region must be xmin, ymin,"
+                               " xmax, ymax")
+        self.no_go = [tuple(rect)]
+        self.no_go_z = config.getfloat('client_no_go_traverse_z', 6.)
         entries = config.getlist('client_allow', sep='\n')
         self.rules = parse_allowlist(entries, self.printer.config_error)
         self.refused = 0
@@ -250,6 +268,11 @@ class MuonGuard:
             if self.gcode.gcode_handlers.get(name) is None:
                 return True, ""
             return False, "'%s' is not on the client allowlist" % (name,)
+        if name in MOVES:
+            ok, why = self._check_move(name, self._traditional_params(
+                name, gcmd))
+            if not ok:
+                return ok, why
         if any(r['open'] and not r['cons'] for r in rules):
             return self._check_state(name, {})
         if self.gcode.is_traditional_gcode(name):
@@ -265,6 +288,46 @@ class MuonGuard:
             return self._check_state(name, params)
         return False, ("'%s' is on the client allowlist only with limited "
                        "parameters, and these are not among them" % (name,))
+
+    def _traditional_params(self, name, gcmd):
+        return dict((k, v) for k, v in gcmd.get_command_parameters().items()
+                    if not (k == name[0] and v == name[1:]))
+
+    # KAN-1731: where the move goes, in toolhead coordinates, the way
+    # gcode_move.cmd_G1 / gcode_arcs compute it.
+    def _check_move(self, name, params):
+        gm = self.printer.lookup_object('gcode_move')
+        homed = self.printer.lookup_object('toolhead').get_status(
+            0.)['homed_axes']
+        start = list(gm.last_position[:3])
+        end = list(start)
+        for i, axis in enumerate('XYZ'):
+            if axis in params:
+                v = float(params[axis])
+                end[i] = (v + gm.base_position[i] if gm.absolute_coord
+                          else start[i] + v)
+        if 'z' in homed:
+            floor = self.z_floor + gm.homing_position[2]
+            if end[2] < floor - move_limits.EPS and end[2] < start[2]:
+                return False, ("that move goes to Z %.3f, below the Z floor"
+                               " of %.3f" % (end[2] - gm.homing_position[2],
+                                             self.z_floor))
+        if ('x' in homed and 'y' in homed
+                and min(start[2], end[2]) < self.no_go_z
+                and (start[0], start[1]) != (end[0], end[1])):
+            if name in ('G2', 'G3'):
+                pts = move_limits.arc_points(
+                    start, end, (float(params.get('I', 0.)),
+                                 float(params.get('J', 0.))), name == 'G2')
+            else:
+                pts = [start[:2], end[:2]]
+            rect = move_limits.path_hits_rects(pts, self.no_go)
+            if rect is not None:
+                return False, ("that move crosses the notch (x %g..%g, y "
+                               "%g..%g) below Z %g" % (
+                                   rect[0], rect[2], rect[1], rect[3],
+                                   self.no_go_z))
+        return True, ""
 
     def _limit(self, name):
         # A live limit from the printer config, e.g. the extruder max_temp.
