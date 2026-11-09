@@ -125,6 +125,10 @@
 = Control mixins/filament-actions.ts:117 | UNLOAD_FILAMENT
 = Control mixins/filament-actions.ts:117 | LOAD_FILAMENT
 = Control mixins/filament-actions.ts:117 | M600
+# Control: Muon3D_Fluidd origin/develop 904f4e99 (Control v4 print-mode cards)
+= Control services/control/print-mode.ts:72 | SET_PRINT_MODE MODE=quiet
+= Control services/control/print-mode.ts:72 | SET_PRINT_MODE MODE=normal
+= Control services/control/print-mode.ts:72 | SET_PRINT_MODE MODE=turbo
 # Control: sends the allowlist refuses outside dev mode, and why
 ! Control components/widgets/toolhead/ToolheadControlCircle.vue:736 | FORCE_MOVE STEPPER=stepper_x DISTANCE=5 VELOCITY=20 ACCEL=100 # Control e5391126: stepper jog test, a dev tool (refused by design)
 ! Control components/widgets/toolhead/ToolheadPosition.vue:175 | FORCE_MOVE STEPPER=stepper_y DISTANCE=90 VELOCITY=20 ACCEL=100 # Control e5391126: move-to-position by stepper, a dev tool (refused by design)
