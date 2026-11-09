@@ -122,6 +122,10 @@ class ContactGuard:
         # what the load cell reads afterwards.
         self.sync_below_z = config.getfloat('sync_below_z', 3.0)
         self.enabled = True
+        # ENABLE=0 TIMEOUT=<s> (CUT_FILAMENT's press into the cutter): the
+        # guard is back by itself at this reactor time, or on a command
+        # error, should the macro never reach its ENABLE=1
+        self.stand_aside_end = None
         # Objects found at connect
         self.probe = self.load_cell = self.print_stats = None
         self.homing_override = self.homing_scope = self.nozzle_wipe = None
@@ -433,7 +437,8 @@ class ContactGuard:
         # own Z homing is probe-homed (the load cell probe) and that was
         # commanded to park clear of the plate vouches for the load it
         # reads.  The park is the COMMANDED Z, not a measured one.
-        if not self.enabled or self.probe is None:
+        if (not self._is_enabled(self.reactor.monotonic())
+                or self.probe is None):
             return "the guard is disabled"
         if not self.g28_z_homed or self.g28_z0 is None:
             return "this G28 did not home Z"
@@ -618,7 +623,20 @@ class ContactGuard:
             self.z_trusted = self.probe_since_reset = False
             self.g28_z_homed = False
 
+    def _end_stand_aside(self):
+        if self.stand_aside_end is not None:
+            self.stand_aside_end = None
+            self.enabled = True
+            logging.info("contact_guard: enabled again after standing aside")
+
+    def _is_enabled(self, eventtime):
+        if (self.stand_aside_end is not None
+                and eventtime >= self.stand_aside_end):
+            self._end_stand_aside()
+        return self.enabled
+
     def _handle_command_error(self):
+        self._end_stand_aside()
         # A failed G28 does not send home_rails_end
         self.homing_moves = 0
         self.homing_rails = False
@@ -672,7 +690,7 @@ class ContactGuard:
 
     # The states in which the guard never refuses
     def _may_refuse(self, eventtime):
-        if not self.enabled or self.probe is None:
+        if not self._is_enabled(eventtime) or self.probe is None:
             return False
         if self._is_homing() or self._job_active(eventtime):
             return False
@@ -962,7 +980,7 @@ class ContactGuard:
             'contact': active and self.contact,
             'load': int(round(self.load)),
             'active': active,
-            'enabled': self.enabled,
+            'enabled': self._is_enabled(eventtime),
         }
 
     def _rezero(self, force=False):
@@ -1025,13 +1043,20 @@ class ContactGuard:
         return old
 
     cmd_SET_CONTACT_GUARD_help = (
-        "Enable or disable refusing XY moves while the nozzle touches;"
+        "Enable or disable refusing XY moves while the nozzle touches"
+        " (ENABLE=0 TIMEOUT=<s>: until then or a command error);"
         " REZERO=1 [FORCE=1] re-zeroes a steady offset with the toolhead"
         " high")
     def cmd_SET_CONTACT_GUARD(self, gcmd):
         enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
+        timeout = gcmd.get_float('TIMEOUT', None, above=0.)
+        if timeout is not None and enable != 0:
+            raise self.gcode.error("contact_guard: TIMEOUT needs ENABLE=0")
         if enable is not None:
             self.enabled = bool(enable)
+            self.stand_aside_end = None
+            if timeout is not None:
+                self.stand_aside_end = self.reactor.monotonic() + timeout
         if gcmd.get_int('REZERO', 0, minval=0, maxval=1):
             force = bool(gcmd.get_int('FORCE', 0, minval=0, maxval=1))
             # TRY=1 (for macros): a refusal is reported, not raised, so
