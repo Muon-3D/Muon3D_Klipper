@@ -731,7 +731,9 @@ class MCURestartHelper:
                      self._name, self._openocd_config)
         cmd = ["openocd", "-f", self._openocd_config,
                "-c", "init; reset run; exit"]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # MUON KAN-1362: a hung openocd must not hang FIRMWARE_RESTART
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                check=True, timeout=30.)
         if result.stdout:
             logging.info("openocd stdout: %s", result.stdout.strip())
         if result.stderr:
