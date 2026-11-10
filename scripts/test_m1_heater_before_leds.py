@@ -129,6 +129,13 @@ class M1:
             'axis_minimum': {'x': 0., 'y': -10., 'z': -4., 'e': 0.},
             'homed_axes': 'xyz', 'estimated_print_time': 0.}
         printer.add_object('toolhead', Status(self.toolhead))
+        # PAUSE and RESUME work their moves out from the G-code position, in
+        # absolute mode (review of #107, blocker 2).
+        self.gcode_move = {'gcode_position': {'x': 100., 'y': 90., 'z': 40.,
+                                              'e': 0.},
+                           'absolute_coordinates': True,
+                           'absolute_extrude': True}
+        printer.add_object('gcode_move', Status(self.gcode_move))
         self.extruder = {'can_extrude': True, 'target': 215.,
                          'temperature': 215.}
         printer.add_object('extruder', Status(self.extruder))
@@ -1722,23 +1729,114 @@ class PauseResumeSymmetry(_M1TestCase):
         self.assertNotIn('G1', names)
         self.assertIn('MACHINE_PAUSED REASON=plate_removed', self.m1.timeline)
 
+    def at_z(self, z):
+        self.m1.toolhead['position']['z'] = z
+        self.m1.gcode_move['gcode_position']['z'] = z
+
     def test_pause_lifts_5mm_and_parks_back_right(self):
-        # Harry, 2026-11-04: lift 5 mm, park at X and Y max less 5 mm.
+        # Harry, 2026-11-04: lift 5 mm, park at X and Y max less 5 mm. The
+        # lift is absolute from the G-code position (40 here).
         self.pause()
         tl = self.m1.timeline
-        self.assertIn('G1 Z5.0 F900', tl)
+        self.assertIn('G1 Z45.0 F900', tl)
         self.assertIn('G1 X195.0 Y175.0 F6000', tl)
+        self.assertLess(tl.index('G1 Z45.0 F900'),
+                        tl.index('G1 X195.0 Y175.0 F6000'))
 
     def test_pause_lift_stops_at_the_top_of_z(self):
         # 2 mm below the top of Z: lift 2 mm, not 5 into the end of the axis.
-        self.m1.toolhead['position']['z'] = 178.
+        self.at_z(178.)
         self.pause()
-        self.assertIn('G1 Z2.0 F900', self.m1.timeline)
+        self.assertIn('G1 Z180.0 F900', self.m1.timeline)
+        self.assertIn('G1 X195.0 Y175.0 F6000', self.m1.timeline)
 
-    def test_pause_at_the_top_of_z_does_not_lift(self):
-        self.m1.toolhead['position']['z'] = 180.
+    def test_pause_at_the_top_of_z_does_not_lift_or_park(self):
+        # Review of #107: with no lift the park crossed the top layer at
+        # print height. It stays where it is instead.
+        self.at_z(180.)
         self.pause()
-        self.assertFalse(any(line.startswith('G1 Z')
+        self.assertFalse(any(line.startswith('G1 Z') or line.startswith(
+            'G1 X') for line in self.m1.timeline), self.m1.timeline)
+        self.assertIn('MACHINE_PAUSED REASON=user FAN=0.5', self.m1.timeline)
+
+    def test_pause_lifting_less_than_min_park_lift_does_not_park(self):
+        self.at_z(179.5)
+        self.pause()
+        self.assertIn('G1 Z180.0 F900', self.m1.timeline)
+        self.assertFalse(any(line.startswith('G1 X')
+                             for line in self.m1.timeline), self.m1.timeline)
+
+    def test_pause_records_before_it_moves_and_never_uses_g91(self):
+        # Review of #107, blocker 2: the record comes straight after
+        # PAUSE_BASE and G90 comes before the first move.
+        names = self.pause()
+        self.assertNotIn('G91', names)
+        first_move = names.index('G1')
+        self.assertLess(names.index('PAUSE_BASE'),
+                        names.index('MACHINE_PAUSED'))
+        self.assertLess(names.index('MACHINE_PAUSED'), names.index('G90'))
+        self.assertLess(names.index('G90'), first_move)
+
+    def refused_pause(self):
+        # The refused move raises out of PAUSE, as Klipper's does.
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('PAUSE')
+        self.assertTrue(any('failing on purpose' in r
+                            for r in self.m1.responses))
+        self.m1.responses.clear()
+        self.log.records.clear()
+
+    def assert_recorded_and_absolute(self):
+        tl = self.m1.timeline
+        names = self.m1.names()
+        self.assertIn('MACHINE_PAUSED REASON=user FAN=0.5', tl)
+        self.assertNotIn('G91', names)
+        self.assertIn('G90', names)
+        # The record and G90 were both in place before the refused move
+        refused = max(i for i, n in enumerate(names) if n == 'G1')
+        self.assertLess(names.index('MACHINE_PAUSED'), refused)
+        self.assertLess(names.index('G90'), refused)
+
+    def test_a_refused_park_keeps_the_pause_record_and_g90(self):
+        # z_power's X/Y gate, contact_guard or a travel limit refuses it.
+        self.m1.raising_lines.add('G1 X')
+        self.refused_pause()
+        self.assert_recorded_and_absolute()
+        self.assertIn('M104 S0', self.m1.timeline)
+
+    def test_a_refused_lift_keeps_the_pause_record_and_g90(self):
+        self.m1.raising_lines.add('G1 Z')
+        self.refused_pause()
+        self.assert_recorded_and_absolute()
+        self.assertFalse(any(line.startswith('G1 X')
+                             for line in self.m1.timeline))
+
+    def test_a_refused_retract_keeps_the_record_and_records_no_retract(self):
+        self.m1.raising_lines.add('G1 E')
+        self.refused_pause()
+        self.assert_recorded_and_absolute()
+        self.assertEqual(self.m1.macro_vars('PAUSE')['retracted'], 0)
+
+    def test_resume_unretracts_what_pause_retracted(self):
+        self.pause()
+        self.assertEqual(self.m1.macro_vars('PAUSE')['retracted'], 1)
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertIn('G1 E1.0 F2100', self.m1.timeline)
+        self.assertNotIn('G91', self.m1.names())
+        self.assertEqual(self.m1.macro_vars('PAUSE')['retracted'], 0)
+
+    def test_resume_does_not_unretract_a_pause_that_did_not_retract(self):
+        # Review of #107: a cold or zeroed nozzle is not retracted, and
+        # RESUME's +1 mm then left a blob at the park.
+        self.m1.extruder['can_extrude'] = False
+        self.pause()
+        self.assertEqual(self.m1.macro_vars('PAUSE')['retracted'], 0)
+        self.m1.extruder['can_extrude'] = True
+        self.m1.timeline.clear()
+        self.m1.run('RESUME')
+        self.assertFalse(any(line.startswith('G1 E')
                              for line in self.m1.timeline), self.m1.timeline)
 
     def test_pause_turns_the_hot_end_off_after_the_retract(self):
@@ -1754,7 +1852,7 @@ class PauseResumeSymmetry(_M1TestCase):
         # motor still moves the carriage. (The audit's F6 assumed it did
         # not.)
         self.pause('PAUSE REASON=column_unlocked')
-        self.assertIn('G1 Z5.0 F900', self.m1.timeline)
+        self.assertIn('G1 Z45.0 F900', self.m1.timeline)
         self.assertTrue(any(line.startswith('G1 X')
                             for line in self.m1.timeline))
 

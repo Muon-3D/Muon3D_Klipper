@@ -57,6 +57,9 @@ class Rig:
         self.hot = hot
         self.latch = latch
         self.x, self.y, self.z = 100.0, 100.0, z
+        self.e = 0.0
+        self.refuse = set()    # command prefixes refused, as a guard does
+        self.pause_vars = self.vars('PAUSE')
         self.absolute = True
         self.saved = {}
         self.log = []          # every move that reached a motor
@@ -74,7 +77,10 @@ class Rig:
                          'axis_maximum': {'x': 250., 'y': 250., 'z': 250.},
                          'position': {'x': self.x, 'y': self.y, 'z': self.z}},
             'configfile': {'settings': {'extruder': {'max_temp': 300}}},
-            'gcode_macro PAUSE': self.vars('PAUSE'),
+            'gcode_macro PAUSE': self.pause_vars,
+            'gcode_move': {'gcode_position': {'x': self.x, 'y': self.y,
+                                              'z': self.z, 'e': self.e},
+                           'absolute_extrude': True},
         }
 
     def vars(self, name):
@@ -113,6 +119,10 @@ class Rig:
             if self.paused:
                 self.paused = False
                 self.log.append('RESUME_BASE move back')
+        elif name == 'SET_GCODE_VARIABLE':
+            kv = dict(t.split('=', 1) for t in rest.split())
+            if kv.get('MACRO') == 'PAUSE':
+                self.pause_vars[kv['VARIABLE']] = float(kv['VALUE'])
         elif name in ('M600', 'PAUSE', '_CANCEL_M600', 'RESUME',
                       '_RESUME_RESTORE_HOTEND', '_RESUME_UNRETRACT'):
             self.run_macro(name, rest)
@@ -137,7 +147,11 @@ class Rig:
         # LED_INFO and the rest: no motion, nothing to model.
 
     def g1(self, rest):
+        if any(('G1 ' + rest).startswith(p) for p in self.refuse):
+            raise Failure("refused: G1 " + rest)
         w = dict((t[0], float(t[1:])) for t in rest.split() if t[0] != 'F')
+        if 'E' in w:
+            self.e = w['E'] if self.absolute else self.e + w['E']
         nx, ny, nz = self.x, self.y, self.z
         if 'X' in w:
             nx = w['X'] if self.absolute else self.x + w['X']
@@ -195,7 +209,7 @@ def test_printing_m600_pauses_and_parks():
     check(rig.paused, "printing M600 pauses")
     # m1_machine's PAUSE lifts by its `lift` (5 mm, less near the top of
     # Z), not the 2 mm it used to.
-    check(rig.log == ['G1 E-1', 'G1 Z5', 'G1 X245 Y245'],
+    check(rig.log == ['G1 E-1', 'G1 Z25', 'G1 X245 Y245'],
           "printing M600 retracts, lifts and parks: %r" % rig.log)
     check(rig.prompt_shown(), "printing M600 shows the prompt")
     check(rig.absolute, "absolute mode after a printing M600")
@@ -249,8 +263,34 @@ def test_resume_of_a_print_pause_still_works():
     rig = Rig(state='printing', hot=True)
     runs(rig, 'PAUSE')
     runs(rig, '_CANCEL_M600')
-    check('RESUME_BASE move back' in rig.log and 'G1 E1' in rig.log,
+    # Absolute E since the review of #107: retract to -1, back to 0.
+    check('RESUME_BASE move back' in rig.log and 'G1 E0' in rig.log,
           "a print pause is resumed: %r" % rig.log)
+    check(rig.e == 0.0, "the un-retract undoes the retract (e %g)" % rig.e)
+
+
+def test_refused_lift_keeps_the_record_and_g90():
+    # Review of #107, blocker 2: a refused Z lift used to leave G91 on and
+    # lose MACHINE_PAUSED, which only ran after the park.
+    rig = Rig(state='printing', hot=True)
+    rig.refuse.add('G1 Z')
+    check(not runs(rig, 'PAUSE'), "the lift is refused")
+    check(rig.paused, "the pause stands")
+    check(any(c.startswith('MACHINE_PAUSED') for c in rig.cmdlog),
+          "the pause was recorded: %r" % rig.cmdlog)
+    check(rig.absolute, "absolute mode after the refused lift")
+    check('G91' not in [c.split()[0] for c in rig.cmdlog], "no G91 at all")
+
+
+def test_refused_park_keeps_the_record_and_g90():
+    rig = Rig(state='printing', hot=True)
+    rig.refuse.add('G1 X')
+    check(not runs(rig, 'PAUSE'), "the park is refused")
+    names = [c.split()[0] for c in rig.cmdlog]
+    check('MACHINE_PAUSED' in names
+          and names.index('MACHINE_PAUSED') < names.index('G1'),
+          "recorded before the first move: %r" % rig.cmdlog)
+    check(rig.absolute, "absolute mode after the refused park")
 
 
 def test_paused_print_m600_only_reshows_prompt():
@@ -267,7 +307,7 @@ def test_paused_state_without_pause_resume_still_pauses():
     # print_stats paused counts as a print, so PAUSE does its job.
     rig = Rig(state='paused', paused=False, hot=True)
     runs(rig, 'M600')
-    check(rig.paused and 'G1 Z5' in rig.log,
+    check(rig.paused and any(m.startswith('G1 Z') for m in rig.log),
           "a paused-state print is paused and lifted: %r" % rig.log)
 
 

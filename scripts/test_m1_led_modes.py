@@ -297,6 +297,13 @@ class M1Leds:
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
             'axis_minimum': {'x': 0., 'y': -10., 'z': -4., 'e': 0.},
             'homed_axes': 'xyz', 'estimated_print_time': 0.}))
+        # PAUSE and RESUME work their moves out from the G-code position, in
+        # absolute mode (review of #107, blocker 2).
+        self.gcode_move = {'gcode_position': {'x': 100., 'y': 90., 'z': 40.,
+                                              'e': 0.},
+                           'absolute_coordinates': True,
+                           'absolute_extrude': True}
+        printer.add_object('gcode_move', Status(self.gcode_move))
         printer.add_object('extruder', Status({
             'can_extrude': True, 'target': 0., 'temperature': 215.}))
         printer.add_object('heaters', Status({}))
