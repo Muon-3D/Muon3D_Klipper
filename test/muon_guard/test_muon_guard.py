@@ -1068,8 +1068,8 @@ def test_every_macro_is_classified():
     # gate waits hold the gcode mutex and the event commands record what the
     # machine did, so a client may send none of them.
     check('MACHINE_STATUS' in allowed, "MACHINE_STATUS is on the allowlist")
-    for name in ('MACHINE_PLATE_CLEAR', 'MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
-                 'MACHINE_PAUSED', 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
+    for name in ('MACHINE_PLATE_CLEAR', 'MACHINE_WAIT_READY',
+                 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT', 'MACHINE_PAUSED', 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
                  'MACHINE_TOOLHEAD_CONNECTED'):
         check(name not in allowed, "%s is not on the allowlist" % (name,))
 
