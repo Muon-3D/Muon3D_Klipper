@@ -452,10 +452,36 @@ class TestStartGate(unittest.TestCase):
     def test_times_out(self):
         m = Machine(gate_timeout=60.)
         m.start_print()
+        m.detector.present = False
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertIn('Fit the build plate', str(e.exception))
+
+    def test_missing_filament_refuses_at_once(self):
+        # Review of #107: the load an insert starts is gcode, queued behind
+        # the gate, so a gate that waited for the sensor started the print
+        # with the filament not yet at the nozzle.
+        m = Machine()
+        m.start_print()
         m.filament.status['filament_detected'] = False
         with self.assertRaises(CommandError) as e:
             m.run('MACHINE_WAIT_READY', ACTION='print')
-        self.assertIn('Load filament', str(e.exception))
+        self.assertIn('Load filament first', str(e.exception))
+        self.assertEqual(m.reactor.pauses, 0)
+
+    def test_filament_pulled_during_the_gate_ends_it(self):
+        m = Machine()
+        m.start_print()
+        m.detector.present = False
+        m.reactor.schedule(3., lambda: m.filament.status.update(
+            filament_detected=False))
+        m.reactor.schedule(5., lambda: m.filament.status.update(
+            filament_detected=True))
+        m.reactor.schedule(6., lambda: setattr(m.detector, 'present', True))
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertIn('Load filament first', str(e.exception))
+        self.assertIsNone(m.m1.gate)
 
     def test_print_cancel_aborts_it(self):
         # KAN-382: pause_resume/cancel requests an abort, which every wait

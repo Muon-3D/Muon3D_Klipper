@@ -81,6 +81,16 @@ ORDER = list(REASONS)
 # A gate cannot wait for them (see THE GCODE LOCK), so it refuses at once.
 REFUSE = ('bed_power_fault', 'bed_power_inhibited', 'fan_fault',
           'hotend_failed')
+# The start gate also refuses missing filament rather than wait for it
+# (review of #107): the filament load an insert starts is gcode too, so it
+# queues behind the gate, and a gate that saw the sensor go true started
+# the print with the filament not yet fed to the nozzle.
+GATE_REFUSE = REFUSE + ('filament_absent',)
+GATE_REFUSE_TEXT = {
+    'filament_absent': "Load filament first: insert it, let it load, then"
+                       " start the print again. It cannot load while the"
+                       " print waits to start",
+}
 
 # What a heater wait stops for (MACHINE_HEAT_WAIT): the bed needs its plate and
 # the column it is powered through, the hot end its toolhead.
@@ -651,7 +661,7 @@ class M1Machine:
         miss = missing(action, c)
         if not miss:
             return
-        self._refuse_latched(gcmd, action, miss)
+        self._refuse_gate(gcmd, action, miss)
         # Run by hand from the console, or sent by a client, there is no
         # job for KAN-382's abort to cancel: wait only manual_gate_timeout.
         # A cancel request stops the wait either way (request_gate_abort).
@@ -682,7 +692,7 @@ class M1Machine:
                     raise gcmd.error("Print cancelled while waiting")
                 c = self.conditions(eventtime)
                 miss = missing(action, c)
-                self._refuse_latched(gcmd, action, miss)
+                self._refuse_gate(gcmd, action, miss)
                 if miss != self.gate['missing']:
                     self.gate['missing'] = miss
                     if miss:
@@ -728,6 +738,14 @@ class M1Machine:
         self.gate_abort = "%s while waiting to %s" % (msg,
                                                       self.gate['action'])
         return True
+
+    def _refuse_gate(self, gcmd, action, miss):
+        self._refuse_latched(gcmd, action, miss)
+        refuse = [m for m in miss if m in GATE_REFUSE]
+        if refuse:
+            raise gcmd.error("Cannot %s: %s" % (action, "; ".join(
+                GATE_REFUSE_TEXT.get(m) or checklist_lines([m])[0]
+                for m in refuse)))
 
     def _refuse_latched(self, gcmd, action, miss):
         latched = [m for m in miss if m in REFUSE]
