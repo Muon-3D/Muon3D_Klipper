@@ -123,7 +123,19 @@ class HeaterSupply:
         self.reactor = printer.get_reactor()
         self.name = config.get_name()
         self.heater_name = self.name.split()[-1]
-        resistance = config.getfloat('resistance', above=0.)
+        # The learnt resistance is saved as `resistance`, in the calibration
+        # file. The core config gives the nominal one as default_resistance:
+        # a core `resistance` makes that save a config error (core keys may
+        # not be overridden by calibration), so after the first learnt value
+        # Klipper would not start (sloe, 2026-11-10). A plain `resistance`
+        # with no saved value still works, for configs without the split.
+        default_resistance = config.getfloat('default_resistance', None,
+                                             above=0.)
+        resistance = config.getfloat('resistance', default_resistance,
+                                     above=0.)
+        if resistance is None:
+            raise config.error("%s: needs default_resistance (or resistance)"
+                               % (self.name,))
         rng = config.getfloatlist('resistance_range',
                                   (resistance / 2., resistance * 2.), count=2)
         if not 0. < rng[0] < resistance < rng[1]:
