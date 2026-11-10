@@ -133,8 +133,11 @@ class NozzleWipeSmart:
         self.gcode.run_script_from_command(script)
 
     def _set_fan(self, fan_pct):
+        # M106.1, the raw duty: M106 maps through the print mode's curve
+        # ([fan_modes]), which turned 20 % into about 10 % duty on the M1's
+        # blower, too little to cool the nozzle (sloe, 2026-11-10).
         fan_s = int(max(0.0, min(1.0, fan_pct)) * 255.0)
-        self._run_script("M106 S%d" % (fan_s,))
+        self._run_script("M106.1 S%d" % (fan_s,))
 
     def _fan_off(self):
         self._run_script("M106 S0")
