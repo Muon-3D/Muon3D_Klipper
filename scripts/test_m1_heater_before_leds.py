@@ -159,7 +159,7 @@ class M1:
             'extruder': {'max_temp': 265.0},
             'load_cell_probe': {'z_offset': 0.0},
             # The anti-ooze temperature PRINT_START holds (nozzle_wipe.cfg).
-            'nozzle_wipe_smart': {'stop_temp': 130.0},
+            'nozzle_wipe_smart': {'stop_temp': 135.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
