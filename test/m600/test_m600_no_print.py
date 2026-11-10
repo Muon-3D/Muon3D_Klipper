@@ -193,7 +193,9 @@ def test_printing_m600_pauses_and_parks():
     rig = Rig(state='printing', hot=True)
     check(runs(rig, 'M600'), "printing M600 succeeds")
     check(rig.paused, "printing M600 pauses")
-    check(rig.log == ['G1 E-1', 'G1 Z2', 'G1 X245 Y245'],
+    # m1_machine's PAUSE lifts by its `lift` (5 mm, less near the top of
+    # Z), not the 2 mm it used to.
+    check(rig.log == ['G1 E-1', 'G1 Z5', 'G1 X245 Y245'],
           "printing M600 retracts, lifts and parks: %r" % rig.log)
     check(rig.prompt_shown(), "printing M600 shows the prompt")
     check(rig.absolute, "absolute mode after a printing M600")
@@ -265,7 +267,7 @@ def test_paused_state_without_pause_resume_still_pauses():
     # print_stats paused counts as a print, so PAUSE does its job.
     rig = Rig(state='paused', paused=False, hot=True)
     runs(rig, 'M600')
-    check(rig.paused and 'G1 Z2' in rig.log,
+    check(rig.paused and 'G1 Z5' in rig.log,
           "a paused-state print is paused and lifted: %r" % rig.log)
 
 

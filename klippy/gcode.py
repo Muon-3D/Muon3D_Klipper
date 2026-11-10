@@ -313,13 +313,16 @@ class GCodeDispatch:
     # affected, so a timer running its own commands meanwhile is not.  Moves
     # already queued are not stopped; the caller follows up with something
     # that waits for them (PRINT_END's M400).
-    def run_abortable_script(self, script):
+    # `origin` is as for run_client_script(): a print file's lines are
+    # client content (muon_guard) as well as abortable.
+    def run_abortable_script(self, script, origin=None):
         with self.mutex:
             self._abort_owner = greenlet.getcurrent()
             self._abort_msg = None
             self._abort_hold = 0
             try:
-                self._process_commands(script.split('\n'), need_ack=False)
+                self._process_commands(script.split('\n'), need_ack=False,
+                                       origin=origin)
             finally:
                 self._abort_owner = None
                 self._abort_msg = None

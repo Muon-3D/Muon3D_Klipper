@@ -641,6 +641,30 @@ def test_internal_sources_pass():
               "run_script_from_command passes: %s" % cmd)
 
 
+def test_abortable_file_line_is_checked():
+    # virtual_sdcard runs each print-file line through run_abortable_script
+    # (a cancel can stop PRINT_START, #93) with origin='file' (#112). The
+    # origin must reach the guard on that path too, and the abortable path
+    # without an origin stays unchecked.
+    rig = Rig()
+    del rig.calls[:]
+    try:
+        rig.gcode.run_abortable_script('SET_KINEMATIC_POSITION Z=1',
+                                       origin='file')
+        err = None
+    except CommandError as e:
+        err = str(e)
+    check(err is not None and rig.calls == [],
+          "an abortable 'file' line is checked: %r %r" % (err, rig.calls))
+    del rig.calls[:]
+    rig.gcode.run_abortable_script('M104 S0', origin='file')
+    check(rig.calls == ['M104 S0'], "an allowed abortable 'file' line runs")
+    del rig.calls[:]
+    rig.gcode.run_abortable_script('SET_KINEMATIC_POSITION Z=1')
+    check(rig.calls == ['SET_KINEMATIC_POSITION Z=1'],
+          "an abortable script with no origin is not checked")
+
+
 def test_tag_is_what_decides():
     # Negative control. Without the tag the same line is not refused, so the
     # refusals above are the tag working and not an accident of the rig.
@@ -824,7 +848,10 @@ def test_virtual_sdcard_lines():
     path = os.path.join(ROOT, 'klippy', 'extras', 'virtual_sdcard.py')
     with open(path, encoding='utf-8') as f:
         src = f.read()
-    check("self.gcode.run_client_script(line, 'file')" in src,
+    # With #93 the line is also abortable (a cancel stops PRINT_START), so
+    # it goes in through run_abortable_script, still tagged 'file'.
+    check("self.gcode.run_client_script(line, 'file')" in src
+          or "self.gcode.run_abortable_script(line, origin='file')" in src,
           "virtual_sdcard sends each file line in as a 'file' client line")
     check("self.gcode.run_script(self.on_error_gcode.render())" in src,
           "virtual_sdcard keeps on_error_gcode internal")
@@ -846,7 +873,12 @@ def test_door_inventory():
                 continue
             p = os.path.join(base, fn)
             with open(p, encoding='utf-8') as f:
-                n = f.read().count('run_client_script(')
+                text = f.read()
+                # A door is run_client_script, or run_abortable_script given
+                # a client origin (virtual_sdcard, #93 + #112).
+                n = (text.count('run_client_script(')
+                     + len(re.findall(r'run_abortable_script\([^)]*origin=',
+                                      text)))
             if n:
                 found[os.path.relpath(p, ROOT)] = n
     found.pop(os.path.join('klippy', 'gcode.py'), None)   # the definition
@@ -969,15 +1001,21 @@ def test_every_macro_is_classified():
     # 384 and filament.ts:127), not by a prompt button
     panel_sent = set(['_BED_MESH_RECORD', '_SAVE_CONFIG_IF_PENDING',
                       '_SET_MPC_MATERIAL'])
-    check(underscore_allowed <= prompt_targets | panel_sent,
+    # m1_machine took the plate-refit prompt over and _BED_RESUME_NOW is
+    # no longer a button target. It is kept, as a wrapper that only runs
+    # RESUME (bed.cfg), for a prompt still on a screen across an update and
+    # for any interface that calls it.
+    compat = set(['_BED_RESUME_NOW'])
+    check(underscore_allowed <= prompt_targets | panel_sent | compat,
           "underscore macros on the allowlist are prompt-button targets or "
           "sent by the panel: %r"
-          % (sorted(underscore_allowed - prompt_targets - panel_sent),))
+          % (sorted(underscore_allowed - prompt_targets - panel_sent
+                    - compat),))
     check(underscore_allowed == set([
         '_BED_RESUME_NOW', '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
-        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE'])
-        | panel_sent,
-        "the underscore exceptions are exactly the nine reviewed ones: %r"
+        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE',
+        '_RUNOUT_UNLOAD']) | panel_sent,
+        "the underscore exceptions are exactly the ten reviewed ones: %r"
         % (sorted(underscore_allowed),))
     for name in macros_in_core():
         if name.startswith('_') and name not in underscore_allowed:
@@ -1003,6 +1041,15 @@ def test_every_macro_is_classified():
                  'RESUME', 'CANCEL_PRINT', 'SDCARD_PRINT_FILE',
                  'SET_HEATER_TEMPERATURE', 'TURN_OFF_HEATERS'):
         check(name in allowed, "%s is on the allowlist" % (name,))
+    # m1_machine: the report and the plate-cleared word are a client's; the
+    # gate waits hold the gcode mutex and the event commands record what the
+    # machine did, so a client may send none of them.
+    for name in ('MACHINE_STATUS', 'MACHINE_PLATE_CLEAR'):
+        check(name in allowed, "%s is on the allowlist" % (name,))
+    for name in ('MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
+                 'MACHINE_PAUSED', 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
+                 'MACHINE_TOOLHEAD_CONNECTED'):
+        check(name not in allowed, "%s is not on the allowlist" % (name,))
 
 
 def test_allowlist_has_a_reason_per_entry():
