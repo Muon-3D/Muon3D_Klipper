@@ -383,7 +383,9 @@ class MpcCalibrate:
         ambient_settle_rate = gcmd.get_float(
             "AMBIENT_SETTLE_RATE", 0.01, above=0.0
         )
-        fan_breakpoints = gcmd.get_int("FAN_BREAKPOINTS", 3, minval=2)
+        # FAN_BREAKPOINTS=1 skips the fan sweep: one transfer measurement,
+        # fan off. MPC then uses ambient_transfer at any fan speed.
+        fan_breakpoints = gcmd.get_int("FAN_BREAKPOINTS", 3, minval=1)
         target_temp = gcmd.get_float("TARGET", 200.0, minval=90.0)
         threshold_temp = gcmd.get_float(
             "THRESHOLD", max(50.0, min(100, target_temp - 100.0))
@@ -669,11 +671,20 @@ class MpcCalibrate:
         fan = self.orig_control.cooling_fan
 
         fan_powers = []
-        if fan is None:
+        if fan is None or fan_breakpoints == 1:
+            if fan is not None:
+                curtime = self.heater.reactor.monotonic()
+                print_time = fan.get_mcu().estimated_print_time(curtime)
+                fan.set_speed(0.0, print_time + PIN_MIN_TIME)
             power_base = self.measure_power(
                 ambient_max_measure_time, ambient_measure_sample_time
             )
             gcmd.respond_info(f"Average stable power: {power_base} W")
+            if fan is not None:
+                # One point (fan off), so the saved fan_ambient_transfer
+                # still parses, and MPC, given one point, uses
+                # ambient_transfer at any fan speed.
+                fan_powers.append((0.0, power_base))
         else:
             if fan is not None:
                 for idx in range(0, fan_breakpoints):
