@@ -38,6 +38,8 @@ class FakeToolhead:
                        'max_accel': 20000., 'minimum_cruise_ratio': 0.5}
     def get_status(self, et):
         return dict(self.status)
+    def get_kinematics(self):
+        return FakeKin()
     def get_last_move_time(self):
         return self.last_move_time
     def wait_moves(self):
@@ -110,8 +112,17 @@ class FakeDriver:
 
 
 class FakeStepper:
+    def __init__(self, name):
+        self.name = name
+    def get_name(self):
+        return self.name
     def get_step_dist(self):
         return 40. / (200 * 64)
+
+
+class FakeKin:
+    def get_steppers(self):
+        return [FakeStepper('stepper_x'), FakeStepper('stepper_y')]
 
 
 class FakePrinter:
@@ -161,8 +172,7 @@ def make():
     reads = []
     objs = {'gcode': gc, 'toolhead': th, 'mcu': FakeMcu(r),
             'tmc2241 stepper_x': FakeDriver(FakeMcuTmc(r, reads)),
-            'tmc2241 stepper_y': FakeDriver(FakeMcuTmc(r, reads)),
-            'stepper_x': FakeStepper(), 'stepper_y': FakeStepper()}
+            'tmc2241 stepper_y': FakeDriver(FakeMcuTmc(r, reads))}
     p = FakePrinter(objs, r)
     fd, path = tempfile.mkstemp(suffix='.jsonl')
     os.close(fd)

@@ -58,6 +58,7 @@ class MotorTune:
         self.stepper_names = config.getlist('steppers',
                                             ('stepper_x', 'stepper_y'))
         self.drivers = {}
+        self.steppers = {}
         self.toolhead = self.mcu = None
         self.printer.register_event_handler('klippy:connect',
                                             self._handle_connect)
@@ -69,6 +70,9 @@ class MotorTune:
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         self.mcu = self.printer.lookup_object('mcu')
+        # Steppers are not printer objects: the kinematics hold them.
+        for s in self.toolhead.get_kinematics().get_steppers():
+            self.steppers[s.get_name()] = s
         for name in self.stepper_names:
             for drv in DRIVERS:
                 obj = self.printer.lookup_object('%s %s' % (drv, name), None)
@@ -78,6 +82,17 @@ class MotorTune:
 
     # Register reads
     def _read_driver(self, name):
+        # Never let a read take Klipper down (an exception in a command is
+        # a shutdown): log it in the record instead.
+        try:
+            return self._read_driver_regs(name)
+        except self.printer.command_error:
+            raise
+        except Exception as e:
+            logging.exception("motor_tune: reading %s", name)
+            return {'error': repr(e)}
+
+    def _read_driver_regs(self, name):
         mcu_tmc = self.drivers[name].mcu_tmc
         fields = mcu_tmc.get_fields()
         out = {}
@@ -94,7 +109,11 @@ class MotorTune:
                     out[f] = fields.get_field(f, val)
         tstep = out.get('tstep')
         if tstep and tstep < 0xfffff:
-            out['speed_measured'] = round(self._tstep_speed(name, tstep), 2)
+            try:
+                out['speed_measured'] = round(
+                    self._tstep_speed(name, tstep), 2)
+            except Exception:
+                logging.exception("motor_tune: speed from TSTEP")
         return out
 
     def _tstep_speed(self, name, tstep):
@@ -102,7 +121,7 @@ class MotorTune:
         # (fCLK 12.5 MHz), whatever the configured microstepping.
         # As TMCtstepHelper: step_dist at the configured microstepping,
         # divided down to 1/256.
-        stepper = self.printer.lookup_object(name)
+        stepper = self.steppers[name]
         mcu_tmc = self.drivers[name].mcu_tmc
         step_dist_256 = stepper.get_step_dist() / (
             1 << mcu_tmc.get_fields().get_field('mres'))
