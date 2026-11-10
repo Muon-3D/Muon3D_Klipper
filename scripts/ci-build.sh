@@ -135,6 +135,12 @@ $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
+# MUON: TAP_TRACE per-tap CSV and its summary script (KAN-1361).
+start_test tap_trace "Test TAP_TRACE CSV writer and summary"
+$PYTHON test/tap_path/test_tap_trace.py
+$PYTHON test/tap_path/test_tap_onset.py
+finish_test tap_trace "Test TAP_TRACE CSV writer and summary"
+
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
 start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
