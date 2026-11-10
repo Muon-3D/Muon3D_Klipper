@@ -293,9 +293,12 @@ The following command is available when a
 enabled.
 
 #### SET_CONTACT_GUARD
-`SET_CONTACT_GUARD [ENABLE=<0|1>] [REZERO=1 [FORCE=1] [TRY=1]]`: Turn
-the contact guard off or back on, for macros that must move X or Y with
-the nozzle loaded. REZERO=1 takes the steady load the cell reads now as
+`SET_CONTACT_GUARD [ENABLE=<0|1> [TIMEOUT=<seconds>]] [REZERO=1 [FORCE=1]
+[TRY=1]]`: Turn the contact guard off or back on, for macros that must
+move X or Y with the nozzle loaded. With TIMEOUT, ENABLE=0 only stands
+the guard aside: it is enabled again after that many seconds, or at once
+on any command error, should the macro not reach its ENABLE=1
+(CUT_FILAMENT uses it for the press into the cutter). REZERO=1 takes the steady load the cell reads now as
 the new zero and clears contact; it is for an offset that is not a
 touch, such as filament tension after an extruder FORCE_MOVE. It waits
 for queued moves, and fails (leaving contact as it was) unless Z was

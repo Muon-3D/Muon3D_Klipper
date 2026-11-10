@@ -180,3 +180,9 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
+# (KAN-1940); batch mode exits on any error, so this reads the log.
+start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+$PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
+finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"

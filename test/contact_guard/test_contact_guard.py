@@ -457,6 +457,9 @@ class Cmd:
         self.info = []
     def get_int(self, name, default, minval=None, maxval=None):
         return self.params.get(name, default)
+    def get_float(self, name, default, minval=None, maxval=None,
+                  above=None):
+        return self.params.get(name, default)
     def respond_info(self, msg):
         self.info.append(msg)
 
@@ -470,6 +473,61 @@ def test_enable():
     check(r.refused(60, 50, 5) is None, "XY allowed with ENABLE=0")
     r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
     check(r.refused(70, 50, 5) == REFUSAL, "ENABLE=1 refuses again")
+
+
+def test_stand_aside_times_out():
+    # KAN-1940: CUT_FILAMENT stands the guard aside for the cutter press,
+    # ENABLE=0 TIMEOUT=<s>.  Should the macro never get to ENABLE=1, the
+    # guard is back on its own once the timeout has run
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    check(not r.status()['enabled'], "ENABLE=0 TIMEOUT=30 stands aside")
+    check(r.refused(60, 50, 5) is None, "XY allowed while standing aside")
+    r.printer.reactor.now += 29.
+    check(r.refused(62, 50, 5) is None, "still aside before the timeout")
+    r.printer.reactor.now += 2.
+    r.feed(200000, 0.05)            # the stream goes on meanwhile
+    check(r.status()['enabled'], "enabled again after the timeout")
+    check(r.refused(70, 50, 5) == REFUSAL, "and refusing again")
+
+
+def test_stand_aside_ends_on_command_error():
+    # Klipper macros have no try/finally: an error part-way through the cut
+    # (at any macro level, even one PRINT_END's park then catches) leaves no
+    # ENABLE=1 to run.  The error itself ends the stand-aside
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    r.report(CommandError("injected"), levels=3)
+    check(r.status()['enabled'], "a command error ends the stand-aside")
+    check(r.refused(70, 50, 5) == REFUSAL, "and the guard refuses again")
+
+
+def test_stand_aside_ends_on_enable():
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
+    check(r.refused(70, 50, 5) == REFUSAL, "ENABLE=1 ends the stand-aside")
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0))
+    r.printer.reactor.now += 31.
+    r.feed(200000, 0.05)
+    r.report(CommandError("unrelated"))
+    check(not r.status()['enabled'] and r.refused(72, 50, 5) is None,
+          "a plain ENABLE=0 stays off: no stale timeout, errors leave it")
+
+
+def test_stand_aside_timeout_needs_enable_0():
+    r = Rig()
+    for params in ({'TIMEOUT': 30.}, {'ENABLE': 1, 'TIMEOUT': 30.}):
+        try:
+            r.guard.cmd_SET_CONTACT_GUARD(Cmd(**params))
+        except CommandError:
+            pass
+        else:
+            raise AssertionError("TIMEOUT accepted with %s" % (params,))
+    check(r.status()['enabled'], "and nothing changed")
 
 
 def test_drift():
