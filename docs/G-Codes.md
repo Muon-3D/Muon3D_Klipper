@@ -1858,6 +1858,9 @@ false for the toolhead MCU coming up at a Klipper start.
 #### MACHINE_PLATE_CLEAR
 `MACHINE_PLATE_CLEAR`: Say the plate is clear of the last print, so a new
 print may start without the plate being taken off and refitted.
+Printer-only: muon_guard refuses it from every client door (Moonraker,
+the serial pty, a print file) outside dev mode, so no remote client can
+declare the plate cleared.
 
 #### MACHINE_STATUS
 `MACHINE_STATUS`: Report the activity, the conditions, and what each action

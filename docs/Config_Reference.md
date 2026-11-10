@@ -4966,7 +4966,8 @@ file as printing, not toolhead motion.
 #   it to the print's target. 0 keeps it on.
 #require_plate_cleared: True
 #   After a print that printed something, refuse the next print until the
-#   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR).
+#   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR, which
+#   muon_guard refuses from every client door: printer-only).
 #pause_cool_temp:
 #   On a pause, a part fan that was on keeps running at the print's speed
 #   until the hot end is below this temperature, where filament no longer

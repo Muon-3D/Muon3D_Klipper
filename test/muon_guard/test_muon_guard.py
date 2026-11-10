@@ -665,6 +665,29 @@ def test_abortable_file_line_is_checked():
           "an abortable script with no origin is not checked")
 
 
+def test_plate_clear_is_printer_only():
+    # Jack, 10 Nov 2026: a remote client (Control, the app, an agent) may
+    # not declare the plate cleared, from any door, even if someone puts it
+    # on the allowlist. The printer's own path (a macro, the refit the plate
+    # detector sees) still marks it clear.
+    for allow in (None, core_allow() + '\nMACHINE_PLATE_CLEAR'):
+        rig = Rig(allow=allow)
+        rig._register('MACHINE_PLATE_CLEAR')
+        for origin in ('webhooks', 'pty', 'file'):
+            err = rig.client('MACHINE_PLATE_CLEAR', origin)
+            check(err is not None and 'Only at the printer' in err
+                  and 'fit it back' in err,
+                  "remote MACHINE_PLATE_CLEAR refused from %s: %r"
+                  % (origin, err))
+            check(rig.calls == [], "and it did not run (%s)" % (origin,))
+        rig.from_macro('MACHINE_PLATE_CLEAR')
+        check(rig.calls == ['MACHINE_PLATE_CLEAR'],
+              "a printer macro still runs MACHINE_PLATE_CLEAR")
+        rig.internal('MACHINE_PLATE_CLEAR')
+        check(rig.calls == ['MACHINE_PLATE_CLEAR'],
+              "an internal source still runs MACHINE_PLATE_CLEAR")
+
+
 def test_tag_is_what_decides():
     # Negative control. Without the tag the same line is not refused, so the
     # refusals above are the tag working and not an accident of the rig.
@@ -1044,9 +1067,8 @@ def test_every_macro_is_classified():
     # m1_machine: the report and the plate-cleared word are a client's; the
     # gate waits hold the gcode mutex and the event commands record what the
     # machine did, so a client may send none of them.
-    for name in ('MACHINE_STATUS', 'MACHINE_PLATE_CLEAR'):
-        check(name in allowed, "%s is on the allowlist" % (name,))
-    for name in ('MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
+    check('MACHINE_STATUS' in allowed, "MACHINE_STATUS is on the allowlist")
+    for name in ('MACHINE_PLATE_CLEAR', 'MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
                  'MACHINE_PAUSED', 'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED',
                  'MACHINE_TOOLHEAD_CONNECTED'):
         check(name not in allowed, "%s is not on the allowlist" % (name,))

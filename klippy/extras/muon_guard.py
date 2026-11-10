@@ -49,6 +49,18 @@ FREE_TEXT_COMMANDS = ('M117', 'M118', 'M23')
 # Commands that start or resume a print; blocked while the saved Z offset
 # is out of range (the probe ignores it and reports z_offset_invalid)
 PRINT_STARTS = ('PRINT_START', 'SDCARD_PRINT_FILE', 'M24')
+# Confirmations a person gives at the printer, never through a client door,
+# whatever client_allow says (Jack, 10 Nov 2026: confirmations meant for the
+# printer happen on the printer). Klipper cannot tell the panel from Control
+# or the app (all of them come in through Moonraker's webhooks), so these
+# are refused from every client door; the printer's own macros still run
+# them, and dev mode still allows them.
+PRINTER_ONLY = {
+    'MACHINE_PLATE_CLEAR':
+        "Only at the printer: a remote client cannot mark the plate clear."
+        " Take the build plate off and fit it back at the printer, which"
+        " marks it clear",
+}
 
 NAME_RE = re.compile(r'^[A-Z0-9_.]+$')
 KEY_RE = re.compile(r'^[A-Z0-9_]+$')
@@ -240,6 +252,8 @@ class MuonGuard:
             first = cmd.split()[0]
             if first in FREE_TEXT_COMMANDS:
                 name = first
+        if name in PRINTER_ONLY:
+            return False, PRINTER_ONLY[name]
         rules = self.rules.get(name)
         if rules is None:
             # Nothing is registered under this name, so nothing will run:
@@ -333,7 +347,7 @@ class MuonGuard:
         self.last_refusal = why
         logging.warning("muon_guard: refused %s command: %s (%s)", origin,
                         gcmd.get_commandline(), why)
-        if why.startswith('Saved Z offset'):
+        if why.startswith('Saved Z offset') or why in PRINTER_ONLY.values():
             raise gcmd.error(why)
         raise gcmd.error(
             "Refused: %s. Dev mode is off, so a client may only start the "
