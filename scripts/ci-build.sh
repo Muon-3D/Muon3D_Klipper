@@ -140,6 +140,7 @@ start_test tap_trace "Test TAP_TRACE CSV writer and summary"
 $PYTHON test/tap_path/test_tap_trace.py
 $PYTHON test/tap_path/test_tap_onset.py
 $PYTHON test/tap_path/test_tap_confirm.py
+$PYTHON test/tap_path/test_tap_overtravel.py
 finish_test tap_trace "Test TAP_TRACE CSV writer and summary"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).

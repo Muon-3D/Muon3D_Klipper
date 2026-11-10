@@ -361,12 +361,13 @@ class ADXL345Probe:
         def opt(name, getter, default, **kw):
             base = getter('tap_confirm_%s' % (name,), default, **kw)
             return getter('%s_tap_confirm_%s' % (axis, name), base, **kw)
-        return {
+        profile = {
             'samples': opt('samples', config.getint, 1, minval=1),
             'tolerance': opt('tolerance', config.getfloat, 0.2, above=0.),
             'retries': opt('retries', config.getint, 2, minval=0),
             'retract_dist': opt('retract_dist', config.getfloat, 3.,
                                 above=0.),
+            'overtravel': opt('overtravel', config.getfloat, None),
             'retract_speed': opt('retract_speed', config.getfloat, None,
                                  above=0.),
             'speed': opt('speed', config.getfloat, None, above=0.),
@@ -381,6 +382,18 @@ class ADXL345Probe:
                               self._default_stall_dist(config, axis),
                               minval=0.),
         }
+        overtravel = profile['overtravel']
+        if overtravel is not None:
+            if overtravel < 0.15:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be at least 0.15mm"
+                    " to leave room for the homing deceleration distance"
+                    % (axis,))
+            if overtravel >= profile['retract_dist']:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be less than"
+                    " tap_confirm_retract_dist" % (axis,))
+        return profile
 
     def _default_stall_dist(self, config, axis):
         # One electrical cycle of the axis' stepper, in mm.
@@ -1059,6 +1072,9 @@ class ADXL345Probe:
         speed = cfg['speed'] or hi.speed
         retract_speed = cfg['retract_speed'] or hi.retract_speed
         retract_dist = cfg['retract_dist']
+        overtravel = cfg['overtravel']
+        if overtravel is None:
+            overtravel = retract_dist
         arm_delay = self.axis_homing_arm_delay.get(axis, 0.)
         if retract_dist <= speed * arm_delay:
             raise cmderr(
@@ -1137,34 +1153,43 @@ class ADXL345Probe:
         seek_left = cfg['seek_retries']
         stalls = 0
         while len(accepted) < cfg['samples']:
-            # Back off, then re-approach over twice the retract distance.
+            # Cap follow-through to avoid driving into the stop after a missed tap.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
             toolhead.move(retractpos, retract_speed)
             self._trace_phase = 'confirm'
-            trig, travelled, info = run_homing_move(retract_dist * 2., speed)
+            trig, travelled, info = run_homing_move(
+                retract_dist + overtravel, speed)
             if trig is None:
-                # Nothing within reach: the previous tap was spurious.
+                # No tap within reach; retain the bounded seek fallback.
                 # Resume the seek from here within the travel budget.
                 seek_budget -= travelled
+                capped = ""
+                if cfg['overtravel'] is not None:
+                    capped = ("; approach capped at %.3fmm past the previous"
+                              " tap: previous tap spurious or stop further on"
+                              % (overtravel,))
+                    logging.info("adxl345_probe: %s no trigger%s", axis, capped)
                 if seek_left <= 0 or seek_budget <= 0.:
                     raise cmderr(
                         "adxl345_probe: %s home tap not confirmed; no"
                         " contact within %.1fmm of the reported tap"
-                        " and seek retries exhausted"
-                        % (axis, retract_dist))
+                        " and seek retries exhausted%s"
+                        % (axis, retract_dist, capped))
                 seek_left -= 1
                 seek_dist = seek_budget
-                logging.info("adxl345_probe: %s tap judged spurious,"
+                logging.info("adxl345_probe: %s %s,"
                              " resuming seek for up to %.1fmm",
-                             axis, seek_dist)
+                             axis, ("capped approach had no trigger"
+                                    if capped else "tap judged spurious"),
+                             seek_dist)
                 self._trace_phase = 'resume_seek'
                 trig, travelled, info = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:
                     raise cmderr(
                         "adxl345_probe: %s home failed; no tap within"
-                        " %.1fmm of resumed seek" % (axis, seek_dist))
+                        " %.1fmm of resumed seek%s" % (axis, seek_dist, capped))
                 accepted = [trig]
                 continue
             delta, kind = compare(accepted[-1], trig, info)

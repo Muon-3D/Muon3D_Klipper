@@ -1,0 +1,9 @@
+# Exercise capped Y confirmation and unchanged single-tap X in batch mode.
+CONFIG adxl345_probe_overtravel.cfg
+DICTIONARY linuxprocess.dict
+
+G28 Y
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.009
+G28 Y
+G28 X
+G1 X50 Y50 F6000
