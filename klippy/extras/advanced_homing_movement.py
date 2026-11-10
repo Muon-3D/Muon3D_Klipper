@@ -95,7 +95,16 @@ class AxisAdvancedHomingMovement:
         return self.last
 
     def get_status(self, eventtime=None):
-        return {'last': dict(self.last)}
+        # mcu_steps: each X/Y/Z stepper's position in microsteps as the mcu
+        # counts them. Homing resets the commanded position, not these, so
+        # the same commanded position before and after a re-home differs
+        # here by exactly the steps the motor lost (STEPLOSS_TEST).
+        steps = {}
+        toolhead = self.printer.lookup_object('toolhead', None)
+        if toolhead is not None:
+            for s in toolhead.get_kinematics().get_steppers():
+                steps[s.get_name()] = s.get_mcu_position()
+        return {'last': dict(self.last), 'mcu_steps': steps}
 
     def _parse_endstop_source(self, config, option, default):
         raw = config.get(option, default)
