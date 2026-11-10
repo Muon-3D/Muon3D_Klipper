@@ -291,7 +291,18 @@ class Suite:
         tid = 'preflight'
         self.check()
         self.gcode("TURN_OFF_HEATERS\nM107")
-        self.gcode("G28")
+        # Straight after a Klipper restart HOMING_GATE can still see the
+        # toolhead and the Z column as missing and put up a prompt instead
+        # of homing, so G28 returns with nothing homed. Retry until Z homes.
+        for attempt in range(6):
+            self.gcode("G28")
+            if self.dry or 'z' in self.query(['toolhead'])['toolhead'][
+                    'homed_axes']:
+                break
+            self.log("G28 did not home Z (homing gate?), retrying in 10 s")
+            time.sleep(10)
+        else:
+            raise Stop("G28 does not home Z")
         self.gcode("G90\nG1 Z60 F600\nM400")
         self.gcode("MOTOR_TUNE_READ LABEL=preflight")
         snap = {}
