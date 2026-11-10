@@ -18,6 +18,15 @@
 #   both CoreXY motors at SPEED.
 # MOTOR_TUNE_READ LABEL=<text> TAG=<json>
 #   The same registers at standstill (PWM_AUTO after StealthChop tuning).
+# MOTOR_TUNE_MARK NAME=<n>, then G28 X Y, then MOTOR_TUNE_MEASURE NAME=<m>
+#   MARK=<n>
+#   Where the re-home's first X and first Y tap triggered, in the coordinates
+#   in use at the mark: the X/Y error accumulated since the last home, plus
+#   the tap's own repeat. Only the first tap of each axis is used: after it
+#   the motors are driven on into the stop and skip (about 4.8 mm on motor A
+#   per G28 X Y on sloe, 2026-11-10), so later step counts no longer match
+#   the carriage. Taken the same way before and after a stress, the
+#   difference is the steps lost in between (STEPLOSS_TEST).
 #
 # The registers say:
 #   pwm_scale_sum  StealthChop's drive amplitude, 0-1023 on the TMC2240/41
@@ -60,8 +69,17 @@ class MotorTune:
         self.drivers = {}
         self.steppers = {}
         self.toolhead = self.mcu = None
+        self.homing_moves = []
+        self.marks = {}
+        self.measures = {}
         self.printer.register_event_handler('klippy:connect',
                                             self._handle_connect)
+        self.printer.register_event_handler('homing:homing_move_end',
+                                            self._handle_homing_move_end)
+        self.gcode.register_command('MOTOR_TUNE_MARK', self.cmd_MARK,
+                                    desc=self.cmd_MARK_help)
+        self.gcode.register_command('MOTOR_TUNE_MEASURE', self.cmd_MEASURE,
+                                    desc=self.cmd_MEASURE_help)
         self.gcode.register_command('MOTOR_TUNE_SAMPLE', self.cmd_SAMPLE,
                                     desc=self.cmd_SAMPLE_help)
         self.gcode.register_command('MOTOR_TUNE_READ', self.cmd_READ,
@@ -79,6 +97,65 @@ class MotorTune:
                 if obj is not None:
                     self.drivers[name] = obj
                     break
+
+    # Homing trigger positions
+    def _handle_homing_move_end(self, hmove):
+        rec = {}
+        for sp in getattr(hmove, 'stepper_positions', []):
+            rec[sp.stepper_name] = (sp.start_pos, sp.trig_pos)
+        self.homing_moves.append(rec)
+        del self.homing_moves[:-40]
+
+    def get_status(self, eventtime=None):
+        return {'measures': dict(self.measures)}
+
+    cmd_MARK_help = "Bench: mark the X/Y step counts before a re-home"
+    def cmd_MARK(self, gcmd):
+        name = gcmd.get('NAME')
+        self.toolhead.wait_moves()
+        mark = {}
+        for n, s in self.steppers.items():
+            mark[n] = (s.get_mcu_position(), s.get_commanded_position(),
+                       s.get_step_dist())
+        self.marks[name] = mark
+        self.homing_moves = []
+
+    cmd_MEASURE_help = ("Bench: where the first X and Y taps since a mark"
+                        " triggered, in the mark's coordinates")
+    def cmd_MEASURE(self, gcmd):
+        name = gcmd.get('NAME')
+        mark = self.marks.get(gcmd.get('MARK'))
+        if mark is None:
+            raise gcmd.error("MOTOR_TUNE_MEASURE: no mark %s"
+                             % (gcmd.get('MARK'),))
+        kin = self.toolhead.get_kinematics()
+        out = {'x': None, 'y': None, 'moves': len(self.homing_moves)}
+        for rec in self.homing_moves:
+            if 'stepper_x' not in rec or 'stepper_y' not in rec:
+                continue
+            (sa, ta), (sb, tb) = rec['stepper_x'], rec['stepper_y']
+            if ta is None or tb is None:
+                continue
+            da, db = ta - sa, tb - sb
+            if abs(da) < 10 and abs(db) < 10:
+                continue
+            # CoreXY: an X move turns both motors the same way, Y opposite.
+            axis = 'x' if da * db > 0 else 'y'
+            if out[axis] is not None:
+                continue
+            pos = {n: 0. for n in self.steppers}
+            for n, (m0, c0, sd) in mark.items():
+                if n in rec:
+                    pos[n] = c0 + (rec[n][1] - m0) * sd
+            xyz = kin.calc_position(pos)
+            out[axis] = round(xyz[0 if axis == 'x' else 1], 4)
+        self.measures[name] = out
+        rec = {'kind': 'measure', 'name': name}
+        rec.update(out)
+        self._log(rec)
+        gcmd.respond_info("MOTOR_TUNE_MEASURE %s: first X tap at %s, first"
+                          " Y tap at %s (in the mark's coordinates)"
+                          % (name, out['x'], out['y']))
 
     # Register reads
     def _read_driver(self, name):

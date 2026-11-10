@@ -231,19 +231,24 @@ class Suite:
             rec.update(passed=True, final=True)
             self.record(rec)
             return True, rec
-        v = self.query(['gcode_macro STEPLOSS_TEST', 'configfile'])
-        t = v['gcode_macro STEPLOSS_TEST']
-        cfg = v['configfile']['settings']['stepper_x']
-        sd = float(cfg['rotation_distance']) / (
-            float(cfg.get('full_steps_per_rotation', 200))
-            * float(cfg['microsteps']))
-        da = (t['after_a'] - t['before_a']) * sd
-        db = (t['after_b'] - t['before_b']) * sd
-        limit = max(0.1, 3. * (self.noise_mm or 0.))
+        m = self.query(['motor_tune'])['motor_tune']['measures']
+        bef, aft = m.get('before') or {}, m.get('after') or {}
+        if None in (bef.get('x'), bef.get('y'), aft.get('x'), aft.get('y')):
+            rec.update(error="no tap in a measuring home: before %s,"
+                       " after %s" % (bef, aft), passed=False, final=True,
+                       seconds=round(time.time() - t0, 1))
+            self.log("%s: ERROR %s" % (tid, rec['error']))
+            self.record(rec)
+            return False, rec
+        dx, dy = aft['x'] - bef['x'], aft['y'] - bef['y']
+        da, db = dx + dy, dx - dy
+        # The pass limit: 0.1 mm, or above the taps' own repeat (the noise
+        # runs) with margin. A pole slip is 0.8 mm.
+        limit = max(0.1, 1.5 * (self.noise_mm or 0.))
         passed = max(abs(da), abs(db)) <= limit
         rec.update(motor_a_mm=round(da, 4), motor_b_mm=round(db, 4),
-                   x_mm=round((da + db) / 2., 4),
-                   y_mm=round((da - db) / 2., 4), limit_mm=round(limit, 4),
+                   x_mm=round(dx, 4), y_mm=round(dy, 4),
+                   before=bef, after=aft, limit_mm=round(limit, 4),
                    passed=passed, final=True,
                    seconds=round(time.time() - t0, 1),
                    temps_after=self.temps())

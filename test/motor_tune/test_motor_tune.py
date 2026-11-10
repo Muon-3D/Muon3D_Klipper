@@ -111,18 +111,47 @@ class FakeDriver:
         self.mcu_tmc = mcu_tmc
 
 
+SD = 40. / (200 * 64)
+
+
 class FakeStepper:
+    """mcu count = commanded / SD + offset."""
     def __init__(self, name):
         self.name = name
+        self.cmd = 0.
+        self.offset = 1000
     def get_name(self):
         return self.name
     def get_step_dist(self):
-        return 40. / (200 * 64)
+        return SD
+    def get_commanded_position(self):
+        return self.cmd
+    def get_mcu_position(self):
+        return int(round(self.cmd / SD)) + self.offset
+
+
+STEPPERS = {}
 
 
 class FakeKin:
     def get_steppers(self):
-        return [FakeStepper('stepper_x'), FakeStepper('stepper_y')]
+        if not STEPPERS:
+            for n in ('stepper_x', 'stepper_y'):
+                STEPPERS[n] = FakeStepper(n)
+        return list(STEPPERS.values())
+    def calc_position(self, sp):
+        a, b = sp['stepper_x'], sp['stepper_y']
+        return [0.5 * (a + b), 0.5 * (a - b), 0.]
+
+
+class FakeSP:
+    def __init__(self, name, start, trig):
+        self.stepper_name, self.start_pos, self.trig_pos = name, start, trig
+
+
+class FakeHMove:
+    def __init__(self, sps):
+        self.stepper_positions = sps
 
 
 class FakePrinter:
@@ -214,6 +243,47 @@ class TestMotorTune(unittest.TestCase):
         os.unlink(path)
         self.assertEqual(reads, [])
         self.assertIn('no constant-speed part', g.out[-1])
+
+    def _home_from(self, mt, x, y, trig_x, trig_y):
+        """At commanded (x, y): mark, then a Y tap at trig_y and an X tap
+        at trig_x (in the marked coordinates), as a G28 X Y does."""
+        sa, sb = STEPPERS['stepper_x'], STEPPERS['stepper_y']
+        sa.cmd, sb.cmd = x + y, x - y
+        mt.cmd_MARK(FakeGcmd({'NAME': 'm'}))
+        a0, b0 = sa.get_mcu_position(), sb.get_mcu_position()
+        dy = int(round((trig_y - y) / SD))
+        mt._handle_homing_move_end(FakeHMove([
+            FakeSP('stepper_x', a0, a0 + dy),
+            FakeSP('stepper_y', b0, b0 - dy)]))
+        # The Y home's overrun then skips 300 steps on A: counts no longer
+        # match the carriage.
+        a1, b1 = a0 + dy + 300, b0 - dy
+        dx = int(round((trig_x - x) / SD))
+        mt._handle_homing_move_end(FakeHMove([
+            FakeSP('stepper_x', a1, a1 + dx),
+            FakeSP('stepper_y', b1, b1 + dx)]))
+        mt.cmd_MEASURE(FakeGcmd({'NAME': 'r', 'MARK': 'm'}))
+        return dict(mt.measures['r'])
+
+    def test_first_taps_measured_in_the_marked_frame(self):
+        mt, gc, th, reads, path = make()
+        r = self._home_from(mt, 100., 100., 200., 174.)
+        os.unlink(path)
+        self.assertAlmostEqual(r['y'], 174., delta=0.01)
+        # X carries the Y overrun's skip (300 steps on A, half in X); taken
+        # the same way before and after a stress, it cancels.
+        self.assertAlmostEqual(r['x'], 200. + 0.5 * 300 * SD, delta=0.01)
+
+    def test_a_lost_pole_shows_as_a_shift(self):
+        mt, gc, th, reads, path = make()
+        before = self._home_from(mt, 100., 100., 200., 174.)
+        # Motor A lost 4 full steps (0.8 mm): the taps come 0.4 mm later in
+        # X and in Y.
+        after = self._home_from(mt, 100., 100., 200.4, 174.4)
+        os.unlink(path)
+        dx, dy = after['x'] - before['x'], after['y'] - before['y']
+        self.assertAlmostEqual(dx + dy, 0.8, delta=0.01)
+        self.assertAlmostEqual(dx - dy, 0., delta=0.01)
 
     def test_unhomed_is_refused(self):
         mt, gc, th, reads, path = make()
