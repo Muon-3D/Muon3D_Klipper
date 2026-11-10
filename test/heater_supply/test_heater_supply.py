@@ -131,7 +131,11 @@ class FakeConfig:
     def get(self, key, default=None):
         return self.opts.get(key, default)
     def getfloat(self, key, default=None, above=None):
-        return float(self.opts.get(key, default))
+        # An option given as None counts as absent.
+        value = self.opts.get(key)
+        if value is None:
+            value = default
+        return None if value is None else float(value)
     def getfloatlist(self, key, default=None, count=None):
         return self.opts.get(key, default)
 
@@ -240,6 +244,24 @@ def drive(supply, heater, zp, seconds, duty, amps, start=0.):
 
 
 class TestHeaterSupply(unittest.TestCase):
+    # The core config gives default_resistance; a learnt value saved to the
+    # calibration file as `resistance` takes over. (A core `resistance` made
+    # that save a config error: sloe would not start, 2026-11-10.)
+    def test_default_resistance_from_the_core_config(self):
+        supply, _h, _zp, _cf = make_supply(resistance=None,
+                                           default_resistance=11.9)
+        self.assertEqual(supply.estimator.resistance, 11.9)
+
+    def test_saved_resistance_takes_over_from_the_default(self):
+        supply, _h, _zp, _cf = make_supply(resistance=16.383,
+                                           default_resistance=11.9)
+        self.assertEqual(supply.estimator.resistance, 16.383)
+        self.assertAlmostEqual(supply.available_power(), 45. ** 2 / 16.383)
+
+    def test_no_resistance_at_all_is_a_config_error(self):
+        with self.assertRaises(FakeConfigError):
+            make_supply(resistance=None)
+
     def test_available_power_tracks_the_rail(self):
         supply, _h, _zp, _cf = make_supply(volts=48.)
         self.assertAlmostEqual(supply.available_power(), 48. ** 2 / 11.9)
