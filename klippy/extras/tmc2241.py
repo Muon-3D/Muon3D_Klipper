@@ -10,7 +10,7 @@
 # field. The supply voltage ADC is scaled differently, and the datasheet
 # current equation includes the 248/256 amplitude of the default
 # microstep table.
-import math
+import logging, math
 from . import tmc, tmc2130, tmc2240, tmc_uart
 
 TMC_FREQUENCY=12500000.
@@ -66,12 +66,92 @@ FieldFormatters.update({
 MSLUT_AMPLITUDE = 248. / 256.
 
 class TMC2241CurrentHelper(tmc2240.TMC2240CurrentHelper):
+    # Burst current (Muon3D, 2026-11-10). The current range (DRV_CONF) is
+    # chosen at startup from run_current and caps SET_TMC_CURRENT: 1.370 A
+    # for run_current 0.8 A at RREF 12k. With burst_current set, a
+    # SET_TMC_CURRENT above that cap moves the driver up a range for as long
+    # as it lasts, and a lower one moves it back. burst_time is a backstop:
+    # a burst still running that long after it started is ended (back to
+    # run_current), so a macro that stops before its own restore can't leave
+    # the motors at burst current. Without burst_current, nothing changes.
+    def __init__(self, config, mcu_tmc):
+        tmc2240.TMC2240CurrentHelper.__init__(self, config, mcu_tmc)
+        self.base_range = self.fields.get_field("current_range")
+        self.base_run_current = config.getfloat('run_current')
+        self.burst_current = config.getfloat(
+            'burst_current', None, above=self._get_ifs_rms(self.base_range),
+            maxval=self._get_ifs_rms(3))
+        self.burst_time = config.getfloat('burst_time', 5., above=0.)
+        self.reactor = self.printer.get_reactor()
+        self.burst_timer = None
+        self.burst_seq = 0
     def _get_ifs_rms(self, current_range=None):
         if current_range is None:
             current_range = self.fields.get_field("current_range")
         KIFS = [11750., 24000., 36000., 36000.]
         return ((KIFS[current_range] / self.Rref) * MSLUT_AMPLITUDE
                 / math.sqrt(2.))
+    def get_current(self):
+        run, hold, req_hold, ifs = (
+            tmc2240.TMC2240CurrentHelper.get_current(self))
+        # The most SET_TMC_CURRENT may ask for.
+        if self.burst_current is not None:
+            ifs = max(ifs, self.burst_current)
+        return run, hold, req_hold, ifs
+    def _write_range(self, current_range, print_time):
+        val = self.fields.set_field("current_range", current_range)
+        self.mcu_tmc.set_register("DRV_CONF", val, print_time)
+    def set_current(self, run_current, hold_current, print_time):
+        if self.burst_current is None:
+            tmc2240.TMC2240CurrentHelper.set_current(
+                self, run_current, hold_current, print_time)
+            return
+        new_range = max(self.base_range,
+                        self._calc_current_range(run_current))
+        old_range = self.fields.get_field("current_range")
+        # Change the range on the side that keeps the current between the
+        # old and new values: currents then range going up, the reverse
+        # going down.
+        if new_range < old_range:
+            self._write_range(new_range, print_time)
+        else:
+            self.fields.set_field("current_range", new_range)
+        tmc2240.TMC2240CurrentHelper.set_current(
+            self, run_current, hold_current, print_time)
+        if new_range > old_range:
+            self.fields.set_field("current_range", old_range)
+            self._write_range(new_range, print_time)
+        if new_range > self.base_range:
+            self._arm_backstop(print_time)
+        else:
+            self._disarm_backstop()
+    def _arm_backstop(self, print_time):
+        self.burst_seq += 1
+        mcu = self.mcu_tmc.get_mcu()
+        now = self.reactor.monotonic()
+        lead = max(0., print_time - mcu.estimated_print_time(now))
+        waketime = now + lead + self.burst_time
+        if self.burst_timer is None:
+            self.burst_timer = self.reactor.register_timer(
+                self._end_burst, waketime)
+        else:
+            self.reactor.update_timer(self.burst_timer, waketime)
+    def _disarm_backstop(self):
+        if self.burst_timer is not None:
+            self.reactor.update_timer(self.burst_timer, self.reactor.NEVER)
+    def _end_burst(self, eventtime):
+        if self.fields.get_field("current_range") > self.base_range:
+            msg = ("%s: burst current still on after %.1f s, back to"
+                   " run_current %.2f A" % (self.name, self.burst_time,
+                                            self.base_run_current))
+            logging.warning(msg)
+            mcu = self.mcu_tmc.get_mcu()
+            self.set_current(self.base_run_current, self.req_hold_current,
+                             mcu.estimated_print_time(eventtime) + 0.100)
+            gcode = self.printer.lookup_object('gcode', None)
+            if gcode is not None:
+                gcode.respond_info(msg)
+        return self.reactor.NEVER
 
 
 ######################################################################
