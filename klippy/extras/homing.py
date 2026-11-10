@@ -76,6 +76,20 @@ class HomingMove:
                 for cp, tp in zip(cpos, thpos[:3])] + thpos[3:]
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):
+        self.command_end = list(movepos)
+        try:
+            return self._homing_move(movepos, speed, probe_pos,
+                                     triggered, check_triggered)
+        except self.printer.command_error as e:
+            summaries = self.printer.send_event(
+                'homing:homing_move_error', self, e)
+            details = '; '.join(s for s in summaries if s)
+            if details:
+                raise self.printer.command_error('%s; %s' % (e, details))
+            raise
+
+    def _homing_move(self, movepos, speed, probe_pos=False,
+                     triggered=True, check_triggered=True):
         # Notify start of homing/probing move
         self.printer.send_event("homing:homing_move_begin", self)
         # Note start location
@@ -160,6 +174,7 @@ class HomingMove:
                 haltpos = self.calc_toolhead_pos(halt_kin_spos, over_steps)
             self.toolhead.set_position(haltpos)
         # Signal homing/probing move complete
+        self.move_error = error
         try:
             self.printer.send_event("homing:homing_move_end", self)
         except self.printer.command_error as e:
@@ -204,6 +219,18 @@ class Homing:
     def set_homed_position(self, pos):
         self.toolhead.set_position(self._fill_coord(pos))
     def home_rails(self, rails, forcepos, movepos):
+        try:
+            self._home_rails(rails, forcepos, movepos)
+        except self.printer.command_error as e:
+            summaries = self.printer.send_event(
+                'homing:home_rails_error', self, rails, e)
+            details = '; '.join(s for s in summaries if s)
+            if details:
+                raise self.printer.command_error('%s; %s' % (e, details))
+            raise
+        self.printer.send_event('homing:home_rails_complete', self, rails)
+
+    def _home_rails(self, rails, forcepos, movepos):
         # Notify of upcoming homing operation
         self.printer.send_event("homing:home_rails_begin", self, rails)
         # Alter kinematics class to think printer is at forcepos

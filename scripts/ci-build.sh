@@ -142,6 +142,7 @@ $PYTHON test/tap_path/test_tap_onset.py
 $PYTHON test/tap_path/test_tap_confirm.py
 $PYTHON test/tap_path/test_tap_overtravel.py
 $PYTHON test/tap_path/test_tap_failsafe.py
+$PYTHON test/tap_path/test_y_tap_log.py
 finish_test tap_trace "Test TAP_TRACE CSV writer and summary"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).

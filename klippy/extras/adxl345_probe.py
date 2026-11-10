@@ -3,6 +3,7 @@ import os
 import tempfile
 import pins
 from . import probe, adxl345, homing, tap_onset, tap_trace, tap_confirm
+from . import y_tap_log
 
 REG_THRESH_TAP = 0x1D
 REG_DUR = 0x21
@@ -270,6 +271,13 @@ class ADXL345Probe:
             'homing:homing_move_begin', self._handle_homing_move_begin)
         self.printer.register_event_handler(
             'homing:homing_move_end', self._handle_homing_move_end)
+        self._y_tap_log = y_tap_log.YTapLog(self)
+        self.printer.register_event_handler(
+            'homing:homing_move_error', self._handle_y_move_error)
+        self.printer.register_event_handler(
+            'homing:home_rails_error', self._handle_y_rails_error)
+        self.printer.register_event_handler(
+            'homing:home_rails_complete', self._handle_y_rails_complete)
         self.printer.register_event_handler(
             'homing:home_rails_end', self._handle_home_rails_end)
         self.printer.register_event_handler(
@@ -678,6 +686,8 @@ class ADXL345Probe:
                     if w in hmove.get_mcu_endstops()]
         if not wrappers:
             return
+        if any(w.get_axis() == 'y' for w in wrappers):
+            self._y_tap_log.start(hmove)
         profile = self._merge_profiles(wrappers)
         arm_delay = max([self.axis_homing_arm_delay.get(w.get_axis(), 0.)
                          for w in wrappers])
@@ -930,6 +940,9 @@ class ADXL345Probe:
         return None
 
     def _handle_home_rails_begin(self, homing_state, rails):
+        if any(es is self._axis_wrappers['y']
+               for rail in rails for es, name in rail.get_endstops()):
+            self._y_tap_log.begin()
         if self._trace is None:
             return
         for rail in rails:
@@ -1042,16 +1055,41 @@ class ADXL345Probe:
         if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
             return
         wrappers = list(self._active_axis_homing_wrappers)
+        hmove.y_tap_raw_steps = {
+            stage: {sp.stepper_name: getattr(sp, attr)
+                    for sp in hmove.stepper_positions}
+            for stage, attr in (('start', 'start_pos'),
+                                ('trigger', 'trig_pos'), ('halt', 'halt_pos'))}
+        error = getattr(hmove, 'move_error', None)
         try:
-            self._stop_tap('axis_homing')
-        finally:
             try:
-                self._apply_tap_onset(hmove, wrappers)
+                self._stop_tap('axis_homing')
             finally:
                 try:
-                    self._release_onset_client()
+                    self._apply_tap_onset(hmove, wrappers)
                 finally:
-                    self._reset_axis_homing_state()
+                    try:
+                        self._release_onset_client()
+                    finally:
+                        self._reset_axis_homing_state()
+        except Exception as e:
+            error = e
+            raise
+        finally:
+            if any(w.get_axis() == 'y' for w in wrappers):
+                self._y_tap_log.record(hmove, error)
+
+    def _handle_y_move_error(self, hmove, error):
+        if not self._y_tap_log.active:
+            return ''
+        self._y_tap_log.record(hmove, error, halted=False)
+        return self._y_tap_log.finish('failed', error)
+
+    def _handle_y_rails_error(self, homing_state, rails, error):
+        return self._y_tap_log.finish('failed', error)
+
+    def _handle_y_rails_complete(self, homing_state, rails):
+        self._y_tap_log.finish('accepted')
 
     def _handle_home_rails_end(self, homing_state, rails):
         # Confirm an X/Y tap home with further agreeing taps before the
@@ -1183,6 +1221,8 @@ class ADXL345Probe:
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
             toolhead.move(retractpos, retract_speed)
             self._trace_phase = 'confirm'
+            if axis == 'y' and hasattr(self, '_y_tap_log'):
+                self._y_tap_log.kind = 'confirm'
             trig, travelled, info = run_homing_move(
                 retract_dist + overtravel, speed)
             if trig is None:
@@ -1214,6 +1254,8 @@ class ADXL345Probe:
                                     if capped else "tap judged spurious"),
                              seek_dist)
                 self._trace_phase = 'resume_seek'
+                if axis == 'y' and hasattr(self, '_y_tap_log'):
+                    self._y_tap_log.kind = 'resume'
                 trig, travelled, info = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:

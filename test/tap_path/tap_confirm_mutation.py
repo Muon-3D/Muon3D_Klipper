@@ -39,6 +39,11 @@ EXPECT = {
 
 # name, file, old, new, the test that must notice
 MUTATIONS = [
+    ("DRV_STATUS read exception propagates",
+     os.path.join('klippy', 'extras', 'y_tap_log.py'),
+     "        return 'unavailable(%s)' % str(e)\n",
+     "        raise\n",
+     'unit_y_log'),
     ("stream timeout warns instead of aborting", PROBE,
      "                raise self.printer.command_error("
      "self._stream_stop_error)\n",
@@ -92,6 +97,8 @@ def make_tree(tmp):
     shutil.copytree(os.path.join(ROOT, 'test', 'tap_path'),
                     os.path.join(tmp, 'test', 'tap_path'),
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    shutil.copy(os.path.join(ROOT, 'scripts', 'y_tap_log_summary.py'),
+                os.path.join(tmp, 'scripts'))
 
 
 def run_test(tmp, dictdir, name):
@@ -106,9 +113,11 @@ def run_test(tmp, dictdir, name):
 
 def check(tmp, dictdir, name):
     """None if the test ends as EXPECT says, else why not."""
-    if name == 'unit_failsafe':
+    if name in ('unit_failsafe', 'unit_y_log'):
+        test = ('test_tap_failsafe.py' if name == 'unit_failsafe'
+                else 'test_y_tap_log.py')
         result = subprocess.run(
-            [sys.executable, 'test/tap_path/test_tap_failsafe.py'], cwd=tmp,
+            [sys.executable, os.path.join('test', 'tap_path', test)], cwd=tmp,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if result.returncode:
             lines = result.stdout.decode('utf-8', 'replace').strip().split('\n')
@@ -158,6 +167,10 @@ def main(argv=None):
         why = check(tmp, dictdir, 'unit_failsafe')
         if why:
             print('FAIL unmutated failsafe: ' + why)
+            return 1
+        why = check(tmp, dictdir, 'unit_y_log')
+        if why:
+            print('FAIL unmutated Y log: ' + why)
             return 1
         for title, fname, old, new, name in MUTATIONS:
             src = mutate(tmp, fname, old, new)

@@ -52,9 +52,10 @@ def test_finally_timeout_propagates_and_resets_after_int_disabled():
     p._stop_tap = lambda mode: calls.append('INT disabled')
     p._apply_tap_onset = lambda *a: p._release_onset_client()
     p._reset_axis_homing_state = lambda: calls.append('reset')
+    p._y_tap_log = NS(record=lambda *a: None)
     try:
         method('_handle_homing_move_end', {})(
-            p, NS(get_mcu_endstops=lambda: [wrapper]))
+            p, NS(get_mcu_endstops=lambda: [wrapper], stepper_positions=[]))
     except ValueError as e:
         assert 'accelerometer stream' in str(e)
     else:
@@ -91,7 +92,7 @@ def test_homing_preserves_timeout_alongside_an_earlier_error():
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                and n.name == 'HomingMove')
     move = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
-                and n.name == 'homing_move')
+                and n.name == '_homing_move')
     end = next(i for i, n in enumerate(move.body)
                if isinstance(n, ast.Try) and any(
                    isinstance(c, ast.Constant)
