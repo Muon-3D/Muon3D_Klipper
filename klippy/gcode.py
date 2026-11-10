@@ -129,6 +129,8 @@ class GCodeDispatch:
         self.mux_commands = {}
         self.gcode_help = {}
         self.status_commands = {}
+        # KAN-1730: checks a command a client door handed in (muon_guard)
+        self.client_gate = None
         # Register commands needed before config file is loaded
         handlers = ['M110', 'M112', 'M115',
                     'RESTART', 'FIRMWARE_RESTART', 'ECHO', 'STATUS', 'HELP']
@@ -213,7 +215,30 @@ class GCodeDispatch:
         self._respond_state("Ready")
     # Parse input into commands
     args_r = re.compile('([A-Z_]+|[A-Z*])')
-    def _process_commands(self, commands, need_ack=True):
+    def register_client_gate(self, func):
+        if self.client_gate is not None:
+            raise self.printer.config_error(
+                "a client command gate is already registered")
+        self.client_gate = func
+    def _check_client_command(self, origin, gcmd):
+        # Fail closed: a gate that breaks refuses, it does not allow.
+        gate = self.client_gate
+        if gate is None:
+            return
+        try:
+            gate(origin, gcmd)
+        except self.error:
+            raise
+        except Exception:
+            logging.exception("client command gate failed")
+            raise self.error("Refused: the client command check failed. Dev"
+                             " mode is off, so only allowlisted commands"
+                             " can be started.")
+    def _process_commands(self, commands, need_ack=True, origin=None):
+        # `origin` names the client door the commands came in through
+        # (webhooks, pty, file) and is None for everything the printer runs
+        # on its own account, including the body of a macro a client
+        # started: that calls run_script_from_command, which passes none.
         for line in commands:
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
@@ -235,6 +260,8 @@ class GCodeDispatch:
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
             try:
                 self.check_abort()
+                if origin is not None:
+                    self._check_client_command(origin, gcmd)
                 handler(gcmd)
             except CommandAbort as e:
                 # Unwinds every macro level back to run_abortable_script().
@@ -305,6 +332,12 @@ class GCodeDispatch:
         if (self._abort_msg is not None and not self._abort_hold
                 and greenlet.getcurrent() is self._abort_owner):
             raise CommandAbort(self._abort_msg)
+    def run_client_script(self, script, origin):
+        # The doors a client uses. Only the commands on this level are
+        # checked; see muon_guard.
+        with self.mutex:
+            self._process_commands(script.split('\n'), need_ack=False,
+                                   origin=origin)
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):
@@ -535,7 +568,7 @@ class GCodeIO:
         while pending_commands:
             self.pending_commands = []
             with self.gcode_mutex:
-                self.gcode._process_commands(pending_commands)
+                self.gcode._process_commands(pending_commands, origin='pty')
             pending_commands = self.pending_commands
         self.is_processing_data = False
         if self.fd_handle is None:
