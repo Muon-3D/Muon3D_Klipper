@@ -188,6 +188,12 @@ start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
 
+# MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
+# (KAN-1940); batch mode exits on any error, so this reads the log.
+start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+$PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
+finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+
 # MUON: the KAN-1361 tap confirmation in batch mode: each stall test ends
 # for the right reason, and breaking the fix makes one of them fail.
 start_test tap_confirm_mutation "Test tap confirmation mutation check"
