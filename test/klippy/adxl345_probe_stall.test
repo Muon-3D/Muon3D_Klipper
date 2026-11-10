@@ -1,0 +1,32 @@
+# KAN-1361: Y tap confirmation when taps are driven into the stop.
+# ADXL_TAP_SIMULATE gives where each confirm tap of the next home triggers,
+# in mm further towards the stop than the first tap (batch mode has no
+# stop). One electrical cycle of stepper_y is 0.8 mm here, as on the M1.
+CONFIG adxl345_probe_stall.cfg
+DICTIONARY linuxprocess.dict
+
+# No simulated taps: the harness agrees with itself, as before
+G28 Y
+
+# Two taps at first contact (Boxwood 6 Nov home 2: 0.009 mm)
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.009
+G28 Y
+
+# A confirm tap may trigger early, inside the tolerance (9 Nov home 7)
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=-0.169
+G28 Y
+
+# 9 Nov, 0.8 A, home 4: one tap driven into the stop, then two at contact
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.591,0.803,0.803
+G28 Y
+
+# 6 Nov home 3 (the 0.803 mm ratchet that failed after 2 retries), then two
+# taps at contact (the first reads 0.27 mm on: the rest of the lost cycle).
+# Only the stall retries get this far
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.806,1.609,2.412,2.682,2.682
+G28 Y
+
+# The home is still good for moves, and X (one tap) is untouched
+G28 X
+G1 F6000
+G1 X50 Y50

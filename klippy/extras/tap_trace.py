@@ -24,6 +24,8 @@ FIELDS = [
     'int_time', 'onset_time', 'int_minus_onset_ms',
     'start_pos_mm', 'onset_pos_mm', 'int_pos_mm', 'halt_pos_mm',
     'onset_steps', 'int_steps', 'halt_steps',
+    'travelled_mm', 'follow_mm',
+    'start_phase', 'int_phase', 'halt_phase', 'halt_mscnt',
     'thresh', 'tap_axes',
     'sample_time', 't_rel_int_ms', 'ax', 'ay', 'az', 'tap_mag',
     'over_thresh',
@@ -36,6 +38,21 @@ def format_steps(steps):
     if not steps:
         return ''
     return ';'.join('%s:%d' % (n, steps[n]) for n in sorted(steps))
+
+
+def format_dists(dists):
+    if not dists:
+        return ''
+    return ';'.join('%s:%.5f' % (n, dists[n]) for n in sorted(dists))
+
+
+def parse_dists(text):
+    out = {}
+    for part in (text or '').split(';'):
+        if part:
+            name, val = part.rsplit(':', 1)
+            out[name] = float(val)
+    return out
 
 
 def parse_steps(text):
@@ -98,6 +115,10 @@ def tap_rows(tap, samples, pre, post):
         base[what + '_pos_mm'] = _f(tap.get(what + '_pos_mm'), '%.5f')
         if what != 'start':
             base[what + '_steps'] = format_steps(tap.get(what + '_steps'))
+    for what in ('travelled_mm', 'follow_mm'):
+        base[what] = format_dists(tap.get(what))
+    for what in ('start_phase', 'int_phase', 'halt_phase', 'halt_mscnt'):
+        base[what] = format_steps(tap.get(what))
     rows = []
     for s in window_samples(samples, int_time, pre, post):
         mag = tap_magnitude(s, axes)

@@ -139,6 +139,7 @@ finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 start_test tap_trace "Test TAP_TRACE CSV writer and summary"
 $PYTHON test/tap_path/test_tap_trace.py
 $PYTHON test/tap_path/test_tap_onset.py
+$PYTHON test/tap_path/test_tap_confirm.py
 finish_test tap_trace "Test TAP_TRACE CSV writer and summary"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
@@ -186,3 +187,9 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: the KAN-1361 tap confirmation in batch mode: each stall test ends
+# for the right reason, and breaking the fix makes one of them fail.
+start_test tap_confirm_mutation "Test tap confirmation mutation check"
+$PYTHON test/tap_path/tap_confirm_mutation.py -d ${DICTDIR}
+finish_test tap_confirm_mutation "Test tap confirmation mutation check"

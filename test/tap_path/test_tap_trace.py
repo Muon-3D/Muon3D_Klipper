@@ -144,6 +144,59 @@ def test_summary_finds_the_ratchet():
         assert h2['int_one_way'] == '' and h2['onset_spread_mm'] < 1e-9
         assert per_tap[0]['first_over_ms'] is not None
         assert tap_trace_summary.main([path]) == 0
+        # these taps step back from the stop: not the stall signature
+        assert [t['kind'] for t in per_tap[:4]] == [None] + ['disagree'] * 3
+    finally:
+        shutil.rmtree(d)
+
+
+def test_summary_names_stalls_and_checks_the_bench_bar():
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, 'trace.csv')
+        w = tap_trace.TapTraceWriter(path, 0.06, 0.03)
+        # home 1 (Boxwood 9 Nov home 4): contact, +0.59, +0.21, +0.00
+        for i, pos in enumerate((12., 12.59, 12.80, 12.80)):
+            t0 = 1. + i
+            w.write_tap(tap(1, i + 1, t0 + 0.001, t0, pos, pos,
+                            'seek' if i == 0 else 'confirm'),
+                        stream(t0, t0 - 0.1, t0 + 0.1))
+        # home 2: two taps at contact; home 3: the +0.8 ratchet
+        for i, pos in enumerate((12., 12.003)):
+            t0 = 10. + i
+            w.write_tap(tap(2, i + 1, t0 + 0.001, t0, pos, pos),
+                        stream(t0, t0 - 0.1, t0 + 0.1))
+        for i in range(3):
+            t0 = 20. + i
+            w.write_tap(tap(3, i + 1, t0 + 0.001, t0, 12. + 0.8 * i, 12.),
+                        stream(t0, t0 - 0.1, t0 + 0.1))
+        w.close()
+        per_tap, per_home = tap_trace_summary.summarise(
+            tap_trace_summary.read_taps(path))
+        assert [t['kind'] for t in per_tap] == [
+            None, 'stall', 'stall', 'agree', None, 'agree',
+            None, 'stall', 'stall'], [t['kind'] for t in per_tap]
+        h1, h2, h3 = per_home
+        assert (h1['stalls'], h1['disagrees'], h1['confirmed']) == (
+            2, 0, True), h1
+        assert (h2['stalls'], h2['confirmed']) == (0, True), h2
+        assert (h3['stalls'], h3['confirmed']) == (2, False), h3
+        # nothing over the threshold more than 3 ms ahead of INT here
+        assert per_tap[1]['before_mag'] < THRESH
+        assert per_tap[1]['before_ms'] < -3.
+        ok, why = tap_trace_summary.bench_verdict(per_home, 3)
+        assert not ok and [x.split(':')[0] for x in why] == [
+            'home 1', 'home 3'], why
+        assert 'one-way drift +' in why[1] and 'not confirmed' in why[1]
+        ok, why = tap_trace_summary.bench_verdict([h2], 1)
+        assert ok and not why, why
+        ok, why = tap_trace_summary.bench_verdict([h2], 20)
+        assert not ok and 'need 20' in why[0], why
+        assert tap_trace_summary.main([path, '--bench', '3']) == 2
+        # a wider class is a choice of the caller, not of the file
+        per_tap, _ = tap_trace_summary.summarise(
+            tap_trace_summary.read_taps(path), cycle=0.)
+        assert per_tap[1]['kind'] == 'disagree'
     finally:
         shutil.rmtree(d)
 
@@ -199,6 +252,32 @@ class FakePrinter:
 
     def get_start_args(self):
         return {'log_file': os.path.join(self.logdir, 'klippy.log')}
+
+    def lookup_objects(self):
+        return list(self.objs.items())
+
+
+class FakeFields:
+    def lookup_register(self, field, default=None):
+        return 'MSCNT' if field == 'mscnt' else default
+
+    def get_field(self, field, reg):
+        return reg & 0x3ff
+
+
+class FakeTmc:
+    # 64 microsteps: 256 phases per electrical cycle (0.8 mm)
+    def __init__(self, mscnt):
+        self.fields = FakeFields()
+        self.mcu_tmc = self
+        self.mscnt = mscnt
+
+    def get_phase_offset(self):
+        return 5, 256
+
+    def get_register(self, reg):
+        assert reg == 'MSCNT'
+        return self.mscnt
 
 
 class FakeReactor:
@@ -303,6 +382,7 @@ def run_hook(from_samples):
         t_tap, t_int = 0.29, 0.303
         p._trace_home = 1
         kin = p.printer.objs['toolhead'].kin
+        p.printer.objs['tmc2130 stepper_x'] = FakeTmc(700)
         sps = [SP(s, t_int) for s in kin.steppers]
         before = [sp.trig_pos for sp in sps]
         w = FakeWrapper(t_int)
@@ -332,6 +412,72 @@ def test_hook_writes_int_and_onset_without_moving_the_trigger():
     assert r['int_steps'] == 'stepper_x:%d;stepper_y:%d' % tuple(before)
     ts = [float(x['t_rel_int_ms']) for x in rows]
     assert max(ts) > 25., max(ts)   # POST samples after INT are kept
+
+
+def test_hook_writes_travel_follow_through_and_phases():
+    rows, before, after, t_tap, t_int = run_hook(False)
+    r = rows[0]
+    trav = tap_trace.parse_dists(r['travelled_mm'])
+    follow = tap_trace.parse_dists(r['follow_mm'])
+    # 0.3 s of approach and 2 ms of follow-through at SPEED, per stepper
+    assert abs(trav['stepper_x'] - SPEED * 0.3) < 2 * STEP_DIST, trav
+    assert abs(trav['stepper_y'] + SPEED * 0.3) < 2 * STEP_DIST, trav
+    assert abs(follow['stepper_x'] - SPEED * 0.002) < 2 * STEP_DIST, follow
+    # phases only for the stepper with a driver; offset 5, 256 per cycle
+    assert r['int_phase'] == 'stepper_x:%d' % ((before[0] + 5) % 256,), r
+    start = tap_trace.parse_steps(r['start_phase'])['stepper_x']
+    halt = tap_trace.parse_steps(r['halt_phase'])['stepper_x']
+    assert 0 <= start < 256 and 0 <= halt < 256
+    assert r['halt_mscnt'] == 'stepper_x:700', r['halt_mscnt']
+
+
+class FakeBulk:
+    # like bulk_sensor.BatchBulkHelper: the batch timer drops a finished
+    # client, then stops the chip (stop_cb) before clearing is_started
+    def __init__(self, client, reactor):
+        self.client_cbs = [client.handle_batch]
+        self.is_started = True
+        self.client = client
+        self.log = []
+        reactor.bulk = self
+
+    def tick(self):
+        if self.client_cbs and self.client.is_finished:
+            del self.client_cbs[:]
+            self.log.append('dropped')
+        elif self.is_started and not self.client_cbs:
+            self.is_started = False
+            self.log.append('stopped')
+
+
+class TickingReactor(FakeReactor):
+    def pause(self, t):
+        self.bulk.tick()
+
+
+class FakeBatchClient:
+    is_finished = False
+
+    def handle_batch(self, msg):
+        return not self.is_finished
+
+
+def test_release_waits_for_the_stream_to_stop():
+    # The chip's register I/O at the stream stop must be over before the
+    # probe touches the chip again (the SPI fault of 9 Nov).
+    d = tempfile.mkdtemp()
+    try:
+        p = make_probe(d, False)
+        p.reactor = TickingReactor()
+        client = FakeBatchClient()
+        p.adxl345.batch_bulk = bulk = FakeBulk(client, p.reactor)
+        p._onset_client = client
+        p._release_onset_client()
+        assert client.is_finished and p._onset_client is None
+        assert bulk.log == ['dropped', 'stopped'], bulk.log
+        assert not bulk.is_started
+    finally:
+        shutil.rmtree(d)
 
 
 def test_hook_with_onset_trigger_records_what_was_used():

@@ -1,0 +1,9 @@
+# KAN-1361: a tap that slips one electrical cycle (0.8 mm) every time is
+# never accepted, however regular it is: the home fails once the stall and
+# general retries (6 + 2) are spent.
+CONFIG adxl345_probe_stall.cfg
+DICTIONARY linuxprocess.dict
+SHOULD_FAIL
+
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.8,1.6,2.4,3.2,4.0,4.8,5.6,6.4,7.2,7.2
+G28 Y

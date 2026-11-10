@@ -1,0 +1,9 @@
+# KAN-1361: taps that differ any other way than a stall (here: each one
+# triggers earlier than the last) only get tap_confirm_retries (2). The
+# fourth confirm tap would agree, but the home has failed by then.
+CONFIG adxl345_probe_stall.cfg
+DICTIONARY linuxprocess.dict
+SHOULD_FAIL
+
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=-0.5,-1.0,-1.5,-1.5
+G28 Y

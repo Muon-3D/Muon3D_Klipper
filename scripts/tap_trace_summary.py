@@ -13,6 +13,14 @@ overrun from INT to the halt.  Per home it prints the spread of the
 positions and whether consecutive taps moved one way only (the ratchet
 seen on Boxwood).  --plot (needs matplotlib) draws the tap signal around
 INT for every tap, and the onset and INT positions against tap number.
+It also names each confirm tap against the one before it, as
+klippy/extras/tap_confirm.py does: 'agree' (within --tolerance), 'stall'
+(up to one electrical cycle, --cycle, further into the stop: the tap was
+missed at first contact and INT came from the motors slipping a pole) or
+'disagree'.  For a stall, look at "before": the largest tap signal more
+than 3 ms ahead of INT, and when.  A bump under the threshold there, about
+(d INT / speed) ahead of INT, is the first contact that was missed.
+--bench checks the KAN-1361 bench bar: every pair agrees, in every home.
 Standard library only, apart from the optional plot.
 """
 import argparse
@@ -62,11 +70,26 @@ def _diff(a, b):
     return a - b
 
 
-def summarise(taps):
+AGREE, STALL, DISAGREE = 'agree', 'stall', 'disagree'
+EARLY_MS = 3.
+
+
+def classify(delta, tolerance, cycle):
+    """As klippy/extras/tap_confirm.py; delta is signed towards the
+    stop."""
+    if abs(delta) <= tolerance:
+        return AGREE
+    if cycle and tolerance < delta <= cycle + tolerance:
+        return STALL
+    return DISAGREE
+
+
+def summarise(taps, tolerance=0.2, cycle=0.8):
     """(per_tap, per_home). per_tap rows add d_onset_mm / d_int_mm (vs the
     previous tap of the same home), overrun_mm (halt - INT, signed along
     the move), peak_mag and first_over_ms (first sample over threshold,
-    relative to INT)."""
+    relative to INT), kind (classify() of d_int_mm) and before_mag /
+    before_ms (the largest signal more than EARLY_MS ahead of INT)."""
     per_tap = []
     prev = {}
     for tap in taps:
@@ -81,6 +104,15 @@ def summarise(taps):
         over = [t for t, _, o in tap['samples'] if o]
         row['first_over_ms'] = over[0] if over else None
         row['n_samples'] = len(tap['samples'])
+        early = [(m, t) for t, m, _ in tap['samples'] if t < -EARLY_MS]
+        row['before_mag'], row['before_ms'] = (max(early) if early
+                                               else (None, None))
+        row['kind'] = None
+        if (row['d_int_mm'] is not None and tap['int_pos_mm'] is not None
+                and tap['start_pos_mm'] is not None):
+            to_stop = 1. if tap['int_pos_mm'] >= tap['start_pos_mm'] else -1.
+            row['kind'] = classify(row['d_int_mm'] * to_stop, tolerance,
+                                   cycle)
         per_tap.append(row)
         if tap['triggered']:
             prev[tap['home']] = tap
@@ -101,6 +133,10 @@ def summarise(taps):
                   if t['int_minus_onset_ms'] is not None]
         out['delay_ms_min'] = min(delays) if delays else None
         out['delay_ms_max'] = max(delays) if delays else None
+        kinds = [t['kind'] for t in rows if t['kind'] is not None]
+        out['stalls'] = kinds.count(STALL)
+        out['disagrees'] = kinds.count(DISAGREE)
+        out['confirmed'] = bool(kinds) and kinds[-1] == AGREE
         per_home.append(out)
     return per_tap, per_home
 
@@ -135,9 +171,12 @@ def print_summary(per_tap, per_home, out=sys.stdout):
             ('int_pos_mm', 'INT mm', '%.4f'),
             ('d_onset_mm', 'd onset', '%+.4f'),
             ('d_int_mm', 'd INT', '%+.4f'),
+            ('kind', 'kind', None),
             ('overrun_mm', 'overrun', '%+.4f'),
             ('peak_mag', 'peak', '%.0f'),
             ('first_over_ms', 'over@ms', '%.2f'),
+            ('before_mag', 'before', '%.0f'),
+            ('before_ms', '@ms', '%.2f'),
             ('n_samples', 'n', None)]
     table = [[h for _, h, _ in cols]]
     for t in per_tap:
@@ -149,7 +188,8 @@ def print_summary(per_tap, per_home, out=sys.stdout):
     for h in per_home:
         out.write(
             "home %d: %d taps (%d without INT); onset spread %s mm %s; INT"
-            " spread %s mm %s; INT-onset %s..%s ms\n" % (
+            " spread %s mm %s; INT-onset %s..%s ms; %d stall, %d disagree,"
+            " %s\n" % (
                 h['home'], h['taps'], h['missed'],
                 _fmt(h['onset_spread_mm'], '%.4f'),
                 ('one-way ' + h['onset_one_way']) if h['onset_one_way']
@@ -157,7 +197,33 @@ def print_summary(per_tap, per_home, out=sys.stdout):
                 _fmt(h['int_spread_mm'], '%.4f'),
                 ('one-way ' + h['int_one_way']) if h['int_one_way'] else '',
                 _fmt(h['delay_ms_min'], '%.2f'),
-                _fmt(h['delay_ms_max'], '%.2f')))
+                _fmt(h['delay_ms_max'], '%.2f'),
+                h['stalls'], h['disagrees'],
+                'confirmed' if h['confirmed'] else 'NOT confirmed'))
+
+
+def bench_verdict(per_home, homes=20):
+    """(passed, reasons) against the KAN-1361 bench bar: at least `homes`
+    homes, each confirmed, with no pair over the tolerance, no tap without
+    INT and no one-way drift."""
+    why = []
+    if len(per_home) < homes:
+        why.append("%d homes, need %d" % (len(per_home), homes))
+    for h in per_home:
+        bad = []
+        if not h['confirmed']:
+            bad.append("not confirmed")
+        if h['stalls']:
+            bad.append("%d stall" % (h['stalls'],))
+        if h['disagrees']:
+            bad.append("%d disagree" % (h['disagrees'],))
+        if h['missed']:
+            bad.append("%d taps without INT" % (h['missed'],))
+        if h['int_one_way'] and h['taps'] > 2:
+            bad.append("one-way drift " + h['int_one_way'])
+        if bad:
+            why.append("home %d: %s" % (h['home'], ', '.join(bad)))
+    return not why, why
 
 
 def plot(taps, per_tap, path):
@@ -201,13 +267,27 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('csv')
     ap.add_argument('--plot', metavar='PNG')
+    ap.add_argument('--tolerance', type=float, default=0.2,
+                    help="tap_confirm_tolerance in mm (default 0.2)")
+    ap.add_argument('--cycle', type=float, default=0.8,
+                    help="one motor electrical cycle in mm (default 0.8)")
+    ap.add_argument('--bench', type=int, nargs='?', const=20, metavar='N',
+                    help="check the bench bar over at least N homes"
+                         " (default 20); exit 2 when it is not met")
     args = ap.parse_args(argv)
     taps = read_taps(args.csv)
     if not taps:
         sys.stderr.write('%s has no taps\n' % (args.csv,))
         return 1
-    per_tap, per_home = summarise(taps)
+    per_tap, per_home = summarise(taps, args.tolerance, args.cycle)
     print_summary(per_tap, per_home)
+    verdict = 0
+    if args.bench is not None:
+        passed, why = bench_verdict(per_home, args.bench)
+        print('bench bar: %s' % ('PASS' if passed else 'FAIL'))
+        for line in why:
+            print('  ' + line)
+        verdict = 0 if passed else 2
     if args.plot:
         try:
             plot(taps, per_tap, args.plot)
@@ -215,7 +295,7 @@ def main(argv=None):
             sys.stderr.write('--plot needs matplotlib\n')
             return 1
         print('plot written to %s' % (args.plot,))
-    return 0
+    return verdict
 
 
 if __name__ == '__main__':
