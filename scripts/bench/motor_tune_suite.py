@@ -27,13 +27,18 @@
 #   ladders    STEPLOSS_TEST accel ladders (5k..30k) per driver mode
 #              (SpreadCycle; StealthChop below 100/150/200/300 mm/s), current
 #              (0.8, 1.0 A; 0.6 A for two modes) and speed (600, 800 mm/s),
-#              stopping at the first confirmed fail; the best pass confirmed
-#              with 4x the moves
+#              stopping at the first confirmed fail or any slip over 5 mm
+#              (never retried: the carriage then runs into the frame); the
+#              best pass confirmed with 4x the moves, else the level below
 #
 # About 5-6 hours if every ladder passes to 30k; fails end ladders early.
-#   overspeed  SpreadCycle speed ladder 800..1200 mm/s at 20k
 #   thermal    10-minute stress at 1.0 and 0.8 A with driver temperatures
 #   closing    noise and resonance again, for drift over the night
+#   overspeed  SpreadCycle speed ladder 800..1200 mm/s at 20k
+#   explore    past the config, for speed benches: SpreadCycle accel ladders
+#              to 50k at 400 mm/s (0.8/1.0/1.2 A) and at 600/800 mm/s at
+#              1.2 A, and 1000..1500 mm/s at 15k for 1.0 and 1.2 A; then
+#              noise again
 #
 # Stop it: touch <out>/STOP (it stops after the current test).
 # Results: <out>/results.jsonl, <out>/run.log; register samples in
@@ -51,8 +56,8 @@ MODES = (('spread', 0), ('stealth300', 300), ('stealth150', 150),
 ACCELS = (5000, 10000, 15000, 20000, 25000, 30000)
 HOT_C = 95.          # wait for the drivers to cool above this
 COOL_C = 75.
-BIG_SLIP_MM = 5.     # a slip this big is a crash risk: re-home, count it
-MAX_BIG_SLIPS = 3
+BIG_SLIP_MM = 5.     # a slip this big is a crash risk: ends its ladder
+MAX_BIG_SLIPS = 8    # per run of the script; then the suite stops
 
 
 class Stop(Exception):
@@ -275,6 +280,11 @@ class Suite:
                     last = rec
         return last
 
+    @staticmethod
+    def slip_mm(rec):
+        return max(abs(rec.get('motor_a_mm') or 0.),
+                   abs(rec.get('motor_b_mm') or 0.))
+
     def recover(self):
         """After a refused command: Klipper must be ready, then re-home."""
         st = self.state()
@@ -290,6 +300,23 @@ class Suite:
     def phase_preflight(self):
         tid = 'preflight'
         self.check()
+        self.home_all()
+        self.gcode("MOTOR_TUNE_READ LABEL=preflight")
+        snap = {}
+        if not self.dry:
+            st = self.query(['configfile', 'toolhead'])
+            s = st['configfile']['settings']
+            snap = {k: s.get(k) for k in (
+                'printer', 'stepper_x', 'stepper_y', 'tmc2241 stepper_x',
+                'tmc2241 stepper_y', 'input_shaper')}
+            snap['toolhead'] = {k: st['toolhead'].get(k) for k in (
+                'max_velocity', 'max_accel', 'minimum_cruise_ratio',
+                'square_corner_velocity')}
+        self.record({'id': tid, 'kind': 'preflight', 'config': snap,
+                     'temps': self.temps() if not self.dry else {}})
+
+    def home_all(self):
+        """Heaters off, G28 until Z is homed, nozzle to Z60."""
         self.gcode("TURN_OFF_HEATERS\nM107")
         # Straight after a Klipper restart HOMING_GATE can still see the
         # toolhead and the Z column as missing and put up a prompt instead
@@ -304,19 +331,6 @@ class Suite:
         else:
             raise Stop("G28 does not home Z")
         self.gcode("G90\nG1 Z60 F600\nM400")
-        self.gcode("MOTOR_TUNE_READ LABEL=preflight")
-        snap = {}
-        if not self.dry:
-            st = self.query(['configfile', 'toolhead'])
-            s = st['configfile']['settings']
-            snap = {k: s.get(k) for k in (
-                'printer', 'stepper_x', 'stepper_y', 'tmc2241 stepper_x',
-                'tmc2241 stepper_y', 'input_shaper')}
-            snap['toolhead'] = {k: st['toolhead'].get(k) for k in (
-                'max_velocity', 'max_accel', 'minimum_cruise_ratio',
-                'square_corner_velocity')}
-        self.record({'id': tid, 'kind': 'preflight', 'config': snap,
-                     'temps': self.temps() if not self.dry else {}})
 
     def phase_noise(self, tag='noise', n=5):
         shifts = []
@@ -468,7 +482,7 @@ class Suite:
                          'seconds': round(time.time() - t0, 1)})
 
     def ladder(self, mode, stealth, current, speed, accels=ACCELS,
-               overspeed_speeds=None):
+               overspeed_speeds=None, suffix=''):
         """Accel ladder (or a speed ladder when overspeed_speeds is given):
         up until a fail that repeats, then confirm the best pass with 4x
         the moves."""
@@ -480,30 +494,43 @@ class Suite:
         base = 'ladder_%s_c%.1f_v%d' % (mode, current, speed)
         if overspeed_speeds:
             base = 'overspeed_%s_c%.1f_a%d' % (mode, current, accels[0])
+        base += suffix
+        passes = []
         for v, a in steps:
             tid = '%s_%s%d' % (base, 'v' if overspeed_speeds else 'a',
                                v if overspeed_speeds else a)
             extra = {'mode': mode, 'ladder': base}
-            ok, _ = self.steploss(tid, v, a, count, stealth, current,
-                                  overspeed=bool(overspeed_speeds),
-                                  extra=extra)
+            ok, rec = self.steploss(tid, v, a, count, stealth, current,
+                                    overspeed=bool(overspeed_speeds),
+                                    extra=extra)
             if not ok:
-                ok, _ = self.steploss(tid + '_retry', v, a, count, stealth,
-                                      current,
-                                      overspeed=bool(overspeed_speeds),
-                                      extra=extra)
+                # A big slip leaves the carriage tens of mm out, and the rest
+                # of that run drives it into the frame: never repeat one.
+                if self.slip_mm(rec) > BIG_SLIP_MM:
+                    break
+                ok, rec = self.steploss(tid + '_retry', v, a, count, stealth,
+                                        current,
+                                        overspeed=bool(overspeed_speeds),
+                                        extra=extra)
                 if not ok:
                     break
             best = (v, a)
+            passes.append(best)
         summary = {'id': base, 'kind': 'ladder', 'ladder_kind': kind,
                    'mode': mode, 'stealth': stealth, 'current': current,
                    'speed': speed, 'best': best, 'final': True}
         if best and not self.quick:
-            ok, _ = self.steploss(base + '_confirm', best[0], best[1],
-                                  count * 4, stealth, current,
-                                  overspeed=bool(overspeed_speeds),
-                                  extra={'mode': mode, 'ladder': base})
-            summary['confirmed'] = ok
+            # Confirm the best pass with 4x the moves; if that fails, step
+            # down once and confirm the level below.
+            for i, (v, a) in enumerate(reversed(passes[-2:])):
+                tid = base + ('_confirm' if i == 0 else '_confirm2')
+                ok, _ = self.steploss(tid, v, a, count * 4, stealth, current,
+                                      overspeed=bool(overspeed_speeds),
+                                      extra={'mode': mode, 'ladder': base})
+                summary['confirmed'] = ok
+                summary['confirmed_at'] = [v, a] if ok else None
+                if ok:
+                    break
         if base not in self.done:
             self.record(summary)
         self.log("%s: best %s" % (base, best))
@@ -514,9 +541,18 @@ class Suite:
             for mode, st, c, v in plan:
                 self.ladder(mode, st, c, v, accels=(5000, 10000))
             return
-        plan = []
+        # Most useful first, in case the night runs out: the shipped mode
+        # (StealthChop below 300 mm/s at 0.8 A), then 1.0 A, then the rest.
+        plan = [('spread', 0, 0.8, 600), ('spread', 0, 0.8, 800)]
+        for c in (0.8, 1.0):
+            for v in (600, 800):
+                plan.append(('stealth300', 300, c, v))
+        for v in (600, 800):
+            plan.append(('spread', 0, 1.0, v))
         for c in (0.8, 1.0):
             for mode, st in MODES:
+                if mode in ('spread', 'stealth300'):
+                    continue
                 for v in (600, 800):
                     plan.append((mode, st, c, v))
         for mode, st in (('spread', 0), ('stealth150', 150)):
@@ -530,6 +566,34 @@ class Suite:
         for c in ((0.8,) if self.quick else (1.0, 0.8)):
             self.ladder('spread', 0, c, 0, accels=(20000,),
                         overspeed_speeds=speeds)
+
+    def phase_explore(self):
+        """Past the config's limits, for speed-bench territory rather than
+        print quality: a speed x accel x current cross-section in
+        SpreadCycle. 1.2 A is over the motors' 1.0 A rating, so short runs
+        only, under the driver temperature guard. The ladders stop at the
+        first slip, so the frame sees at most one crash per ladder."""
+        if self.quick:
+            return
+        hi = (10000, 15000, 20000, 25000, 30000, 35000, 40000, 50000)
+        # Short-move regime (small features, infill): low cruise, high accel.
+        for c in (0.8, 1.0, 1.2):
+            self.ladder('spread', 0, c, 400, accels=hi)
+        # Mid and top cruise at 1.2 A, and 1.0 A at 600 past 30k.
+        self.ladder('spread', 0, 1.2, 600, accels=hi[2:])
+        self.ladder('spread', 0, 1.2, 800, accels=hi)
+        main = self.lookup('ladder_spread_c1.0_v600').get('best') or [0, 0]
+        if main[1] >= ACCELS[-1]:
+            self.ladder('spread', 0, 1.0, 600, accels=(35000, 40000, 50000),
+                        suffix='_hi')
+        # Top speed. At 15k, reaching 1500 mm/s and stopping again takes
+        # v^2/a = 150 mm: the 170 mm X strokes and the diagonals cruise, the
+        # 130 mm Y strokes do not.
+        for c in (1.0, 1.2):
+            self.ladder('spread', 0, c, 0, accels=(15000,),
+                        overspeed_speeds=(1000, 1100, 1200, 1300, 1400,
+                                          1500))
+        self.phase_noise('final_noise', 3)
 
     def phase_thermal(self):
         for c in ((0.8,) if self.quick else (1.0, 0.8)):
@@ -567,8 +631,10 @@ class Suite:
         self.phase_noise('closing_noise', 3)
         self.phase_resonance('closing_resonance')
 
+    # Overspeed and explore last: they are the likeliest to shut Klipper
+    # down (step rate), and the drift check in closing should not be lost.
     PHASES = ('preflight', 'noise', 'resonance', 'stealth', 'spread',
-              'ladders', 'overspeed', 'thermal', 'closing')
+              'ladders', 'thermal', 'closing', 'overspeed', 'explore')
 
     def run(self, phases):
         self.log("motor tune suite: phases %s%s%s" % (
