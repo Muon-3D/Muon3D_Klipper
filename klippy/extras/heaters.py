@@ -58,6 +58,9 @@ class Heater:
         self.last_pwm_time = 0.
         # Named holds that force the heater off (see hold_pwm)
         self.pwm_holds = {}
+        # Host time the last hold was released, for verify_heater, which
+        # samples once a second and so would miss most short holds.
+        self.last_hold_release = None
         # Setup control algorithm sub-class
         # algos = {'watermark': ControlBangBang, 'pid': ControlPID}
         # algo = config.getchoice('control', algos)
@@ -210,7 +213,11 @@ class Heater:
             self.mcu_pwm.set_pwm(pwm_time, 0.)
     def release_pwm(self, name):
         with self.lock:
-            self.pwm_holds.pop(name, None)
+            if name in self.pwm_holds:
+                del self.pwm_holds[name]
+                self.last_hold_release = self.printer.get_reactor().monotonic()
+    def get_last_hold_release(self):
+        return self.last_hold_release
     def get_pwm_holds(self):
         return dict(self.pwm_holds)
     # External commands

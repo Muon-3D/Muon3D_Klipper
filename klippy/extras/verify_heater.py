@@ -62,8 +62,38 @@ class HeaterCheck:
         if self.check_timer is not None:
             reactor = self.printer.get_reactor()
             reactor.update_timer(self.check_timer, reactor.NEVER)
+    # MUON: time the heater was forced off by a hold (hold_pwm), or within
+    # HOLD_GRACE of one, is not charged as error. A probe tap holds the
+    # hotend heater off to keep its switching out of the load cell, and a
+    # mesh is mostly taps: the hotend drifted from 130 to 113 C over one and
+    # verify_heater shut the printer down (sloe, 2026-11-10). HOLD_GRACE
+    # covers the moves between taps, too short for the heater to show a
+    # gain. Like an MCU outage, the heater is then credited once it climbs
+    # heating_gain (recovery_goal), and time it is free to heat is charged
+    # as before, so a heater that does not recover after the taps still
+    # faults.
+    HOLD_GRACE = 3.
+    def _recently_held(self, eventtime):
+        get_holds = getattr(self.heater, 'get_pwm_holds', None)
+        if get_holds is None:
+            return False
+        if get_holds():
+            return True
+        released = self.heater.get_last_hold_release()
+        return released is not None and eventtime - released < self.HOLD_GRACE
     def check_event(self, eventtime):
         temp, target = self.heater.get_temp(eventtime)
+        if (target > 0. and temp < target - self.hysteresis
+                and self._recently_held(eventtime)):
+            if self.approaching_target and self.goal_systime != self.printer.get_reactor().NEVER:
+                self.goal_systime += 1.
+            self.recovery_goal = temp + self.heating_gain
+            if target != self.last_target and not self.approaching_target:
+                self.approaching_target = self.starting_approach = True
+                self.goal_temp = temp + self.heating_gain
+                self.goal_systime = eventtime + self.check_gain_time
+            self.last_target = target
+            return eventtime + 1.
         if self.recovery_goal is not None and temp >= self.recovery_goal:
             # The heater has climbed heating_gain since the last credit, so it
             # is working. Clear the error it accrued re-heating what the outage
