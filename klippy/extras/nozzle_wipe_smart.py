@@ -23,6 +23,10 @@ class NozzleWipeSmart:
         self.plunge = config.getfloat("plunge", 1.2, minval=0.0)
         self.sx = config.getfloat("sx", 9.0, above=0.0)
         self.sy = config.getfloat("sy", 2.0, above=0.0)
+        # If set, the travel to the pad goes via (x, approach_y) and then
+        # straight in Y to the pad, instead of diagonally (M1: the cutter nub
+        # sits near the pad).
+        self.approach_y = config.getfloat("approach_y", None)
         self.passes = config.getint("passes", 5, minval=1)
         self.f_travel = config.getfloat("f_travel", 7800.0, above=0.0)
         self.f_wipe = config.getfloat("f_wipe", 2000.0, above=0.0)
@@ -160,9 +164,15 @@ class NozzleWipeSmart:
             "G90",
             "G0 Z%.6f F%.6f" % (z_safe, params["f_travel"]),
         ]
-        if position.y < params["y"]:
-            lines.append("G0 Y%.6f F%.6f" % (params["y"], params["f_travel"]))
+        via_y = params["y"]
+        if self.approach_y is not None:
+            via_y = max(params["y"], self.approach_y)
+        if position.y < via_y:
+            lines.append("G0 Y%.6f F%.6f" % (via_y, params["f_travel"]))
             lines.append("M400")
+        if via_y != params["y"]:
+            lines.append("G0 X%.6f Y%.6f F%.6f" % (
+                params["x"], via_y, params["f_travel"]))
         lines.extend([
             "G0 X%.6f Y%.6f F%.6f" % (
                 params["x"], params["y"], params["f_travel"]),
