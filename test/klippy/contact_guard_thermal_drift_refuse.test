@@ -1,0 +1,17 @@
+# KAN-1940 A2: after 6 minutes of followed thermal drift, a step touch at
+# low Z still refuses XY.  Exits with an error;
+# contact_guard_thermal_drift.test asserts the preamble ends in contact.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+SHOULD_FAIL
+
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=360 DRIFT=-833 RATE=500
+G28 X Y
+G90
+G1 X50 Y50 Z0.5 F6000
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05 DRIFT=-833
+G1 X60 Y50

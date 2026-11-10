@@ -1,0 +1,23 @@
+# KAN-1940 A2: the cell drifts toward pressing as the hot end cools
+# (~15000 counts per degree C; 91k -> 275k on Boxwood).  +300000 over 6
+# minutes with nothing touching is followed: no contact, and G28 X Y and
+# the XY moves after it are not refused.  A step touch at low Z afterwards
+# still latches; contact_guard_thermal_drift_refuse.test is the refused XY.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=360 DRIFT=-833 RATE=500
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G28 X Y
+G90
+G1 X100 Y100 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5 DRIFT=-833
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X50 Y50 F6000
+G1 Z0.5 F600
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05 DRIFT=-833
+ASSERT_GUARD ACTIVE=1 CONTACT=1

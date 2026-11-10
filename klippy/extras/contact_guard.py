@@ -97,6 +97,13 @@ class ContactGuard:
         # follow Z.  The steady load becomes the new zero, latched or not.
         self.clearance_lift = config.getfloat('clearance_lift', 1.0,
                                               above=0.)
+        # An upward Z homing move of at least this much (the G28 macro's
+        # AXIS_PROTECTED_MOVE Z+10) leaves the nozzle clear of the plate:
+        # the steady load after it is the zero even at contact level
+        # (thermal drift, KAN-1940).  A shorter lift's zero is refused at
+        # contact level, since its steps are open loop.
+        self.lift_clear = config.getfloat('lift_clear_distance', 5.0,
+                                          minval=self.clearance_lift)
         # SET_CONTACT_GUARD REZERO=1 is the explicit recovery for an offset
         # that does not follow Z (filament tension after the unlock
         # retract).  It only runs with Z really homed (home_rails, or a
@@ -115,6 +122,12 @@ class ContactGuard:
         self.max_absorbed = config.getint('max_absorbed_counts',
                                           self.threshold // 2, minval=0,
                                           maxval=self.threshold - 1)
+        # That budget refills at this many counts per second of samples,
+        # so drift toward pressing slower than it (the cell as the hot end
+        # cools, KAN-1940) is followed without limit.  A touch is a step
+        # over milliseconds; creep faster than this still adds up.
+        self.drift_rate = config.getfloat('drift_follow_rate', 1000.,
+                                          minval=0.)
         # Moves are checked as they enter the lookahead queue, before the
         # moves ahead of them have run.  Starting below this machine Z (or
         # with Z unhomed) the queued motion could put the nozzle on the
@@ -395,7 +408,8 @@ class ContactGuard:
             # at the end of its range.  This is what lets G28 recover a
             # false latch with Z unhomed, when G1 Z is not allowed.
             self.lift_zero = {'after': self.toolhead.print_time,
-                              'start': None, 'samples': [], 'kind': 'lift'}
+                              'start': None, 'samples': [], 'kind': 'lift',
+                              'lifted': lifted}
             logging.info("contact_guard: Z homing move lifted %.3f mm;"
                          " re-zeroing on the steady load after it", lifted)
             self._settle_lift_zero()
@@ -533,14 +547,19 @@ class ContactGuard:
             self._real_zero()
             return True
         load = sign * (mean - self.baseline)
-        if abs(load) >= self.threshold:
+        clear = lz['lifted'] >= self.lift_clear - MOVE_EPSILON
+        if abs(load) >= self.threshold and not clear:
             # Open loop: a steady real press (skipped steps, a tall
             # object) would be absorbed.  Leave the latch as it is.
             logging.info("contact_guard: lift re-zero refused: the steady"
-                         " load after the lift is %d counts from the zero,"
-                         " at or above the %d contact threshold",
-                         load, self.threshold)
+                         " load after the %.3f mm lift is %d counts from"
+                         " the zero, at or above the %d contact threshold",
+                         lz['lifted'], load, self.threshold)
             return False
+        if abs(load) >= self.threshold:
+            logging.info("contact_guard: %.3f mm lift (>= %.3f mm): taking"
+                         " the steady %d count offset as the zero",
+                         lz['lifted'], self.lift_clear, load)
         self.baseline = mean
         self.g28_lift_baseline = mean
         self._real_zero()
@@ -767,8 +786,9 @@ class ContactGuard:
     def _absorb(self, new, sign):
         # Drift following and steady relocks.  Toward less pressed is free
         # and gives back what was absorbed; toward more pressed is limited
-        # to max_absorbed_counts in total since the last real zero, so the
-        # excess reads as load and, past the threshold, as contact.
+        # to max_absorbed_counts since the last real zero, refilled at
+        # drift_follow_rate, so the excess reads as load and, past the
+        # threshold, as contact.
         step = sign * (new - self.baseline)
         if step > 0.:
             step = min(step, max(0., self.max_absorbed - self.absorbed))
@@ -891,6 +911,7 @@ class ContactGuard:
             return
         dt = 0. if self.prev_time is None else max(0., t - self.prev_time)
         self.prev_time = t
+        self.absorbed = max(0., self.absorbed - self.drift_rate * dt)
         load = sign * (counts - self.baseline)
         self.load = load
         # Contact hysteresis

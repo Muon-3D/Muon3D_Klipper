@@ -1493,8 +1493,10 @@ def test_g28_lift_rezero_survives_home_y():
     r.printer.reactor.on_pause[:] = []
     check(r.guard.lift_zero is None,
           'the lift re-zero is decided before homing_move_end returns')
-    check(r.guard.baseline is not None and abs(r.guard.baseline - ZERO) < 1,
-          'and refused: 717295 counts is a contact-level load')
+    check(r.guard.baseline is not None
+          and abs(r.guard.baseline - (ZERO + PRESS * 717295)) < 1,
+          'and re-zeroed: a steady load after a 10 mm lift is no touch'
+          ' (KAN-1940)')
     # _HOME_Y: SKPs, AXIS_PROTECTED_MOVE AXIS=Y, G28.1 Y
     r.set_position()
     hy = FakeHomingMove('y', 5.)
@@ -1541,10 +1543,11 @@ def test_g28_lift_rezero_settles_inside_homing_scope():
     r.printer.reactor.on_pause[:] = []
     check(r.guard.lift_zero is None,
           'the lift re-zero is decided inside the homing scope')
-    # Opus review 6 Nov: the lift is open loop, so a contact-level steady
-    # load is refused; the release is the trusted end-of-G28 zero
-    check(r.guard.baseline is not None and abs(r.guard.baseline - ZERO) < 1,
-          'the open-loop lift zero refuses a 200k load')
+    # KAN-1940: after a lift of lift_clear_distance or more a steady load,
+    # even at contact level, is no touch: the lift re-zero takes it
+    check(r.guard.baseline is not None
+          and abs(r.guard.baseline - (ZERO + PRESS * 200000)) < 1,
+          'the 10 mm lift zero takes a steady 200k load')
     r.feed(200000, 0.3)
     check(r.status()['active'] is False,
           'contact is not judged inside the homing scope')
@@ -1586,6 +1589,17 @@ def test_upward_homing_lift_clears_false_latch():
     check(r.status()['contact'], 'false latch, Z unhomed')
     r.homing_move('z', -10.)         # AXIS_PROTECTED_MOVE AXIS=Z DIST=10
     # _HOME_X's first XY move comes before any sample: it waits for them
+    r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
+    check(r.refused(50, 10, 20.) is None and not r.status()['contact'],
+          'KAN-1940: a steady 300000 load after the 10 mm lift is re-zeroed;'
+          ' the G28 macro XY move is allowed')
+    # A lift shorter than lift_clear_distance is only open-loop evidence: a
+    # contact-level load after it is not absorbed
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(300000, 1.)
+    r.printer.toolhead.homed_axes = ''
+    r.homing_move('z', -2.)
     r.printer.reactor.on_pause.append(lambda: r.feed(300000, 0.005))
     check(r.refused(50, 10, 20.) == contact_guard.REFUSAL_Z_UNHOMED
           and r.status()['contact'],
@@ -1825,15 +1839,16 @@ def test_xy_only_g28_never_rezeroes_from_samples():
 
 
 def test_lift_zero_refuses_a_contact_level_load():
-    # C: the lift is verified only by step counts (open loop).  A steady
-    # load at contact level after it is not absorbed into the zero; the
-    # latch stays.  Read outside the scope.
+    # C: the lift is verified only by step counts (open loop).  After a
+    # lift shorter than lift_clear_distance a steady load at contact level
+    # is not absorbed into the zero; the latch stays.  Read outside the
+    # scope.
     r = Rig(z=20.)
     r.feed(0, 0.5)
     r.feed(200000, 1.)
     check(r.status()['contact'], 'latched before the lift')
     r.printer.toolhead.homed_axes = ''
-    hm = FakeHomingMove('z', -10.)
+    hm = FakeHomingMove('z', -2.)    # under lift_clear_distance (5 mm)
     r.printer.send_event("homing:homing_move_begin", hm)
     r.printer.toolhead.print_time = r.t
     r.printer.reactor.on_pause.append(lambda: r.feed(200000, 0.005))
@@ -2021,6 +2036,122 @@ def test_command_error_in_scope_cleans_up():
     r.printer.toolhead.print_time = r.t
     r.printer.send_event("homing_scope:end")        # even a stray end
     check(g.lift_zero is None, 'and a stray end event starts no window')
+
+
+def lift(r, offset, dist):
+    """An upward Z homing move of dist mm, then steady samples after it."""
+    hm = FakeHomingMove('z', -dist)
+    r.printer.send_event("homing:homing_move_begin", hm)
+    r.feed(offset, 0.2)                      # inside the move: ignored
+    r.printer.toolhead.print_time = r.t
+    r.printer.reactor.on_pause.append(lambda: r.feed(offset, 0.005))
+    r.printer.send_event("homing:homing_move_end", hm)
+    r.printer.reactor.on_pause[:] = []
+
+
+def test_lift_clear_distance_accepts_a_steady_offset():
+    # KAN-1940 A1: a lift of lift_clear_distance (5 mm) or more puts the
+    # nozzle clear of the plate, so the steady load after it is the zero
+    # however large it is; under that the contact-level refusal stays
+    for dist, accepted in ((10., True), (5., True), (4.9, False),
+                           (1., False)):
+        r = Rig(z=20.)
+        r.feed(0, 0.5)
+        r.printer.toolhead.homed_axes = ''
+        lift(r, 275000, dist)
+        r.feed(275000, 0.1)
+        st = r.status()
+        if accepted:
+            check(not st['contact'] and abs(st['load']) < 1000,
+                  'a steady 275000 offset after a %.1f mm lift is the new'
+                  ' zero' % dist)
+        else:
+            check(st['contact'] and st['load'] == 275000,
+                  'after a %.1f mm lift it is refused: latched' % dist)
+    # Still not evidence: the cell flat at its plateau, or a changing load
+    r = Rig(z=20.)
+    r.printer.probe.reference_max = ZERO + PRESS * 1920000
+    r.feed(0, 0.5)
+    lift(r, 1830000, 10.)
+    r.feed(1830000, 0.1)
+    check(r.status()['contact'], 'a 10 mm lift at the plateau: latched')
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.feed(300000, 1.)
+    r.homing_move('z', -10.)
+    for i in range(60):
+        r.feed(300000 + 30000 * (i % 2), 0.01)
+    check(r.status()['contact'], 'a changing load after a 10 mm lift: latched')
+
+
+def test_xy_g28_after_thermal_drift():
+    # KAN-1940, Boxwood 9 Nov: the cell drifted 168140 counts toward
+    # pressing as the hot end cooled.  Control's Home sent G28 X Y: the
+    # macro's AXIS_PROTECTED_MOVE Z+10 lift re-zero refused it (contact
+    # level), no trusted zero (Z not homed), and every XY move after was
+    # refused with Z unhomed.  Now the 10 mm lift takes the steady load.
+    r = Rig(z=100.)
+    r.feed(0, 0.5)
+    r.feed(168140, 1.)
+    check(r.status()['contact'], 'the drifted offset reads as contact')
+    g28_scope_begin(r)
+    g28_lift(r, 168140)                      # Z+10, Z unhomed
+    r.feed(168140, 0.3)                      # _HOME_Y
+    r.homing_move('y', 5.)
+    r.feed(168140, 0.3)                      # _HOME_X
+    r.homing_move('x', 5.)
+    r.printer.toolhead.homed_axes = 'xy'
+    g28_scope_end(r, 168140)
+    r.feed(168140, 0.1)
+    st = r.status()
+    check(st['active'] and not st['contact'] and abs(st['load']) < 1000,
+          'after G28 X Y the drifted offset is the zero')
+    r.guard.last_position = [5., 174., 110., 0.]
+    check(r.refused(100, 100, 110.) is None, 'XY jogs are allowed')
+    # A real touch after it is still caught
+    r.feed(168140 + 200000, 0.05)
+    check(r.status()['contact']
+          and r.refused(120, 100, 110.) == contact_guard.REFUSAL_Z_UNHOMED,
+          'a step touch afterwards still latches and refuses XY')
+
+
+def test_slow_thermal_drift_is_followed():
+    # KAN-1940 A2: the cell drifts ~15000 counts per degree C as the hot
+    # end cools (91k -> 275k on Boxwood).  Drift toward pressing slower than
+    # drift_follow_rate (1000 counts/s) is followed without a cap; a touch,
+    # a step over milliseconds, still latches.
+    for z in (20., 0.5):
+        r = Rig(z=z)
+        r.home_z()
+        r.feed(0, 0.5)
+        r.feed(0, 360., drift=-833.)         # +300000 over 6 minutes
+        st = r.status()
+        check(not st['contact'] and abs(st['load']) < 22500,
+              '300000 counts of drift over 6 min is followed (Z %.1f)' % z)
+        check(r.refused(60, 50, z) is None, 'and XY is allowed (Z %.1f)' % z)
+        r.feed(200000, 0.05, drift=-833.)
+        check(r.status()['contact'] and r.refused(70, 50, z) == REFUSAL,
+              'a step touch after the drift still latches (Z %.1f)' % z)
+
+
+def test_drift_budget_does_not_bank_idle_time():
+    # The budget refills at drift_follow_rate but never past
+    # max_absorbed_counts: a long idle buys no extra capacity for a later
+    # staircase of steady steps
+    r = Rig(z=5.)
+    r.feed(0, 0.5)
+    r.feed(0, 120.)
+    r.feed(80000, 0.6)
+    check(r.status()['load'] == 80000 - THRESHOLD // 2,
+          'after 2 min idle only max_absorbed_counts of a step is absorbed')
+    r.feed(160000, 0.6)
+    check(r.status()['contact'] and r.refused(100, 50, 5.) == REFUSAL,
+          'and the second step is contact')
+    # Fast creep still adds up to contact: 5000 counts/s is past the rate
+    r = Rig(z=0.5)
+    r.feed(0, 0.5)
+    r.feed(0, 60., drift=-5000.)
+    check(r.status()['contact'], 'creep at 5000 counts/s latches within 60 s')
 
 
 def main():

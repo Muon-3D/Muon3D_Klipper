@@ -5637,8 +5637,10 @@ queued ahead of it to run and is decided on the load cell readings after
 them. It fails closed: if those readings do not arrive, or the stream has
 stopped while contact was latched or near the plate, the move is refused
 too ("no current load cell data"). A Z homing move that lifts at least
-`clearance_lift` (the M1 G28's protected Z lift) re-zeroes on the steady
-load after it, so G28 recovers a false latch even with Z unhomed. The
+`clearance_lift` re-zeroes on the steady load after it; one that lifts at
+least `lift_clear_distance` (the M1 G28's protected Z lift, also run by
+`G28 X Y`) takes that load as the zero even at contact level, so G28 and
+G28 X Y recover a false latch from drift even with Z unhomed. The
 guard is inactive during a job (a virtual_sdcard print that is printing or
 paused, or commands arriving over the G-code pty, until 5 seconds after
 the last), during homing, probing and NOZZLE_WIPE_SMART, for
@@ -5685,9 +5687,15 @@ recognised as a job. See the
 #   toward unloading gives it back. Beyond it the excess reads as load,
 #   and past threshold_counts as contact, so neither steps that are each
 #   under the threshold nor slow creep (a hot end growing into the plate)
-#   can add up to an absorbed press. Drift toward pressing past it latches
-#   contact with nothing touching; a 1 mm Z lift clears that. The default
-#   is half of threshold_counts.
+#   can add up to an absorbed press. The budget refills at
+#   drift_follow_rate. The default is half of threshold_counts.
+#drift_follow_rate: 1000
+#   Counts per second at which the max_absorbed_counts budget refills, up
+#   to max_absorbed_counts, so drift toward pressing slower than this (the
+#   load cell as the hot end heats or cools, about 15000 counts per degree
+#   on the M1) is followed without limit. A touch is a step within
+#   milliseconds and creep faster than this still adds up to contact. 0
+#   makes the budget a fixed total since the last real zero.
 #clearance_lift: 1.0
 #   Positive clearance. A load that stays within the band while the
 #   executed toolhead Z travels clearance_lift mm is not a touch, since a
@@ -5698,6 +5706,12 @@ recognised as a job. See the
 #   its rails are never evidence, since the cell reads flat there however
 #   hard it is pressed. A position reset (SET_KINEMATIC_POSITION, homing),
 #   a Z motor enable change or a gap in the samples breaks the evidence.
+#lift_clear_distance: 5.0
+#   A Z homing move that lifts at least this many mm leaves the nozzle
+#   clear of the plate, so the steady load after it becomes the zero even
+#   at or above threshold_counts (drift). After a shorter lift, which is
+#   checked only by step counts, a steady load at contact level is refused
+#   and contact stays latched. Must be at least clearance_lift.
 #rezero_min_z: 10.0
 #   SET_CONTACT_GUARD REZERO=1 is refused unless the toolhead is at least
 #   this high, with Z really homed since the last SET_KINEMATIC_POSITION
