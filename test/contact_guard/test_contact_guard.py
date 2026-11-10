@@ -50,6 +50,8 @@ class FakeConfig:
         return self.printer
     def _get(self, name, default):
         return self.values.get(name, default)
+    def get(self, name, default=None):
+        return self._get(name, default)
     def getint(self, name, default=None, minval=None, maxval=None):
         return int(self._get(name, default))
     def getfloat(self, name, default=None, minval=None, maxval=None,
@@ -2079,6 +2081,203 @@ def test_command_error_in_scope_cleans_up():
     r.printer.toolhead.print_time = r.t
     r.printer.send_event("homing_scope:end")        # even a stray end
     check(g.lift_zero is None, 'and a stray end event starts no window')
+
+
+# KAN-828: one baseline model.  The zero is re-set only at safe points
+# (trusted G28 zero, bounded REZERO, an open-loop lift inside the drift
+# envelope, the same-pose re-seat after a stand-aside); between them it
+# follows drift freely only high above the plate and no faster than
+# drift_max_rate; a fast or large load step is contact.
+
+def cooled_rig(rate=-6000., seconds=30., hot=200., cold=30., trusted=False):
+    """A guard zeroed hot, then the hot end cooling with raw pressing
+    drift of `rate` counts/s.  Returns the rig."""
+    r = Rig(z=20.)
+    r.guard.sim_temp = hot
+    if trusted:
+        r.home_z()
+    r.feed(0, 0.5)
+    for i in range(int(seconds)):
+        r.guard.sim_temp = hot + (cold - hot) * (i + 1) / seconds
+        r.feed(0, 1., drift=rate)
+    return r
+
+
+def test_cooling_false_lockout_cleared_by_g28_lift():
+    # Field log 9-10 Nov: cooling from print temperature pushes the zero
+    # 91k -> 168k -> 275k counts; the 45k budget runs out and the guard
+    # latches in free air at Z 20.  The G28 lift is then refused (91863
+    # at or above 90000) and nothing clears it.  The lift now re-zeroes
+    # because 180k is inside 45000 + min(10000 * 30 s, 20000 * 170 degC).
+    r = cooled_rig()
+    check(r.status()['contact'], 'untrusted Z: the drift latched (as before)')
+    g28_lift(r, 0)
+    r.feed(0, 0.1)
+    st = r.status()
+    check(not st['contact'] and abs(st['load']) < 1000,
+          'the G28 lift re-zeroes the cooled offset (load %d)' % st['load'])
+    check(r.refused(60, 50, 20) is None, 'and XY moves again')
+    r.feed(200000, 0.1)
+    check(r.status()['contact'] and r.refused(70, 50, 20) is not None,
+          'a real press after it is still contact')
+
+
+def test_lift_zero_refuses_a_press_outside_the_envelope():
+    # Opus review of #123 (blocking): a faulted Z driver leaves a pressed
+    # nozzle pressed after an open-loop lift.  With no temperature change
+    # since the trusted zero only drift_margin_counts can be drift.
+    r = Rig(z=20.)
+    r.guard.sim_temp = 30.
+    r.feed(0, 0.5)
+    r.feed(200000, 1.)
+    g28_lift(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'], 'steady temperature: a 200k press stays')
+    # A long time but a 1 degC swing: 45000 + 20000 is the bound
+    r = Rig(z=20.)
+    r.guard.sim_temp = 30.
+    r.feed(0, 0.5)
+    r.printer.reactor.now += 3600.
+    r.n += int(3600 * SPS)
+    r.guard.sim_temp = 31.
+    r.feed(200000, 1.)
+    g28_lift(r, 200000)
+    r.feed(200000, 0.1)
+    check(r.status()['contact'],
+          'an hour idle with 1 degC of swing: 200k is not drift')
+    # No heater at all: margin only
+    r = Rig(z=20.)
+    r.feed(0, 0.5)
+    r.n += int(600 * SPS)
+    r.feed(120000, 1.)
+    g28_lift(r, 120000)
+    r.feed(120000, 0.1)
+    check(r.status()['contact'], 'no temperature known: 120k stays latched')
+
+
+def test_lift_envelope_is_from_the_trusted_zero_not_the_last_lift():
+    # A chain of open-loop lifts never widens the bound: each is measured
+    # from the last closed-loop zero
+    r = cooled_rig(rate=-3000., seconds=20., hot=31., cold=30.)
+    g28_lift(r, 0)                           # 60k from trusted: accepted
+    r.feed(0, 0.1)
+    check(not r.status()['contact'], 'the first lift re-zeroes 60k')
+    r.feed(100000, 1.)
+    g28_lift(r, 100000)
+    r.feed(100000, 0.1)
+    check(r.status()['contact'],
+          'a 100k press after it is 160k from the trusted zero: refused')
+
+
+def test_high_z_follows_thermal_drift():
+    # Z homed, trusted, at Z 20: cooling drift of 8000 counts/s for 60 s
+    # (480k counts) is followed, where the 45k budget used to latch
+    r = cooled_rig(rate=-8000., seconds=60., trusted=True)
+    st = r.status()
+    check(not st['contact'] and abs(st['load']) < THRESHOLD / 4,
+          'followed at Z 20 (load %d)' % st['load'])
+    check(r.refused(60, 50, 20) is None, 'XY allowed')
+    r.feed(200000, 0.05)
+    check(r.status()['contact'] and r.refused(70, 50, 20) == REFUSAL,
+          'a fast press after hours of followed drift is contact')
+
+
+def test_drift_faster_than_the_physical_rate_is_budgeted():
+    r = cooled_rig(rate=-22000., seconds=30., trusted=True)
+    check(r.status()['contact'],
+          '22000 counts/s is faster than drift: it latches')
+
+
+def test_low_z_drift_keeps_the_budget():
+    # Opus review of #123: a slow sub-threshold press at Z 0.5 must not
+    # be followed.  Below sync_below_z the budget holds even trusted.
+    r = Rig(z=0.5)
+    r.home_z()
+    r.feed(0, 0.5)
+    for _ in range(60):
+        r.feed(0, 1., drift=-5000.)
+    check(r.status()['contact'], 'a slow press at Z 0.5 latches')
+    r = Rig(z=20.)                           # Z not trusted: budget too
+    r.feed(0, 0.5)
+    for _ in range(60):
+        r.feed(0, 1., drift=-5000.)
+    check(r.status()['contact'], 'untrusted Z 20: latches')
+
+
+def xy_g28_after_lift(r, before, after, z_event=False):
+    g28_scope_begin(r)
+    g28_lift(r, before)
+    r.feed(before, 0.2)
+    if z_event:
+        r.set_position()                     # Z set behind the guard
+    r.homing_move('y', 5.)
+    r.homing_move('x', 5.)
+    r.feed(after, 0.5)
+    g28_scope_end(r, after)
+    r.feed(after, 0.1)
+
+
+def test_xy_g28_rezeroes_on_the_lifted_load_at_its_end():
+    # G28 X Y from Control after a cool-down: the Y tap and the cooling
+    # during homing leave the zero off; the toolhead is still lifted
+    # (no Z event since the lift), so the end of the G28 re-zeroes it
+    # within the same envelope.
+    r = cooled_rig(rate=-3000., seconds=30., hot=60., cold=30.)
+    xy_g28_after_lift(r, 0, 100000)
+    st = r.status()
+    check(not st['contact'] and abs(st['load']) < 1000,
+          'G28 X Y: re-zeroed at its end (load %d)' % st['load'])
+    r = cooled_rig(rate=-3000., seconds=30., hot=60., cold=30.)
+    xy_g28_after_lift(r, 0, 100000, z_event=True)
+    check(r.status()['contact'], 'Z touched after the lift: no re-zero')
+    r = Rig(z=20.)
+    r.guard.sim_temp = 30.
+    r.feed(0, 0.5)
+    xy_g28_after_lift(r, 0, 200000)
+    check(r.status()['contact'], 'a press outside the envelope stays')
+
+
+def stand_aside(r):
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=60.))
+
+
+def test_stand_aside_reseats_the_cutter_offset():
+    # CUT_FILAMENT: the press into the cutter latches contact (571913)
+    # and leaves a mechanical offset; with Z faked at 0 no REZERO may
+    # clear it, so the printer stayed locked out until a full G28.
+    r = Rig(z=0.)
+    r.feed(0, 0.5)
+    stand_aside(r)
+    r.feed(570000, 0.3)
+    r.feed(150000, 0.3)                      # back at the same pose
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
+    st = r.status()
+    check(not st['contact'] and abs(st['load']) < 1000,
+          're-seated (load %d)' % st['load'])
+    check(r.refused(60, 50, 0) is None, 'XY allowed after the cut')
+    r.feed(150000 + 200000, 0.05)
+    check(r.refused(70, 50, 0) == REFUSAL, 'a real press after it: refused')
+
+
+def test_stand_aside_reseat_needs_the_same_state():
+    for change in ('pose', 'z', 'contact', 'timeout'):
+        r = Rig(z=0.)
+        r.feed(0, 0.5)
+        if change == 'contact':
+            r.feed(200000, 0.1)
+        stand_aside(r)
+        r.feed(570000, 0.3)
+        if change == 'pose':
+            r.printer.toolhead.position[0] = 60.
+        elif change == 'z':
+            r.set_position()
+        r.feed(150000, 0.3)
+        if change == 'timeout':
+            r.printer.reactor.now += 61.
+            r.feed(150000, 0.05)
+        r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
+        check(r.status()['contact'],
+              '%s changed: no re-seat, the latch stays' % change)
 
 
 def main():

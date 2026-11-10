@@ -5750,7 +5750,27 @@ recognised as a job. See the
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,
 #   so a descent queued just ahead of it is seen. Above it, moves are not
-#   delayed.
+#   delayed. With Z homed, still trusted, and both the commanded and the
+#   executed Z at this height or above, drift toward pressing is followed
+#   at up to drift_max_rate without counting against max_absorbed_counts.
+#drift_max_rate: 10000
+#   The fastest the zero can drift on its own (the hot end heating or
+#   cooling the cell), in counts per second. Faster changes are load.
+#drift_per_degree: 20000
+#   How far the zero can drift per degree C of drift_heater temperature
+#   swing since the last trusted zero (Z probe home, trusted end-of-G28
+#   park, REZERO without FORCE).
+#drift_margin_counts:
+#   An open-loop re-zero (after the G28 Z lift, or at the end of a G28
+#   X Y that lifted Z and left it untouched) of an offset at or above
+#   threshold_counts is accepted only if the new zero is within
+#   drift_margin_counts plus the smaller of drift_max_rate times the
+#   seconds and drift_per_degree times the temperature swing since the
+#   last trusted zero; otherwise the latch stays. The default is half of
+#   threshold_counts.
+#drift_heater: extruder
+#   The heater whose temperature bounds the drift. Without it only
+#   drift_margin_counts is accepted.
 ```
 
 ## Board specific hardware support

@@ -1,0 +1,23 @@
+# KAN-828 A1 (Opus review of #123): Z not trusted (here SET_KINEMATIC_
+# POSITION), the hot end cools and the zero drifts past the budget: a
+# false latch at Z 20.  The M1 G28's opening Z lift (open loop) re-zeroes
+# it, because 3000 counts/s for 60 s is inside the drift envelope:
+# drift_margin_counts + min(drift_max_rate * s, drift_per_degree * degC)
+# since the trusted zero.  contact_guard_lift_refuse.test: a press with no
+# temperature change is outside the envelope and stays latched.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard_lift.cfg
+
+CONTACT_GUARD_SIMULATE TEMP=220
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+SET_KINEMATIC_POSITION Z=21
+CONTACT_GUARD_SIMULATE TEMP=120 LOAD=0 DURATION=30 DRIFT=-3000
+CONTACT_GUARD_SIMULATE TEMP=30 LOAD=0 DURATION=30 DRIFT=-3000
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+G28 X Y
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X100 Y50 F6000

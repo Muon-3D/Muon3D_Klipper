@@ -115,6 +115,23 @@ class ContactGuard:
         self.max_absorbed = config.getint('max_absorbed_counts',
                                           self.threshold // 2, minval=0,
                                           maxval=self.threshold - 1)
+        # KAN-828: the physical bound on how far the zero can drift on its
+        # own (the hot end heating or cooling the cell; field logs show
+        # ~9000 counts/s while taring and 15000-19000 counts per degC while
+        # cooling).  An open-loop lift may re-zero a contact-level offset
+        # only if it is within drift_margin_counts plus the smaller of
+        # drift_max_rate * seconds and drift_per_degree * the heater's
+        # temperature swing since the last trusted zero.  The same rate is
+        # the most the zero is followed per second without limit, and only
+        # with Z homed, trusted and at sync_below_z or higher.
+        self.drift_rate = config.getfloat('drift_max_rate', 10000.,
+                                          minval=0.)
+        self.drift_per_degree = config.getfloat('drift_per_degree', 20000.,
+                                                minval=0.)
+        self.drift_margin = config.getint('drift_margin_counts',
+                                          self.threshold // 2, minval=0,
+                                          maxval=self.threshold)
+        self.drift_heater_name = config.get('drift_heater', 'extruder')
         # Moves are checked as they enter the lookahead queue, before the
         # moves ahead of them have run.  Starting below this machine Z (or
         # with Z unhomed) the queued motion could put the nozzle on the
@@ -177,6 +194,21 @@ class ContactGuard:
         # A homing_override probe triggered since the last position reset:
         # the reset that follows it (Z from the probe) keeps the trust
         self.probe_since_reset = False
+        # The last trusted zero (closed loop: probe-homed Z, a trusted
+        # end-of-G28 park, a bounded REZERO) and the heater's temperature
+        # range since: the drift envelope for open-loop re-zeroes
+        self.ref_baseline = self.ref_time = None
+        self.ref_temp_lo = self.ref_temp_hi = None
+        self.drift_heater = None
+        self.drift_free = False
+        # Z position events (resets, Z homing moves, FORCE_MOVE, motor
+        # off) so far; equal counts mean Z was not touched in between
+        self.z_events = 0
+        self.g28_lift_events = None
+        # SET_CONTACT_GUARD ENABLE=0 TIMEOUT: the state it was entered in
+        self.reseat = None
+        self.hmove_z_begin = None
+        self.sim_temp = None
         self.motion_known = False
         self.motion_base_z = None
         self.motion_moves = []
@@ -217,6 +249,13 @@ class ContactGuard:
                                         self.cmd_CONTACT_GUARD_SIMULATE)
 
     def _handle_connect(self):
+        heaters = self.printer.lookup_object('heaters', None)
+        if heaters is not None:
+            try:
+                self.drift_heater = heaters.lookup_heater(
+                    self.drift_heater_name)
+            except self.printer.config_error:
+                self.drift_heater = None
         self.probe = self.printer.lookup_object('load_cell_probe', None)
         if self.probe is None or not hasattr(self.probe, 'get_load_cell'):
             raise self.printer.config_error(
@@ -354,6 +393,8 @@ class ContactGuard:
     def _handle_homing_move_begin(self, hmove):
         self.homing_moves += 1
         self.lift_zero = None
+        self.hmove_z_begin = (None if self.toolhead is None
+                              else self.toolhead.get_position()[2])
         self.own_error = None
         # Remember what the cell read just before the move.  It becomes the
         # zero at the end only if this was a Z move that travelled far
@@ -374,8 +415,13 @@ class ContactGuard:
                 continue
             if batch:
                 # Batch mode simulates no stepper motion (as
-                # check_no_movement does): take a Z move as a probe that
-                # moved
+                # check_no_movement does): a Z move that ended higher than
+                # it began (as commanded) is a lift, any other a probe
+                # that moved
+                begin = self.hmove_z_begin
+                z = self.toolhead.get_position()[2]
+                if begin is not None and z - begin > MOVE_EPSILON:
+                    return 0., z - begin
                 return float('inf'), 0.
             mtc = sp.stepper.mcu_to_commanded_position
             moved = mtc(sp.start_pos) - mtc(sp.trig_pos)
@@ -391,7 +437,12 @@ class ContactGuard:
         self.homing_moves = max(0, self.homing_moves - 1)
         candidate, self.homing_candidate = self.homing_candidate, None
         travel, lifted = self._z_travel(hmove)
+        if any(sp.stepper.is_active_axis('z')
+               for sp in getattr(hmove, 'stepper_positions', [])):
+            self.z_events += 1
         if lifted >= self.clearance_lift - MOVE_EPSILON:
+            if getattr(self.homing_scope, 'in_scope', False):
+                self.g28_lift_events = self.z_events
             # A real lift (the G28 macro's AXIS_PROTECTED_MOVE Z+10), on the
             # steppers' own counts.  Its samples are not watched, so the
             # reading before it proves nothing; a steady reading after it
@@ -426,11 +477,13 @@ class ContactGuard:
         self.baseline = self.pending_zero
         self.pending_zero = None
         self._real_zero()
+        self._set_reference(self.data_time)
 
     def _handle_g28_begin(self):
         self.g28_z_homed = False
         self.g28_z0 = None
         self.g28_lift_baseline = None
+        self.g28_lift_events = None
 
     def _trusted_zero_refusal(self):
         # Why this G28 gets no trusted zero, or None.  Only a G28 whose
@@ -456,11 +509,30 @@ class ContactGuard:
         # pending_zero (the anchor from before the probe) and the open-loop
         # lift zero.  Anything less keeps the zero as it is.
         reason = self._trusted_zero_refusal()
+        lifted = (self.g28_lift_events is not None
+                  and self.g28_lift_events == self.z_events)
+        self.g28_lift_events = None
+        mcu = self.load_cell.sensor.get_mcu()
+        if reason is not None and lifted and self._is_enabled(
+                self.reactor.monotonic()) and self.probe is not None:
+            # G28 X Y (KAN-828): Z lifted at its start and untouched since,
+            # so the toolhead is still lifted.  The same open-loop zero as
+            # after the lift, on the steady load after the XY homing,
+            # bounded by the drift envelope
+            logging.info("contact_guard: no trusted zero after G28: %s;"
+                         " re-zeroing on the lifted load after it", reason)
+            self.lift_zero = {'after': self.toolhead.get_last_move_time(),
+                              'start': None, 'samples': [], 'kind': 'lift'}
+            if mcu.is_fileoutput():
+                return
+            self._settle_lift_zero()
+            if self.lift_zero is not None:
+                self.lift_zero = None
+            return
         if reason is not None:
             logging.info("contact_guard: no trusted zero after G28: %s;"
                          " keeping the existing zero", reason)
             return
-        mcu = self.load_cell.sensor.get_mcu()
         if mcu.is_fileoutput():
             return
         self.lift_zero = {'after': self.toolhead.get_last_move_time(),
@@ -536,16 +608,29 @@ class ContactGuard:
             self.baseline = mean
             self.pending_zero = None
             self._real_zero()
+            self._set_reference(t)
             return True
         load = sign * (mean - self.baseline)
         if abs(load) >= self.threshold:
-            # Open loop: a steady real press (skipped steps, a tall
-            # object) would be absorbed.  Leave the latch as it is.
-            logging.info("contact_guard: lift re-zero refused: the steady"
-                         " load after the lift is %d counts from the zero,"
-                         " at or above the %d contact threshold",
-                         load, self.threshold)
-            return False
+            # Open loop: the lift is only step counts, and a faulted Z
+            # driver leaves a pressed nozzle pressed.  A contact-level
+            # offset is re-zeroed only if drift alone could have put it
+            # there since the last trusted zero; otherwise the latch stays.
+            within, drift, envelope = self._drift_envelope(t, mean, sign)
+            if not within:
+                logging.info(
+                    "contact_guard: lift re-zero refused: the steady load"
+                    " after the lift is %d counts from the zero, at or"
+                    " above the %d contact threshold, and %s counts from"
+                    " the last trusted zero, outside the %d count drift"
+                    " envelope", load, self.threshold,
+                    "?" if drift is None else "%d" % drift, envelope)
+                return False
+            logging.info(
+                "contact_guard: lift re-zero accepted a contact-level"
+                " offset of %d counts: %d counts from the last trusted"
+                " zero, inside the %d count drift envelope",
+                load, drift, envelope)
         self.baseline = mean
         self.g28_lift_baseline = mean
         self._real_zero()
@@ -557,6 +642,63 @@ class ContactGuard:
         # The baseline was just set from evidence that nothing touched
         self.absorbed = 0.
         self._reset_detector()
+
+    def _heater_temp(self, eventtime):
+        if self.sim_temp is not None:
+            return self.sim_temp
+        if self.drift_heater is None:
+            return None
+        try:
+            return self.drift_heater.get_temp(eventtime)[0]
+        except Exception:
+            return None
+
+    def _set_reference(self, t):
+        # A closed-loop zero: the drift envelope restarts here
+        self.ref_baseline = self.baseline
+        self.ref_time = t
+        temp = self._heater_temp(self.reactor.monotonic())
+        self.ref_temp_lo = self.ref_temp_hi = temp
+
+    def _track_temperature(self, eventtime):
+        temp = self._heater_temp(eventtime)
+        if temp is None or self.ref_temp_lo is None:
+            if temp is not None and self.ref_baseline is not None:
+                self.ref_temp_lo = self.ref_temp_hi = temp
+            return
+        self.ref_temp_lo = min(self.ref_temp_lo, temp)
+        self.ref_temp_hi = max(self.ref_temp_hi, temp)
+
+    def _drift_envelope(self, t, mean, sign):
+        # (within, drift, envelope): how far `mean` is from the last
+        # trusted zero, and how far drift could have taken it since.  No
+        # trusted zero or no temperature: only the margin, never more
+        if self.ref_baseline is None or self.ref_time is None:
+            return False, None, 0
+        drift = sign * (mean - self.ref_baseline)
+        swing = 0.
+        if self.ref_temp_lo is not None:
+            swing = self.ref_temp_hi - self.ref_temp_lo
+        possible = min(self.drift_rate * max(0., t - self.ref_time),
+                       self.drift_per_degree * swing)
+        envelope = int(self.drift_margin + possible)
+        return abs(drift) <= envelope, drift, envelope
+
+    def _drift_follow_allowed(self, eventtime, t):
+        # Following the zero without the max_absorbed_counts budget is
+        # only safe where no press can creep in: Z homed for real, still
+        # trusted, and both the commanded and the executed Z at
+        # sync_below_z or above (KAN-828, Opus review of #123)
+        if (self.toolhead is None or not self.z_trusted
+                or self._is_homing()):
+            return False
+        kin_status = self.toolhead.get_kinematics().get_status(eventtime)
+        if 'z' not in kin_status['homed_axes']:
+            return False
+        if self.toolhead.get_position()[2] < self.sync_below_z:
+            return False
+        z = self._z_at(t)
+        return z is None or z >= self.sync_below_z
 
     def _handle_home_rails_begin(self, homing_state, rails):
         self.homing_rails = True
@@ -596,6 +738,7 @@ class ContactGuard:
         if old_z is not None and abs(new_z - old_z) < MOVE_EPSILON:
             # SET_KINEMATIC_POSITION SET_HOMED=... with Z unchanged
             return
+        self.z_events += 1
         if self._override_active() and self.probe_since_reset:
             # Z set from the probe that just triggered
             self.probe_since_reset = False
@@ -611,6 +754,7 @@ class ContactGuard:
         # nozzle is
         self.own_error = None
         if stepper.is_active_axis('z'):
+            self.z_events += 1
             self.z_trusted = self.probe_since_reset = False
             self.g28_z_homed = False
 
@@ -619,11 +763,13 @@ class ContactGuard:
         # enable change are not comparable for clearance
         self.clear_win = None
         self.position_reset_time = max(self.position_reset_time, print_time)
+        self.z_events += 1
         if not enabled:
             self.z_trusted = self.probe_since_reset = False
             self.g28_z_homed = False
 
     def _end_stand_aside(self):
+        self.reseat = None
         if self.stand_aside_end is not None:
             self.stand_aside_end = None
             self.enabled = True
@@ -723,6 +869,9 @@ class ContactGuard:
             anchor_only = self._is_homing()
         self._apply_pending_zero()
         self._update_motion_history(samples[0][0], samples[-1][0])
+        self._track_temperature(self.sample_systime)
+        self.drift_free = self._drift_follow_allowed(self.sample_systime,
+                                                     samples[0][0])
         sign = self.probe.get_press_direction(
             self.baseline if self.baseline is not None else samples[0][2])
         for sample in samples:
@@ -782,15 +931,20 @@ class ContactGuard:
         self.drift_min = self.drift_max = None
         self.clear_win = None
 
-    def _absorb(self, new, sign):
+    def _absorb(self, new, sign, free=0.):
         # Drift following and steady relocks.  Toward less pressed is free
         # and gives back what was absorbed; toward more pressed is limited
         # to max_absorbed_counts in total since the last real zero, so the
-        # excess reads as load and, past the threshold, as contact.
+        # excess reads as load and, past the threshold, as contact.  Up to
+        # `free` counts of it (drift_max_rate over the sample interval,
+        # high above the plate) is thermal drift and not counted.
         step = sign * (new - self.baseline)
         if step > 0.:
-            step = min(step, max(0., self.max_absorbed - self.absorbed))
-            self.absorbed += step
+            free_step = min(step, free)
+            charged = min(step - free_step,
+                          max(0., self.max_absorbed - self.absorbed))
+            self.absorbed += charged
+            step = free_step + charged
         else:
             self.absorbed = max(0., self.absorbed + step)
         self.baseline += sign * step
@@ -894,6 +1048,7 @@ class ContactGuard:
             self.recent.popleft()
         if self.baseline is None:
             self.baseline = float(counts)
+            self._set_reference(t)
         if anchor_only:
             # Not judged, but a pending lift re-zero must still settle:
             # G28 is one homing_scope, so every sample in it is
@@ -947,7 +1102,8 @@ class ContactGuard:
         # Baseline: follow small changes slowly
         if abs(load) < self.band:
             self._absorb(self.baseline + (counts - self.baseline)
-                         * min(1., dt / self.tau), sign)
+                         * min(1., dt / self.tau), sign,
+                         self.drift_rate * dt if self.drift_free else 0.)
             self.drift_since = None
             return
         # Require a steady window, not merely time outside the band. An
@@ -1037,10 +1193,59 @@ class ContactGuard:
         old = self.load
         self.baseline = mean
         self._real_zero()
+        if not force:
+            self._set_reference(self.data_time)
         self.load = 0.
         logging.info("contact_guard: re-zeroed by command at Z %.2f, load"
                      " was %d", z, old)
         return old
+
+    def _reseat_snapshot(self):
+        # ENABLE=0 TIMEOUT (CUT_FILAMENT): note the pose and whether the
+        # guard reads clear there once the queued motion has run
+        self._sync()
+        clear = (self.baseline is not None and not self.contact
+                 and self.above_since is None and bool(self.recent)
+                 and self.data_time >= self._holdoff_end())
+        return {'pose': self.toolhead.get_position()[:3], 'clear': clear,
+                'z_events': self.z_events}
+
+    def _reseat(self, snap):
+        # ENABLE=1 ending that stand-aside (KAN-828): the cutter press
+        # leaves a mechanical offset that latches as contact, and with Z
+        # faked or low no REZERO may clear it.  Back at the same pose, with
+        # Z untouched, a toolhead that read clear there before the press is
+        # not on the plate now: the steady load becomes the zero.
+        # Returns why not, or None once re-seated.
+        if not snap['clear']:
+            return "it did not read clear when it stood aside"
+        if snap['z_events'] != self.z_events:
+            return "Z was moved or reset meanwhile"
+        pose = self.toolhead.get_position()[:3]
+        if any(abs(a - b) > MOVE_EPSILON for a, b in zip(pose, snap['pose'])):
+            return "the toolhead is not back where it stood aside"
+        self._sync()
+        eventtime = self.reactor.monotonic()
+        if (not self.recent or self.sample_systime is None
+                or eventtime - self.sample_systime > STREAM_TIMEOUT
+                or self.data_time < self._holdoff_end()):
+            return "no current load cell samples"
+        counts = [c for t, c in self.recent]
+        if max(counts) - min(counts) > self.band:
+            return "the load is changing"
+        sign = self.probe.get_press_direction(self.baseline)
+        if any(self._out_of_range(c, sign) for c in counts):
+            return "the load cell is at the end of its range"
+        mean = float(sum(counts)) / len(counts)
+        old = sign * (mean - self.baseline)
+        if self.ref_baseline is not None:
+            self.ref_baseline += mean - self.baseline
+        self.baseline = mean
+        self._real_zero()
+        self.load = 0.
+        logging.info("contact_guard: re-seated after standing aside at the"
+                     " same pose, load was %d", old)
+        return None
 
     cmd_SET_CONTACT_GUARD_help = (
         "Enable or disable refusing XY moves while the nozzle touches"
@@ -1053,10 +1258,23 @@ class ContactGuard:
         if timeout is not None and enable != 0:
             raise self.gcode.error("contact_guard: TIMEOUT needs ENABLE=0")
         if enable is not None:
+            self._is_enabled(self.reactor.monotonic())  # timed out yet?
+            snap = self.reseat if self.stand_aside_end is not None else None
+            self.reseat = None
+            if timeout is not None:
+                snap = None
+                self.reseat = self._reseat_snapshot()
             self.enabled = bool(enable)
             self.stand_aside_end = None
             if timeout is not None:
                 self.stand_aside_end = self.reactor.monotonic() + timeout
+            if enable and snap is not None:
+                why = self._reseat(snap)
+                if why is not None:
+                    logging.info("contact_guard: not re-seated after"
+                                 " standing aside: %s", why)
+                    gcmd.respond_info("contact_guard: not re-seated: %s"
+                                      % (why,))
         if gcmd.get_int('REZERO', 0, minval=0, maxval=1):
             force = bool(gcmd.get_int('FORCE', 0, minval=0, maxval=1))
             # TRY=1 (for macros): a refusal is reported, not raised, so
@@ -1083,6 +1301,12 @@ class ContactGuard:
         # PLATE_Z=<z> STIFFNESS=<counts/mm> instead models a plate at that
         # toolhead Z: samples then follow the executed motion in the trapq,
         # and are generated whenever the guard waits for them.
+        temp = gcmd.get_float('TEMP', None)
+        if temp is not None:
+            # The drift heater's temperature from now on
+            self.sim_temp = temp
+            if gcmd.get('DURATION', None) is None:
+                return
         plate_z = gcmd.get_float('PLATE_Z', None)
         if plate_z is not None:
             self.sim_plate = (plate_z, gcmd.get_float('STIFFNESS', above=0.))

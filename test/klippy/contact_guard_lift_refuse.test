@@ -1,0 +1,18 @@
+# KAN-828 (Opus review of #123, blocking): a faulted Z driver leaves a
+# pressed nozzle pressed after the open-loop lift.  No temperature change
+# since the trusted zero: 200000 counts is outside the drift envelope, the
+# lift does not re-zero it, and the XY move after G28 X Y is refused.
+SHOULD_FAIL
+DICTIONARY atmega2560.dict
+CONFIG contact_guard_lift.cfg
+
+CONTACT_GUARD_SIMULATE TEMP=30
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+SET_KINEMATIC_POSITION Z=21
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.5
+G28 X Y
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.5
+G1 X100 Y50 F6000

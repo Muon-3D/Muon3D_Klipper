@@ -1,0 +1,25 @@
+SHOULD_FAIL
+# KAN-828: the hot end cools from print temperature with Z homed at Z 20.
+# The zero drifts 8000 counts/s in the pressing direction for 60 s
+# (480000 counts, ~15000 counts/degC).  It used to be followed only up to
+# max_absorbed_counts and then latched in free air (refused at Z 19.98,
+# load 91401).  High above the plate it is now followed at up to
+# drift_max_rate; a fast press after it still latches.
+# The XY move after the press is refused.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+
+CONTACT_GUARD_SIMULATE TEMP=220
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE TEMP=180 LOAD=0 DURATION=15 DRIFT=-8000
+CONTACT_GUARD_SIMULATE TEMP=120 LOAD=0 DURATION=15 DRIFT=-8000
+CONTACT_GUARD_SIMULATE TEMP=70 LOAD=0 DURATION=15 DRIFT=-8000
+CONTACT_GUARD_SIMULATE TEMP=30 LOAD=0 DURATION=15 DRIFT=-8000
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X100 Y50 F6000
+G1 Z1 F600
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
+G1 X60 Y50 F6000
