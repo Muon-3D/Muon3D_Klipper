@@ -164,6 +164,9 @@ class M1:
         # PRINT_START reads these while it renders, before its first line.
         printer.add_object('configfile', Status({'settings': {
             'extruder': {'max_temp': 265.0},
+            # CUT_FILAMENT puts run_current back (CutCurrentRestore)
+            'tmc2241 stepper_x': {'run_current': 0.8},
+            'tmc2241 stepper_y': {'run_current': 0.8},
             'load_cell_probe': {'z_offset': 0.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
@@ -1916,6 +1919,71 @@ class PauseResumeSymmetry(_M1TestCase):
         self.assertTrue(any(
             line.startswith('MACHINE_PAUSED REASON=toolhead_disconnected')
             for line in self.m1.timeline))
+
+
+class CutCurrentRestore(_M1TestCase):
+    """Review of #107: CUT_FILAMENT drops X/Y to 0.6 A for the push and
+    raises them to 1.35 A (35% over the motors' rating) for the cut. A macro
+    has no finally, so an error in between left the motors there.
+    _CUT_CURRENT_RESTORE, armed before the first change and disarmed on
+    success, puts run_current back once the macro has ended. The real
+    CUT_FILAMENT runs here; the moves and the drivers are recorded."""
+
+    REAL_CUT = tuple(n for n in STUBS if n != 'CUT_FILAMENT') + (
+        'AXIS_HOME_MOVE', 'SET_TMC_CURRENT', 'PARK_PRINTER',
+        'SET_CONTACT_GUARD')
+
+    def setUp(self):
+        super().setUp()
+        with mock.patch.object(sys.modules[__name__], 'STUBS',
+                               self.REAL_CUT):
+            self.m1 = M1(self.variables_file)
+
+    def currents(self):
+        return [line for line in self.m1.timeline
+                if line.startswith('SET_TMC_CURRENT')]
+
+    def test_a_cut_puts_run_current_back_and_disarms_the_restore(self):
+        self.m1.timeline.clear()
+        self.m1.run('CUT_FILAMENT')
+        cur = self.currents()
+        self.assertIn('SET_TMC_CURRENT STEPPER=stepper_x CURRENT=1.35', cur)
+        self.assertEqual(cur[-2:], [
+            'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.8',
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8'])
+        self.m1.timeline.clear()
+        self.m1.reactor.advance(5.)
+        self.assertEqual(self.currents(), [])
+        self.assertFalse(any('ended early' in r for r in self.m1.responses))
+
+    def test_an_error_mid_cut_puts_run_current_back(self):
+        self.m1.raising_lines.add('AXIS_HOME_MOVE')
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('CUT_FILAMENT')
+        self.assertEqual(self.currents()[-1],
+                         'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6')
+        self.m1.responses.clear()
+        self.m1.timeline.clear()
+        self.m1.reactor.advance(2.)
+        self.assertEqual(self.currents(), [
+            'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.8',
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8'])
+        self.assertTrue(any('ended early' in r for r in self.m1.responses))
+
+    def test_an_error_at_the_cut_current_puts_run_current_back(self):
+        self.m1.raising_lines.add('G1 X138')
+        self.m1.timeline.clear()
+        with self.assertRaises(gcode.CommandError):
+            self.m1.run('CUT_FILAMENT')
+        self.assertEqual(self.currents()[-1],
+                         'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=1.35')
+        self.m1.responses.clear()
+        self.m1.timeline.clear()
+        self.m1.reactor.advance(2.)
+        self.assertEqual(self.currents(), [
+            'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.8',
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8'])
 
 
 class ToolheadConnectAutoLoad(_M1TestCase):
