@@ -1215,6 +1215,7 @@ class ADXL345Probe:
 
         seek_left = cfg['seek_retries']
         stalls = 0
+        missed = 0
         while len(accepted) < cfg['samples']:
             # Cap follow-through to avoid driving into the stop on a missed tap.
             retractpos = list(toolhead.get_position())
@@ -1226,20 +1227,34 @@ class ADXL345Probe:
             trig, travelled, info = run_homing_move(
                 retract_dist + overtravel, speed)
             if trig is None:
-                history.append('no_trigger halt [%s]'
+                kind = ('missed' if cfg['overtravel'] is not None
+                        else 'no_trigger')
+                history.append('%s halt [%s]'
                                ' (trigger delta unavailable,'
                                ' approach %.3fmm)' % (
+                                   kind,
                                    positions(info['halt']),
                                    retract_dist + overtravel))
+                if cfg['overtravel'] is not None:
+                    missed += 1
+                    if not budget.take('missed'):
+                        raise cmderr(
+                            "adxl345_probe: %s home aborted: tap not detected"
+                            " within %.3fmm of the previous tap %d times;"
+                            " either the tap threshold is too high or the"
+                            " previous tap was spurious. Seek not resumed,"
+                            " to avoid driving into the stop."
+                            % (axis, overtravel, missed) + summary())
+                    # Undo the approach rebase so missed taps cannot walk
+                    # the capped endpoint further into the stop on retry.
+                    haltpos = list(toolhead.get_position())
+                    haltpos[axis_idx] += direction * overtravel
+                    toolhead.set_position(haltpos)
+                    continue
                 # No tap within reach; retain the bounded seek fallback.
                 # Resume the seek from here within the travel budget.
                 seek_budget -= travelled
                 capped = ""
-                if cfg['overtravel'] is not None:
-                    capped = ("; approach capped at %.3fmm past the previous"
-                              " tap: previous tap spurious or stop further on"
-                              % (overtravel,))
-                    logging.info("adxl345_probe: %s no trigger%s", axis, capped)
                 if seek_left <= 0 or seek_budget <= 0.:
                     raise cmderr(
                         "adxl345_probe: %s home tap not confirmed; no"

@@ -16,6 +16,7 @@ TOLERANCE_MM = 0.2
 SG_LOW = 10
 CS_DROP = 2
 POSITION_EPS_MM = 0.003125
+MISSED_MIN = 2
 
 
 def parse_line(text, prefix):
@@ -93,6 +94,10 @@ def verdict(home):
             previous[name] = cs
         if delta is not None and near_cycle(delta) and evidence:
             return 'pole_slip'
+    missed = [r for r in rows if r.get('classification') == 'missed']
+    if (len(missed) >= MISSED_MIN
+            and not any(r.get('step_anomaly', False) for r in missed)):
+        return 'detection_margin'
     for row in rows:
         delta = row.get('delta')
         if (row.get('kind') == 'confirm' and delta is not None

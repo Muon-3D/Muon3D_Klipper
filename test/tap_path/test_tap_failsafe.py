@@ -121,9 +121,9 @@ def test_exhausted_errors_include_positions_deltas_and_classes():
         assert 'initial [stepper_y=0(0.00000mm)]' in error
         assert 'delta ' in error and kind in error and 'vs anchor [' in error
     _, _, error = run(0.3, triggered=False)
-    assert 'y home tap not confirmed' in error
+    assert 'y home aborted: tap not detected' in error
     assert 'initial [stepper_y=0(0.00000mm)]' in error
-    assert 'no_trigger halt [stepper_y=' in error
+    assert 'missed halt [stepper_y=' in error
     assert 'trigger delta unavailable' in error
 
 

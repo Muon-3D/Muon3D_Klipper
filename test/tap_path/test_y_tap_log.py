@@ -31,7 +31,8 @@ def fixture(fail=False):
                 for n in yt.STEPPERS]
     owner = NS(_lookup_tmc=lambda n: drv,
                _axis_wrappers={'y': NS(last_trigger_time=1.)},
-               tap_confirm={'y': {'tolerance': 0.2, 'stall_dist': 0.8}})
+               tap_confirm={'y': {'tolerance': 0.2, 'stall_dist': 0.8,
+                                   'overtravel': 0.3}})
     move = NS(toolhead=NS(get_position=lambda: [0., 158., 0., 0.],
               get_kinematics=lambda: NS(get_steppers=lambda: steppers)),
               command_end=[0., 174., 0., 0.],
@@ -41,8 +42,12 @@ def fixture(fail=False):
     return owner, move, reads
 
 
-def capture(fail=False, no_trigger=False, aborted=False):
+def capture(fail=False, no_trigger=False, aborted=False, cap=0.3,
+            anomaly=False):
     owner, move, reads = fixture(fail)
+    owner.tap_confirm['y']['overtravel'] = cap
+    if anomaly:
+        move.stepper_positions[1].halt_pos = 260
     if no_trigger:
         owner._axis_wrappers['y'].last_trigger_time = 0.
     stream = io.StringIO()
@@ -99,8 +104,15 @@ def test_failed_driver_reads_never_propagate():
 def test_no_trigger_and_unverified_abort_are_recorded_once():
     lines, _ = capture(no_trigger=True)
     row = summary.parse_line(lines[0], 'y tap attempt:')
-    assert row['classification'] == 'no_trigger'
+    assert row['classification'] == 'missed'
     assert row['trigger_mm'] is None
+    assert not row['step_anomaly']
+    lines, _ = capture(no_trigger=True, anomaly=True)
+    row = summary.parse_line(lines[0], 'y tap attempt:')
+    assert row['classification'] == 'missed' and row['step_anomaly']
+    lines, _ = capture(no_trigger=True, cap=None)
+    row = summary.parse_line(lines[0], 'y tap attempt:')
+    assert row['classification'] == 'no_trigger'
     lines, reads = capture(aborted=True)
     row = summary.parse_line(lines[0], 'y tap attempt:')
     assert row['classification'] == 'aborted' and reads == []
@@ -131,6 +143,10 @@ def test_parser_hypotheses_and_empty_input():
     assert summary.read_homes(['y tap attempt: broken']) == {}
     assert summary.read_homes(['y tap attempt: attempt=1']) == {}
     assert hypothesis([synthetic()]) == 'ok'
+    missed = synthetic(classification='missed', trigger_mm=None, delta=None)
+    assert hypothesis([missed, missed]) == 'detection_margin'
+    assert hypothesis([missed]) == 'ok'
+    assert hypothesis([missed, dict(missed, step_anomaly=True)]) == 'ok'
     assert hypothesis([synthetic(0.8, sg=0)]) == 'pole_slip'
     assert hypothesis([synthetic(-0.4)]) == 'early_trigger'
     assert hypothesis([synthetic(), synthetic(0.35, halt=0.35)]) == 'binding'

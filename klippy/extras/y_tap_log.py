@@ -97,14 +97,17 @@ class YTapLog:
                                  if row['halt_mm'] is not None
                                  and row['trigger_mm'] is not None else None)
         row['step_anomaly'] = False
-        if triggered and all(row['start_steps'][n] is not None
-                             and row['trigger_steps'][n] is not None
-                             for n in STEPPERS):
-            x_drift = sum((row['trigger_steps'][n] - row['start_steps'][n])
+        check_steps = row['trigger_steps' if triggered else 'halt_steps']
+        if all(row['start_steps'][n] is not None
+               and check_steps[n] is not None for n in STEPPERS):
+            x_drift = sum((check_steps[n] - row['start_steps'][n])
                           * steppers[n].get_step_dist() for n in STEPPERS) / 2.
             row['step_anomaly'] = abs(x_drift) > cfg['tolerance']
         row['delta'] = None
         row['classification'] = 'aborted' if error else 'no_trigger'
+        if (not error and not triggered and row['kind'] == 'confirm'
+                and cfg['overtravel'] is not None):
+            row['classification'] = 'missed'
         trig = row['trigger_steps']
         if triggered and all(trig[n] is not None for n in STEPPERS):
             if self.anchor is None or row['kind'] != 'confirm':

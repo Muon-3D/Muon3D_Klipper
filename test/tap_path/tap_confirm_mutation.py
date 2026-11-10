@@ -39,6 +39,10 @@ EXPECT = {
 
 # name, file, old, new, the test that must notice
 MUTATIONS = [
+    ("capped no-trigger resumes the seek", PROBE,
+     "                if cfg['overtravel'] is not None:\n",
+     "                if False:\n",
+     'unit_overtravel'),
     ("DRV_STATUS read exception propagates",
      os.path.join('klippy', 'extras', 'y_tap_log.py'),
      "        return 'unavailable(%s)' % str(e)\n",
@@ -113,9 +117,10 @@ def run_test(tmp, dictdir, name):
 
 def check(tmp, dictdir, name):
     """None if the test ends as EXPECT says, else why not."""
-    if name in ('unit_failsafe', 'unit_y_log'):
+    if name in ('unit_failsafe', 'unit_y_log', 'unit_overtravel'):
         test = ('test_tap_failsafe.py' if name == 'unit_failsafe'
-                else 'test_y_tap_log.py')
+                else 'test_y_tap_log.py' if name == 'unit_y_log'
+                else 'test_tap_overtravel.py')
         result = subprocess.run(
             [sys.executable, os.path.join('test', 'tap_path', test)], cwd=tmp,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -171,6 +176,10 @@ def main(argv=None):
         why = check(tmp, dictdir, 'unit_y_log')
         if why:
             print('FAIL unmutated Y log: ' + why)
+            return 1
+        why = check(tmp, dictdir, 'unit_overtravel')
+        if why:
+            print('FAIL unmutated overtravel: ' + why)
             return 1
         for title, fname, old, new, name in MUTATIONS:
             src = mutate(tmp, fname, old, new)
