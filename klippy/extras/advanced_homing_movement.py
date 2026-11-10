@@ -512,6 +512,13 @@ class AxisAdvancedHomingMovement:
                     " %.3f" % (dist, axis.upper(), axis_max - axis_min))
             cur[axis_i] = axis_max if sign * dist < 0. else axis_min
         target_axis = cur[axis_i] + sign * dist
+        if was_homed:
+            # Stop at the axis limit rather than be refused past it. The
+            # caller's DIST is in G-code terms, and a coordinate transform
+            # (skew) can put the toolhead a little off them.
+            _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
+            target_axis = self._clamp_axis_target(target_axis, axis_min,
+                                                  axis_max)
         toolhead.set_position(list(cur), homing_axes=axis)
 
         try:

@@ -240,6 +240,15 @@ class BedMesh:
         self.update_status()
         if self.auto_skew and mesh is not None:
             self._sync_skew_from_mesh()
+        elif self.auto_skew:
+            # MUON: the tilt skew belongs to the mesh it came from. Left in
+            # place after BED_MESH_CLEAR it kept leaning XY by Z * tilt: on
+            # sloe (2026-11-10) G1 Y10 at Z50 went to Y9.534, and
+            # CUT_FILAMENT's tap towards Y min was refused past the limit.
+            skew = self.printer.lookup_object('skew_correction', None)
+            if skew is not None:
+                skew._update_skew(skew.xy_factor, 0., 0.)
+                logging.info("bed_mesh skew sync: cleared with the mesh")
     def get_z_factor(self, z_pos):
         z_pos += self.tool_offset
         if z_pos >= self.fade_end:
