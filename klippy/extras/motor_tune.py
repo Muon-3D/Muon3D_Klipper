@@ -20,8 +20,8 @@
 #   The same registers at standstill (PWM_AUTO after StealthChop tuning).
 #
 # The registers say:
-#   pwm_scale_sum  StealthChop's drive amplitude, 0-255 (0-1023 on some
-#                  parts). Near the top it has no voltage left to hold the
+#   pwm_scale_sum  StealthChop's drive amplitude, 0-1023 on the TMC2240/41
+#                  (sloe at 0.8 A: 186 at 100, 549 at 400, 913 at 700 mm/s). Near the top it has no voltage left to hold the
 #                  current: the speed where that happens bounds StealthChop.
 #   pwm_ofs_auto, pwm_grad_auto  StealthChop's learnt tuning (AT#1, AT#2).
 #   cs_actual      the current scale the driver is actually using (0-31).

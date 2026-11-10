@@ -94,7 +94,7 @@ def section_resonance(res, w):
 
 def section_stealth(samples, res, w):
     w("## StealthChop headroom (PWM_SCALE_SUM vs speed)\n\n"
-      "StealthChop holds the current only while PWM_SCALE_SUM has room;"
+      "StealthChop holds the current only while PWM_SCALE_SUM (0-1023 on the TMC2241) has room;"
       " where it flattens there is no voltage left. Switch to SpreadCycle"
       " well below that (about 70-80 %).\n\n")
     rows = [s for s in samples if s.get('label') == 'stealth_sweep']
