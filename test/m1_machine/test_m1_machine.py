@@ -427,6 +427,53 @@ class TestStartGate(unittest.TestCase):
         m.run('MACHINE_WAIT_READY', ACTION='print')
         self.assertGreaterEqual(m.reactor.now - t0, 7.)
 
+    def _grab_machine(self, grabbed):
+        m = Machine(settle_time=1.)
+        m.printer.objects['gcode_macro _GATE_FILAMENT_GRAB'] = object()
+        m.printer.objects['extruder_homing sensorless_extruder'] = Status(
+            last_triggered=grabbed)
+        m.start_print()
+        m.filament.status['filament_detected'] = False
+        return m
+
+    def test_filament_inserted_while_waiting_is_grabbed(self):
+        # The sensor's insert_gcode does not run during a job, so the gate
+        # grabs it itself before the print goes on (Harry, 2026-11-10).
+        m = self._grab_machine(grabbed=True)
+        m.reactor.schedule(
+            3., lambda: m.filament.status.update(filament_detected=True))
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertEqual(m.gcode.scripts.count('_GATE_FILAMENT_GRAB'), 1)
+        self.assertIn('// Filament grabbed', m.gcode.out)
+
+    def test_filament_not_grabbed_keeps_the_gate_waiting(self):
+        m = self._grab_machine(grabbed=False)
+        homing = m.printer.objects['extruder_homing sensorless_extruder']
+        m.reactor.schedule(
+            3., lambda: m.filament.status.update(filament_detected=True))
+        # Pulled out and inserted again; this time it is grabbed.
+        m.reactor.schedule(
+            10., lambda: m.filament.status.update(filament_detected=False))
+
+        def reinsert():
+            homing.status['last_triggered'] = True
+            m.filament.status['filament_detected'] = True
+        m.reactor.schedule(14., reinsert)
+        t0 = m.reactor.now
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertGreaterEqual(m.reactor.now - t0, 14.)
+        self.assertEqual(m.gcode.scripts.count('_GATE_FILAMENT_GRAB'), 2)
+        text = ' '.join(m.prompts())
+        self.assertIn('Filament not grabbed', text)
+
+    def test_filament_already_in_is_not_grabbed(self):
+        m = self._grab_machine(grabbed=True)
+        m.filament.status['filament_detected'] = True
+        m.detector.present = False
+        m.reactor.schedule(3., lambda: setattr(m.detector, 'present', True))
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertNotIn('_GATE_FILAMENT_GRAB', m.gcode.scripts)
+
     def test_latched_fault_refuses_at_once(self):
         # Its acknowledgement is a gcode command, which cannot run while
         # the gate holds the gcode lock.

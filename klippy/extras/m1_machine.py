@@ -67,6 +67,8 @@ REASONS = {
     'hotend_detecting': "Detecting the hot end",
     'hotend_failed': "The hot end sensor is faulty (see MUON_HOTEND_STATUS)",
     'filament_absent': "Load filament: insert it into the toolhead",
+    'filament_not_grabbed': "Filament not grabbed: pull it out and insert"
+                            " it again",
     'bed_power_starting': "Bed power is starting",
     'bed_power_inhibited': "Bed power is held off (Z_POWER_INHIBIT ENABLE=0)",
     'bed_power_fault': "Bed power fault: check the bed and its cable, then"
@@ -76,6 +78,9 @@ REASONS = {
                          " fit it again",
 }
 ORDER = list(REASONS)
+
+# The macro the start gate runs to grab filament inserted while it waits.
+GATE_GRAB_MACRO = '_GATE_FILAMENT_GRAB'
 
 # Missing items that need a person to acknowledge with a gcode command.
 # A gate cannot wait for them (see THE GCODE LOCK), so it refuses at once.
@@ -648,6 +653,13 @@ class M1Machine:
         self._run_led('LED_WARNING')
         check_abort = getattr(self.gcode, 'check_abort', None)
         met_since = None
+        # Filament inserted while the gate waits is grabbed here: the
+        # sensor's insert_gcode does not run during a job, so before this
+        # the gate saw it present and the print started with it loose
+        # (Harry, 2026-11-10). Only an insert seen during the wait is
+        # grabbed; filament already in at the start is left alone.
+        grab_pending = 'filament_absent' in miss
+        grab_failed = False
         try:
             while True:
                 if self.printer.is_shutdown():
@@ -661,7 +673,19 @@ class M1Machine:
                     # us: stop here rather than carry on into the heating.
                     raise gcmd.error("Print cancelled while waiting")
                 c = self.conditions(eventtime)
+                fil = c.get('filament')
+                if fil == 'absent':
+                    grab_pending, grab_failed = True, False
+                elif fil == 'present' and grab_pending:
+                    grab_pending = False
+                    grab_failed = not self._gate_grab_filament(gcmd)
+                    eventtime = reactor.monotonic()
+                    c = self.conditions(eventtime)
+                    met_since = None
                 miss = missing(action, c)
+                if grab_failed and c.get('filament') == 'present':
+                    miss = sorted(miss + ['filament_not_grabbed'],
+                                  key=ORDER.index)
                 self._refuse_latched(gcmd, action, miss)
                 if miss != self.gate['missing']:
                     self.gate['missing'] = miss
@@ -692,6 +716,29 @@ class M1Machine:
             self.gate = None
             self._end_prompt('gate')
         gcmd.respond_info("Ready to %s" % (action,))
+
+    def _gate_grab_filament(self, gcmd):
+        """Wind in filament inserted at the start gate (filament.cfg's
+        _GATE_FILAMENT_GRAB, the insert flow's grab without its prompts).
+        True when it was grabbed, or when there is no grab to run."""
+        if self.printer.lookup_object('gcode_macro ' + GATE_GRAB_MACRO,
+                                      None) is None:
+            return True
+        gcmd.respond_info("Filament inserted: grabbing it")
+        try:
+            self.gcode.run_script_from_command(GATE_GRAB_MACRO)
+        except self.printer.command_error as e:
+            gcmd.respond_info("Filament grab failed: %s" % (e,))
+            return False
+        homing = self.printer.lookup_object(
+            'extruder_homing sensorless_extruder', None)
+        if homing is None:
+            return True
+        st = self._status_of(homing, self.reactor.monotonic())
+        grabbed = bool(st.get('last_triggered', True))
+        gcmd.respond_info("Filament grabbed" if grabbed
+                          else "Filament not grabbed")
+        return grabbed
 
     def _refuse_latched(self, gcmd, action, miss):
         latched = [m for m in miss if m in REFUSE]
