@@ -477,10 +477,63 @@ class TestStartGate(unittest.TestCase):
         with self.assertRaises(CommandError):
             m.run('MACHINE_WAIT_READY', ACTION='print')
 
-    def test_by_hand_outside_a_job_still_waits(self):
+    def test_outside_a_job_waits_only_briefly(self):
+        # Review of #107, blocker 1: a client's PRINT_START is no print
+        # file, so KAN-382's abort cannot reach it, and the gate holds the
+        # gcode lock. It still waits, but only manual_gate_timeout (30 s).
         m = Machine(settle_time=0.)
         m.detector.present = False
         m.reactor.schedule(5., lambda: setattr(m.detector, 'present', True))
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+
+    def test_outside_a_job_gives_up_after_the_manual_timeout(self):
+        m = Machine(gate_timeout=1800.)
+        m.detector.present = False
+        t0 = m.reactor.now
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertGreaterEqual(m.reactor.now - t0, 30.)
+        self.assertLess(m.reactor.now - t0, 31.)
+        self.assertIn('after 30 s', str(e.exception))
+        self.assertIsNone(m.m1.gate)
+
+    def test_in_a_job_the_long_timeout_still_applies(self):
+        m = Machine(gate_timeout=1800.)
+        m.start_print()
+        m.detector.present = False
+        m.reactor.schedule(600., lambda: setattr(m.detector, 'present', True))
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertGreaterEqual(m.reactor.now, 1600.)
+
+    def test_cancel_request_stops_the_gate_outside_a_job(self):
+        # The event pause_resume/cancel and a gcode/script CANCEL_PRINT
+        # send ahead of queuing for the lock.
+        m = Machine()
+        m.detector.present = False
+        t0 = m.reactor.now
+        m.reactor.schedule(
+            5., lambda: m.printer.handlers['muon:cancel_requested']())
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertIn('cancelled', str(e.exception))
+        self.assertLess(m.reactor.now - t0, 6.)
+        self.assertIsNone(m.m1.gate)
+        self.assertIsNone(m.m1.gate_abort)
+
+    def test_cancel_request_stops_the_gate_in_a_job_too(self):
+        m = Machine()
+        m.start_print()
+        m.detector.present = False
+        m.reactor.schedule(
+            5., lambda: m.printer.handlers['muon:cancel_requested']())
+        with self.assertRaises(CommandError):
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+
+    def test_a_cancel_with_no_gate_does_not_stop_the_next_one(self):
+        m = Machine(settle_time=0.)
+        self.assertFalse(m.m1.request_gate_abort())
+        m.detector.present = False
+        m.reactor.schedule(2., lambda: setattr(m.detector, 'present', True))
         m.run('MACHINE_WAIT_READY', ACTION='print')
 
     def test_batch_mode_does_not_wait(self):

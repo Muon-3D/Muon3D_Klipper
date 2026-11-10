@@ -189,6 +189,9 @@ finish_test bed_removal "Test bed_removal_detector pauses only in the print phas
 # MUON: M1 machine state, start/resume gates and heat waits (m1_machine).
 start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 $PYTHON test/m1_machine/test_m1_machine.py
+# A client's PRINT_START in the gate: both cancel doors stop it, and with
+# no cancel it gives up after manual_gate_timeout (review of #107).
+$PYTHON test/m1_machine/test_gate_cancel.py
 finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 
 # MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).

@@ -223,6 +223,12 @@ class M1Machine:
         # pushed half way or a plate seated twice does not start the print.
         self.settle_time = config.getfloat('settle_time', 3., minval=0.)
         self.gate_timeout = config.getfloat('gate_timeout', 1800., minval=0.)
+        # Outside a print file (PRINT_START sent by a client or typed at the
+        # console) there is no job for #93's abort to stop, and the gate
+        # holds the gcode lock, so CANCEL_PRINT and every panel button queue
+        # behind it. Bound that wait hard (review of #107, blocker 1).
+        self.manual_gate_timeout = config.getfloat(
+            'manual_gate_timeout', 30., minval=0., maxval=300.)
         # A paused print's bed stays at target this long, then goes off
         # (audit 6.3). The hot end goes off at the pause itself (PAUSE).
         self.pause_bed_off_time = config.getfloat('pause_bed_off_time',
@@ -278,6 +284,12 @@ class M1Machine:
         self.resume_refused = False    # MACHINE_REQUIRE showed the checklist
         printer.register_event_handler('klippy:connect', self._connect)
         printer.register_event_handler('klippy:ready', self._ready)
+        # A cancel that does not wait for the gcode lock: Moonraker's
+        # print/cancel (pause_resume/cancel) and a CANCEL_PRINT sent as a
+        # gcode/script both announce it before they queue for the lock.
+        self.gate_abort = None
+        printer.register_event_handler('muon:cancel_requested',
+                                       self.request_gate_abort)
         for name, func in (
                 ('MACHINE_WAIT_READY', self.cmd_MACHINE_WAIT_READY),
                 ('MACHINE_REQUIRE', self.cmd_MACHINE_REQUIRE),
@@ -640,8 +652,14 @@ class M1Machine:
         if not miss:
             return
         self._refuse_latched(gcmd, action, miss)
-        # Run by hand from the console there is no job to be cancelled.
+        # Run by hand from the console, or sent by a client, there is no
+        # job for KAN-382's abort to cancel: wait only manual_gate_timeout.
+        # A cancel request stops the wait either way (request_gate_abort).
         in_job = self.ps_state(eventtime) in ('printing', 'paused')
+        if not in_job and self.manual_gate_timeout:
+            timeout = (min(timeout, self.manual_gate_timeout) if timeout
+                       else self.manual_gate_timeout)
+        self.gate_abort = None
         self.gate = {'action': action, 'missing': miss, 'since': start}
         gcmd.respond_info("Waiting to %s: %s"
                           % (action, "; ".join(checklist_lines(miss))))
@@ -655,6 +673,8 @@ class M1Machine:
                                      % (action,))
                 if check_abort is not None:
                     check_abort()
+                if self.gate_abort is not None:
+                    raise gcmd.error(self.gate_abort)
                 if in_job and self.ps_state(eventtime) not in (
                         'printing', 'paused'):
                     # Without KAN-382's abort, a cancel ends the job under
@@ -673,7 +693,10 @@ class M1Machine:
                     self._show('gate', "Waiting to start",
                                ["The print starts by itself once:"]
                                + ["- " + t for t in checklist_lines(miss)]
-                               + ["Cancel the print to stop waiting."], [])
+                               + ["Cancel the print to stop waiting."
+                                  if in_job else
+                                  "Cancel to stop waiting (gives up after"
+                                  " %d s)." % (timeout,)], [])
                 else:
                     if met_since is None:
                         met_since = eventtime
@@ -683,15 +706,28 @@ class M1Machine:
                     if eventtime - met_since >= settle:
                         break
                 if timeout and eventtime - start >= timeout:
+                    waited = ("%d min" % (timeout // 60,) if timeout >= 60
+                              else "%d s" % (timeout,))
                     raise gcmd.error(
-                        "Not ready to %s after %d min: %s" % (
-                            action, timeout // 60,
+                        "Not ready to %s after %s: %s" % (
+                            action, waited,
                             "; ".join(checklist_lines(miss))))
                 eventtime = reactor.pause(eventtime + self.poll_time)
         finally:
             self.gate = None
+            self.gate_abort = None
             self._end_prompt('gate')
         gcmd.respond_info("Ready to %s" % (action,))
+
+    def request_gate_abort(self, msg="Print start cancelled"):
+        # Called from a webhook, outside the gcode lock the gate holds. The
+        # gate checks the flag at its next poll and stops there. Nothing is
+        # flagged when no gate is waiting, so a later print is unaffected.
+        if self.gate is None:
+            return False
+        self.gate_abort = "%s while waiting to %s" % (msg,
+                                                      self.gate['action'])
+        return True
 
     def _refuse_latched(self, gcmd, action, miss):
         latched = [m for m in miss if m in REFUSE]

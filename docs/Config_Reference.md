@@ -4954,6 +4954,13 @@ file as printing, not toolhead motion.
 #   Seconds every condition must hold before MACHINE_WAIT_READY continues.
 #gate_timeout: 1800
 #   Seconds MACHINE_WAIT_READY waits before it fails (0 waits for ever).
+#manual_gate_timeout: 30
+#   Seconds MACHINE_WAIT_READY waits when no print file is running (a
+#   PRINT_START sent by a client or typed at the console). The wait holds
+#   the gcode lock, and no print abort can reach it, so it is kept short.
+#   A cancel (Moonraker's print/cancel, or CANCEL_PRINT sent as a script)
+#   stops the wait at its next poll either way. At most 300; 0 uses
+#   gate_timeout.
 #pause_bed_off_time: 1800
 #   Seconds into a pause after which the bed is turned off. RESUME reheats
 #   it to the print's target. 0 keeps it on.
