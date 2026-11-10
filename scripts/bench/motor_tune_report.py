@@ -60,13 +60,15 @@ def section_noise(res, w):
 
 SHAPER_RE = re.compile(r"Fitted shaper '(\w+)' frequency = ([\d.]+) Hz"
                        r" \(vibrations = ([\d.]+)%, smoothing ~= ([\d.]+)\)")
-ACCEL_RE = re.compile(r"suggested max_accel <= (\d+)")
+ACCEL_RE = re.compile(r"with '(\w+)', suggested max_accel <= (\d+)")
 RECO_RE = re.compile(r"Recommended shaper_type_(\w) = (\w+),"
                      r" shaper_freq_\w = ([\d.]+)")
 
 
 def section_resonance(res, w):
-    w("## Resonance (SHAPER_CALIBRATE, 20-130 Hz)\n")
+    w("## Resonance (SHAPER_CALIBRATE, 20-130 Hz)\n\n"
+      "max accel is Klipper's suggestion to keep the shaper's smoothing"
+      " down (print quality), not a step-loss limit.\n")
     for r in res:
         if r.get('kind') != 'resonance':
             continue
@@ -74,18 +76,27 @@ def section_resonance(res, w):
         if r.get('error'):
             w("Error: %s\n" % (r['error'],))
             continue
+        # The console window can start inside the other axis's output:
+        # take only the lines after this axis's own command.
         lines = r.get('console', [])
-        joined = '\n'.join(lines)
-        w("| shaper | freq Hz | vibrations % | smoothing | max accel |\n"
-          "|---|---|---|---|---|\n")
-        for line in joined.split('\n'):
+        cmd = 'SHAPER_CALIBRATE AXIS=%s' % (r.get('axis', '').upper(),)
+        starts = [i for i, l in enumerate(lines) if l.startswith(cmd)]
+        if starts:
+            lines = lines[starts[-1]:]
+        fitted, accel = [], {}
+        for line in lines:
             m = SHAPER_RE.search(line)
             if m:
-                a = ACCEL_RE.search(line)
-                w("| %s | %s | %s | %s | %s |\n" % (
-                    m.group(1), m.group(2), m.group(3), m.group(4),
-                    a.group(1) if a else '-'))
-        for m in RECO_RE.finditer(joined):
+                fitted.append(m.groups())
+            a = ACCEL_RE.search(line)
+            if a:
+                accel[a.group(1)] = a.group(2)
+        w("| shaper | freq Hz | vibrations % | smoothing | max accel |\n"
+          "|---|---|---|---|---|\n")
+        for name, freq, vib, smooth in fitted:
+            w("| %s | %s | %s | %s | %s |\n" % (name, freq, vib, smooth,
+                                                accel.get(name, '-')))
+        for m in RECO_RE.finditer('\n'.join(lines)):
             w("\nRecommended: %s at %s Hz\n" % (m.group(2), m.group(3)))
         if r.get('csv'):
             w("\nData: `%s`\n" % (r['csv'],))
