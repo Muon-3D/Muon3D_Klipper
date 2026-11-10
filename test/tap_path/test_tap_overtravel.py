@@ -18,7 +18,8 @@ def method(name, env):
                and n.name == 'ADXL345Probe')
     node = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
                 and n.name == name)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), '<probe>', 'exec'), env)
+    module = ast.Module(body=[node], type_ignores=[])
+    exec(compile(module, '<probe>', 'exec'), env)
     return env[name]
 
 
@@ -57,10 +58,10 @@ def test_validation_and_axis_override():
     assert profile({})['overtravel'] is None
 
 
-def run(cap, triggered=True, seek_retries=0):
+def run(cap, triggered=True, seek_retries=0, offsets=None, samples=2):
     cfg = profile({'tap_confirm_retract_dist': 8,
                    'y_tap_confirm_overtravel': cap,
-                   'y_tap_confirm_samples': 2,
+                   'y_tap_confirm_samples': samples,
                    'tap_confirm_seek_retries': seek_retries})
     pos = [0., 174., 0., 0.]
     moves = []
@@ -87,9 +88,11 @@ def run(cap, triggered=True, seek_retries=0):
             pos[:] = target
 
     printer = NS(command_error=ValueError, lookup_object=lambda n: tool,
-                 get_start_args=lambda: {})
+                 get_start_args=lambda: {'debuginput': 'test'}
+                 if offsets is not None else {})
     owner = NS(printer=printer, axis_homing_arm_delay={},
-               _sim_taps={}, _trace_phase=None)
+               _sim_taps={} if offsets is None else {'y': list(offsets)},
+               _trace_phase=None)
     hi = NS(positive_dir=True, position_endstop=174., speed=60.,
             retract_speed=60.)
     rail = NS(get_homing_info=lambda: hi, get_range=lambda: (-10., 174.1),

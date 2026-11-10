@@ -165,6 +165,8 @@ class HomingMove:
         except self.printer.command_error as e:
             if error is None:
                 error = str(e)
+            else:
+                error += "; %s" % (e,)
         if error is not None:
             raise self.printer.command_error(error)
         return trigpos

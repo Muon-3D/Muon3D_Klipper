@@ -521,6 +521,8 @@ class ADXL345Probe:
         return self.reactor.NEVER
 
     def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
+        if getattr(self, '_stream_stop_error', None):
+            raise self.printer.command_error(self._stream_stop_error)
         if self._tap_mode is not None:
             raise self.printer.command_error(
                 "ADXL345 tap detection already active (%s)" % (self._tap_mode,))
@@ -691,6 +693,8 @@ class ADXL345Probe:
     def _start_onset_client(self, wrappers, profile):
         # Stream accelerometer samples during the move so the tap onset can
         # be located afterwards.  The MCU stop still comes from the INT pin.
+        if getattr(self, '_stream_stop_error', None):
+            self._release_onset_client()
         self._onset_client = None
         if len(wrappers) != 1:
             return
@@ -713,7 +717,6 @@ class ADXL345Probe:
 
     def _release_onset_client(self):
         client = self._onset_client
-        self._onset_client = None
         if client is None:
             return
         client.is_finished = True
@@ -723,23 +726,31 @@ class ADXL345Probe:
         # 'spi_transfer_response'", 9 Nov) or blind the next tap.
         bulk = getattr(self.adxl345, 'batch_bulk', None)
         if bulk is None:
+            self._onset_client = None
             return
         reactor = self.reactor
         deadline = reactor.monotonic() + 1.
-        while (client.handle_batch in bulk.client_cbs
-               or (bulk.is_started and not bulk.client_cbs)):
+        while client.handle_batch in bulk.client_cbs or bulk.is_started:
             now = reactor.monotonic()
             if now >= deadline:
-                logging.warning("adxl345_probe: accelerometer stream did"
-                                " not stop in time")
-                break
+                axes = ''.join(w.get_axis() for w in getattr(
+                    self, '_active_axis_homing_wrappers', [])) or 'tap'
+                self._stream_stop_error = (
+                    "adxl345_probe: %s home aborted: accelerometer stream"
+                    " did not stop within 1.0s; a tap armed now could be"
+                    " blind and drive into the stop. Re-run G28; if it"
+                    " repeats, check other ADXL clients (TAP_TRACE,"
+                    " resonance tests)" % (axes,))
+                raise self.printer.command_error(self._stream_stop_error)
             reactor.pause(now + 0.01)
+        self._onset_client = None
+        self._stream_stop_error = None
 
     def _apply_tap_onset(self, hmove, wrappers):
         # Replace the stepper trigger positions with those at the onset of
         # the tap (tap_trigger_from_samples), and write the tap to the trace
-        # when TAP_TRACE is on.  Never raises: on any problem the hardware
-        # trigger positions stand.
+        # when TAP_TRACE is on. Refinement failures keep the hardware
+        # trigger positions; stream-stop failures must abort the home.
         client = self._onset_client
         if client is None:
             return
@@ -1037,8 +1048,10 @@ class ADXL345Probe:
             try:
                 self._apply_tap_onset(hmove, wrappers)
             finally:
-                self._release_onset_client()
-                self._reset_axis_homing_state()
+                try:
+                    self._release_onset_client()
+                finally:
+                    self._reset_axis_homing_state()
 
     def _handle_home_rails_end(self, homing_state, rails):
         # Confirm an X/Y tap home with further agreeing taps before the
@@ -1113,7 +1126,9 @@ class ADXL345Probe:
             wrapper.last_trigger_time = 0.
             hmove.homing_move(homepos, move_speed, check_triggered=False)
             if wrapper.last_trigger_time <= 0.:
-                return None, start_dist, None
+                return None, start_dist, {
+                    'halt': {sp.stepper_name: sp.halt_pos
+                             for sp in hmove.stepper_positions}}
             sps = hmove.stepper_positions
             trig = {sp.stepper_name: sp.trig_pos for sp in sps}
             dirs = tap_confirm.tap_dirs(
@@ -1150,10 +1165,20 @@ class ADXL345Probe:
             return delta, kind
 
         accepted = [dict(homing_state.trigger_mcu_pos)]
+        history = []
+
+        def positions(tap):
+            return ' '.join('%s=%d(%.5fmm)' % (n, tap[n],
+                           tap[n] * step_dists[n]) for n in sorted(step_dists))
+
+        def summary():
+            return '; taps: initial [%s]; %s' % (
+                positions(homing_state.trigger_mcu_pos), '; '.join(history))
+
         seek_left = cfg['seek_retries']
         stalls = 0
         while len(accepted) < cfg['samples']:
-            # Cap follow-through to avoid driving into the stop after a missed tap.
+            # Cap follow-through to avoid driving into the stop on a missed tap.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
             toolhead.move(retractpos, retract_speed)
@@ -1161,6 +1186,11 @@ class ADXL345Probe:
             trig, travelled, info = run_homing_move(
                 retract_dist + overtravel, speed)
             if trig is None:
+                history.append('no_trigger halt [%s]'
+                               ' (trigger delta unavailable,'
+                               ' approach %.3fmm)' % (
+                                   positions(info['halt']),
+                                   retract_dist + overtravel))
                 # No tap within reach; retain the bounded seek fallback.
                 # Resume the seek from here within the travel budget.
                 seek_budget -= travelled
@@ -1175,7 +1205,7 @@ class ADXL345Probe:
                         "adxl345_probe: %s home tap not confirmed; no"
                         " contact within %.1fmm of the reported tap"
                         " and seek retries exhausted%s"
-                        % (axis, retract_dist, capped))
+                        % (axis, retract_dist, capped) + summary())
                 seek_left -= 1
                 seek_dist = seek_budget
                 logging.info("adxl345_probe: %s %s,"
@@ -1187,12 +1217,20 @@ class ADXL345Probe:
                 trig, travelled, info = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:
+                    history.append('resume_seek no_trigger halt [%s]'
+                                   ' (trigger delta unavailable)'
+                                   % positions(info['halt']))
                     raise cmderr(
                         "adxl345_probe: %s home failed; no tap within"
-                        " %.1fmm of resumed seek%s" % (axis, seek_dist, capped))
+                        " %.1fmm of resumed seek%s" % (axis, seek_dist, capped)
+                        + summary())
+                history.append('resume_seek [%s] (new anchor)'
+                               % positions(trig))
                 accepted = [trig]
                 continue
-            delta, kind = compare(accepted[-1], trig, info)
+            delta, kind = compare(accepted[0], trig, info)
+            history.append('[%s] delta %+.3fmm %s vs anchor [%s]' % (
+                positions(trig), delta, kind, positions(accepted[0])))
             if kind == tap_confirm.AGREE:
                 accepted.append(trig)
                 continue
@@ -1209,7 +1247,7 @@ class ADXL345Probe:
                 raise cmderr(
                     "adxl345_probe: %s home taps disagree by %.3fmm"
                     " (tolerance %.3fmm) after %d retries%s"
-                    % (axis, abs(delta), tol, budget.used, why))
+                    % (axis, abs(delta), tol, budget.used, why) + summary())
             logging.info("adxl345_probe: %s taps disagree by %.3fmm (%s),"
                          " retrying confirmation", axis, abs(delta), kind)
             accepted = [trig]
@@ -1224,8 +1262,10 @@ class ADXL345Probe:
                 self._stop_tap('axis_homing')
             except Exception:
                 logging.exception("ADXL345 axis homing cleanup failed")
-            self._release_onset_client()
-            self._reset_axis_homing_state()
+            try:
+                self._release_onset_client()
+            finally:
+                self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
             try:
                 self._stop_tap('tap_test')

@@ -31,14 +31,24 @@ EXPECT = {
                " 8 retries; 9 taps were driven into the stop"),
     'adxl345_probe_stall_other': (
         False, "y home taps disagree by 0.500mm (tolerance 0.200mm) after"
-               " 2 retries\n"),
+               " 2 retries; taps:"),
     'adxl345_probe_stall_far': (
         False, "y home taps disagree by 1.200mm (tolerance 0.200mm) after"
-               " 2 retries\n"),
+               " 2 retries; taps:"),
 }
 
 # name, file, old, new, the test that must notice
 MUTATIONS = [
+    ("stream timeout warns instead of aborting", PROBE,
+     "                raise self.printer.command_error("
+     "self._stream_stop_error)\n",
+     "                logging.warning(self._stream_stop_error)\n"
+     "                break\n",
+     'unit_failsafe'),
+    ("acceptance compares to predecessor instead of anchor", PROBE,
+     "            delta, kind = compare(accepted[0], trig, info)\n",
+     "            delta, kind = compare(accepted[-1], trig, info)\n",
+     'unit_failsafe'),
     ("no stall retries (the code before the fix)", CONFIRM,
      "        if kind == STALL and self.stall_retries > 0:\n",
      "        if False:\n",
@@ -79,6 +89,9 @@ def make_tree(tmp):
     for fname in os.listdir(src):
         if fname.startswith('adxl345_probe_stall'):
             shutil.copy(os.path.join(src, fname), dst)
+    shutil.copytree(os.path.join(ROOT, 'test', 'tap_path'),
+                    os.path.join(tmp, 'test', 'tap_path'),
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
 
 
 def run_test(tmp, dictdir, name):
@@ -93,6 +106,14 @@ def run_test(tmp, dictdir, name):
 
 def check(tmp, dictdir, name):
     """None if the test ends as EXPECT says, else why not."""
+    if name == 'unit_failsafe':
+        result = subprocess.run(
+            [sys.executable, 'test/tap_path/test_tap_failsafe.py'], cwd=tmp,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if result.returncode:
+            lines = result.stdout.decode('utf-8', 'replace').strip().split('\n')
+            return lines[-1]
+        return None
     passes, text = EXPECT[name]
     ok, log = run_test(tmp, dictdir, name)
     log = log.replace('\r\n', '\n')
@@ -133,6 +154,10 @@ def main(argv=None):
             failed += bool(why)
         if failed:
             print("the unmutated tree fails; mutations not run")
+            return 1
+        why = check(tmp, dictdir, 'unit_failsafe')
+        if why:
+            print('FAIL unmutated failsafe: ' + why)
             return 1
         for title, fname, old, new, name in MUTATIONS:
             src = mutate(tmp, fname, old, new)
