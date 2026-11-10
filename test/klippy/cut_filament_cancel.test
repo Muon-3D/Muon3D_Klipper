@@ -1,0 +1,20 @@
+# KAN-1940: CANCEL_PRINT on the first layer. The park lifts off the plate
+# before any XY move, then the cut runs at the real Z and completes.
+#
+# CANCEL_PRINT runs PRINT_END only for a print that is running (KAN-382,
+# #93: a second press must not park an already parked head), so the cancel
+# is sent from a print file. In batch mode virtual_sdcard only runs the file
+# once this input is exhausted, so the SDCARD_PRINT_FILE must stay last; the
+# file's one line cancels and then asserts (_CUT_TEST_CANCEL).
+DICTIONARY atmega2560.dict
+CONFIG cut_filament.cfg
+
+G28
+G90
+G1 X100 Y100 Z5 F6000
+G1 Z0.2 F600
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0
+_CUT_TEST
+
+SDCARD_PRINT_FILE FILENAME=cancel_first_layer.gcode

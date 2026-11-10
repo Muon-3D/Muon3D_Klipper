@@ -293,10 +293,27 @@ The following command is available when a
 enabled.
 
 #### SET_CONTACT_GUARD
-`SET_CONTACT_GUARD [ENABLE=<0|1>]`: Turn the contact guard off or back
-on, for macros that must move X or Y with the nozzle loaded. Without
-parameters it reports whether it is enabled, active and in contact, and the
-current load.
+`SET_CONTACT_GUARD [ENABLE=<0|1> [TIMEOUT=<seconds>]] [REZERO=1 [FORCE=1]
+[TRY=1]]`: Turn the contact guard off or back on, for macros that must
+move X or Y with the nozzle loaded. With TIMEOUT, ENABLE=0 only stands
+the guard aside: it is enabled again after that many seconds, or at once
+on any command error, should the macro not reach its ENABLE=1
+(CUT_FILAMENT uses it for the press into the cutter). REZERO=1 takes the steady load the cell reads now as
+the new zero and clears contact; it is for an offset that is not a
+touch, such as filament tension after an extruder FORCE_MOVE. It waits
+for queued moves, and fails (leaving contact as it was) unless Z was
+really homed (see `rezero_min_z`) since the last SET_KINEMATIC_POSITION
+that changed Z, FORCE_MOVE of a Z stepper or Z motor disable, the
+toolhead is at or above `rezero_min_z`, current samples are arriving
+outside a probe's hold-off, the load is not changing, and the cell is
+not at the end of its range. A load at contact level (latched, or at
+`threshold_counts` or more) also needs FORCE=1, which is logged:
+toolhead Z says nothing about a part under the nozzle. Moving Z up by
+`clearance_lift` with the load steady clears such an offset without
+either. TRY=1 reports a refused REZERO instead of raising an error, for
+macros that must carry on (the M1 unlock press uses it). Without
+parameters it reports whether it is enabled, active and in contact, and
+the current load.
 
 ### [delayed_gcode]
 
@@ -1793,6 +1810,61 @@ print.
 `RAISE_ERROR MSG=<text>`: Stop the running script with the error `<text>`.
 Available when a [raise_error config section](Config_Reference.md#raise_error)
 is enabled.
+
+### [m1_machine]
+
+The following commands are available when an
+[m1_machine config section](Config_Reference.md#m1_machine) is enabled.
+
+#### MACHINE_WAIT_READY
+`MACHINE_WAIT_READY [ACTION=print] [TIMEOUT=<seconds>] [SETTLE=<seconds>]`:
+Wait until nothing ACTION needs is missing, showing one prompt that lists
+every missing item and updates as they are fixed. Continues by itself once
+everything has held for SETTLE seconds. Fails at once on a latched fault
+(its acknowledgement is a gcode command that cannot run during the wait),
+after TIMEOUT, or when a print cancel aborts it. PRINT_START runs it first.
+
+#### MACHINE_REQUIRE
+`MACHINE_REQUIRE ACTION=<action> [WAIT=<seconds>]`: Fail unless nothing
+ACTION needs is missing, after waiting up to WAIT seconds (at most 10). For
+`ACTION=resume` on a paused print the checklist prompt then follows the
+machine and offers Resume once it is complete. RESUME runs it first.
+
+#### MACHINE_HEAT_WAIT
+`MACHINE_HEAT_WAIT HEATER=<heater> MINIMUM=<temperature>`: Like
+TEMPERATURE_WAIT, but fails when the heater's target drops below MINIMUM or
+what it heats goes away: for `heater_bed` the plate or the locked column,
+for the hot end the toolhead, its sensor, or the fan.
+
+#### MACHINE_PAUSED
+`MACHINE_PAUSED REASON=<code> [FAN=<0..1>]`: Called by PAUSE. Records a new
+pause, its reason and the part-fan speed to restore, and starts the
+cool-down: a part fan that was on stays at that speed while the hot end is
+above `pause_cool_temp`, otherwise it goes off. On a pause already recorded it only
+replaces a `user` reason.
+
+#### MACHINE_PAUSE_REASON
+`MACHINE_PAUSE_REASON REASON=<code>`: Set why the print is paused.
+
+#### MACHINE_RESUMED
+`MACHINE_RESUMED`: Called by RESUME. Ends the pause record and its prompt.
+
+#### MACHINE_TOOLHEAD_CONNECTED
+`MACHINE_TOOLHEAD_CONNECTED`: Called by TOOLHEAD_CONNECT. Sets the status
+field `toolhead_hotplug`: true after a disconnect, or for a first connect
+more than `toolhead_startup_grace` seconds after Klipper became ready;
+false for the toolhead MCU coming up at a Klipper start.
+
+#### MACHINE_PLATE_CLEAR
+`MACHINE_PLATE_CLEAR`: Say the plate is clear of the last print, so a new
+print may start without the plate being taken off and refitted.
+Printer-only: muon_guard refuses it from every client door (Moonraker,
+the serial pty, a print file) outside dev mode, so no remote client can
+declare the plate cleared.
+
+#### MACHINE_STATUS
+`MACHINE_STATUS`: Report the activity, the conditions, and what each action
+is missing.
 
 ### [z_power]
 

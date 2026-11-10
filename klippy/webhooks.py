@@ -445,11 +445,19 @@ class GCodeHelper:
     def _handle_help(self, web_request):
         web_request.send(self.gcode.get_command_help())
     def _handle_script(self, web_request):
-        self.gcode.run_script(web_request.get_str('script'))
+        script = web_request.get_str('script')
+        # Muon: a CANCEL_PRINT sent as a script queues for the gcode mutex
+        # like any other line, and m1_machine's start gate may hold it with
+        # no print file to cancel. Announce the cancel first, outside the
+        # mutex, as pause_resume/cancel does (m1_machine).
+        if any(line.strip().split(' ')[0].upper() == 'CANCEL_PRINT'
+               for line in script.split('\n')):
+            self.printer.send_event("muon:cancel_requested")
+        self.gcode.run_client_script(script, 'webhooks')
     def _handle_restart(self, web_request):
-        self.gcode.run_script('restart')
+        self.gcode.run_client_script('restart', 'webhooks')
     def _handle_firmware_restart(self, web_request):
-        self.gcode.run_script('firmware_restart')
+        self.gcode.run_client_script('firmware_restart', 'webhooks')
     def _output_callback(self, msg):
         for cconn, template in list(self.clients.items()):
             if cconn.is_closed():

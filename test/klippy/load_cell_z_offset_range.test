@@ -1,0 +1,7 @@
+# A saved probe z_offset beyond +-2 mm does not stop klippy: it is ignored
+# (0.0 stands in), flagged z_offset_invalid, and printing is blocked by
+# muon_guard. Homing still works (KAN-1730).
+DICTIONARY atmega2560.dict
+CONFIG load_cell_z_offset_range.cfg
+
+G28

@@ -45,6 +45,9 @@ class PauseResume:
         # PRINT_START in progress holds for minutes.  Stop it first.
         if self.is_sd_active():
             self.v_sd.request_cancel()
+        # Muon: m1_machine's start gate can hold the mutex with no print
+        # file to cancel (a client's PRINT_START); let it stop too.
+        self.printer.send_event("muon:cancel_requested")
         self.gcode.run_script("CANCEL_PRINT")
     def _handle_pause_request(self, web_request):
         self.gcode.run_script("PAUSE")

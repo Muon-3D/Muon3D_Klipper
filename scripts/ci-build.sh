@@ -64,6 +64,12 @@ $PYTHON scripts/test_m1_led_modes.py
 $PYTHON scripts/test_m1_heater_before_leds.py
 # KAN-990: the start purge is drawn only where the bed mesh probed.
 $PYTHON scripts/test_m1_purge_line.py
+# KAN-1730: PRINT_START refuses a saved Z offset past the safe range, in
+# dev mode too, and applies the probe's live offset, not the raw saved one.
+$PYTHON scripts/test_m1_print_start_z_offset.py
+# KAN-742: the unlock press reports the contact_guard offset its retract
+# leaves, moves nothing, and never uses REZERO FORCE.
+$PYTHON scripts/test_m1_unlock_guard_offset.py
 finish_test m1_led_modes "Test M1 LED macros"
 
 
@@ -159,15 +165,40 @@ finish_test z_power "Test z_power decisions"
 start_test heater_supply "Test heater_supply and MPC on a simulated bed"
 $PYTHON test/heater_supply/test_heater_supply.py
 finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
-# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
-start_test fan_modes "Test fan_modes speed table mapping"
-$PYTHON test/fan_modes/test_fan_modes.py
-finish_test fan_modes "Test fan_modes speed table mapping"
+
+# MUON: fail-closed dev-mode check; clients start only allowlisted commands
+# outside dev mode, macros and internal sources are not checked (KAN-1730).
+start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+$PYTHON test/muon_guard/test_muon_guard.py
+finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+
+# MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
+start_test homing_scope "Test homing_scope"
+$PYTHON test/homing_scope/test_homing_scope.py
+finish_test homing_scope "Test homing_scope"
+
+# MUON: M600 with no print only prompts; PAUSE restores absolute mode (KAN-1699).
+start_test m600 "Test M600 with no print only prompts"
+$PYTHON test/m600/test_m600_no_print.py
+finish_test m600 "Test M600 with no print only prompts"
 
 # MUON: a plate pull pauses only while a file is printing (KAN-272).
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+# MUON: M1 machine state, start/resume gates and heat waits (m1_machine).
+start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
+$PYTHON test/m1_machine/test_m1_machine.py
+# A client's PRINT_START in the gate: both cancel doors stop it, and with
+# no cancel it gives up after manual_gate_timeout (review of #107).
+$PYTHON test/m1_machine/test_gate_cancel.py
+finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
+
+# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
+start_test fan_modes "Test fan_modes speed table mapping"
+$PYTHON test/fan_modes/test_fan_modes.py
+$PYTHON test/fan_modes/test_print_modes.py
+finish_test fan_modes "Test fan_modes speed table mapping"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
@@ -190,3 +221,9 @@ finish_test klippy "Test invoke klippy (Python3)"
 start_test print_cancel "Test cancel during PRINT_START"
 $PYTHON test/print_cancel/test_cancel_during_print_start.py
 finish_test print_cancel "Test cancel during PRINT_START"
+
+# MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
+# (KAN-1940); batch mode exits on any error, so this reads the log.
+start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+$PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
+finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
