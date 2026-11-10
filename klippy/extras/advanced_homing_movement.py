@@ -60,6 +60,11 @@ class AxisAdvancedHomingMovement:
         self.axis_ctx = {}      # axis -> context dict
         self.axis_errors = {}   # axis -> user-visible error string
         self.endstop_cache = {} # virtual_endstop pin -> mcu_endstop
+        # What the last AXIS_HOME_MOVE or AXIS_PROTECTED_MOVE found, for
+        # macros: printer.advanced_homing_movement.last. A macro renders
+        # before it runs, so read it in a macro called after the move.
+        self.last = self._new_result(None, None, None)
+        self.count = 0
 
         # Keep config for lazy axis initialization.
         self._config = config
@@ -75,6 +80,22 @@ class AxisAdvancedHomingMovement:
         self.gcode.register_command(
             'AXIS_PROTECTED_MOVE', self.cmd_AXIS_PROTECTED_MOVE,
             desc=self.cmd_AXIS_PROTECTED_MOVE_help)
+
+    def _new_result(self, command, axis, direction):
+        # position is in printer coordinates, and None unless the axis was
+        # homed and the endstop triggered (an unhomed axis has no frame).
+        return {'command': command, 'axis': axis, 'direction': direction,
+                'homed': False, 'triggered': False, 'position': None,
+                'count': getattr(self, 'count', 0)}
+
+    def _start_result(self, command, axis, direction):
+        self.count += 1
+        self.last = self._new_result(command, axis, direction)
+        self.last['count'] = self.count
+        return self.last
+
+    def get_status(self, eventtime=None):
+        return {'last': dict(self.last)}
 
     def _parse_endstop_source(self, config, option, default):
         raw = config.get(option, default)
@@ -339,6 +360,8 @@ class AxisAdvancedHomingMovement:
         start_axis_virtual = end_axis - sign * travel
         was_homed = axis in ks.get('homed_axes', '')
         original_axis = toolhead.get_position()[axis_i]
+        result = self._start_result('AXIS_HOME_MOVE', axis, direction)
+        result['homed'] = was_homed
 
         coord_offset = None
         frame_restored = False
@@ -356,6 +379,9 @@ class AxisAdvancedHomingMovement:
             pos_after_virtual = toolhead.get_position()
             trigger_axis_real = pos_after_virtual[axis_i] + coord_offset
             final_axis_real = trigger_axis_real
+            result['triggered'] = True
+            if was_homed:
+                result['position'] = trigger_axis_real
             if was_homed:
                 # Retract in real coordinates when the axis already had a
                 # trusted frame.
@@ -469,6 +495,8 @@ class AxisAdvancedHomingMovement:
         ks = kin.get_status(self.printer.get_reactor().monotonic())
         was_homed = axis in ks.get('homed_axes', '')
         original_axis = toolhead.get_position()[axis_i]
+        result = self._start_result('AXIS_PROTECTED_MOVE', axis, direction)
+        result['homed'] = was_homed
 
         cur = toolhead.get_position()
         target_axis = cur[axis_i] + sign * dist
@@ -484,6 +512,9 @@ class AxisAdvancedHomingMovement:
 
             pos_after = toolhead.get_position()
             stalled = abs(pos_after[axis_i] - target_axis) > 0.001
+            result['triggered'] = stalled
+            if stalled and was_homed:
+                result['position'] = pos_after[axis_i]
             if stalled and backoff > 0.0:
                 final_axis = pos_after[axis_i] - sign * backoff
                 backoff_pos = [None, None, None]
