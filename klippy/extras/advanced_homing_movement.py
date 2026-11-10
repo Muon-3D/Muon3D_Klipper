@@ -499,6 +499,18 @@ class AxisAdvancedHomingMovement:
         result['homed'] = was_homed
 
         cur = toolhead.get_position()
+        if not was_homed:
+            # An unhomed axis has no real coordinate. Start the move from
+            # the far end of the axis, so any DIST up to the axis span stays
+            # inside its limits (from the leftover coordinate, a long move
+            # was refused as out of range). The coordinate is put back after.
+            # A negative DIST moves against DIR.
+            _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
+            if abs(dist) > axis_max - axis_min:
+                raise gcmd.error(
+                    "AXIS_PROTECTED_MOVE: DIST=%.3f exceeds the %s axis span"
+                    " %.3f" % (dist, axis.upper(), axis_max - axis_min))
+            cur[axis_i] = axis_max if sign * dist < 0. else axis_min
         target_axis = cur[axis_i] + sign * dist
         toolhead.set_position(list(cur), homing_axes=axis)
 
