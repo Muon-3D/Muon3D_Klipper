@@ -901,8 +901,14 @@ class MCUConnectHelper:
         event_type = params['#name']
         if self.is_non_critical:
             # Treat as a soft disconnect; don't take the whole printer down.
-            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)",
-                         self._name, event_type, self._shutdown_msg)
+            # The same dump a critical mcu's shutdown logs: the clock it
+            # stopped at and the last messages sent to it, which is what
+            # names the command behind "Timer too close".
+            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)"
+                         " at clock %s\n%s\n%s",
+                         self._name, event_type, self._shutdown_msg,
+                         shutdown_clock, self._clocksync.dump_debug(),
+                         self._serial.dump_debug())
             self.handle_non_critical_disconnect()
             return
         self._printer.invoke_async_shutdown(
