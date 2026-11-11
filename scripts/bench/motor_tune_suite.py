@@ -266,6 +266,15 @@ class Suite:
             if self.big_slips >= MAX_BIG_SLIPS:
                 raise Stop("%d slips over %.0f mm" % (self.big_slips,
                                                       BIG_SLIP_MM))
+            # A crash can loosen the drive itself (on 2026-11-10 one at 30k
+            # left sloe losing tens of mm on plain travel moves). Check with
+            # no stress moves before trusting any later result.
+            if not tid.endswith('_postcheck'):
+                ok, _ = self.steploss(tid + '_postcheck', 300, 5000, 0)
+                if not ok:
+                    raise Stop("position lost with no stress moves after %s:"
+                               " check belts, tensioners and pulley grub"
+                               " screws" % (tid,))
         return passed, rec
 
     def lookup(self, tid):
