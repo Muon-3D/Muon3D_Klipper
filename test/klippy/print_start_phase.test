@@ -6,11 +6,10 @@ CONFIG print_start_phase.cfg
 ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=0
 
-# A print whose slicer region crosses the no-go notch at the front (x 75 to
-# 125, y 0 to 34): 4 x 4 points on a 30 x 26 mm grid, rows alternating
-# direction. On the y=20 row, x=80 is 5 mm inside the notch's left edge, so
-# it is snapped to x=75, and x=110 is more than 10 mm from every edge, so it
-# is dropped.
+# A print whose slicer region crosses the no-go notch at the front (x 45 to
+# 128, y 0 to 30): 4 x 4 points on a 30 x 26 mm grid, rows alternating
+# direction. On the y=20 row, x=50, 80 and 110 are 10 mm under the notch's
+# back edge, so each is snapped to y=30; x=140 is clear of it.
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 
 # What a subscriber reading phase saw at each stub PRINT_START called.
@@ -22,7 +21,7 @@ ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=1
 ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 ASSERT_PHASE_T
-ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
+ASSERT_MESH_PLAN PROBED_COUNT=16 LAST_PROBED=1 POINTS=50.00,30.00/80.00,30.00/110.00,30.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
 # The same print again: the M1 probes before every print, so it is probed
 # again over the same points.
@@ -33,7 +32,7 @@ ASSERT_SWEEPS COUNT=1
 # This negative assertion exercises the production gate's reuse branch, not
 # merely the sweep counter: the second request must explicitly report no sweep.
 ASSERT_LAST_RESONANCE_SWEPT VALUE=0
-ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
+ASSERT_MESH_PLAN PROBED_COUNT=16 LAST_PROBED=1 POINTS=50.00,30.00/80.00,30.00/110.00,30.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
 # A reconnect may be a toolhead/nozzle swap and invalidates the session flag.
 TOOLHEAD_CONNECT
@@ -51,13 +50,13 @@ ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
 # lands at y=99.98 and not 100.
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,100
-ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.66/110.00,46.66/80.00,46.66/50.00,46.66/50.00,73.32/80.00,73.32/110.00,73.32/140.00,73.32/140.00,99.98/110.00,99.98/80.00,99.98/50.00,99.98
+ASSERT_MESH_PLAN PROBED_COUNT=16 LAST_PROBED=1 POINTS=50.00,30.00/80.00,30.00/110.00,30.00/140.00,20.00/140.00,46.66/110.00,46.66/80.00,46.66/50.00,46.66/50.00,73.32/80.00,73.32/110.00,73.32/140.00,73.32/140.00,99.98/110.00,99.98/80.00,99.98/50.00,99.98
 
 # No slicer region: the whole configured region at the configured 4 x 3,
-# which the notch sits between the columns of. _BED_MESH_PLAN always probes
-# here.
+# _BED_MESH_PLAN always probes here. (70, 7) is 7 mm from the notch's front
+# edge, which is off the bed, and 23 mm from its back edge, so it is dropped.
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA
-ASSERT_MESH_PLAN PROBED_COUNT=12 LAST_PROBED=1 POINTS=10.00,7.00/70.00,7.00/130.00,7.00/190.00,7.00/190.00,88.50/130.00,88.50/70.00,88.50/10.00,88.50/10.00,170.00/70.00,170.00/130.00,170.00/190.00,170.00
+ASSERT_MESH_PLAN PROBED_COUNT=11 LAST_PROBED=1 POINTS=10.00,7.00/130.00,7.00/190.00,7.00/190.00,88.50/130.00,88.50/70.00,88.50/10.00,88.50/10.00,170.00/70.00,170.00/130.00,170.00/190.00,170.00
 
 # A cancel clears the phase, part way through or not.
 _PRINT_START_MARK PHASE=start
@@ -90,10 +89,10 @@ ASSERT_PHASE NAME=
 
 # KAN-990: a profile that calls PURGE_LINE asks for a purge lane. For the
 # part above it is 6 mm in front, at y 14, which is in the notch's rows, so
-# it steps left of the notch to x 13..73. The mesh covers it, and PURGE_LINE
+# it steps left of the notch to x 10..43. The mesh covers it, and PURGE_LINE
 # draws along it here in klippy, once.
 PRINT_START BED=65 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98 PURGE_LANE=1
-ASSERT_PURGE_LANE LANE=13.00,73.00,14.00,1
+ASSERT_PURGE_LANE LANE=10.00,43.00,14.00,1
 ASSERT_MESH_COVERS_PURGE_LANE
 PURGE_LINE
 ASSERT_PURGE_LANE LANE=
