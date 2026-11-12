@@ -259,3 +259,32 @@ if __name__ == '__main__':
         if name.startswith('test_'):
             fn()
             print("ok  " + name)
+
+
+def test_out_of_range_after_a_good_probe_keeps_the_height():
+    # Review of #129: "Move out of range" is raised further down the
+    # chain, after the guard accepted the move.  It is not a failed probe.
+    r = Rig(z=20.)
+    r.homing_move('z', 5.)          # a PROBE that triggered
+    th = r.printer.toolhead
+    orig = th.move
+
+    def out_of_range(newpos, speed):
+        raise base.CommandError("Move out of range")
+    th.move = out_of_range
+    assert r.refused(999., 60., 20.) == "Move out of range"
+    th.move = orig
+    assert r.refused(60., 60., 20.) is None
+
+
+def test_homed_flag_lost_and_put_back_is_not_a_height():
+    # CLEAR_HOMED=Z (or a failed G28) and then SET_HOMED=Z on the same
+    # number: the flag is back, the height is not
+    r = Rig(z=20.)
+    r.printer.toolhead.homed_axes = 'xy'
+    assert r.status()['z_known'] is False       # a status poll sees it go
+    r.printer.toolhead.homed_axes = 'xyz'
+    r.set_position()                            # Z unchanged
+    assert r.refused(60., 60., 20.) == HOME_FIRST
+    r.home_z()
+    assert r.refused(60., 60., 20.) is None

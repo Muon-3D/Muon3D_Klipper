@@ -292,15 +292,27 @@ class ContactGuard:
 
     def move(self, newpos, speed):
         self._check_move(newpos)
+        # The guard accepted a G-code move: whatever homed or probed before
+        # it finished without an error.  Cleared before the move is passed
+        # on, so that "Move out of range" from further down the chain is
+        # not taken for a failed probe.
+        self.homing_touched = False
         self.next_transform.move(newpos, speed)
         self.last_position = list(newpos)
-        # A G-code move was accepted: whatever homed or probed before it
-        # finished without an error
-        self.homing_touched = False
 
     def _height_known(self, eventtime):
         kin = self.toolhead.get_kinematics().get_status(eventtime)
-        return 'z' in kin['homed_axes'] and self.z_trusted
+        if 'z' not in kin['homed_axes']:
+            # Z lost its homed flag (CLEAR_HOMED, a failed G28): the number
+            # it keeps is no longer a height, and setting the flag back on
+            # the same number must not make it one.  Nothing announces the
+            # flag going, so this is seen at the next move or status poll;
+            # outside homing, when the flag can be faked for a moment
+            if self.z_trusted and not self._is_homing():
+                self.z_trusted = self.probe_since_reset = False
+                self.g28_z_homed = False
+            return False
+        return self.z_trusted
 
     def _min_xy_z(self):
         mesh = None
