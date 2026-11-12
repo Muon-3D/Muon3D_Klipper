@@ -160,7 +160,7 @@ class Test(unittest.TestCase):
         self.check_homed(m)
         self.assertEqual(obj.false_touches, 1)
         self.assertEqual(obj.last_attempts, 2)
-        self.assertEqual(m.dwells, [2.])
+        self.assertEqual(m.dwells, [])   # retries at once by default
         self.assertIn('first touch was not the bed', g.info[0])
         self.assertEqual(sum(1 for l in m.log
                              if l.startswith('SET_KINEMATIC_POSITION Z=160')),
@@ -207,6 +207,13 @@ class Test(unittest.TestCase):
             cmd(FakeGcmd())
         self.assertIn('samples_tolerance', str(cm.exception))
         self.assertEqual(obj.false_touches, 0)
+
+    def test_retry_settle_dwells_before_the_retry(self):
+        m = Machine(real_start=159.5, touches=[159.])
+        obj, cmd = make(m, retry_settle=1.5)
+        cmd(FakeGcmd())
+        self.check_homed(m)
+        self.assertEqual(m.dwells, [1.5])
 
     def test_tolerance_passed_to_confirm(self):
         m = Machine()

@@ -13,7 +13,8 @@
 #
 # "No trigger" on the confirm proves the first touch was false: the bed is
 # further down. So the axis is soft-homed at the top again and the whole home
-# repeats, after a pause for whatever disturbed the load cell to settle.
+# repeats straight away (retry_settle, default 0: the first attempt has no
+# pause either, and false touches came with the hotend cold and still).
 # A fast approach that finds nothing over the full travel is still an error.
 #
 # On sloe (2026-11-11) false touches also came on plain G28s, after 1.4-2.5 mm
@@ -27,7 +28,7 @@ class LoadCellHomeZ:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.attempts = config.getint('attempts', 5, minval=1)
-        self.retry_settle = config.getfloat('retry_settle', 2., minval=0.)
+        self.retry_settle = config.getfloat('retry_settle', 0., minval=0.)
         self.fast_speed = config.getfloat('fast_speed', 15., above=0.)
         self.fast_lift_speed = config.getfloat('fast_lift_speed', 10.,
                                                above=0.)
