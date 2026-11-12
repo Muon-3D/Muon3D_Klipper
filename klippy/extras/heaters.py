@@ -24,6 +24,15 @@ AMBIENT_TEMP = 25.
 PID_PARAM_BASE = 255.
 MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
+# MUON: the least time from a pwm update still queued to a hold's "off".
+# The host's serial queue holds a pwm command back until the mcu has reached
+# the previous one's clock (minclock), so an "off" at that same clock leaves
+# only when it is due and arrives late: "Timer too close" on the toolhead.
+# A tap hold on sloe did this on 2026-11-12, when the tap began within 0.1 s
+# of a PID update (the shutdown dump shows it). The gap gives the "off" the
+# usual 0.1 s to arrive.
+# set_pwm does not need it: its updates are a report interval apart.
+PWM_QUEUE_GAP = 0.100
 
 class Heater:
     def __init__(self, config, sensor):
@@ -206,7 +215,11 @@ class Heater:
                 return
             if not self.last_pwm_value:
                 return
-            pwm_time = max(print_time, self.last_pwm_time)
+            pwm_time = max(print_time, self.last_pwm_time + PWM_QUEUE_GAP)
+            if pwm_time > print_time:
+                logging.info("%s: hold '%s' off moved %.0f ms to go after"
+                             " a queued update", self.name, name,
+                             (pwm_time - print_time) * 1000.)
             self.last_pwm_time = pwm_time
             self.last_pwm_value = 0.
             self.next_pwm_time = 0.
