@@ -8,14 +8,6 @@ import logging, math
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
 ENDSTOP_SAMPLE_COUNT = 4
-# MUON: an endstop start carries a clock at least this far ahead of now.
-# The drip lead (0.1 s) suits steps, but on a CM4 short of memory the host
-# can stall past it while it sends the trsync and trigger_analog starts
-# (sloe, 2026-11-11: a print-start Z home took the toolhead MCU down with
-# "Timer too close").  Upstream primes 0.25 s; this costs a tap 0.1 s.
-HOMING_START_LEAD = 0.200
-# Log a start sent with less than this left, as evidence of host stalls.
-HOMING_START_WARN = 0.050
 
 # Return a completion that completes when all completions in a list complete
 def multi_complete(printer, completions):
@@ -101,14 +93,6 @@ class HomingMove:
         if _drip_prime is None:
             _drip_prime = self.toolhead.get_last_move_time
         print_time = _drip_prime()
-        main_mcu = self.printer.lookup_object('mcu')
-        reactor = self.printer.get_reactor()
-        _lead_dwell = getattr(self.toolhead, 'drip_dwell', None)
-        short = (main_mcu.estimated_print_time(reactor.monotonic())
-                 + HOMING_START_LEAD - print_time)
-        if short > 0. and _lead_dwell is not None:
-            _lead_dwell(short)
-            print_time = _drip_prime()
         endstop_triggers = []
         for mcu_endstop, name in self.endstops:
             rest_time = self._calc_endstop_rate(mcu_endstop, movepos, speed)
@@ -116,10 +100,6 @@ class HomingMove:
                                           ENDSTOP_SAMPLE_COUNT, rest_time,
                                           triggered=triggered)
             endstop_triggers.append(wait)
-        left = print_time - main_mcu.estimated_print_time(reactor.monotonic())
-        if left < HOMING_START_WARN and not main_mcu.is_fileoutput():
-            logging.warning("homing: endstop start sent only %.0f ms ahead"
-                            " of its clock (host stall?)", left * 1000.)
         all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
         # dwell() primes print_time BUFFER_TIME_START out; the drip-lead
         # dwell is enough here and is what the drip move itself uses.
