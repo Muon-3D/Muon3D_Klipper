@@ -148,6 +148,14 @@ class ContactGuard:
         self.unmeshed_margin = config.getfloat('unmeshed_margin', 1.5,
                                                minval=0.)
         self.bed_mesh = None
+        # height (Jack, 12 Nov, "Option A"): a homing move lifted the plate
+        # at least the unmeshed minimum on the steppers' own counts, and Z
+        # has not moved down since, nor been turned by hand.  The plate is
+        # then clear of the nozzle wherever Z is believed to be, so XY may
+        # move at that height with the height itself unknown.  This is what
+        # G28 X Y leaves behind, and what CENTER, FRONT, CUT_FILAMENT and
+        # the other macros that home only X and Y move on.
+        self.lift_clear = False
         # A homing or probing move began and no G-code move has passed
         # since: an error now may be that move failing (see
         # _handle_command_error)
@@ -239,6 +247,8 @@ class ContactGuard:
                                             self._handle_set_position)
         self.printer.register_event_handler("force_move:manual_move",
                                             self._handle_manual_move)
+        self.printer.register_event_handler("bed_removal_detector:removed",
+                                            self._handle_bed_removed)
         self.gcode.register_command('SET_CONTACT_GUARD',
                                     self.cmd_SET_CONTACT_GUARD,
                                     desc=self.cmd_SET_CONTACT_GUARD_help)
@@ -297,6 +307,9 @@ class ContactGuard:
         # on, so that "Move out of range" from further down the chain is
         # not taken for a failed probe.
         self.homing_touched = False
+        if newpos[2] < self.last_position[2] - MOVE_EPSILON:
+            # Z moved down: what a lift cleared is no longer known
+            self.lift_clear = False
         self.next_transform.move(newpos, speed)
         self.last_position = list(newpos)
 
@@ -314,22 +327,43 @@ class ContactGuard:
             return False
         return self.z_trusted
 
-    def _min_xy_z(self):
+    def _drop_height(self):
+        # Z is no longer known, and no lift vouches for the clearance
+        self.z_trusted = self.probe_since_reset = False
+        self.g28_z_homed = False
+        self.lift_clear = False
+
+    def _in_mesh(self, mesh, pos):
+        # The mesh says nothing outside the region it probed (an adaptive
+        # mesh stays loaded after its print, and KAN-219 measured the plate
+        # ~2 mm higher outside it).  A mesh without bounds covers nothing.
+        try:
+            return (mesh.mesh_x_min - MOVE_EPSILON <= pos[0]
+                    <= mesh.mesh_x_max + MOVE_EPSILON
+                    and mesh.mesh_y_min - MOVE_EPSILON <= pos[1]
+                    <= mesh.mesh_y_max + MOVE_EPSILON)
+        except AttributeError:
+            return False
+
+    def _min_xy_z(self, *points):
         mesh = None
         if self.bed_mesh is not None:
             mesh = self.bed_mesh.get_mesh()
-        if mesh is None:
+        if mesh is None or not all(self._in_mesh(mesh, p) for p in points):
             return self.contact_z + self.unmeshed_margin
         return self.contact_z
 
     def _check_height(self, last, newpos, eventtime):
         if not self._height_known(eventtime):
+            if self.lift_clear and newpos[2] >= last[2] - MOVE_EPSILON:
+                # Option A: lifted by a home, not lowered since
+                return
             logging.info("contact_guard: refused move %s -> %s, plate height"
                          " not known", last[:3], list(newpos[:3]))
             raise self._own_error(REFUSAL_HOME)
         # The lowest point of the move decides
         low = min(last[2], newpos[2])
-        min_z = self._min_xy_z()
+        min_z = self._min_xy_z(last, newpos)
         if low < min_z - MOVE_EPSILON:
             logging.info("contact_guard: refused move %s -> %s, below Z"
                          " %.3f", last[:3], list(newpos[:3]), min_z)
@@ -470,6 +504,14 @@ class ContactGuard:
         self.homing_moves = max(0, self.homing_moves - 1)
         candidate, self.homing_candidate = self.homing_candidate, None
         travel, lifted = self._z_travel(hmove)
+        if travel > MOVE_EPSILON:
+            # A probe or any Z homing move toward the plate
+            self.lift_clear = False
+        elif lifted >= (self.contact_z + self.unmeshed_margin
+                        - MOVE_EPSILON):
+            # The G28 macro's AXIS_PROTECTED_MOVE Z+10, or a Z park toward
+            # the top: the plate is at least this far from the nozzle
+            self.lift_clear = True
         if lifted >= self.clearance_lift - MOVE_EPSILON:
             # A real lift (the G28 macro's AXIS_PROTECTED_MOVE Z+10), on the
             # steppers' own counts.  Its samples are not watched, so the
@@ -535,6 +577,9 @@ class ContactGuard:
         # a fresh steady window after the park as the zero: it replaces
         # pending_zero (the anchor from before the probe) and the open-loop
         # lift zero.  Anything less keeps the zero as it is.
+        # Whatever homed or probed in this G28 succeeded: a later unrelated
+        # error is not its failure
+        self.homing_touched = False
         reason = self._trusted_zero_refusal()
         if reason is not None:
             logging.info("contact_guard: no trusted zero after G28: %s;"
@@ -692,8 +737,16 @@ class ContactGuard:
         # nozzle is
         self.own_error = None
         if stepper.is_active_axis('z'):
-            self.z_trusted = self.probe_since_reset = False
-            self.g28_z_homed = False
+            self._drop_height()
+
+    def _handle_bed_removed(self):
+        # The plate went back on (or will) wherever it seats: neither the
+        # homed height nor a lift says where it is now.  The load cell
+        # model is left as it was.
+        if self.move_guard == 'height':
+            logging.info("contact_guard: bed removed; plate height not"
+                         " known until the next home")
+            self._drop_height()
 
     def _handle_z_motor(self, print_time, enabled):
         # Off, the axis can be moved by hand; samples either side of an
@@ -701,8 +754,7 @@ class ContactGuard:
         self.clear_win = None
         self.position_reset_time = max(self.position_reset_time, print_time)
         if not enabled:
-            self.z_trusted = self.probe_since_reset = False
-            self.g28_z_homed = False
+            self._drop_height()
 
     def _end_stand_aside(self):
         if self.stand_aside_end is not None:
@@ -735,8 +787,7 @@ class ContactGuard:
             return
         # A homing or probing move that ended in an error proves nothing
         self.pending_zero = self.lift_zero = None
-        self.z_trusted = self.probe_since_reset = False
-        self.g28_z_homed = False
+        self._drop_height()
 
     def _is_homing(self):
         if self.homing_moves or self.homing_rails:
@@ -1074,12 +1125,13 @@ class ContactGuard:
         # is the height decision; what the load cell thinks is load_contact
         known = self.toolhead is not None and self._height_known(eventtime)
         may = self._may_refuse(eventtime)
-        min_z = self._min_xy_z()
+        min_z = self._min_xy_z(self.last_position)
         near = known and self.last_position[2] < min_z - MOVE_EPSILON
         return {
             'contact': may and near,
-            'home_required': may and not known,
+            'home_required': may and not known and not self.lift_clear,
             'z_known': known,
+            'lift_clear': self.lift_clear,
             'min_xy_z': min_z,
             'load': int(round(self.load)),
             'load_contact': active and self.contact,

@@ -29,6 +29,13 @@ CONTACT_Z = 0.1
 UNMESHED = 1.5
 
 
+class FakeMesh:
+    """A probed region, as bed_mesh's ZMesh reports it."""
+    def __init__(self, x=(10., 190.), y=(10., 190.)):
+        self.mesh_x_min, self.mesh_x_max = x
+        self.mesh_y_min, self.mesh_y_max = y
+
+
 class FakeBedMesh:
     def __init__(self):
         self.mesh = None
@@ -41,7 +48,7 @@ class Rig(base.Rig):
     def __init__(self, z=20., homed=True, mesh=False, values=None):
         self.bed_mesh = FakeBedMesh()
         if mesh:
-            self.bed_mesh.mesh = object()
+            self.bed_mesh.mesh = FakeMesh()
         values = dict(values or {})
         values.setdefault("move_guard", "height")
         orig = base.FakePrinter
@@ -204,7 +211,7 @@ def test_without_a_mesh_keeps_the_margin():
     r.move(50., 50., 1.6)
     assert r.refused(60., 50., 1.6) is None
     # the mesh loads: Z is now height above the measured surface
-    r.bed_mesh.mesh = object()
+    r.bed_mesh.mesh = FakeMesh()
     r.move(60., 50., 0.2)
     assert r.refused(70., 50., 0.2) is None
 
@@ -288,3 +295,259 @@ def test_homed_flag_lost_and_put_back_is_not_a_height():
     assert r.refused(60., 60., 20.) == HOME_FIRST
     r.home_z()
     assert r.refused(60., 60., 20.) is None
+
+
+# Option A (Jack, 12 Nov): "XY homing lifts the plate first, so nothing
+# scratches unless Z is moved down later".  A homing move that lifted the
+# plate vouches for XY at that height until Z moves down or is let go.
+
+LIFT = -10.     # the G28 macro's AXIS_PROTECTED_MOVE Z+10 (travel < 0 is up)
+
+
+def g28_xy(r, lift=LIFT):
+    """G28 X Y on the M1: the macro fakes Z to 100, lifts 10 mm as a homing
+    move, clears Z's homed flag, then homes Y and X"""
+    p = r.printer
+    p.send_event("homing_scope:begin")
+    p.homing_scope.in_scope = True
+    p.toolhead.position[2] = 100.
+    r.set_position()
+    r.homing_move('z', lift)
+    p.toolhead.position[2] = 100. - lift
+    p.toolhead.homed_axes = 'xy'
+    r.homing_move('y', 5.)
+    r.homing_move('x', 5.)
+    p.send_event("homing_scope:end")
+    p.homing_scope.in_scope = False
+    r.guard.get_position()
+
+
+def test_lift_lets_xy_move_with_the_height_unknown():
+    r = Rig(z=20., homed=False)
+    assert r.refused(60., 60., 20.) == HOME_FIRST
+    g28_xy(r)
+    st = r.status()
+    assert st['z_known'] is False
+    assert st['lift_clear'] is True
+    assert st['home_required'] is False
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) is None          # CENTER
+    assert r.refused(100., 190., z) is None        # FRONT
+    assert r.refused(120., 100., z + 5.) is None   # lifting as it goes
+
+
+def test_z_down_after_the_lift_needs_a_home():
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    z = r.printer.toolhead.position[2]
+    # a diagonal that comes down is refused, and does not run
+    assert r.refused(60., 60., z - 1.) == HOME_FIRST
+    assert r.status()['lift_clear'] is True
+    # Z alone down: allowed (not this guard's business), but it ends it
+    r.move(r.guard.last_position[0], r.guard.last_position[1], z - 1.)
+    assert r.status()['lift_clear'] is False
+    assert r.status()['home_required'] is True
+    assert r.refused(70., 60., z - 1.) == HOME_FIRST
+    # back up again is not enough: the lift was the evidence, not Z
+    r.move(r.guard.last_position[0], r.guard.last_position[1], z + 5.)
+    assert r.refused(80., 60., z + 5.) == HOME_FIRST
+
+
+def test_cut_filament_fakes_z_zero_after_the_lift():
+    # CUT_FILAMENT and FILAMENT_INSERT_FULL_PURGE: G28 X Y, then
+    # SET_KINEMATIC_POSITION Z=0 SET_HOMED=Z, then XY moves at that "Z 0"
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    th = r.printer.toolhead
+    th.position[2] = 0.
+    th.homed_axes = 'xyz'
+    r.set_position()
+    r.guard.get_position()
+    assert r.refused(116., 10., 0.) is None
+    assert r.refused(138., 10., 0.) is None
+    assert r.refused(116., 10., 0.) is None
+    # and the fake is no height: once Z goes down from there, Home first
+    r.move(116., 10., -0.5)
+    assert r.refused(120., 10., -0.5) == HOME_FIRST
+
+
+def test_park_printer_fakes_z_fifty_after_a_z_park():
+    # PARK_PRINTER with Z unhomed: Z_PARK's AXIS_HOME_MOVE lifts to the top,
+    # then SET_KINEMATIC_POSITION SET_HOMED=Z Z=50 and G0 X135 Y63
+    r = Rig(z=20., homed=False)
+    r.homing_move('z', -60.)
+    th = r.printer.toolhead
+    th.position[2] = 50.
+    r.set_position()
+    r.guard.get_position()
+    assert r.refused(135., 63., 50.) is None
+
+
+def test_a_short_lift_is_not_enough():
+    # Less than the unmeshed minimum (contact_z + unmeshed_margin)
+    r = Rig(z=20., homed=False)
+    g28_xy(r, lift=-1.0)
+    assert r.status()['lift_clear'] is False
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) == HOME_FIRST
+
+
+def test_motors_off_force_move_and_bed_removal_end_the_lift():
+    for lose in ('motor', 'force_move', 'bed'):
+        r = Rig(z=20., homed=False)
+        g28_xy(r)
+        z = r.printer.toolhead.position[2]
+        assert r.refused(60., 60., z) is None
+        if lose == 'motor':
+            r.z_motor(False)
+        elif lose == 'force_move':
+            r.printer.send_event("force_move:manual_move",
+                                 base.FakeStepper('z'))
+        else:
+            r.printer.send_event("bed_removal_detector:removed")
+        assert r.refused(70., 60., z) == HOME_FIRST, lose
+        assert r.status()['home_required'] is True, lose
+
+
+def test_failed_home_after_the_lift_needs_a_home():
+    # Boxwood, 12 Nov: "y home taps disagree by 0.931mm"
+    r = Rig(z=20., homed=False)
+    p = r.printer
+    p.send_event("homing_scope:begin")
+    p.homing_scope.in_scope = True
+    r.homing_move('z', LIFT)
+    hmove = base.FakeHomingMove('y', 5.)
+    p.send_event("homing:homing_move_begin", hmove)
+    r.report(base.CommandError("adxl345_probe: y home taps disagree by"
+                               " 0.931mm (tolerance 0.200mm)"))
+    p.homing_scope.in_scope = False
+    assert r.refused(60., 60., 30.) == HOME_FIRST
+
+
+def test_unrelated_error_after_a_good_g28_keeps_the_lift():
+    # homing_scope:end means the G28 succeeded; a typo next is not its
+    # failure
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    r.report(base.CommandError("Unknown command:\"CENTRE\""))
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) is None
+
+
+def test_unrelated_error_after_a_good_full_g28_keeps_the_height():
+    r = Rig(z=20., homed=False)
+    p = r.printer
+    p.send_event("homing_scope:begin")
+    p.homing_scope.in_scope = True
+    r.home_z()
+    p.send_event("homing_scope:end")
+    p.homing_scope.in_scope = False
+    r.report(base.CommandError("Unknown command:\"CENTRE\""))
+    assert r.status()['z_known'] is True
+    assert r.refused(60., 60., 20.) is None
+
+
+def test_probe_down_ends_the_lift_and_a_good_home_takes_over():
+    # Full G28: lift, Y, X, then Z homes by probing down
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    r.homing_move('z', 100.)            # a probe travelling down
+    assert r.status()['lift_clear'] is False
+    r.printer.toolhead.homed_axes = 'xyz'
+    r.home_z()
+    assert r.status()['z_known'] is True
+    assert r.refused(60., 60., 20.) is None
+
+
+def m1_home_z(r, second_probe_fails=False):
+    """_LOAD_CELL_HOME_Z, the M1's homing_override: soft-home Z to its
+    maximum, probe, set Z from the probe, G1 Z1, probe again, set Z, G1 Z10"""
+    p = r.printer
+    th = p.toolhead
+    p.homing_override.in_script = True
+    th.position[2] = 150.
+    r.set_position()                    # SET_KINEMATIC_POSITION Z=max
+    r.homing_move('z', 140.)            # PROBE from clear travel
+    th.position[2] = 10.
+    r.set_position()                    # _HOME_Z_FROM_LAST_PROBE
+    th.position[2] = 11.                # G1 Z1 (relative)
+    if second_probe_fails:
+        hmove = base.FakeHomingMove('z', 3.)
+        p.send_event("homing:homing_move_begin", hmove)
+        p.homing_override.in_script = False
+        r.report(base.CommandError("No trigger on probe after full"
+                                   " movement"), levels=3)
+        return
+    r.homing_move('z', 1.)              # PROBE at standard speed
+    th.position[2] = 0.
+    r.set_position()
+    th.position[2] = 10.                # G1 Z10
+    p.homing_override.in_script = False
+    r.guard.get_position()
+
+
+def test_m1_z_home_through_the_override_is_trusted():
+    r = Rig(z=20., homed=False)
+    m1_home_z(r)
+    assert r.status()['z_known'] is True
+    assert r.refused(60., 60., 10.) is None
+    r.move(60., 60., 1.0)
+    assert r.refused(60., 70., 1.0).startswith(NEAR_START)
+
+
+def test_m1_z_home_with_a_failed_second_probe_is_not():
+    r = Rig(z=20., homed=False)
+    m1_home_z(r, second_probe_fails=True)
+    assert r.status()['z_known'] is False
+    r.guard.get_position()
+    assert r.refused(60., 60., 11.) == HOME_FIRST
+
+
+def test_g28_x_after_a_good_home_moves_on_the_lift():
+    # G28 X with Z homed: the macro's lift fakes Z to 100 and clears Z's
+    # homed flag, so the height is gone; the lift still clears the plate
+    r = Rig(z=20.)
+    assert r.status()['z_known'] is True
+    g28_xy(r)
+    assert r.status()['z_known'] is False
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) is None
+    r.move(60., 60., z - 2.)
+    assert r.refused(70., 60., z - 2.) == HOME_FIRST
+
+
+def test_outside_the_mesh_keeps_the_margin():
+    # Review of #129: an adaptive mesh stays loaded after its print; past
+    # its region the plate can be ~2 mm higher (KAN-219)
+    r = Rig(z=20., mesh=True)
+    r.bed_mesh.mesh = FakeMesh(x=(60., 140.), y=(60., 140.))
+    r.move(100., 100., 20.)
+    r.move(100., 100., 0.5)
+    assert r.refused(120., 120., 0.5) is None
+    assert r.status()['min_xy_z'] == CONTACT_Z
+    # leaving the region at that height is refused
+    err = r.refused(150., 120., 0.5)
+    assert err is not None and err.startswith(NEAR_START), err
+    # and so is coming in from outside it
+    r.move(120., 120., 2.)
+    r.move(150., 120., 2.)
+    assert abs(r.status()['min_xy_z'] - (CONTACT_Z + UNMESHED)) < 1e-9
+    r.move(150., 120., 0.5)
+    assert r.refused(120., 120., 0.5).startswith(NEAR_START)
+
+
+def test_bed_removal_loses_the_height():
+    r = Rig(z=20.)
+    assert r.refused(60., 60., 20.) is None
+    r.printer.send_event("bed_removal_detector:removed")
+    assert r.refused(70., 60., 20.) == HOME_FIRST
+    r.home_z()
+    assert r.refused(70., 60., 20.) is None
+
+
+def test_bed_removal_leaves_the_load_cell_model_alone():
+    r = base.Rig(z=20.)
+    r.home_z()
+    assert r.guard.z_trusted
+    r.printer.send_event("bed_removal_detector:removed")
+    assert r.guard.z_trusted

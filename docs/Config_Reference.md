@@ -5671,16 +5671,21 @@ Refuse G-code moves that would drag the nozzle across the plate.
 With `move_guard: height` (the default) the guard decides on the known
 plate height and never on the load cell. A G-code move with an X or Y
 component is refused only if its lowest point is below `contact_z` (plus
-`unmeshed_margin` while no bed mesh is active), with "The plate is at the
-nozzle ...: lift Z before moving X or Y". If the height is not known (Z
-not homed, or homed and then invalidated by a position reset outside
-homing, a FORCE_MOVE of Z, the Z motor turned off, or a homing or probing
-move that failed) every X or Y move is refused with "Home first: ...". The
-guard is inactive during a job, during homing and probing and during
-NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is the
-height decision, `home_required` and `z_known` report the height state, and
-the load cell model below still runs and reports `load` and `load_contact`
-but refuses nothing.
+`unmeshed_margin` while no bed mesh is active, or where either end of the
+move is outside the region the active mesh probed), with "The plate is at
+the nozzle ...: lift Z before moving X or Y". If the height is not known
+(Z not homed, or homed and then invalidated by a position reset outside
+homing, a FORCE_MOVE of Z, the Z motor turned off, the bed removed, or a
+homing or probing move that failed) an X or Y move is refused with "Home
+first: ...", unless a homing move has lifted the plate by at least
+`contact_z` plus `unmeshed_margin` (the M1's G28 lifts 10 mm before it
+homes X and Y) and Z has not moved down, been forced or been turned off
+since: the plate is then clear, and X and Y may move at that height or
+higher. The guard is inactive during a job, during homing and probing and
+during NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is
+the height decision, `home_required`, `z_known` and `lift_clear` report the
+height state, and the load cell model below still runs and reports `load`
+and `load_contact` but refuses nothing.
 
 With `move_guard: load_cell` the load cell contact model decides instead.
 It is kept for probing and contact detection work and is not meant for
