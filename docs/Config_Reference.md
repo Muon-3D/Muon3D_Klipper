@@ -5678,10 +5678,15 @@ the nozzle ...: lift Z before moving X or Y". If the height is not known
 homing, a FORCE_MOVE of Z, the Z motor turned off, the bed removed, or a
 homing or probing move that failed) an X or Y move is refused with "Home
 first: ...", unless a homing move has lifted the plate by at least
-`contact_z` plus `unmeshed_margin` (the M1's G28 lifts 10 mm before it
-homes X and Y) and Z has not moved down, been forced or been turned off
-since: the plate is then clear, and X and Y may move at that height or
-higher. The guard is inactive during a job, during homing and probing and
+`lift_clear_min` (the M1's G28 lifts 10 mm before it homes X and Y), no
+G-code move has taken Z down since, every Z stepper is still
+`lift_clear_min` above where the lift began (on its own step count, so Z
+moves made outside G-code count too), and Z has not been forced or turned
+off and the bed has not been removed: the plate is then clear, and X and Y
+may move at that height or higher. A bed mesh that was loaded when the bed
+was removed is treated as no mesh until another is loaded. Moves that
+modules make directly on the toolhead (SHAPER_CALIBRATE, the AXIS_* moves
+of X and Y) do not pass through the guard. The guard is inactive during a job, during homing and probing and
 during NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is
 the height decision, `home_required`, `z_known` and `lift_clear` report the
 height state, and the load cell model below still runs and reports `load`
@@ -5722,9 +5727,14 @@ recognised as a job. See the
 #   move_guard: height. The lowest G-code Z, in mm, at which X and Y may
 #   move. With a bed mesh active this is the height above the measured
 #   surface.
-#unmeshed_margin: 1.5
+#unmeshed_margin: 2.5
 #   move_guard: height. Added to contact_z while no bed mesh is active,
-#   when Z is only known at the point Z homing probed.
+#   when Z is only known at the point Z homing probed, and for a move
+#   with either end outside the region the active mesh probed.
+#lift_clear_min: 5.0
+#   move_guard: height. How far, in mm, a homing move must lift the plate
+#   (on the Z steppers' step counts) for X and Y to move with the height
+#   not known. It may not be less than contact_z plus unmeshed_margin.
 #threshold_counts: 90000
 #   Raw load cell counts, in the direction the probe presses, above which
 #   the nozzle is in contact. The default is half the force at which the

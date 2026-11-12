@@ -26,7 +26,7 @@ HOME_FIRST = ("Home first: the plate height is not known, so X and Y"
 NEAR_START = "The plate is at the nozzle (Z "
 OLD_REFUSAL = "Nozzle is touching the plate: lift Z before moving X or Y"
 CONTACT_Z = 0.1
-UNMESHED = 1.5
+UNMESHED = 2.5
 
 
 class FakeMesh:
@@ -206,10 +206,10 @@ def test_refuses_only_below_the_contact_height():
 def test_without_a_mesh_keeps_the_margin():
     r = Rig(z=20., mesh=False)
     assert abs(r.status()['min_xy_z'] - (CONTACT_Z + UNMESHED)) < 1e-9
-    r.move(50., 50., 1.0)
-    assert r.refused(60., 50., 1.0).startswith(NEAR_START)
-    r.move(50., 50., 1.6)
-    assert r.refused(60., 50., 1.6) is None
+    r.move(50., 50., 2.0)       # KAN-219: the plate peaks ~2 mm up
+    assert r.refused(60., 50., 2.0).startswith(NEAR_START)
+    r.move(50., 50., 2.6)
+    assert r.refused(60., 50., 2.6) is None
     # the mesh loads: Z is now height above the measured surface
     r.bed_mesh.mesh = FakeMesh()
     r.move(60., 50., 0.2)
@@ -384,9 +384,9 @@ def test_park_printer_fakes_z_fifty_after_a_z_park():
 
 
 def test_a_short_lift_is_not_enough():
-    # Less than the unmeshed minimum (contact_z + unmeshed_margin)
+    # Less than lift_clear_min (5 mm)
     r = Rig(z=20., homed=False)
-    g28_xy(r, lift=-1.0)
+    g28_xy(r, lift=-4.0)
     assert r.status()['lift_clear'] is False
     z = r.printer.toolhead.position[2]
     assert r.refused(60., 60., z) == HOME_FIRST
@@ -529,8 +529,8 @@ def test_outside_the_mesh_keeps_the_margin():
     err = r.refused(150., 120., 0.5)
     assert err is not None and err.startswith(NEAR_START), err
     # and so is coming in from outside it
-    r.move(120., 120., 2.)
-    r.move(150., 120., 2.)
+    r.move(120., 120., 3.)
+    r.move(150., 120., 3.)
     assert abs(r.status()['min_xy_z'] - (CONTACT_Z + UNMESHED)) < 1e-9
     r.move(150., 120., 0.5)
     assert r.refused(120., 120., 0.5).startswith(NEAR_START)
@@ -551,3 +551,113 @@ def test_bed_removal_leaves_the_load_cell_model_alone():
     assert r.guard.z_trusted
     r.printer.send_event("bed_removal_detector:removed")
     assert r.guard.z_trusted
+
+
+# Review of 5ad0de0c: Z moves that bypass G-code, and the rest
+
+
+def test_z_park_retract_after_the_lift_still_holds():
+    # PARK_PRINTER with Z unhomed: Z_PARK's AXIS_HOME_MOVE lifts to the
+    # top, then its manual_move retracts 10 mm; the plate is still far
+    # above where the lift began
+    r = Rig(z=20., homed=False)
+    r.homing_move('z', -60.)
+    r.z_steps(-10.)
+    th = r.printer.toolhead
+    th.position[2] = 50.
+    r.set_position()
+    r.guard.get_position()
+    assert r.refused(135., 63., 50.) is None
+
+
+def test_z_lowered_behind_the_guard_ends_the_lift():
+    # The G28 X Y lift, then a manual_move (an AXIS_HOME_MOVE retract after
+    # a park that stalled at once) takes the plate back down 10 mm: no
+    # G-code move went down, but the steppers did
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) is None
+    r.z_steps(-10.)
+    waits = r.printer.toolhead.waits
+    assert r.refused(70., 60., z) == HOME_FIRST
+    assert r.printer.toolhead.waits > waits, "decided before the queue ran"
+    assert r.status()['lift_clear'] is False
+    assert r.status()['home_required'] is True
+
+
+def test_z_lowered_a_little_behind_the_guard_keeps_the_lift():
+    # Still lift_clear_min (5 mm) above where the 10 mm lift began
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    r.z_steps(-4.)
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) is None
+    r.z_steps(-1.5)
+    assert r.refused(70., 60., z) == HOME_FIRST
+
+
+def test_status_sees_a_lowered_lift_without_a_move():
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    assert r.status()['lift_clear'] is True
+    r.z_steps(-10.)
+    assert r.status()['lift_clear'] is False
+
+
+def test_refused_z_down_keeps_the_lift():
+    # "Must home axis first" from further down the chain: nothing moved
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    z = r.printer.toolhead.position[2]
+    th = r.printer.toolhead
+    orig = th.move
+
+    def must_home(newpos, speed):
+        raise base.CommandError("Must home axis first: 60.000 60.000 0.000")
+    th.move = must_home
+    x, y = r.guard.last_position[:2]
+    try:
+        r.move(x, y, z - 5.)
+    except base.CommandError as err:
+        r.report(err)
+    th.move = orig
+    assert r.status()['lift_clear'] is True
+    assert r.refused(60., 60., z) is None
+
+
+def test_error_inside_g28_drops_the_height_without_a_poll():
+    # G28 fails (homing_scope clears xyz), then SET_HOMED=Z on the same Z:
+    # no status poll in between
+    r = Rig(z=20.)
+    p = r.printer
+    p.send_event("homing_scope:begin")
+    p.homing_scope.in_scope = True
+    r.report(base.CommandError("adxl345_probe: y home taps disagree"))
+    p.homing_scope.in_scope = False
+    r.set_position()        # SET_KINEMATIC_POSITION SET_HOMED=Z, Z same
+    assert r.refused(60., 60., 20.) == HOME_FIRST
+
+
+def test_mesh_from_before_a_bed_removal_is_not_trusted():
+    r = Rig(z=20., mesh=True)
+    r.move(100., 100., 20.)
+    r.move(100., 100., 0.5)
+    assert r.refused(110., 100., 0.5) is None
+    r.printer.send_event("bed_removal_detector:removed")
+    r.home_z()
+    assert abs(r.status()['min_xy_z'] - (CONTACT_Z + UNMESHED)) < 1e-9
+    assert r.refused(120., 100., 0.5).startswith(NEAR_START)
+    # a new mesh (PRINT_START re-probes) is trusted again
+    r.bed_mesh.mesh = FakeMesh()
+    assert r.refused(120., 100., 0.5) is None
+
+
+def test_lift_clear_min_cannot_be_below_the_unmeshed_minimum():
+    printer = base.FakePrinter()
+    try:
+        base.contact_guard.load_config(base.FakeConfig(
+            printer, {'lift_clear_min': 1.0}))
+    except base.ConfigError:
+        return
+    raise AssertionError("lift_clear_min 1.0 was accepted")
