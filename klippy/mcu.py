@@ -909,7 +909,14 @@ class MCUConnectHelper:
                          self._name, event_type, self._shutdown_msg,
                          shutdown_clock, self._clocksync.dump_debug(),
                          self._serial.dump_debug())
-            self.handle_non_critical_disconnect()
+            # This runs on the serial thread, inside SerialReader.lock. The
+            # disconnect unregisters the 'clock' response (which takes that
+            # same, non-reentrant lock) and joins this thread, so calling it
+            # here deadlocked the thread and then the reactor with it: the
+            # whole host froze mid-print. Hand it to the reactor instead,
+            # as the critical path does with invoke_async_shutdown.
+            self._reactor.register_async_callback(
+                lambda e: self.handle_non_critical_disconnect())
             return
         self._printer.invoke_async_shutdown(
             "MCU shutdown", {"reason": msg, "mcu": self._name,
