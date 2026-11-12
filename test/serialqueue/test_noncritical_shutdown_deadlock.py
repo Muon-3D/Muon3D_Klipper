@@ -128,8 +128,29 @@ def test_shutdown_does_not_deadlock_serial_thread():
     assert h._printer.events == [h._non_critical_disconnect_event_name]
 
 
+def test_a_failing_dump_still_disconnects():
+    # The debug dump is only for the log. If it raises, the disconnect must
+    # still be handed to the reactor: _is_shutdown is already set, so a
+    # repeat shutdown message would be ignored and the mcu would stay
+    # "connected" but dead.
+    reactor = FakeReactor()
+    reader = make_reader(reactor)
+    h = make_helper(reactor, reader)
+    def boom():
+        raise RuntimeError("dump failed")
+    reader.dump_debug = boom
+    params = {'#name': 'shutdown', 'clock': 597383684,
+              'static_string_id': 'Timer too close'}
+    h._handle_shutdown(params)
+    assert len(reactor.async_callbacks) == 1, \
+        "disconnect was not scheduled when the dump raised"
+    reactor.run_async()
+    assert h._mcu.non_critical_disconnected
+
+
 def main():
     test_shutdown_does_not_deadlock_serial_thread()
+    test_a_failing_dump_still_disconnects()
     print("ok: non-critical MCU shutdown leaves the serial thread free")
     # A deadlocked daemon thread would otherwise keep the process alive.
     sys.stdout.flush()
