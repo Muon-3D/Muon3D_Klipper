@@ -5666,7 +5666,26 @@ sensor_type:
 
 ### [contact_guard]
 
-Refuse G-code moves that would drag the nozzle across the plate. Between
+Refuse G-code moves that would drag the nozzle across the plate.
+
+With `move_guard: height` (the default) the guard decides on the known
+plate height and never on the load cell. A G-code move with an X or Y
+component is refused only if its lowest point is below `contact_z` (plus
+`unmeshed_margin` while no bed mesh is active), with "The plate is at the
+nozzle ...: lift Z before moving X or Y". If the height is not known (Z
+not homed, or homed and then invalidated by a position reset outside
+homing, a FORCE_MOVE of Z, the Z motor turned off, or a homing or probing
+move that failed) every X or Y move is refused with "Home first: ...". The
+guard is inactive during a job, during homing and probing and during
+NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is the
+height decision, `home_required` and `z_known` report the height state, and
+the load cell model below still runs and reports `load` and `load_contact`
+but refuses nothing.
+
+With `move_guard: load_cell` the load cell contact model decides instead.
+It is kept for probing and contact detection work and is not meant for
+moves on a printer: the cell reads many times `threshold_counts` during
+plain X and Y motion. In that mode, between
 probes the guard watches the `[load_cell_probe]` load cell and reports
 contact when the load stays above `threshold_counts`. While it does, a
 G-code move with an X or Y component that does not also raise Z fails with
@@ -5690,6 +5709,17 @@ recognised as a job. See the
 
 ```
 [contact_guard]
+#move_guard: height
+#   What refuses an X or Y move: "height" (the known plate height, "Home
+#   first" when it is not known) or "load_cell" (the load cell contact
+#   model). The default is height.
+#contact_z: 0.1
+#   move_guard: height. The lowest G-code Z, in mm, at which X and Y may
+#   move. With a bed mesh active this is the height above the measured
+#   surface.
+#unmeshed_margin: 1.5
+#   move_guard: height. Added to contact_z while no bed mesh is active,
+#   when Z is only known at the point Z homing probed.
 #threshold_counts: 90000
 #   Raw load cell counts, in the direction the probe presses, above which
 #   the nozzle is in contact. The default is half the force at which the
