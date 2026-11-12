@@ -578,10 +578,10 @@ def test_z_lowered_behind_the_guard_ends_the_lift():
     g28_xy(r)
     z = r.printer.toolhead.position[2]
     assert r.refused(60., 60., z) is None
-    r.z_steps(-10.)
-    waits = r.printer.toolhead.waits
+    # still in the queue when the XY move arrives: the guard must let it
+    # run before it decides
+    r.z_steps(-10., queued=True)
     assert r.refused(70., 60., z) == HOME_FIRST
-    assert r.printer.toolhead.waits > waits, "decided before the queue ran"
     assert r.status()['lift_clear'] is False
     assert r.status()['home_required'] is True
 
@@ -670,6 +670,41 @@ def test_lift_clear_min_cannot_be_below_the_unmeshed_minimum():
     try:
         base.contact_guard.load_config(base.FakeConfig(
             printer, {'lift_clear_min': 1.0}))
-    except base.ConfigError:
+    except base.ConfigError as err:
+        assert 'lift_clear_min' in str(err), err
         return
     raise AssertionError("lift_clear_min 1.0 was accepted")
+
+
+def test_z_park_after_g28_keeps_the_lower_anchor():
+    # Review of 4dd5093e: G28 lifted 10 mm, then Z_PARK finds the top 8 mm
+    # higher and retracts 10: still 8 mm above where G28's lift began
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    r.homing_move('z', -8.)
+    r.z_steps(-10.)
+    th = r.printer.toolhead
+    th.position[2] = 50.
+    r.set_position()
+    r.guard.get_position()
+    assert r.refused(135., 63., 50.) is None
+
+
+def test_bed_removed_while_the_queue_runs():
+    r = Rig(z=20., homed=False)
+    g28_xy(r)
+    z = r.printer.toolhead.position[2]
+    th = r.printer.toolhead
+    th.pending = [lambda: r.printer.send_event(
+        "bed_removal_detector:removed")]
+    assert r.refused(60., 60., z) == HOME_FIRST
+
+
+def test_every_z_stepper_must_be_anchored():
+    # A second Z stepper the lift did not report
+    r = Rig(z=20., homed=False)
+    r.guard.z_steppers['stepper_z1'] = base.FakeStepper('z', 'stepper_z1')
+    g28_xy(r)
+    assert r.status()['lift_clear'] is False
+    z = r.printer.toolhead.position[2]
+    assert r.refused(60., 60., z) == HOME_FIRST

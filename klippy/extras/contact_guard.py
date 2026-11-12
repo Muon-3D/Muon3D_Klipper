@@ -173,9 +173,9 @@ class ContactGuard:
         # Where each Z stepper was when the lift began, in raw MCU steps
         # (which a position reset does not change): {name: (mcu_pos,
         # up_sign, step_dist)}.  The lift holds while every Z stepper is
-        # still lift_clear_min above it.  Z moves that bypass G-code (toolhead.manual_move:
-        # AXIS_HOME_MOVE's retract, AXIS_PROTECTED_MOVE's backoff) are seen
-        # here, not in move().
+        # still lift_clear_min above it.  Z moves that bypass G-code
+        # (toolhead.manual_move: AXIS_HOME_MOVE's retract,
+        # AXIS_PROTECTED_MOVE's backoff) are seen here, not in move().
         self.lift_anchor = {}
         self.z_steppers = {}
         # A homing or probing move began and no G-code move has passed
@@ -359,9 +359,15 @@ class ContactGuard:
         self.z_trusted = self.probe_since_reset = False
         self.g28_z_homed = False
         self.lift_clear = False
+        self.lift_anchor = {}
 
     def _note_lift(self, hmove):
-        # Anchor the lift on the Z steppers' raw positions at its start
+        # Anchor the lift on the Z steppers' raw positions at its start.
+        # A lift that still holds keeps its anchor: that was a real plate
+        # position too, and lower (Z_PARK lifting the last few mm to the
+        # top and retracting 10 must not undo G28's lift).
+        if self._lift_holds(wait=False):
+            return
         anchor = {}
         for sp in getattr(hmove, 'stepper_positions', []):
             if sp.trig_pos is None or not sp.stepper.is_active_axis('z'):
@@ -381,12 +387,15 @@ class ContactGuard:
     def _lift_holds(self, wait=True):
         # The plate is still lift_clear_min above where the lift began, on
         # every Z stepper's own position (Z_PARK's AXIS_HOME_MOVE lifts to
-        # the top and retracts 10 mm: that still holds).  With wait, everything queued ahead has
-        # run first, so its steps are counted.
+        # the top and retracts 10 mm: that still holds).  With wait,
+        # everything queued ahead has run first, so its steps are counted.
         if not self.lift_clear:
             return False
         if wait:
             self.toolhead.wait_moves()
+            if not self.lift_clear:
+                # Dropped while the queue ran (the bed came off)
+                return False
         for name, (anchor, up, step_dist) in self.lift_anchor.items():
             stepper = self.z_steppers.get(name)
             if stepper is None or not hasattr(stepper, 'get_mcu_position'):

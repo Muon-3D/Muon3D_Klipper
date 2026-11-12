@@ -159,6 +159,10 @@ class FakeToolhead:
         return {'homed_axes': self.homed_axes}
     def wait_moves(self):
         self.waits += 1
+        # Motion queued ahead (see Rig.z_steps) has now run
+        pending, self.pending = getattr(self, 'pending', []), []
+        for run in pending:
+            run()
     def get_last_move_time(self):
         return self.print_time
     def get_position(self):
@@ -333,9 +337,18 @@ class Rig:
         self.printer.send_event("homing:homing_move_begin", hmove)
         stepper.mcu_pos = hmove.stepper_positions[0].trig_pos
         self.printer.send_event("homing:homing_move_end", hmove)
-    def z_steps(self, mm):
-        """Move Z behind the guard (toolhead.manual_move); + is up"""
-        self.printer.toolhead.stepper('z').mcu_pos += int(round(mm / 0.0025))
+    def z_steps(self, mm, queued=False):
+        """Move Z behind the guard (toolhead.manual_move); + is up.
+        queued: the steps only happen once the queue runs (wait_moves)"""
+        th = self.printer.toolhead
+        stepper = th.stepper('z')
+
+        def run():
+            stepper.mcu_pos += int(round(mm / 0.0025))
+        if queued:
+            th.pending = getattr(th, 'pending', []) + [run]
+        else:
+            run()
     def set_position(self, at=None):
         # toolhead.set_position marks the trapq at the current print_time;
         # the samples that follow are newer.  print_time is then put back
