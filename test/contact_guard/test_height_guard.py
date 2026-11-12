@@ -631,9 +631,21 @@ def test_error_inside_g28_drops_the_height_without_a_poll():
     # no status poll in between
     r = Rig(z=20.)
     p = r.printer
+
+    class Trapq:
+        # The executed Z before the reset is the Z after it
+        def get_trapq_position(self, print_time):
+            return list(p.toolhead.position), 0.
+
+    class MotionReport:
+        dtrapqs = {'toolhead': Trapq()}
+    p.objects['motion_report'] = MotionReport()
     p.send_event("homing_scope:begin")
     p.homing_scope.in_scope = True
-    r.report(base.CommandError("adxl345_probe: y home taps disagree"))
+    # _HOME_X's plain G1 back-off is a G-code move the guard accepts (it
+    # clears the homing mark); the error comes after it
+    r.move(50., 60., 20.)
+    r.report(base.CommandError("Move out of range: 50.000 -3.000 20.000"))
     p.homing_scope.in_scope = False
     r.set_position()        # SET_KINEMATIC_POSITION SET_HOMED=Z, Z same
     assert r.refused(60., 60., 20.) == HOME_FIRST
