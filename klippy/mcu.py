@@ -882,9 +882,22 @@ class MCUConnectHelper:
         event_type = params['#name']
         if self.is_non_critical:
             # Treat as a soft disconnect; don't take the whole printer down.
-            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)",
-                         self._name, event_type, self._shutdown_msg)
-            self.handle_non_critical_disconnect()
+            # The same dump a critical mcu's shutdown logs: the clock it
+            # stopped at and the last messages sent to it, which is what
+            # names the command behind "Timer too close".
+            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)"
+                         " at clock %s\n%s\n%s",
+                         self._name, event_type, self._shutdown_msg,
+                         shutdown_clock, self._clocksync.dump_debug(),
+                         self._serial.dump_debug())
+            # This runs on the serial thread, inside SerialReader.lock. The
+            # disconnect unregisters the 'clock' response (which takes that
+            # same, non-reentrant lock) and joins this thread, so calling it
+            # here deadlocked the thread and then the reactor with it: the
+            # whole host froze mid-print. Hand it to the reactor instead,
+            # as the critical path does with invoke_async_shutdown.
+            self._reactor.register_async_callback(
+                lambda e: self.handle_non_critical_disconnect())
             return
         self._printer.invoke_async_shutdown(
             "MCU shutdown", {"reason": msg, "mcu": self._name,
