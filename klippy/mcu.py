@@ -902,8 +902,8 @@ class MCUConnectHelper:
                 logging.exception("Non-critical MCU '%s' shutdown dump failed",
                                   self._name)
                 debug = ""
-            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)"
-                         " at clock %s%s",
+            logging.info("Non-critical MCU '%s' reported %s: %s"
+                         " (treating as disconnect) at clock %s%s",
                          self._name, event_type, self._shutdown_msg,
                          shutdown_clock, debug)
             return
