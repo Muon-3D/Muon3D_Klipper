@@ -17,6 +17,14 @@ REFUSAL = "Nozzle is touching the plate: lift Z before moving X or Y"
 REFUSAL_Z_UNHOMED = ("Nozzle is touching the plate and Z is not homed (Z"
                      " cannot be jogged or re-zeroed): run a full home"
                      " (G28) to re-zero the guard")
+# move_guard: height (the default).  The move guard decides on the KNOWN
+# plate height only, never on the load cell: its reading swings by many
+# times threshold_counts during plain XY motion with the plate 20 mm away
+# (Boxwood, 12 Nov 2026: -908000..+441000 against a threshold of 90000).
+REFUSAL_HOME = ("Home first: the plate height is not known, so X and Y"
+                " cannot move safely. Run a home (G28).")
+REFUSAL_NEAR = ("The plate is at the nozzle (Z %.2f, X and Y need Z %.2f or"
+                " more): lift Z before moving X or Y")
 # Fail closed: near the plate, or while the last state was contact, an XY
 # move with no load cell data covering its start is refused too
 NO_DATA = ("contact_guard: no current load cell data, so contact cannot"
@@ -121,6 +129,29 @@ class ContactGuard:
         # plate, so the guard first waits for it to execute and decides on
         # what the load cell reads afterwards.
         self.sync_below_z = config.getfloat('sync_below_z', 3.0)
+        # What refuses an XY move.  "height": the known plate height (Z
+        # homed by a probe or endstop and not invalidated since), "Home
+        # first" when it is not known; the load cell is not consulted.
+        # "load_cell": the load cell contact model above, kept for probing
+        # and contact detection work, not for moves on a printer.
+        self.move_guard = config.get('move_guard', 'height')
+        if self.move_guard not in ('height', 'load_cell'):
+            raise config.error("[contact_guard] move_guard must be 'height'"
+                               " or 'load_cell'")
+        # height: XY may move only at or above this G-code Z.  The guard is
+        # ahead of bed_mesh in the transform chain, so with a mesh active
+        # this is the height above the measured surface.
+        self.contact_z = config.getfloat('contact_z', 0.1, minval=0.)
+        # height: with no bed mesh active Z is relative to the one point Z
+        # homing probed, and the plate elsewhere can be higher by its
+        # out-of-flatness: keep this much more
+        self.unmeshed_margin = config.getfloat('unmeshed_margin', 1.5,
+                                               minval=0.)
+        self.bed_mesh = None
+        # A homing or probing move began and no G-code move has passed
+        # since: an error now may be that move failing (see
+        # _handle_command_error)
+        self.homing_touched = False
         self.enabled = True
         # ENABLE=0 TIMEOUT=<s> (CUT_FILAMENT's press into the cutter): the
         # guard is back by itself at this reactor time, or on a command
@@ -236,6 +267,7 @@ class ContactGuard:
                                                       None)
         self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode_io = self.printer.lookup_object('gcode_io', None)
+        self.bed_mesh = self.printer.lookup_object('bed_mesh', None)
         # A disabled Z motor can be turned by hand: Z is no longer known
         stepper_enable = self.printer.lookup_object('stepper_enable', None)
         if stepper_enable is not None:
@@ -262,14 +294,48 @@ class ContactGuard:
         self._check_move(newpos)
         self.next_transform.move(newpos, speed)
         self.last_position = list(newpos)
+        # A G-code move was accepted: whatever homed or probed before it
+        # finished without an error
+        self.homing_touched = False
+
+    def _height_known(self, eventtime):
+        kin = self.toolhead.get_kinematics().get_status(eventtime)
+        return 'z' in kin['homed_axes'] and self.z_trusted
+
+    def _min_xy_z(self):
+        mesh = None
+        if self.bed_mesh is not None:
+            mesh = self.bed_mesh.get_mesh()
+        if mesh is None:
+            return self.contact_z + self.unmeshed_margin
+        return self.contact_z
+
+    def _check_height(self, last, newpos, eventtime):
+        if not self._height_known(eventtime):
+            logging.info("contact_guard: refused move %s -> %s, plate height"
+                         " not known", last[:3], list(newpos[:3]))
+            raise self._own_error(REFUSAL_HOME)
+        # The lowest point of the move decides
+        low = min(last[2], newpos[2])
+        min_z = self._min_xy_z()
+        if low < min_z - MOVE_EPSILON:
+            logging.info("contact_guard: refused move %s -> %s, below Z"
+                         " %.3f", last[:3], list(newpos[:3]), min_z)
+            raise self._own_error(REFUSAL_NEAR % (low, min_z))
 
     def _check_move(self, newpos):
         last = self.last_position
         moves_xy = (abs(newpos[0] - last[0]) > MOVE_EPSILON
                     or abs(newpos[1] - last[1]) > MOVE_EPSILON)
-        if not moves_xy or newpos[2] > last[2] + MOVE_EPSILON:
+        if not moves_xy:
             return
         eventtime = self.reactor.monotonic()
+        if self.move_guard == 'height':
+            if self._may_refuse(eventtime):
+                self._check_height(last, newpos, eventtime)
+            return
+        if newpos[2] > last[2] + MOVE_EPSILON:
+            return
         if not self._may_refuse(eventtime):
             return
         possible = self._contact_possible(last, eventtime)
@@ -353,6 +419,7 @@ class ContactGuard:
     # Inactive states
     def _handle_homing_move_begin(self, hmove):
         self.homing_moves += 1
+        self.homing_touched = True
         self.lift_zero = None
         self.own_error = None
         # Remember what the cell read just before the move.  It becomes the
@@ -428,6 +495,7 @@ class ContactGuard:
         self._real_zero()
 
     def _handle_g28_begin(self):
+        self.homing_touched = True
         self.g28_z_homed = False
         self.g28_z0 = None
         self.g28_lift_baseline = None
@@ -560,6 +628,7 @@ class ContactGuard:
 
     def _handle_home_rails_begin(self, homing_state, rails):
         self.homing_rails = True
+        self.homing_touched = True
         self.own_error = None
 
     def _handle_home_rails_end(self, homing_state, rails):
@@ -645,6 +714,12 @@ class ContactGuard:
             # The guard's own refusal, at whatever macro level: nothing
             # homed or probed since it was raised (any of that clears the
             # mark), so Z is as trusted as it was
+            return
+        touched, self.homing_touched = self.homing_touched, False
+        if self.move_guard == 'height' and not touched:
+            # An error with no homing or probing move since the last
+            # accepted G-code move (a typo, a move out of range) says
+            # nothing about where the plate is
             return
         # A homing or probing move that ended in an error proves nothing
         self.pending_zero = self.lift_zero = None
@@ -976,11 +1051,29 @@ class ContactGuard:
 
     def get_status(self, eventtime):
         active = self.is_active(eventtime)
+        if self.move_guard != 'height':
+            return {
+                'contact': active and self.contact,
+                'load': int(round(self.load)),
+                'active': active,
+                'enabled': self._is_enabled(eventtime),
+            }
+        # height: "contact" is what locks the move pad of a client, so it
+        # is the height decision; what the load cell thinks is load_contact
+        known = self.toolhead is not None and self._height_known(eventtime)
+        may = self._may_refuse(eventtime)
+        min_z = self._min_xy_z()
+        near = known and self.last_position[2] < min_z - MOVE_EPSILON
         return {
-            'contact': active and self.contact,
+            'contact': may and near,
+            'home_required': may and not known,
+            'z_known': known,
+            'min_xy_z': min_z,
             'load': int(round(self.load)),
-            'active': active,
+            'load_contact': active and self.contact,
+            'active': may,
             'enabled': self._is_enabled(eventtime),
+            'move_guard': self.move_guard,
         }
 
     def _rezero(self, force=False):

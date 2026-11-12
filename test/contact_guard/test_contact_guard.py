@@ -50,6 +50,10 @@ class FakeConfig:
         return self.printer
     def _get(self, name, default):
         return self.values.get(name, default)
+    def get(self, name, default=None):
+        return self._get(name, default)
+    def error(self, msg):
+        return ConfigError(msg)
     def getint(self, name, default=None, minval=None, maxval=None):
         return int(self._get(name, default))
     def getfloat(self, name, default=None, minval=None, maxval=None,
@@ -262,6 +266,10 @@ class Rig:
     def __init__(self, values=None, z=5.):
         self.printer = FakePrinter()
         self.printer.toolhead.position[2] = z
+        # This file tests the load cell contact model, which is no longer
+        # the default move guard (test_height_guard.py tests that)
+        values = dict(values or {})
+        values.setdefault("move_guard", "load_cell")
         self.guard = contact_guard.load_config(
             FakeConfig(self.printer, values))
         self.printer.send_event("klippy:connect")
