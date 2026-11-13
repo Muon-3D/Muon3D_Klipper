@@ -2,8 +2,9 @@
 DICTIONARY atmega2560.dict
 CONFIG print_start_phase.cfg
 
-# Nothing has run yet.
+# A fresh klippy process starts unswept; its first print must sweep.
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=0
 
 # A print whose slicer region crosses the no-go notch at the front (x 75 to
 # 125, y 0 to 34): 4 x 4 points on a 30 x 26 mm grid, rows alternating
@@ -17,6 +18,8 @@ ASSERT_SEEN WANT="wipe:home resonance:home_z dock:resonance save_config:mesh doc
 # Handover was the last mark, and clears it.
 ASSERT_SEQ SEQ=13
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=1
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 ASSERT_PHASE_T
 ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/140.00,20.00/140.00,46.00/110.00,46.00/80.00,46.00/50.00,46.00/50.00,72.00/80.00,72.00/110.00,72.00/140.00,72.00/140.00,98.00/110.00,98.00/80.00,98.00/50.00,98.00
 
@@ -25,7 +28,23 @@ ASSERT_MESH_PLAN PROBED_COUNT=15 LAST_PROBED=1 POINTS=50.00,20.00/75.00,20.00/14
 _TEST_RESET
 PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
 ASSERT_PHASE NAME=
+ASSERT_SWEEPS COUNT=1
+# This negative assertion exercises the production gate's reuse branch, not
+# merely the sweep counter: the second request must explicitly report no sweep.
+ASSERT_LAST_RESONANCE_SWEPT VALUE=0
 ASSERT_MESH_PLAN PROBED_COUNT=0 LAST_PROBED=0 POINTS=
+
+# A reconnect may be a toolhead/nozzle swap and invalidates the session flag.
+TOOLHEAD_CONNECT
+_TEST_RESET
+PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98
+ASSERT_SWEEPS COUNT=2
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
+
+# FORCE remains an unconditional operator override after this session swept.
+FINETUNE_RESONANCE FORCE=1
+ASSERT_SWEEPS COUNT=3
+ASSERT_LAST_RESONANCE_SWEPT VALUE=1
 
 # 2 mm deeper, past what the stored mesh covers, so it is probed. 80 mm over
 # three gaps is 26.666 mm, which bed_mesh floors to 26.66, so the last row
@@ -67,3 +86,19 @@ _PRINT_START_MARK PHASE=start
 ASSERT_PHASE NAME=start
 PRINT_END
 ASSERT_PHASE NAME=
+
+# KAN-990: a profile that calls PURGE_LINE asks for a purge lane. For the
+# part above it is 6 mm in front, at y 14, which is in the notch's rows, so
+# it steps left of the notch to x 13..73. The mesh covers it, and PURGE_LINE
+# draws along it here in klippy, once.
+PRINT_START BED=65 MATERIAL=PLA MESH_MIN=50,20 MESH_MAX=140,98 PURGE_LANE=1
+ASSERT_PURGE_LANE LANE=13.00,73.00,14.00,1
+ASSERT_MESH_COVERS_PURGE_LANE
+PURGE_LINE
+ASSERT_PURGE_LANE LANE=
+PURGE_LINE
+
+# Asked for, but with no slicer region there is no lane to draw.
+PRINT_START BED=65 MATERIAL=PLA PURGE_LANE=1
+ASSERT_PURGE_LANE LANE=
+PURGE_LINE

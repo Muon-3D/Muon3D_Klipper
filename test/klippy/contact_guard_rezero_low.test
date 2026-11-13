@@ -1,0 +1,13 @@
+# contact_guard refuses SET_CONTACT_GUARD REZERO=1 near the plate.  Exits
+# with an error: at Z 5, under rezero_min_z (10), a held load may be a
+# touch, so it is not absorbed.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard.cfg
+SHOULD_FAIL
+
+G28
+G90
+G1 X50 Y50 Z5 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.05
+SET_CONTACT_GUARD REZERO=1 FORCE=1

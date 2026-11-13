@@ -9,6 +9,9 @@ from . import probe, trigger_analog, load_cell, hx71x, ads1220
 
 np = None  # delay NumPy import until configuration time
 
+# KAN-1730: largest probe z_offset the M1 stages or uses (mm)
+MAX_Z_OFFSET = 2.0
+
 # MCU SOS filter scaled to "fractional grams" for consistent sensor precision
 FRAC_GRAMS_CONV = 32768.0
 
@@ -919,8 +922,16 @@ class LoadCellPrinterProbe:
             config, sensor, sos_filter)
         # Probe Interface
         self._param_helper = probe.ProbeParameterHelper(config)
-        self._cmd_helper = probe.ProbeCommandHelper(config, self)
-        self._probe_offsets = probe.ProbeOffsetsHelper(config)
+        # KAN-1730: the nozzle is the probe, so a z_offset beyond this is a
+        # bad calibration (or Z_OFFSET_APPLY_PROBE run in a loop). Staging
+        # one is refused; one already saved is ignored at start (Klipper
+        # still starts, homing and calibration work) and printing is blocked
+        # until Z is calibrated again (muon_guard reads z_offset_invalid).
+        self._cmd_helper = probe.ProbeCommandHelper(
+            config, self, z_limit=MAX_Z_OFFSET)
+        self._probe_offsets = probe.ProbeOffsetsHelper(config, MAX_Z_OFFSET)
+        self._cmd_helper.z_offset_invalid = (
+            self._probe_offsets.invalid_z_offset)
         load_cell_probing_move = LoadCellProbingMove(config, self._load_cell,
             self._mcu_trigger_analog, self._param_helper,
             continuous_tare_filter_helper, config_helper)
@@ -950,6 +961,9 @@ class LoadCellPrinterProbe:
     def get_load_cell(self):
         return self._load_cell
 
+    def get_reference_max_load_counts(self):
+        return self._config_helper.get_reference_max_load_counts()
+
     def get_last_trigger_time(self):
         return self._load_cell_probing_move.get_last_trigger_time()
 
@@ -970,6 +984,9 @@ class LoadCellPrinterProbe:
         status.update(self._load_cell_probing_move.get_status(eventtime))
         status.update(self._tapping_move.get_status(eventtime))
         status.update({
+            # the effective probe z_offset: the stand-in (0.0) when the
+            # saved one was out of range (z_offset_invalid is then set)
+            'z_offset': self._probe_offsets.z_offset,
             'safety_model': self._config_helper.get_safety_model(),
             'reference_max_load_counts':
                 self._config_helper.get_reference_max_load_counts(),

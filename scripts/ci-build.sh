@@ -55,6 +55,25 @@ finish_test check_macro_config "Check macro config"
 
 
 ######################################################################
+# Run the M1 LED state and user-mode macros through klippy's macro code
+######################################################################
+
+start_test m1_led_modes "Test M1 LED macros"
+$PYTHON scripts/test_m1_led_modes.py
+# KAN-569: on fault paths the hot end turns off before any LED command.
+$PYTHON scripts/test_m1_heater_before_leds.py
+# KAN-990: the start purge is drawn only where the bed mesh probed.
+$PYTHON scripts/test_m1_purge_line.py
+# KAN-1730: PRINT_START refuses a saved Z offset past the safe range, in
+# dev mode too, and applies the probe's live offset, not the raw saved one.
+$PYTHON scripts/test_m1_print_start_z_offset.py
+# KAN-742: the unlock press reports the contact_guard offset its retract
+# leaves, moves nothing, and never uses REZERO FORCE.
+$PYTHON scripts/test_m1_unlock_guard_offset.py
+finish_test m1_led_modes "Test M1 LED macros"
+
+
+######################################################################
 # Check the M1 automatic filament load is still armed
 ######################################################################
 
@@ -114,6 +133,7 @@ finish_test klippy "Test klippy import (Python3)"
 start_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
+$PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
@@ -124,7 +144,35 @@ finish_test load_cell "Test load cell collector is stopped on a failed tap"
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
+$PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
+
+# MUON: fail-closed dev-mode check; clients start only allowlisted commands
+# outside dev mode, macros and internal sources are not checked (KAN-1730).
+start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+$PYTHON test/muon_guard/test_muon_guard.py
+finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
+
+# MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
+start_test homing_scope "Test homing_scope"
+$PYTHON test/homing_scope/test_homing_scope.py
+finish_test homing_scope "Test homing_scope"
+
+# MUON: M600 with no print only prompts; PAUSE restores absolute mode (KAN-1699).
+start_test m600 "Test M600 with no print only prompts"
+$PYTHON test/m600/test_m600_no_print.py
+finish_test m600 "Test M600 with no print only prompts"
+
+# MUON: a plate pull pauses only while a file is printing (KAN-272).
+start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+$PYTHON test/bed_removal/test_bed_removal_detector.py
+finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+
+# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
+start_test fan_modes "Test fan_modes speed table mapping"
+$PYTHON test/fan_modes/test_fan_modes.py
+$PYTHON test/fan_modes/test_print_modes.py
+finish_test fan_modes "Test fan_modes speed table mapping"
 
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
@@ -140,3 +188,9 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
+# (KAN-1940); batch mode exits on any error, so this reads the log.
+start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+$PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
+finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
