@@ -703,6 +703,55 @@ def test_every_z_stepper_must_be_anchored():
     assert r.refused(60., 60., z) == HOME_FIRST
 
 
+# jog_limits: what muon_jog asks before it moves the plate itself
+
+
+def test_jog_limits_with_a_mesh():
+    r = Rig(z=20., mesh=True)
+    known, floor = r.guard.jog_limits([60., 60.])
+    assert known is True and abs(floor - CONTACT_Z) < 1e-9
+
+
+def test_jog_limits_without_a_mesh_keeps_the_margin():
+    r = Rig(z=20., mesh=False)
+    known, floor = r.guard.jog_limits([60., 60.])
+    assert known is True and abs(floor - (CONTACT_Z + UNMESHED)) < 1e-9
+
+
+def test_jog_limits_outside_the_mesh_keeps_the_margin():
+    r = Rig(z=20., mesh=True)
+    r.bed_mesh.mesh = FakeMesh(x=(60., 140.), y=(60., 140.))
+    assert abs(r.guard.jog_limits([100., 100.])[1] - CONTACT_Z) < 1e-9
+    assert abs(r.guard.jog_limits([150., 100.])[1]
+               - (CONTACT_Z + UNMESHED)) < 1e-9
+    # several points: the worst one decides
+    assert abs(r.guard.jog_limits([100., 100.], [150., 100.])[1]
+               - (CONTACT_Z + UNMESHED)) < 1e-9
+
+
+def test_jog_limits_height_unknown():
+    r = Rig(z=20., homed=False, mesh=True)
+    assert r.guard.jog_limits([60., 60.])[0] is False
+    # a lift alone does not make the height known
+    g28_xy(r)
+    assert r.status()['lift_clear'] is True
+    assert r.guard.jog_limits([60., 60.])[0] is False
+    r.printer.toolhead.homed_axes = 'xyz'
+    r.home_z()
+    assert r.guard.jog_limits([60., 60.])[0] is True
+    # Z's homed flag lost
+    r.printer.toolhead.homed_axes = 'xy'
+    assert r.guard.jog_limits([60., 60.])[0] is False
+
+
+def test_jog_limits_load_cell_mode_is_unchanged():
+    r = base.Rig(z=20.)
+    assert r.guard.move_guard == 'load_cell'
+    assert r.guard.jog_limits([60., 60.]) == (True, 0.)
+    r.printer.toolhead.homed_axes = ''
+    assert r.guard.jog_limits([60., 60.]) == (True, 0.)
+
+
 if __name__ == '__main__':
     n = 0
     for name, fn in sorted(globals().items()):

@@ -165,6 +165,12 @@ start_test muon_guard "Test muon_guard dev-mode check and client allowlist"
 $PYTHON test/muon_guard/test_muon_guard.py
 finish_test muon_guard "Test muon_guard dev-mode check and client allowlist"
 
+# MUON: streaming jog (Control live drag): bounded path, limits, the contact
+# guard height and Z floor.
+start_test muon_jog "Test muon_jog streaming jog"
+$PYTHON test/muon_jog/test_muon_jog.py
+finish_test muon_jog "Test muon_jog streaming jog"
+
 # MUON: G28 is one homing scope, and a failed G28 homes nothing (KAN-573).
 start_test homing_scope "Test homing_scope"
 $PYTHON test/homing_scope/test_homing_scope.py

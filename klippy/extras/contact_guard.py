@@ -433,6 +433,18 @@ class ContactGuard:
             return self.contact_z + self.unmeshed_margin
         return self.contact_z
 
+    def jog_limits(self, *points, eventtime=None):
+        # For modules that move the plate themselves (muon_jog): whether the
+        # plate height is known, and the lowest Z that is safe at all the
+        # given XY positions (guard coordinates).  move_guard load_cell
+        # decides on the load cell, not on a height: (True, 0.) there.
+        if self.move_guard != 'height':
+            return True, 0.
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        known = self.toolhead is not None and self._height_known(eventtime)
+        return known, self._min_xy_z(*points)
+
     def _check_height(self, last, newpos, eventtime):
         if not self._height_known(eventtime):
             if (self.lift_clear and newpos[2] >= last[2] - MOVE_EPSILON
