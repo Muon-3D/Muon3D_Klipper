@@ -133,6 +133,9 @@ finish_test klippy "Test klippy import (Python3)"
 start_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
+$PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
+# restart_method: swdio waits for openocd through the reactor.
+$PYTHON test/serialqueue/test_swdio_restart.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
 # MUON: FIRMWARE_RESTART after an e-stop cannot hang klippy (KAN-1362).
@@ -148,6 +151,7 @@ finish_test load_cell "Test load cell collector is stopped on a failed tap"
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
+$PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
@@ -171,6 +175,12 @@ start_test bed_removal "Test bed_removal_detector pauses only in the print phase
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 
+# MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
+start_test fan_modes "Test fan_modes speed table mapping"
+$PYTHON test/fan_modes/test_fan_modes.py
+$PYTHON test/fan_modes/test_print_modes.py
+finish_test fan_modes "Test fan_modes speed table mapping"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py
@@ -185,3 +195,9 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
+# (KAN-1940); batch mode exits on any error, so this reads the log.
+start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+$PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
+finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
