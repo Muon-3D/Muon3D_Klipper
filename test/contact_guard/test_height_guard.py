@@ -261,13 +261,6 @@ def test_bad_mode_is_a_config_error():
     raise AssertionError("a misspelt move_guard was accepted")
 
 
-if __name__ == '__main__':
-    for name, fn in sorted(globals().items()):
-        if name.startswith('test_'):
-            fn()
-            print("ok  " + name)
-
-
 def test_out_of_range_after_a_good_probe_keeps_the_height():
     # Review of #129: "Move out of range" is raised further down the
     # chain, after the guard accepted the move.  It is not a failed probe.
@@ -708,3 +701,13 @@ def test_every_z_stepper_must_be_anchored():
     assert r.status()['lift_clear'] is False
     z = r.printer.toolhead.position[2]
     assert r.refused(60., 60., z) == HOME_FIRST
+
+
+if __name__ == '__main__':
+    n = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith('test_') and callable(fn):
+            fn()
+            print("ok  " + name)
+            n += 1
+    print("All %d height guard tests passed" % n)
