@@ -140,6 +140,16 @@ $PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
 $PYTHON test/serialqueue/test_swdio_restart.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
+# MUON: a toolhead reconnect must not run steps backwards or load on a
+# filament reading from before the unplug (KAN-558).
+start_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
+$PYTHON test/motion_queuing/test_reconnect_step_time.py
+$PYTHON test/filament_switch/test_reconnect_resync.py
+$PYTHON test/filament_switch/test_first_sample.py
+$PYTHON test/filament_switch/test_mcu_first_report.py
+$PYTHON test/serialqueue/test_unconfigured_commands.py
+finish_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
+
 # MUON: FIRMWARE_RESTART after an e-stop cannot hang klippy (KAN-1362).
 start_test restart "Test restart path is bounded"
 $PYTHON test/restart/test_restart_bounded.py
