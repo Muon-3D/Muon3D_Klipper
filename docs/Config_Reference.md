@@ -4652,6 +4652,46 @@ run_current:
 #   sensorless homing.
 ```
 
+### [fan_modes]
+
+Print modes for the part fan. The slicer's commanded fan speed is mapped
+through the selected mode's curve before it reaches the fan, so a strong
+fan can be run at a fraction of what stock filament profiles ask for
+without editing every profile. `SET_PART_FAN SPEED=<0..1>` carries the
+commanded speed (an M106 macro calls it), and `SET_PRINT_MODE MODE=<mode>`
+selects the mode and re-applies the commanded speed under the new curve.
+With a `speed_table`, each curve maps the command to a target fan speed
+in rpm instead of a duty, and the table converts that speed to a duty.
+This suits a fan whose speed is far from proportional to its duty, or
+that does not start at small duties: a curve in rpm gives an even step of
+air per step of command. It is open loop; the tachometer is not read.
+The status object reports `mode`, `modes`, `commanded_speed`,
+`target_rpm` (None without a `speed_table`) and `output_speed` (the duty).
+
+```
+[fan_modes]
+#fan: fan
+#   The [fan] section to drive. The default is "fan".
+#modes: normal, quiet, turbo
+#   The available modes. Each needs a <mode>_curve.
+#normal_curve:
+#   Comma separated commanded:output pairs, commanded increasing from
+#   0 to 1, interpolated linearly. Without a speed_table the output is
+#   a duty (0..1): "0:0, 1:0.30" runs the fan at 30% duty when 100% is
+#   commanded. With a speed_table the output is a target speed in rpm,
+#   up to the table's highest rpm: "0:0, 0.01:3400, 1:18300".
+#speed_table:
+#   Optional. Comma separated rpm:duty pairs measured on the fan, both
+#   increasing, interpolated linearly. The first pair is the lowest
+#   speed at which the fan follows its duty: a target above 0 rpm but
+#   below it runs at that pair's duty, and 0 rpm is off.
+#default_mode: normal
+#   The mode at startup.
+#normal_speed_factor:
+#   Optional. When set, selecting the mode also sets the print speed
+#   factor (M220) to this value (1.0 = 100%).
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]
@@ -5626,23 +5666,75 @@ sensor_type:
 
 ### [contact_guard]
 
-Refuse G-code moves that would drag the nozzle across the plate. Between
+Refuse G-code moves that would drag the nozzle across the plate.
+
+With `move_guard: height` (the default) the guard decides on the known
+plate height and never on the load cell. A G-code move with an X or Y
+component is refused only if its lowest point is below `contact_z` (plus
+`unmeshed_margin` while no bed mesh is active, or where either end of the
+move is outside the region the active mesh probed), with "The plate is at
+the nozzle ...: lift Z before moving X or Y". If the height is not known
+(Z not homed, or homed and then invalidated by a position reset outside
+homing, a FORCE_MOVE of Z, the Z motor turned off, the bed removed, or a
+homing or probing move that failed) an X or Y move is refused with "Home
+first: ...", unless a homing move has lifted the plate by at least
+`lift_clear_min` (the M1's G28 lifts 10 mm before it homes X and Y), no
+G-code move has taken Z down since, every Z stepper is still
+`lift_clear_min` above where the lift began (on its own step count, so Z
+moves made outside G-code count too), and Z has not been forced or turned
+off and the bed has not been removed: the plate is then clear, and X and Y
+may move at that height or higher. A bed mesh that was loaded when the bed
+was removed is treated as no mesh until another is loaded. Moves that
+modules make directly on the toolhead (SHAPER_CALIBRATE, the AXIS_* moves
+of X and Y) do not pass through the guard. The guard is inactive during a job, during homing and probing and
+during NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is
+the height decision, `home_required`, `z_known` and `lift_clear` report the
+height state, and the load cell model below still runs and reports `load`
+and `load_contact` but refuses nothing.
+
+With `move_guard: load_cell` the load cell contact model decides instead.
+It is kept for probing and contact detection work and is not meant for
+moves on a printer: the cell reads many times `threshold_counts` during
+plain X and Y motion. In that mode, between
 probes the guard watches the `[load_cell_probe]` load cell and reports
 contact when the load stays above `threshold_counts`. While it does, a
 G-code move with an X or Y component that does not also raise Z fails with
 "Nozzle is touching the plate: lift Z before moving X or Y". A move that
-starts below `sync_below_z`, or with Z unhomed, first waits for the moves
+starts below `sync_below_z`, or with Z unhomed, or within on_time of data
+after a probe's hold-off or a gap in the stream, first waits for the moves
 queued ahead of it to run and is decided on the load cell readings after
-them. The guard is inactive during a job (a virtual_sdcard print that is
-printing or paused, or commands arriving over the G-code pty, until 5
-seconds after the last), during homing, probing and NOZZLE_WIPE_SMART, for
-`holdoff_time` after each probe trigger, and when no load cell samples have
-arrived for 1 second. A print sent line by line through the API is not
+them. It fails closed: if those readings do not arrive, or the stream has
+stopped while contact was latched or near the plate, the move is refused
+too ("no current load cell data"). A Z homing move that lifts at least
+`clearance_lift` (the M1 G28's protected Z lift) re-zeroes on the steady
+load after it, so G28 recovers a false latch even with Z unhomed. The
+guard is inactive during a job (a virtual_sdcard print that is printing or
+paused, or commands arriving over the G-code pty, until 5 seconds after
+the last), during homing, probing and NOZZLE_WIPE_SMART, for
+`holdoff_time` after each probe trigger, and, high above the plate with no
+contact latched, when no load cell samples have arrived for 1 second (the
+toolhead unplugged). A print sent line by line through the API is not
 recognised as a job. See the
 [SET_CONTACT_GUARD](G-Codes.md#set_contact_guard) command.
 
 ```
 [contact_guard]
+#move_guard: height
+#   What refuses an X or Y move: "height" (the known plate height, "Home
+#   first" when it is not known) or "load_cell" (the load cell contact
+#   model). The default is height.
+#contact_z: 0.1
+#   move_guard: height. The lowest G-code Z, in mm, at which X and Y may
+#   move. With a bed mesh active this is the height above the measured
+#   surface.
+#unmeshed_margin: 2.5
+#   move_guard: height. Added to contact_z while no bed mesh is active,
+#   when Z is only known at the point Z homing probed, and for a move
+#   with either end outside the region the active mesh probed.
+#lift_clear_min: 5.0
+#   move_guard: height. How far, in mm, a homing move must lift the plate
+#   (on the Z steppers' step counts) for X and Y to move with the height
+#   not known. It may not be less than contact_z plus unmeshed_margin.
 #threshold_counts: 90000
 #   Raw load cell counts, in the direction the probe presses, above which
 #   the nozzle is in contact. The default is half the force at which the
@@ -5662,8 +5754,43 @@ recognised as a job. See the
 #   The zero only follows the load while it is within this many counts of
 #   it. The default is a quarter of threshold_counts.
 #relock_time: 0.5
-#   A load outside the band that does not become contact within this many
-#   seconds is treated as drift, and the zero moves to it.
+#   A load outside the band that stays steady under threshold_counts for
+#   this many seconds is treated as drift, and the zero moves to it. A load
+#   above threshold_counts is contact and is never aged out, however still
+#   the toolhead is: FORCE_MOVE and a bed moved by hand do not appear in
+#   the toolhead's motion. Contact ends when the load falls, by positive
+#   clearance (below), at a Z homing or probing move that travelled at
+#   least 0.1 mm down before triggering, without error (which re-zeroes
+#   on what the cell read just before it; X and Y homing moves and upward
+#   moves never re-zero), or with SET_CONTACT_GUARD REZERO=1.
+#max_absorbed_counts:
+#   Drift following and steady relocks together may move the zero toward
+#   pressing by at most this many counts in total since the last real
+#   zero (Z homing or probing, positive clearance, REZERO); moving back
+#   toward unloading gives it back. Beyond it the excess reads as load,
+#   and past threshold_counts as contact, so neither steps that are each
+#   under the threshold nor slow creep (a hot end growing into the plate)
+#   can add up to an absorbed press. Drift toward pressing past it latches
+#   contact with nothing touching; a 1 mm Z lift clears that. The default
+#   is half of threshold_counts.
+#clearance_lift: 1.0
+#   Positive clearance. A load that stays within the band while the
+#   executed toolhead Z travels clearance_lift mm is not a touch, since a
+#   touch changes with Z; it becomes the new zero. While contact is
+#   latched only upward travel counts: going on down with the reading
+#   unchanged means the cell stopped measuring. Readings within 10% of
+#   reference_max_load_counts (from the zero) or 1% of the ADC range of
+#   its rails are never evidence, since the cell reads flat there however
+#   hard it is pressed. A position reset (SET_KINEMATIC_POSITION, homing),
+#   a Z motor enable change or a gap in the samples breaks the evidence.
+#rezero_min_z: 10.0
+#   SET_CONTACT_GUARD REZERO=1 is refused unless the toolhead is at least
+#   this high, with Z really homed since the last SET_KINEMATIC_POSITION
+#   that changed Z, FORCE_MOVE of a Z stepper, or Z motor disable. A real
+#   Z home is G28 through an endstop, or a homing_override script whose Z
+#   probe triggered after at least 0.1 mm of downward travel (the
+#   SET_KINEMATIC_POSITION that follows it, from the probe, keeps it).
+#   Any G-code error other than the guard's own refusals also drops it.
 #sync_below_z: 3.0
 #   An XY move that starts below this Z (in machine coordinates, before
 #   bed_mesh) waits for the queued moves to execute before it is decided,
