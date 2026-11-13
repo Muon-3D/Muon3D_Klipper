@@ -51,19 +51,24 @@ class ReconnectTest(unittest.TestCase):
         env = jinja2.Environment('{%', '%}', '{', '}')
         loads = []
         online = True
+        polls = [0]
 
         def render(section):
             context = {'mcu toolhead': {
                 'non_critical_disconnected': not online},
                 'filament_switch_sensor filament_sensor_toolhead':
                     helper.get_status(reactor.now),
-                'gcode_macro TOOLHEAD_DISCONNECT': {'last_partfan_s': 0}}
+                'gcode_macro TOOLHEAD_DISCONNECT': {'last_partfan_s': 0},
+                'gcode_macro TOOLHEAD_CONNECT_WAIT': {'polls': polls[0]}}
             script = env.from_string(cfg.get(section, 'gcode')).render(
                 printer=context)
             for line in script.splitlines():
                 line = line.strip()
                 if line == 'LOAD_FILAMENT':
                     loads.append(reactor.now)
+                if line.startswith('SET_GCODE_VARIABLE MACRO='
+                                   'TOOLHEAD_CONNECT_WAIT'):
+                    polls[0] = int(line.split('VALUE=')[1])
                 if line.startswith('UPDATE_DELAYED_GCODE '):
                     args = dict(p.split('=') for p in line.split()[1:])
                     if args['ID'] != 'TOOLHEAD_CONNECT_LOAD':
@@ -183,6 +188,88 @@ class ReconnectTest(unittest.TestCase):
             printer.reactor.run_callbacks()
             self.assertTrue(helper.sample_ready,
                             'unchanged pin must cross debounce each time')
+
+
+class ConnectLoadBoundTest(unittest.TestCase):
+    """TOOLHEAD_CONNECT_LOAD gives up after 50 polls (about 5 s)."""
+    def setUp(self):
+        cfg = configparser.RawConfigParser(strict=False)
+        cfg.read(ROOT / 'core/M1/macros/toolhead.cfg')
+        self.cfg = cfg
+        self.env = jinja2.Environment('{%', '%}', '{', '}')
+        self.reactor = Reactor()
+        self.polls = 0
+        self.loads = []
+        self.messages = []
+        self.gen = 0
+        self.ready = False
+        self.detected = True
+
+    def render(self, section):
+        sensor = {'sample_ready': self.ready,
+                  'filament_detected': self.detected}
+        context = {
+            'mcu toolhead': {'non_critical_disconnected': False},
+            'filament_switch_sensor filament_sensor_toolhead': sensor,
+            'gcode_macro TOOLHEAD_DISCONNECT': {'last_partfan_s': 0},
+            'gcode_macro TOOLHEAD_CONNECT_WAIT': {'polls': self.polls}}
+        script = self.env.from_string(self.cfg.get(section, 'gcode')).render(
+            printer=context,
+            action_respond_info=lambda m: self.messages.append(m) or '')
+        for line in script.splitlines():
+            line = line.strip()
+            if line == 'LOAD_FILAMENT':
+                self.loads.append(self.reactor.now)
+            elif line.startswith('SET_GCODE_VARIABLE MACRO='
+                                 'TOOLHEAD_CONNECT_WAIT'):
+                self.polls = int(line.split('VALUE=')[1])
+            elif line.startswith('UPDATE_DELAYED_GCODE ID='
+                                 'TOOLHEAD_CONNECT_LOAD'):
+                delay = float(line.split('DURATION=')[1])
+                # One timer: re-arming replaces the pending run.
+                self.gen += 1
+                if delay:
+                    self.reactor.register_callback(
+                        lambda et, g=self.gen: g == self.gen and self.render(
+                            'delayed_gcode TOOLHEAD_CONNECT_LOAD'),
+                        self.reactor.now + delay)
+
+    def connect(self):
+        self.render('gcode_macro TOOLHEAD_CONNECT')
+
+    def test_gives_up_after_the_bound_and_does_not_load(self):
+        self.connect()
+        self.reactor.advance(30.)
+        self.assertEqual(self.loads, [])
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn('not loading automatically', self.messages[0])
+        self.assertEqual(self.polls, 50)
+        # Nothing is armed any more: a sample hours later loads nothing.
+        self.ready = True
+        self.reactor.advance(36000.)
+        self.assertEqual(self.loads, [])
+
+    def test_sample_before_the_bound_loads_once(self):
+        self.connect()
+        self.reactor.advance(3.)
+        self.assertEqual(self.loads, [])
+        self.ready = True
+        self.reactor.advance(30.)
+        self.assertEqual(len(self.loads), 1)
+        self.assertEqual(self.messages, [])
+
+    def test_new_connect_resets_the_count(self):
+        self.connect()
+        self.reactor.advance(4.)
+        self.assertGreater(self.polls, 30)
+        self.connect()
+        self.assertEqual(self.polls, 0)
+        # Another 4 s is within the bound again: no give-up message yet.
+        self.reactor.advance(8.)
+        self.assertEqual(self.messages, [])
+        self.ready = True
+        self.reactor.advance(20.)
+        self.assertEqual(len(self.loads), 1)
 
 
 if __name__ == '__main__':

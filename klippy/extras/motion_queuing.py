@@ -103,7 +103,8 @@ class PrinterMotionQueuing:
         ffi_lib.steppersync_setup_movequeue(ss, serialqueue, move_count)
         mcu_freq = float(mcu.seconds_to_clock(1.))
         time_offset = 0.
-        if any(m is mcu for m in self.movequeue_mcus):
+        seen = any(m is mcu for m in self.movequeue_mcus)
+        if seen or getattr(mcu, "is_non_critical", False):
             # MUON: a non-critical MCU reconnecting. Its clock restarted
             # near zero while print_time kept running, so the upstream
             # placeholder offset of 0 maps the next step thousands of
@@ -112,10 +113,14 @@ class PrinterMotionQueuing:
             # moves before then. Steps queued on offset 0 and then on the
             # real offset run backwards, and the next flush fails with
             # "stepcompress ... Invalid sequence" (boxwood, 2026-10-14).
-            # Calibrate now, exactly as stats() would.
+            # Calibrate now, exactly as stats() would. A non-critical MCU
+            # is also calibrated on its FIRST setup: it is deferred at
+            # startup, so it can first connect when print_time is already
+            # large (klippy RESTART, or toolhead plugged in after boot).
+            # Critical MCUs keep the upstream offset of 0 on first setup.
             time_offset, mcu_freq = mcu.calibrate_clock(
                 self.last_step_gen_time, self.reactor.monotonic())
-        else:
+        if not seen:
             self.movequeue_mcus.append(mcu)
         ffi_lib.steppersync_set_time(ss, time_offset, mcu_freq)
     def stats(self, eventtime):

@@ -45,9 +45,11 @@ class McuError(Exception):
 
 class FakeMcu:
     error = McuError
-    def __init__(self, adj):
+    def __init__(self, adj, non_critical=False):
         self.adj = adj
         self.calibrations = 0
+        self.is_non_critical = non_critical
+        self.non_critical_disconnected = False
     def seconds_to_clock(self, t):
         return int(t * MCU_FREQ)
     def calibrate_clock(self, print_time, eventtime):
@@ -114,11 +116,11 @@ def drip(mq, start, end):
                                flush_time)
 
 
-def replay_reconnect():
+def replay_reconnect(non_critical=False):
     """Run the boxwood sequence; return (error or None, toolhead mcu)."""
     ffi_main, ffi_lib = chelper.get_ffi()
     main_mcu = FakeMcu((0., MCU_FREQ))
-    toolhead = FakeMcu((10.0, MCU_FREQ))   # its first boot, long ago
+    toolhead = FakeMcu((10.0, MCU_FREQ), non_critical)  # first boot, long ago
     mq = make_motion_queuing(main_mcu)
     trapq = mq.allocate_trapq()
     se = mq.allocate_syncemitter(toolhead, "stepper extruder")
@@ -133,8 +135,10 @@ def replay_reconnect():
     try:
         # Startup: first connect, then a stats() tick before any motion.
         mq.setup_mcu_movequeue(toolhead, sq, 1024)
-        assert toolhead.calibrations == 0, \
-            "first setup must keep upstream behaviour (no calibration)"
+        # A critical MCU keeps upstream behaviour on first setup (no
+        # calibration); a non-critical one is calibrated straight away.
+        assert toolhead.calibrations == (1 if non_critical else 0), \
+            toolhead.calibrations
         mq.stats(10.)
         # ... a long session; print_time reaches ~15199.
         mq.last_flush_time = mq.last_step_gen_time = MOVE_START - 1.
@@ -172,8 +176,44 @@ def test_steps_after_reconnect_do_not_run_backwards():
     assert toolhead.calibrations == 3, toolhead.calibrations
 
 
+def test_steps_after_reconnect_do_not_run_backwards_non_critical():
+    err, toolhead = replay_reconnect(non_critical=True)
+    assert err is None, (
+        "step generation failed after a toolhead reconnect: %s" % (err,))
+    # First setup (1) + startup stats() (1) + reconnect setup (1) + the
+    # stats() tick during the move (1).
+    assert toolhead.calibrations == 4, toolhead.calibrations
+
+
+def test_first_setup_of_non_critical_mcu_is_calibrated():
+    # Toolhead first connects (deferred at startup, or plugged in after
+    # boot) when print_time is already large: it must not keep offset 0.
+    ffi_main, ffi_lib = chelper.get_ffi()
+    mq = make_motion_queuing(FakeMcu((0., MCU_FREQ)))
+    mq.last_flush_time = mq.last_step_gen_time = MOVE_START - 1.
+    a, b = socket.socketpair()
+    sq = ffi_lib.serialqueue_alloc(a.fileno(), b'u', 0, b'toolhead test')
+    try:
+        crit = FakeMcu((0., MCU_FREQ))
+        mq.allocate_syncemitter(crit, "stepper x")
+        mq.setup_mcu_movequeue(crit, sq, 1024)
+        assert crit.calibrations == 0, "critical MCU must stay upstream"
+        toolhead = FakeMcu(RECONNECT_ADJ, non_critical=True)
+        mq.allocate_syncemitter(toolhead, "stepper extruder")
+        mq.setup_mcu_movequeue(toolhead, sq, 1024)
+        assert toolhead.calibrations == 1, toolhead.calibrations
+        assert sum(1 for m in mq.movequeue_mcus if m is toolhead) == 1
+    finally:
+        ffi_lib.serialqueue_exit(sq)
+        ffi_lib.serialqueue_free(sq)
+        a.close()
+        b.close()
+
+
 def main():
-    tests = [test_steps_after_reconnect_do_not_run_backwards]
+    tests = [test_steps_after_reconnect_do_not_run_backwards,
+             test_steps_after_reconnect_do_not_run_backwards_non_critical,
+             test_first_setup_of_non_critical_mcu_is_calibrated]
     for test in tests:
         test()
         print("ok  %s" % test.__name__)
