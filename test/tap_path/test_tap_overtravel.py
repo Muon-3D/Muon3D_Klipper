@@ -35,13 +35,20 @@ class Config:
     getint = getfloat
 
 
+# M1 Y: rotation_distance 40 / 200 full steps.  A blocked rotor slips 2 full
+# steps = 0.4mm = 128 microsteps of 0.003125mm.
+FULL_STEP = 0.2
+SLIP_STEPS = 128
+
+
 def profile(values):
     return method('_load_confirm_profile', {})(NS(
-        _default_stall_dist=lambda *a: 0.8), Config(values), 'y')
+        _default_stall_dist=lambda *a: 0.8,
+        _full_step_dist=lambda *a: FULL_STEP), Config(values), 'y')
 
 
 def test_validation_and_axis_override():
-    for value in (-1, 0, 0.149, 8, 9):
+    for value in (-1, 0, 0.149, 8, 9, 0.4, 0.45):
         try:
             profile({'tap_confirm_retract_dist': 8,
                      'y_tap_confirm_overtravel': value})
@@ -49,6 +56,8 @@ def test_validation_and_axis_override():
             assert 'y_tap_confirm_overtravel' in str(e)
             if value < 0.15:
                 assert 'deceleration distance' in str(e)
+            if 0.4 <= value < 8:
+                assert '2 full steps (0.400mm)' in str(e)
         else:
             raise AssertionError(value)
     assert profile({'tap_confirm_overtravel': 0.2})['overtravel'] == 0.2
@@ -135,8 +144,9 @@ def test_missed_tap_is_capped_not_a_cycle_and_is_not_accepted():
     moves, state, error = run(0.3, triggered=False, seek_retries=1,
                               physical=physical)
     length = moves[1][2] - moves[1][1]
-    # Commanded steps beyond the known contact cannot span a 256-step cycle.
-    assert round((length - 8.) / 0.003125) == 96 < 256
+    # Commanded steps beyond the known contact must stay under the 2 full
+    # steps (128 microsteps) a blocked rotor slips.
+    assert round((length - 8.) / 0.003125) == 96 < SLIP_STEPS
     assert state.trigger_mcu_pos == {'stepper_y': 0}
     assert len(moves) == 6, moves
     assert all(abs(end - start) <= 8.3 + 1e-9
@@ -147,6 +157,39 @@ def test_missed_tap_is_capped_not_a_cycle_and_is_not_accepted():
             ' or the previous tap was spurious. Seek not resumed, to avoid'
             ' driving into the stop.') in error
     assert error.count('missed halt') == 3
+
+
+def test_core_cfg_cap_is_accepted_and_stays_under_the_slip():
+    assert profile({'y_tap_confirm_overtravel': 0.15})['overtravel'] == 0.15
+    # Mirror the shipped config so the two cannot drift apart.
+    cfg = os.path.join(os.path.dirname(__file__), '..', '..', 'core', 'M1',
+                       'core.cfg')
+    with open(cfg) as f:
+        lines = [l.strip() for l in f if l.startswith(
+            'y_tap_confirm_overtravel:')]
+    assert lines == ['y_tap_confirm_overtravel: 0.15'], lines
+    physical = []
+    moves, _, error = run(0.15, triggered=False, seek_retries=1,
+                          physical=physical)
+    steps = round((moves[1][2] - moves[1][1] - 8.) / 0.003125)
+    assert steps == 48 < SLIP_STEPS, steps
+    assert all(abs(end - 0.15) < 1e-9 for end in physical), physical
+    assert 'within 0.150mm' in error, error
+
+
+def test_cap_of_two_full_steps_or_more_is_rejected():
+    just_under = 2 * FULL_STEP - 0.001
+    assert profile({'tap_confirm_retract_dist': 8,
+                    'y_tap_confirm_overtravel': just_under}
+                   )['overtravel'] == just_under
+    for value in (2 * FULL_STEP, 0.5, 1.):
+        try:
+            profile({'tap_confirm_retract_dist': 8,
+                     'y_tap_confirm_overtravel': value})
+        except ValueError as e:
+            assert 'less than 2 full steps' in str(e), e
+        else:
+            raise AssertionError(value)
 
 
 def test_uncapped_no_trigger_still_resumes_seek():

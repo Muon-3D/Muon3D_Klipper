@@ -2,8 +2,11 @@
 import ast
 import logging
 import os
+import sys
 from types import SimpleNamespace as NS
 
+import _paths
+sys.path.insert(0, _paths.patched('klippy'))
 from test_tap_overtravel import method, run
 
 
@@ -61,6 +64,44 @@ def test_finally_timeout_propagates_and_resets_after_int_disabled():
     else:
         raise AssertionError('finally swallowed timeout')
     assert calls == ['INT disabled', 'reset'], calls
+
+
+def test_record_failure_cannot_replace_the_homing_error():
+    from extras import y_tap_log as yt
+    p = timeout_probe()
+    wrapper = p._active_axis_homing_wrappers[0]
+
+    def stop(mode):
+        raise ValueError('original homing error')
+
+    p._stop_tap = stop
+    p._apply_tap_onset = lambda *a: None
+    p._release_onset_client = lambda: None
+    p._reset_axis_homing_state = lambda: None
+    log = yt.YTapLog(NS())
+    log.pending = {}  # record() proceeds, then dies on the fake hmove
+    p._y_tap_log = log
+    hmove = NS(get_mcu_endstops=lambda: [wrapper], stepper_positions=[])
+    try:
+        method('_handle_homing_move_end', {'logging': logging})(p, hmove)
+    except ValueError as e:
+        assert str(e) == 'original homing error', e
+    else:
+        raise AssertionError('homing error swallowed')
+    assert log.pending is None  # record() really ran and raised inside
+
+
+def test_command_error_cleanup_survives_a_failed_client_release():
+    calls = []
+
+    def release():
+        raise ValueError('accelerometer stream did not stop within 1.0s')
+
+    p = NS(_tap_mode='axis_homing', _release_onset_client=release,
+           _stop_tap=lambda mode: calls.append('stop'),
+           _reset_axis_homing_state=lambda: calls.append('reset'))
+    method('_handle_command_error', {'logging': logging})(p)
+    assert calls == ['stop', 'reset'], calls
 
 
 def test_acceptance_uses_first_tap_not_predecessor():

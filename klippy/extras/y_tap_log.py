@@ -60,6 +60,13 @@ class YTapLog:
             if s.get_name() in STEPPERS}
 
     def record(self, hmove, error=None, halted=True):
+        # Called from a finally: nothing here may replace the homing error.
+        try:
+            self._record(hmove, error, halted)
+        except Exception:
+            logging.exception("y tap attempt logging failed")
+
+    def _record(self, hmove, error=None, halted=True):
         if self.pending is None:
             return
         row, self.pending = self.pending, None

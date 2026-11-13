@@ -401,7 +401,31 @@ class ADXL345Probe:
                 raise config.error(
                     "%s_tap_confirm_overtravel must be less than"
                     " tap_confirm_retract_dist" % (axis,))
+            # A blocked rotor slips 2 full steps.  The cap is measured from
+            # the previous trigger, which is already late, so it must stay
+            # under that.
+            full_step = self._full_step_dist(config, axis)
+            if full_step and overtravel >= 2. * full_step:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be less than 2 full"
+                    " steps (%.3fmm) of stepper_%s: a blocked rotor slips"
+                    " that far before the cap is reached"
+                    % (axis, 2. * full_step, axis))
         return profile
+
+    def _full_step_dist(self, config, axis):
+        # One full step of the axis' stepper, in mm, or None if unknown.
+        name = 'stepper_' + axis
+        if not config.has_section(name):
+            return None
+        sconfig = config.getsection(name)
+        if sconfig.get('gear_ratio', None, note_valid=False) is not None:
+            return None
+        rd = sconfig.getfloat('rotation_distance', None, note_valid=False)
+        if not rd:
+            return None
+        return rd / sconfig.getint('full_steps_per_rotation', 200,
+                                   note_valid=False)
 
     def _default_stall_dist(self, config, axis):
         # One electrical cycle of the axis' stepper, in mm.
@@ -1052,7 +1076,8 @@ class ADXL345Probe:
         if not self._active_axis_homing_wrappers:
             return
         hmove_endstops = hmove.get_mcu_endstops()
-        if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
+        if not any(w in hmove_endstops
+                   for w in self._active_axis_homing_wrappers):
             return
         wrappers = list(self._active_axis_homing_wrappers)
         hmove.y_tap_raw_steps = {
@@ -1321,6 +1346,8 @@ class ADXL345Probe:
                 logging.exception("ADXL345 axis homing cleanup failed")
             try:
                 self._release_onset_client()
+            except Exception:
+                logging.exception("ADXL345 onset client release failed")
             finally:
                 self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
