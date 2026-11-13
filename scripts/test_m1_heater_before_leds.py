@@ -399,12 +399,14 @@ class HeaterOffBeforeLeds(_M1TestCase):
     # The umbilical unlock press
 
     def test_unlock_press(self):
+        self.m1.print_stats['state'] = 'paused'   # a press while printing is refused
         self.arm_unlock()
         self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assert_heater_off_first()
         self.assertIn('SET_LED_EFFECT', self.m1.names())
 
     def test_unlock_press_with_a_raising_led(self):
+        self.m1.print_stats['state'] = 'paused'   # a press while printing is refused
         self.arm_unlock()
         self.run_failing('connected',
                          'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
@@ -522,6 +524,7 @@ class HeaterOffBeforeAnything(_M1TestCase):
         self.assertEqual(self.m1.extruder['target'], 0.)
 
     def test_unlock_press_when_the_retract_raises(self):
+        self.m1.print_stats['state'] = 'paused'   # a press while printing is refused
         self.arm_unlock()
         self.m1.raising.add('COLD_RETRACT')
         self.run_failing_stub('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
@@ -1387,6 +1390,7 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
 
     def setUp(self):
         super().setUp()
+        self.m1.print_stats['state'] = 'paused'   # a press while printing is refused
         self.arm_unlock()
 
     def press(self):
@@ -1460,6 +1464,7 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
         self.m1.run('TOOLHEAD_DISCONNECT')
         presses.reconnect()
         self.m1.run('TOOLHEAD_CONNECT')
+        self.m1.print_stats['state'] = 'paused'   # a press while printing is refused
         self.arm_unlock()
         self.m1.run('CANCEL_PRINT')
         self.m1.print_stats['state'] = 'standby'

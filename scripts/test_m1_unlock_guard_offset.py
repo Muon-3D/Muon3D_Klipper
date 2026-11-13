@@ -45,7 +45,7 @@ class UnlockReportsGuardOffset(_M1TestCase):
         return names[names.index('COLD_RETRACT') + 1:]
 
     def test_no_motion_in_any_state(self):
-        for state in ('paused', 'standby', 'printing', 'complete'):
+        for state in ('paused', 'standby', 'complete'):
             for z, homed in ((40., 'xyz'), (179.5, 'xyz'), (40., 'xy')):
                 self.m1.timeline.clear()
                 self.m1.print_stats['state'] = state
@@ -71,11 +71,54 @@ class UnlockReportsGuardOffset(_M1TestCase):
         self.assertTrue(any(MESSAGE in r for r in self.m1.responses),
                         self.m1.responses)
 
-    def test_not_rezero_while_printing(self):
+    def test_printing_press_touches_nothing(self):
+        # A print is running: COLD_RETRACT refuses, so the macro returns
+        # before the heater, the retract or any stepper. The release must
+        # then have nothing to restore, and the user is told to pause.
+        self.m1.print_stats['state'] = 'printing'
+        for name, value in (('e_was_enabled', 1), ('changed_hotend_target', 1)):
+            self.m1.run('SET_GCODE_VARIABLE MACRO='
+                        'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED '
+                        'VARIABLE=%s VALUE=%d' % (name, value))
+        self.m1.timeline.clear()
+        self.m1.extruder['target'] = 215.
+        self.press()
+        names = self.m1.names()
+        for n in ('M104', 'COLD_RETRACT', 'SET_STEPPER_ENABLE',
+                  'SET_CONTACT_GUARD', 'PAUSE') + MOTION:
+            self.assertNotIn(n, names, self.m1.timeline)
+        self.assertIn('action:prompt_text Pause the print before unlocking '
+                      'the toolhead', self.m1.prompt_lines())
+        self.assertEqual(self.m1.prompt_lines()[-1], 'action:prompt_show')
+        v = self.m1.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
+        self.assertEqual(int(v['e_was_enabled']), 0)
+        self.assertEqual(int(v['changed_hotend_target']), 0)
+        self.assertEqual(self.m1.extruder['target'], 215.)
+        self.assertFalse(any(MESSAGE in r for r in self.m1.responses))
+
+    def test_printing_press_then_release_does_nothing(self):
         self.m1.print_stats['state'] = 'printing'
         self.press()
-        self.assertNotIn('SET_CONTACT_GUARD', self.m1.names())
-        self.assertTrue(any(MESSAGE in r for r in self.m1.responses))
+        self.m1.timeline.clear()
+        self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED')
+        names = self.m1.names()
+        self.assertNotIn('M104', names)
+        self.assertNotIn('SET_STEPPER_ENABLE', names)
+
+    def test_paused_and_standby_press_do_the_full_sequence(self):
+        for state in ('paused', 'standby'):
+            self.m1.timeline.clear()
+            self.m1.print_stats['state'] = state
+            self.m1.extruder['target'] = 215.
+            self.press()
+            names = self.m1.names()
+            self.assertIn('COLD_RETRACT', names, state)
+            self.assertIn('M104', names, state)
+            self.assertLess(self.m1.heater_off_index(),
+                            names.index('COLD_RETRACT'), state)
+            self.assertIn('SET_STEPPER_ENABLE', names, state)
+            self.assertFalse(any('Pause the print' in l
+                                 for l in self.m1.prompt_lines()), state)
 
     def test_not_when_unarmed(self):
         self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
