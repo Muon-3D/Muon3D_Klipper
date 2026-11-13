@@ -33,6 +33,8 @@
 # for its XY (a jog that starts below it may only go up). Any error ends
 # the jog (fail closed):
 # the queued batches still run (at most max_ahead), nothing more is sent.
+# A macro that moves XY with toolhead.manual_move during a Z session leaves
+# the jog's XY stale; homing moves already end the jog.
 import logging, math
 from . import contact_guard
 
@@ -131,6 +133,17 @@ class MuonJog:
             return None
         return self.guard.jog_limits(pos, eventtime=eventtime)[1]
 
+    def _z_lower(self, eventtime, pos, kin):
+        # The lowest Z a Z jog at pos (its XY) may be driven to, and the
+        # guard's floor there (None: no guard). The one place this is worked
+        # out, for _clamp and the feed. A floor never holds the plate back
+        # from rising: at or below it, the plate's own Z is the limit
+        lo = max(kin['axis_minimum'][2], self.z_min)
+        floor = self._guard_floor(eventtime, pos)
+        if floor is not None:
+            lo = max(lo, floor)
+        return min(lo, pos[2]), floor
+
     # Target clamping, in gcode_move.last_position coordinates (G-code
     # plus the G92/offset base), which is what move_with_transform takes
     def _clamp(self, axes, start, target, eventtime):
@@ -144,10 +157,7 @@ class MuonJog:
             # The guard's minimum Z at this XY (a Z jog never moves XY). A
             # floor never holds the plate back from rising: a jog that
             # starts below it may only go up
-            floor = self._guard_floor(eventtime, start)
-            if floor is not None:
-                lo[2] = max(lo[2], floor)
-            lo[2] = min(lo[2], start[2])
+            lo[2], floor = self._z_lower(eventtime, start, kin)
         for i in ((0, 1) if axes == 'XY' else (2,)):
             v = min(max(target[i], lo[i]), hi[i])
             if abs(v - target[i]) > EPS:
@@ -319,6 +329,16 @@ class MuonJog:
         if not self._height_known(eventtime, gm.last_position):
             self._end(contact_guard.REFUSAL_HOME)
             return
+        if s['axes'] == 'Z' and self.guard is not None:
+            # The floor moves when the bed mesh does (another client
+            # clears it, or loads a smaller one): with FINAL=1 nothing else
+            # ever clamps the target again. Raise it to the floor, never
+            # above the plate's own Z (what is queued cannot be recalled)
+            lo, _ = self._z_lower(eventtime, s['own'], self._kin(eventtime))
+            if s['target'][2] < lo - EPS:
+                s['target'][2] = lo
+                s['clamp'] = ("held at Z%g: the plate is not safe below it"
+                              % (lo,))
         est = self.mcu.estimated_print_time(eventtime)
         ahead, ahead_t = self._ahead(s, est)
         limit = self.max_ahead[s['axes']]
