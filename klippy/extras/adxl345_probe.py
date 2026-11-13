@@ -405,25 +405,37 @@ class ADXL345Probe:
             # the previous trigger, which is already late, so it must stay
             # under that.
             full_step = self._full_step_dist(config, axis)
-            if full_step and overtravel >= 2. * full_step:
+            if overtravel > full_step + 1e-9:
                 raise config.error(
-                    "%s_tap_confirm_overtravel must be less than 2 full"
-                    " steps (%.3fmm) of stepper_%s: a blocked rotor slips"
-                    " that far before the cap is reached"
-                    % (axis, 2. * full_step, axis))
+                    "%s_tap_confirm_overtravel must be at most 1 full"
+                    " step (%.3fmm) of stepper_%s: a blocked rotor slips"
+                    " 2 full steps before the cap is reached"
+                    % (axis, full_step, axis))
+            if profile['tolerance'] >= overtravel:
+                raise config.error(
+                    "%s_tap_confirm_tolerance must be less than"
+                    " %s_tap_confirm_overtravel: otherwise every capped"
+                    " tap agrees" % (axis, axis))
         return profile
 
     def _full_step_dist(self, config, axis):
-        # One full step of the axis' stepper, in mm, or None if unknown.
+        # One full step of the axis' stepper, in mm.  Only needed when an
+        # overtravel cap is configured, so unknown is a config error.
         name = 'stepper_' + axis
         if not config.has_section(name):
-            return None
+            raise config.error(
+                "%s_tap_confirm_overtravel needs a [%s] section to compute"
+                " the full step" % (axis, name))
         sconfig = config.getsection(name)
         if sconfig.get('gear_ratio', None, note_valid=False) is not None:
-            return None
+            raise config.error(
+                "%s_tap_confirm_overtravel cannot be used with gear_ratio on"
+                " %s: the full step cannot be computed" % (axis, name))
         rd = sconfig.getfloat('rotation_distance', None, note_valid=False)
         if not rd:
-            return None
+            raise config.error(
+                "%s_tap_confirm_overtravel needs rotation_distance on %s to"
+                " compute the full step" % (axis, name))
         return rd / sconfig.getint('full_steps_per_rotation', 200,
                                    note_valid=False)
 
@@ -1200,6 +1212,7 @@ class ADXL345Probe:
                              * step_dists[sp.stepper_name] for sp in sps])
             info = {
                 'dirs': dirs, 'travelled': travelled,
+                'halt': {sp.stepper_name: sp.halt_pos for sp in sps},
                 'follow': max([abs(sp.halt_pos - sp.trig_pos)
                                * step_dists[sp.stepper_name] for sp in sps]),
             }
@@ -1251,9 +1264,20 @@ class ADXL345Probe:
                 self._y_tap_log.kind = 'confirm'
             trig, travelled, info = run_homing_move(
                 retract_dist + overtravel, speed)
-            if trig is None:
-                kind = ('missed' if cfg['overtravel'] is not None
-                        else 'no_trigger')
+            # A capped trigger at the commanded end of the approach (the
+            # steps ended there, the position says nothing) is no
+            # measurement.  Debug-harness taps are placed by the test.
+            late = (cfg['overtravel'] is not None and trig is not None
+                    and sim is None
+                    and travelled >= retract_dist + overtravel
+                    - 0.5 * max(step_dists.values()))
+            if trig is None or late:
+                if late:
+                    kind = 'late'
+                elif cfg['overtravel'] is not None:
+                    kind = 'missed'
+                else:
+                    kind = 'no_trigger'
                 history.append('%s halt [%s]'
                                ' (trigger delta unavailable,'
                                ' approach %.3fmm)' % (

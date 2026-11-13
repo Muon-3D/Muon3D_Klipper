@@ -105,12 +105,12 @@ def test_command_error_cleanup_survives_a_failed_client_release():
 
 
 def test_acceptance_uses_first_tap_not_predecessor():
-    _, _, error = run(0.3, offsets=[0.15 * n for n in range(1, 30)],
+    _, _, error = run(0.2, offsets=[0.15 * n for n in range(1, 30)],
                       samples=3)
     assert error is not None, 'a drifting run was accepted'
     assert 'y home taps disagree' in error and 'vs anchor' in error
     for offsets in ([0.15, 0.1], [0.15, 0.3, 0.3, 0.3]):
-        _, _, error = run(0.3, offsets=offsets, samples=3)
+        _, _, error = run(0.2, offsets=offsets, samples=3)
         assert error is None, error
 
 
@@ -157,11 +157,11 @@ def test_homing_preserves_timeout_alongside_an_earlier_error():
 
 def test_exhausted_errors_include_positions_deltas_and_classes():
     for delta, kind in ((0.8, 'stall'), (-0.5, 'disagree')):
-        _, _, error = run(0.3, offsets=[delta * n for n in range(1, 30)])
+        _, _, error = run(0.2, offsets=[delta * n for n in range(1, 30)])
         assert 'y home taps disagree' in error
         assert 'initial [stepper_y=0(0.00000mm)]' in error
         assert 'delta ' in error and kind in error and 'vs anchor [' in error
-    _, _, error = run(0.3, triggered=False)
+    _, _, error = run(0.2, triggered=False)
     assert 'y home aborted: tap not detected' in error
     assert 'initial [stepper_y=0(0.00000mm)]' in error
     assert 'missed halt [stepper_y=' in error
