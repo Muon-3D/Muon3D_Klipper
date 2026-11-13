@@ -932,6 +932,7 @@ NOT_FOR_CLIENTS = {
     'BED_REMOVED': 'raised by bed_removal_detector, not by a client',
     'BED_ATTACHED': 'raised by bed_removal_detector, not by a client',
     'TOOLHEAD_UMBILICAL_UNLOCK_STATE': 'internal arm state',
+    'TOOLHEAD_CONNECT_WAIT': 'internal poll counter of the connect wait',
     'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED': 'raised by gcode_button',
     'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_RELEASED': 'raised by gcode_button',
     'HOTEND_FAN_CHECK': 'delayed_gcode / fault path',
