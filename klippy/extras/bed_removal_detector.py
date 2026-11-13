@@ -108,9 +108,6 @@ class BedRemovalDetector:
 
     def handle_bed_removal(self, eventtime):
         self.bed_removed = True
-        # The plate goes back on wherever it seats: contact_guard no longer
-        # knows its height
-        self.printer.send_event("bed_removal_detector:removed")
         # Remember what the bed was asked for before zeroing it. Nothing else
         # records this, and without it a resume after reattaching continues
         # the print onto a cold plate -- which on ABS or PETG is the warping
@@ -136,6 +133,14 @@ class BedRemovalDetector:
             lambda et: self._run_macro(et, 'BED_REMOVED'))
         self.log.info('Bed removal detected, bed heater off '
                       '(was %.1f C)', self.restore_target)
+        # Last, after the heater is off and the print is paused: the plate
+        # goes back on wherever it seats, so contact_guard no longer knows
+        # its height.  Nothing a listener does can undo the steps above.
+        try:
+            self.printer.send_event("bed_removal_detector:removed")
+        except Exception:
+            self.log.exception('bed_removal_detector:removed listener'
+                               ' failed')
 
     def _in_print_phase(self, eventtime):
         """True while a file is printing and its PRINT_END has not begun.

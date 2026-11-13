@@ -363,9 +363,9 @@ class ContactGuard:
 
     def _note_lift(self, hmove):
         # Anchor the lift on the Z steppers' raw positions at its start.
-        # A lift that still holds keeps its anchor: that was a real plate
-        # position too, and lower (Z_PARK lifting the last few mm to the
-        # top and retracting 10 must not undo G28's lift).
+        # A lift that still holds keeps its older anchor: that was a real
+        # plate position too (Z_PARK lifting the last few mm to the top and
+        # retracting 10 must not undo G28's lift).
         if self._lift_holds(wait=False):
             return
         anchor = {}
@@ -389,7 +389,8 @@ class ContactGuard:
         # every Z stepper's own position (Z_PARK's AXIS_HOME_MOVE lifts to
         # the top and retracts 10 mm: that still holds).  With wait,
         # everything queued ahead has run first, so its steps are counted.
-        if not self.lift_clear:
+        if not self.lift_clear or not self.lift_anchor:
+            self.lift_clear = False
             return False
         if wait:
             self.toolhead.wait_moves()
