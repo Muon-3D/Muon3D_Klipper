@@ -5,7 +5,8 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, gc, optparse, logging, time, collections, importlib
-import util, reactor, queuelogger, msgproto
+import threading, traceback
+import util, reactor, queuelogger, msgproto, serialhdl
 import gcode, configfile, pins, mcu, toolhead, webhooks
 
 message_ready = "Printer is ready"
@@ -36,6 +37,7 @@ class Printer:
         self.state_message = message_startup
         self.in_shutdown_state = False
         self.run_result = None
+        self.restart_watchdog = None
         self.event_handlers = {}
         self.objects = collections.OrderedDict()
         # Init printer components that must be setup prior to config
@@ -192,13 +194,26 @@ class Printer:
                 self.run_result = "error_exit"
         # Check restart flags
         run_result = self.run_result
-        try:
-            if run_result == 'firmware_restart':
-                self.send_event("klippy:firmware_restart")
-            self.send_event("klippy:disconnect")
-        except:
-            logging.exception("Unhandled exception during post run")
+        wd = self.restart_watchdog
+        if wd is not None and run_result in ('firmware_restart', 'restart'):
+            wd.arm("klippy %s" % (run_result,))
+        if run_result == 'firmware_restart':
+            self._send_post_run("klippy:firmware_restart")
+        self._send_post_run("klippy:disconnect")
         return run_result
+    def _send_post_run(self, event):
+        # MUON KAN-1362: one failing handler no longer skips the rest (and
+        # with them the MCU disconnects); a slow one is named in the log.
+        for cb in self.event_handlers.get(event, []):
+            start = time.monotonic()
+            try:
+                cb()
+            except:
+                logging.exception("Unhandled exception during %s", event)
+            took = time.monotonic() - start
+            if took > 2.:
+                logging.warning("%s handler %s took %.1fs", event,
+                                getattr(cb, '__qualname__', cb), took)
     def set_rollover_info(self, name, info, log=True):
         if log:
             logging.info(info)
@@ -249,6 +264,92 @@ class Printer:
 ######################################################################
 # Startup
 ######################################################################
+
+# MUON KAN-1362: if a restart does not get back to a new Printer within
+# RESTART_TIMEOUT, log every thread's stack and re-exec klippy.  Without
+# this a handler or serial thread that never returned left klippy hung until
+# `systemctl restart klipper`.
+# Worst-case restart budget: two openocd runs (SWDIO_OPENOCD_TIMEOUT, 10 s
+# each) plus three serial disconnects (DISCONNECT_TIMEOUT, 5 s each) is 35 s,
+# which fits under this 60 s with margin.
+RESTART_TIMEOUT = 60.
+
+def reexec_argv(argv, executable):
+    return [executable] + list(argv)
+
+def thread_stacks():
+    names = dict((t.ident, t.name) for t in threading.enumerate())
+    out = []
+    for ident, frame in sys._current_frames().items():
+        out.append("Thread %s (%s):\n%s" % (
+            names.get(ident, '?'), ident,
+            ''.join(traceback.format_stack(frame))))
+    return '\n'.join(out)
+
+class RestartWatchdog:
+    def __init__(self, timeout, fallback):
+        self.timeout = timeout
+        self.fallback = fallback
+        self._done = None
+    def arm(self, what):
+        self.disarm()
+        done = self._done = threading.Event()
+        t = threading.Thread(target=self._watch, args=(done, what),
+                             name="restart watchdog", daemon=True)
+        t.start()
+    def disarm(self):
+        if self._done is not None:
+            self._done.set()
+            self._done = None
+    def _watch(self, done, what):
+        if done.wait(self.timeout):
+            return
+        try:
+            logging.error("%s did not finish within %.0fs; re-executing"
+                          " klippy. Thread stacks:\n%s", what, self.timeout,
+                          thread_stacks())
+        finally:
+            # The stack dump above takes time; a disarm() that landed during
+            # it means the restart finished, so do not exec.
+            if not done.is_set():
+                self.fallback()
+
+def reexec_klippy(bglogger):
+    if bglogger is not None:
+        # Flush the log first, but never wait on it for long
+        t = threading.Thread(target=bglogger.stop, daemon=True)
+        t.start()
+        t.join(2.)
+    os.execv(sys.executable, reexec_argv(sys.argv, sys.executable))
+
+def run_restart_loop(start_args, bglogger, versions, watchdog, new_printer):
+    # new_printer() returns (reactor, printer).  Returns the final run() result.
+    while 1:
+        if bglogger is not None:
+            bglogger.clear_rollover_info()
+            bglogger.set_rollover_info('versions', versions)
+        gc.collect()
+        main_reactor, printer = new_printer()
+        watchdog.disarm()
+        printer.restart_watchdog = watchdog
+        res = printer.run()
+        if res in ['exit', 'error_exit']:
+            break
+        if serialhdl._stuck_queues:
+            # A serial disconnect timed out and left its thread running.  The
+            # UARTs are opened exclusive, so reopening them in this process
+            # would fail with EBUSY on every later FIRMWARE_RESTART.  Re-exec
+            # to get a clean process instead.
+            logging.error("serial threads still stuck after restart; "
+                          "re-executing klippy")
+            reexec_klippy(bglogger)
+            return res
+        time.sleep(1.)
+        main_reactor.finalize()
+        main_reactor = printer = None
+        logging.info("Restarting printer")
+        start_args['start_reason'] = res
+    return res
 
 def import_test():
     # Import all optional modules (used as a build test)
@@ -369,21 +470,13 @@ def main():
     gc.disable()
 
     # Start Printer() class
-    while 1:
-        if bglogger is not None:
-            bglogger.clear_rollover_info()
-            bglogger.set_rollover_info('versions', versions)
-        gc.collect()
+    watchdog = RestartWatchdog(RESTART_TIMEOUT,
+                               lambda: reexec_klippy(bglogger))
+    def new_printer():
         main_reactor = reactor.Reactor(gc_checking=True)
-        printer = Printer(main_reactor, bglogger, start_args)
-        res = printer.run()
-        if res in ['exit', 'error_exit']:
-            break
-        time.sleep(1.)
-        main_reactor.finalize()
-        main_reactor = printer = None
-        logging.info("Restarting printer")
-        start_args['start_reason'] = res
+        return main_reactor, Printer(main_reactor, bglogger, start_args)
+    res = run_restart_loop(start_args, bglogger, versions, watchdog,
+                           new_printer)
 
     if bglogger is not None:
         bglogger.stop()

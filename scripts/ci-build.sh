@@ -148,6 +148,11 @@ $PYTHON test/filament_switch/test_mcu_first_report.py
 $PYTHON test/serialqueue/test_unconfigured_commands.py
 finish_test toolhead_reconnect "Test toolhead reconnect step timing and filament resync"
 
+# MUON: FIRMWARE_RESTART after an e-stop cannot hang klippy (KAN-1362).
+start_test restart "Test restart path is bounded"
+$PYTHON test/restart/test_restart_bounded.py
+finish_test restart "Test restart path is bounded"
+
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
 start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
