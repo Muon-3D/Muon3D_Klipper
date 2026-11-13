@@ -271,6 +271,20 @@ class PausesOnlyWhileAFileIsPrinting(unittest.TestCase):
         self.assertTrue(self.status()['bedRemoved'])
         self.assertEqual(self.m.gcode.scripts, ['BED_REMOVED'])
 
+    def test_a_failing_listener_cannot_skip_the_safety_steps(self):
+        # The heater goes off and the print pauses even if a listener of
+        # bed_removal_detector:removed raises
+        def boom():
+            raise RuntimeError("listener failed")
+        self.m.printer.register_event_handler(
+            "bed_removal_detector:removed", boom)
+        self.m.start_file()
+        self.m.pull_plate()
+        self.assert_paused()
+        self.assert_safety_actions()
+        self.assertIn("bed_removal_detector:removed",
+                      self.m.printer.events)
+
     def test_removal_tells_contact_guard(self):
         # contact_guard drops the known plate height on this event
         self.m.pull_plate()
