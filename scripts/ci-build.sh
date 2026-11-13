@@ -133,6 +133,9 @@ finish_test klippy "Test klippy import (Python3)"
 start_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
+$PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
+# restart_method: swdio waits for openocd through the reactor.
+$PYTHON test/serialqueue/test_swdio_restart.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
@@ -143,6 +146,7 @@ finish_test load_cell "Test load cell collector is stopped on a failed tap"
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
+$PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
