@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import subprocess
+import subprocess, tempfile
 import sys, os, zlib, logging, math
 import serialhdl, msgproto, pins, chelper, clocksync
 
@@ -740,17 +740,27 @@ class MCURestartHelper:
         # close". The non-critical reconnect loop runs this every 2-30 s for
         # as long as the toolhead is unplugged, including during the park
         # move that TOOLHEAD_DISCONNECT starts.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
-        deadline = self._reactor.monotonic() + SWDIO_OPENOCD_TIMEOUT
-        while proc.poll() is None:
-            if self._reactor.monotonic() > deadline:
-                proc.kill()
-                proc.wait()
-                raise subprocess.TimeoutExpired(cmd, SWDIO_OPENOCD_TIMEOUT)
-            self._reactor.pause(self._reactor.monotonic() + 0.010)
-        output = proc.stdout.read()
-        proc.stdout.close()
+        # Output goes to a temporary file, not a pipe: nothing reads a pipe
+        # while the process runs, so a full one would block openocd and look
+        # like the timeout below.
+        with tempfile.TemporaryFile(mode='w+') as out:
+            proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                    text=True)
+            try:
+                deadline = self._reactor.monotonic() + SWDIO_OPENOCD_TIMEOUT
+                while proc.poll() is None:
+                    if self._reactor.monotonic() > deadline:
+                        raise subprocess.TimeoutExpired(
+                            cmd, SWDIO_OPENOCD_TIMEOUT)
+                    self._reactor.pause(self._reactor.monotonic() + 0.010)
+            finally:
+                # A timeout, or klippy leaving while this greenlet waits,
+                # must not leave openocd holding the SWD adapter.
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            out.seek(0)
+            output = out.read()
         if output:
             logging.info("openocd output: %s", output.strip())
         if proc.returncode:

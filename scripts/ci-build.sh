@@ -134,6 +134,8 @@ start_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 $PYTHON test/serialqueue/test_fd_leak.py
 $PYTHON test/serialqueue/test_reconnect_backoff.py
 $PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
+# restart_method: swdio waits for openocd through the reactor.
+$PYTHON test/serialqueue/test_swdio_restart.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
