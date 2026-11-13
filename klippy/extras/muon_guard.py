@@ -33,6 +33,7 @@
 # path) is NOT dev mode.
 import fnmatch
 import logging
+import math
 import os
 import re
 import shlex
@@ -90,7 +91,25 @@ def detect_dev_mode(config_file, dev_config_path):
 # or @bed_max_temp, read from the printer config when the command arrives
 RANGE_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?|@[a-z_]+)$')
 LIMITS = {'@extruder_max_temp': ('extruder', 'max_temp'),
-          '@bed_max_temp': ('heater_bed', 'max_temp')}
+          '@bed_max_temp': ('heater_bed', 'max_temp'),
+          '@max_velocity': ('printer', 'max_velocity'),
+          '@max_accel': ('printer', 'max_accel'),
+          '@square_corner_velocity': ('printer', 'square_corner_velocity')}
+
+# KAN-1733: a client may lower the toolhead limits but not raise them past
+# the printer config. Clamped, not refused: slicers send these every layer.
+CLAMPED = {
+    'SET_VELOCITY_LIMIT': (('VELOCITY', '@max_velocity'),
+                           ('ACCEL', '@max_accel'),
+                           ('SQUARE_CORNER_VELOCITY',
+                            '@square_corner_velocity')),
+    'M204': (('S', '@max_accel'), ('P', '@max_accel'), ('T', '@max_accel')),
+}
+# Not clamped, but a NaN in any of these passes the toolhead's range checks
+# (every comparison with NaN is False) and is then stored as the limit.
+NAN_CHECKED = {
+    'SET_VELOCITY_LIMIT': ('MINIMUM_CRUISE_RATIO',),
+}
 
 
 def _parse_spec(spec, name, error):
@@ -207,7 +226,72 @@ class MuonGuard:
         self.refused = 0
         self.last_refusal = ""
         self._cache = None
+        self._client_cmd = None
+        self._last_clamp = None
         self.gcode.register_client_gate(self._gate)
+        self.printer.register_event_handler('klippy:connect',
+                                            self._handle_connect)
+
+    def _handle_connect(self):
+        for name in CLAMPED:
+            orig = self.gcode.register_command(name, None)
+            if orig is None:
+                continue
+            self.gcode.register_command(
+                name, (lambda gcmd, n=name, o=orig: self._clamp(n, o, gcmd)),
+                desc=self.gcode.gcode_help.get(name))
+
+    # The gate marks the client command it let through; the handler it runs
+    # next is that command. A macro's own calls are other objects.
+    def _clamp(self, name, orig, gcmd):
+        if gcmd is not self._client_cmd:
+            return orig(gcmd)
+        self._client_cmd = None
+        params = gcmd.get_command_parameters()
+        new = dict(params)
+        notes = []
+        for key in tuple(k for k, _ in CLAMPED[name]) + NAN_CHECKED.get(
+                name, ()):
+            try:
+                nan = math.isnan(float(params[key]))
+            except (KeyError, ValueError):
+                continue
+            if nan:
+                # NaN is never a request: `nan > lim` is False, so it would
+                # pass the clamp and the toolhead would keep it as the limit.
+                logging.info("muon_guard: refused %s: %s is NaN",
+                             gcmd.get_commandline(), key)
+                raise gcmd.error("Refused: %s, %s is not a number"
+                                 % (name, key))
+        try:
+            for key, limit in CLAMPED[name]:
+                try:
+                    value = float(params[key])
+                except (KeyError, ValueError):
+                    continue
+                lim = self._limit(limit)
+                if value > lim:
+                    new[key] = repr(lim)
+                    notes.append("%s=%s to %s %g" % (
+                        key, params[key], LIMITS[limit][1], lim))
+        except Exception:
+            logging.exception("muon_guard: could not read toolhead limits")
+            raise gcmd.error("Refused: %s, the guard could not read the"
+                             " printer's limits" % (name,))
+        if not notes:
+            return orig(gcmd)
+        if self.gcode.is_traditional_gcode(name):
+            line = ' '.join([name] + ['%s%s' % (k, v) for k, v in new.items()
+                                      if k != name[0]])
+        else:
+            line = ' '.join([name] + ['%s=%s' % (k, shlex.quote(v))
+                                      for k, v in new.items()])
+        msg = "Clamped %s (the printer config maximum)" % (", ".join(notes),)
+        logging.info("muon_guard: %s: %s", gcmd.get_commandline(), msg)
+        if msg != self._last_clamp:
+            gcmd.respond_info(msg)
+        self._last_clamp = msg
+        orig(self.gcode.create_gcode_command(name, line, new))
 
     # Dev-mode detector
     def _dev_mode(self):
@@ -328,6 +412,7 @@ class MuonGuard:
             ok = False
             why = "the guard could not check it"
         if ok:
+            self._client_cmd = gcmd
             return
         self.refused += 1
         self.last_refusal = why
