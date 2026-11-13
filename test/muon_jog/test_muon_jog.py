@@ -652,6 +652,105 @@ def test_guard_z_jog_needs_xyz_homed():
           "a running Z jog ends when X or Y is no longer homed")
 
 
+def test_guard_floor_follows_the_mesh_mid_session():
+    # Another client clears the bed mesh during the drag: the floor goes
+    # from 0.1 to 2.6. The feed re-clamps every tick, so FINAL=1 (nothing
+    # else ever updates the target) is held too.
+    for final in (False, True):
+        rig, p, j = guarded((100., 100., 20.), mesh=True)
+        w = Watch(p, (2,))
+        extra = {'FINAL': '1'} if final else {}
+        if final:
+            jog(p, Z='-50', SPEED='10', **extra)
+            w.run(0.5)
+        else:
+            w.run(0.5, refresh=lambda: jog(p, Z='-50', SPEED='10'))
+        check(w.pos()[2] > 2.6 + 1. and j.session['target'][2] < 0.2,
+              "FINAL=%s: heading for 0.1 over the mesh (Z %.2f)"
+              % (final, w.pos()[2]))
+        rig.bed_mesh.mesh = None
+        n = len(w.trace)
+        w.run(4., refresh=None if final else
+              (lambda: jog(p, Z='-50', SPEED='10')))
+        low = min(t[2] for t in w.trace[n:])
+        check(low >= 2.6 - 1e-6 and abs(w.pos()[2] - 2.6) < 1e-6,
+              "FINAL=%s: mesh cleared mid-drag, Z stops at 2.6 (low %.3f)"
+              % (final, low))
+        check('Z2.6' in j.session['clamp'] if j.session else True,
+              "FINAL=%s: and says why" % (final,))
+    # Already below the new floor: holds where it is, is not driven up
+    for final in (False, True):
+        rig, p, j = guarded((100., 100., 2.0), mesh=True)
+        w = Watch(p, (2,))
+        jog(p, Z='-50', SPEED='1', **({'FINAL': '1'} if final else {}))
+        w.run(0.5, refresh=None if final else
+              (lambda: jog(p, Z='-50', SPEED='1')))
+        held = j.session['own'][2]
+        check(0.1 < held < 2.0, "FINAL=%s: descending below 2.6 on a mesh "
+              "(queued to Z %.2f)" % (final, held))
+        rig.bed_mesh.mesh = None
+        n = len(w.trace)
+        w.run(4., refresh=None if final else
+              (lambda: jog(p, Z='-50', SPEED='1')))
+        check(min(t[2] for t in w.trace[n:]) >= held - 1e-6
+              and abs(w.pos()[2] - held) < 1e-6
+              and abs(p.toolhead.commanded[2] - held) < 1e-6,
+              "FINAL=%s: below the new floor it holds at Z%.2f, not driven "
+              "up (Z %.3f)" % (final, held, w.pos()[2]))
+        if final:
+            check(j.session is None and 'arrived' in j.reason,
+                  "FINAL=%s: and the jog ends: %r" % (final, j.reason))
+
+
+class GuardedGcodeMove(GcodeMove):
+    """move_with_transform goes through the real ContactGuard.move, as
+    gcode_move does (the guard is a move transform); reset_last_position
+    reads the position back through it. The guard's own fake toolhead
+    stands in for the rest of the chain."""
+    def __init__(self, toolhead, guard):
+        GcodeMove.__init__(self, toolhead)
+        self.guard = guard
+
+    def move_with_transform(self, newpos, speed):
+        self.guard.move(newpos, speed)
+        self.toolhead.move(newpos, speed)
+
+    def reset_last_position(self):
+        self.last_position = self.guard.get_position()
+
+
+def test_guard_refusal_of_an_xy_batch_ends_the_jog():
+    # Plate at Z1.0, below the guard's 2.6 minimum (no mesh): an XY jog is
+    # refused by the real guard. A non-zero G92-style base makes the gcode
+    # X/Y/Z differ from last_position, which is what the guard sees.
+    rig, p, j = guarded((100., 100., 1.0))
+    rig.printer.toolhead.position[:2] = [100., 100.]
+    rig.guard.get_position()
+    p.command_error = hg.base.CommandError
+    gm = GuardedGcodeMove(p.toolhead, rig.guard)
+    gm.base_position = [5., -3., 0.5, 0.]
+    p.gcode_move = p.objects['gcode_move'] = j.gcode_move = gm
+    gm.last_position = list(p.toolhead.get_position())
+    check(rig.guard.last_position[:3] == [100., 100., 1.0],
+          "the guard and the jog start in step")
+    jog(p, X='125', Y='97', SPEED='10')
+    check(j.session['target'][:2] == [130., 94.],
+          "the target is in last_position coordinates (base added)")
+    w = Watch(p, (0, 1))
+    w.run(0.3)
+    check(j.session is None and 'refused' in j.reason
+          and 'Z 1.00' in j.reason and '2.60' in j.reason,
+          "the guard refuses the batch and the jog ends: %r" % (j.reason,))
+    check(rig.printer.toolhead.moves == [] and not p.toolhead.batches
+          and gm.last_position[:3] == [100., 100., 1.0]
+          and gm.last_position[:3] == rig.guard.last_position[:3],
+          "nothing moved and gcode_move.last_position is back in sync: %r"
+          % (gm.last_position,))
+    n = len(p.toolhead.batches)
+    w.run(0.3)
+    check(len(p.toolhead.batches) == n, "and nothing more is queued")
+
+
 def test_allowlisted():
     cp = core_cfg()
     entries = cp.get('muon_guard', 'client_allow').split('\n')
