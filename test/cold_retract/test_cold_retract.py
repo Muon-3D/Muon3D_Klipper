@@ -39,6 +39,8 @@ class FakeConfig:
 
 
 class FakeGCmd:
+    error = CommandError
+
     def __init__(self, params):
         self.params = params
     def get_float(self, name, default=None, minval=None, maxval=None,
@@ -76,13 +78,29 @@ class FakeGCode:
         self.commands[name] = func
 
 
+class FakeReactor:
+    def monotonic(self):
+        return 0.
+
+
+class FakePrintStats:
+    def __init__(self, state):
+        self.state = state
+    def get_status(self, eventtime):
+        return {'state': self.state}
+
+
 class FakePrinter:
     def __init__(self):
+        self.print_stats = None
         self.gcode = FakeGCode()
         self.force_move = FakeForceMove()
         self.handlers = {}
     def lookup_object(self, name, default=None):
-        return {'gcode': self.gcode}.get(name, default)
+        return {'gcode': self.gcode,
+                'print_stats': self.print_stats}.get(name, default)
+    def get_reactor(self):
+        return FakeReactor()
     def load_object(self, config, name):
         assert name == 'force_move'
         return self.force_move
@@ -129,6 +147,27 @@ def test_refuses_out_of_bounds():
             continue
         raise AssertionError("did not refuse %s" % what)
     check(p.force_move.moves == [], "nothing moved")
+
+
+def test_refused_while_printing():
+    p, cmd = rig()
+    p.print_stats = FakePrintStats('printing')
+    try:
+        cmd(FakeGCmd({'DISTANCE': '16'}))
+    except CommandError:
+        check(True, "refused while a print is running")
+    else:
+        raise AssertionError("retracted during a print")
+    check(p.force_move.moves == [] and p.force_move.enabled == [],
+          "nothing moved or enabled during a print")
+    for state in ('paused', 'standby', 'complete', 'cancelled'):
+        p.print_stats = FakePrintStats(state)
+        cmd(FakeGCmd({'DISTANCE': '16'}))
+    check(len(p.force_move.moves) == 4, "allowed paused/standby/complete/"
+          "cancelled")
+    p.print_stats = None
+    cmd(FakeGCmd({'DISTANCE': '16'}))
+    check(len(p.force_move.moves) == 5, "allowed with no print_stats object")
 
 
 def test_unknown_stepper_is_a_config_error():

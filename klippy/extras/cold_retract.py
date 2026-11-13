@@ -35,6 +35,15 @@ class ColdRetract:
     cmd_COLD_RETRACT_help = ("Retract the extruder at most a set distance,"
                              " hot end hot or cold")
     def cmd_COLD_RETRACT(self, gcmd):
+        # A running print must not have its filament pulled back by a stray
+        # command. A paused print may still retract: the unlock button is
+        # used then.
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is not None:
+            eventtime = self.printer.get_reactor().monotonic()
+            if print_stats.get_status(eventtime).get('state') == 'printing':
+                raise gcmd.error("COLD_RETRACT refused: a print is running."
+                                 " Pause it first")
         dist = gcmd.get_float('DISTANCE', self.max_distance, above=0.,
                               maxval=self.max_distance)
         logging.info("COLD_RETRACT %s distance=%.3f velocity=%.3f",
