@@ -120,6 +120,17 @@ class BedRemovalDetector:
             # reheat on resume would silently do nothing.
             self.restore_target = target
         self.bed_heater.set_temp(0.0)
+        # Straight after the heater is zeroed and before the pause: under
+        # virtual_sdcard the pause waits in the reactor, and a move that runs
+        # during that wait must already be checked against "plate height
+        # unknown" (contact_guard drops its height on this event). The heater
+        # is still zeroed first, and the try/except means a failing listener
+        # cannot skip the pause.
+        try:
+            self.printer.send_event("bed_removal_detector:removed")
+        except Exception:
+            self.log.exception('bed_removal_detector:removed listener'
+                               ' failed')
         # Stop feeding the file immediately, the way filament_switch_sensor
         # does on runout: the pause half of pause_resume has to take effect
         # now, not whenever the macro below wins the gcode mutex, because
@@ -133,14 +144,6 @@ class BedRemovalDetector:
             lambda et: self._run_macro(et, 'BED_REMOVED'))
         self.log.info('Bed removal detected, bed heater off '
                       '(was %.1f C)', self.restore_target)
-        # Last, after the heater is off and the print is paused: the plate
-        # goes back on wherever it seats, so contact_guard no longer knows
-        # its height.  Nothing a listener does can undo the steps above.
-        try:
-            self.printer.send_event("bed_removal_detector:removed")
-        except Exception:
-            self.log.exception('bed_removal_detector:removed listener'
-                               ' failed')
 
     def _in_print_phase(self, eventtime):
         """True while a file is printing and its PRINT_END has not begun.
