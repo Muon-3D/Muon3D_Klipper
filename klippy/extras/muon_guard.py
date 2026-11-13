@@ -213,8 +213,8 @@ class MuonGuard:
         # no_go_region_1 / no_go_traverse_z; test/muon_guard checks they
         # agree). Macros -- homing, probing, purge -- are not checked.
         self.z_floor = config.getfloat('client_z_floor', 0.)
-        rect = [float(v) for v in config.getlist('client_no_go_region',
-                                                 '75, 0, 125, 34')]
+        rect = list(config.getfloatlist('client_no_go_region',
+                                        (75., 0., 125., 34.), count=4))
         if len(rect) != 4 or rect[0] >= rect[2] or rect[1] >= rect[3]:
             raise config.error("client_no_go_region must be xmin, ymin,"
                                " xmax, ymax")
