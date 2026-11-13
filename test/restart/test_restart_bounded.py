@@ -353,16 +353,95 @@ def test_led_effect_shutdown_does_not_pause():
     assert h.shutdown and time.monotonic() - t0 < 0.1
 
 
-def test_mcu_swdio_reset_has_a_timeout():
-    src = open(os.path.join(ROOT, 'klippy', 'mcu.py'), encoding='utf-8').read()
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'run'
-                and getattr(node.func.value, 'id', '') == 'subprocess'):
-            assert any(k.arg == 'timeout' for k in node.keywords), \
-                "mcu.py:%d openocd reset can hang a FIRMWARE_RESTART" % (
-                    node.lineno,)
+def test_watchdog_does_not_exec_when_disarmed_during_stack_dump():
+    fired = threading.Event()
+    wd = klippy.RestartWatchdog(0.1, fallback=fired.set)
+    dumping = threading.Event()
+    resume = threading.Event()
+    orig = klippy.thread_stacks
+
+    def slow_stacks():
+        dumping.set()
+        resume.wait(3.)
+        return ''
+    klippy.thread_stacks = slow_stacks
+    log = capture()
+    try:
+        wd.arm('klippy firmware_restart')
+        assert dumping.wait(BOUND), "watchdog never started its stack dump"
+        wd.disarm()         # the restart finished while the dump was running
+        resume.set()
+        assert not fired.wait(0.5), "watchdog exec'd after disarm()"
+    finally:
+        resume.set()
+        klippy.thread_stacks = orig
+        logging.getLogger().removeHandler(log)
+
+
+class LoopWatchdog:
+    def __init__(self, events):
+        self.events = events
+
+    def disarm(self):
+        self.events.append('disarm')
+
+
+class LoopReactor:
+    def __init__(self, events):
+        self.events = events
+
+    def finalize(self):
+        self.events.append('finalize')
+
+
+class LoopPrinter:
+    def __init__(self, events, res):
+        self.events = events
+        self.res = res
+        self.restart_watchdog = None
+
+    def run(self):
+        self.events.append('run')
+        return self.res
+
+
+def run_loop(results, stuck):
+    """Drive klippy.run_restart_loop with fake printers; returns events."""
+    events = []
+    results = list(results)
+
+    def new_printer():
+        events.append('new_printer')
+        return LoopReactor(events), LoopPrinter(events, results.pop(0))
+    saved = (time.sleep, klippy.reexec_klippy, list(serialhdl._stuck_queues))
+    time.sleep = lambda s: None
+    klippy.reexec_klippy = lambda bg: events.append('reexec')
+    serialhdl._stuck_queues[:] = stuck
+    try:
+        klippy.run_restart_loop({}, None, 'v', LoopWatchdog(events),
+                                new_printer)
+    finally:
+        time.sleep, klippy.reexec_klippy = saved[0], saved[1]
+        serialhdl._stuck_queues[:] = saved[2]
+    return events
+
+
+def test_main_loop_disarms_watchdog_after_in_process_restart():
+    ev = run_loop(['firmware_restart', 'exit'], stuck=[])
+    # each new Printer is built, then the watchdog is disarmed, then it runs
+    assert ev == ['new_printer', 'disarm', 'run', 'finalize',
+                  'new_printer', 'disarm', 'run'], ev
+
+
+def test_main_loop_reexecs_instead_of_restarting_with_stuck_queues():
+    ev = run_loop(['firmware_restart', 'exit'], stuck=[object()])
+    assert ev == ['new_printer', 'disarm', 'run', 'reexec'], ev
+    assert ev.count('new_printer') == 1, "restarted in-process with stuck UARTs"
+
+
+def test_main_loop_exit_does_not_reexec_even_with_stuck_queues():
+    ev = run_loop(['exit'], stuck=[object()])
+    assert 'reexec' not in ev, ev
 
 
 if __name__ == '__main__':

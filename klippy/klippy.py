@@ -6,7 +6,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, gc, optparse, logging, time, collections, importlib
 import threading, traceback
-import util, reactor, queuelogger, msgproto
+import util, reactor, queuelogger, msgproto, serialhdl
 import gcode, configfile, pins, mcu, toolhead, webhooks
 
 message_ready = "Printer is ready"
@@ -269,6 +269,9 @@ class Printer:
 # RESTART_TIMEOUT, log every thread's stack and re-exec klippy.  Without
 # this a handler or serial thread that never returned left klippy hung until
 # `systemctl restart klipper`.
+# Worst-case restart budget: two openocd runs (SWDIO_OPENOCD_TIMEOUT, 10 s
+# each) plus three serial disconnects (DISCONNECT_TIMEOUT, 5 s each) is 35 s,
+# which fits under this 60 s with margin.
 RESTART_TIMEOUT = 60.
 
 def reexec_argv(argv, executable):
@@ -306,7 +309,10 @@ class RestartWatchdog:
                           " klippy. Thread stacks:\n%s", what, self.timeout,
                           thread_stacks())
         finally:
-            self.fallback()
+            # The stack dump above takes time; a disarm() that landed during
+            # it means the restart finished, so do not exec.
+            if not done.is_set():
+                self.fallback()
 
 def reexec_klippy(bglogger):
     if bglogger is not None:
@@ -315,6 +321,35 @@ def reexec_klippy(bglogger):
         t.start()
         t.join(2.)
     os.execv(sys.executable, reexec_argv(sys.argv, sys.executable))
+
+def run_restart_loop(start_args, bglogger, versions, watchdog, new_printer):
+    # new_printer() returns (reactor, printer).  Returns the final run() result.
+    while 1:
+        if bglogger is not None:
+            bglogger.clear_rollover_info()
+            bglogger.set_rollover_info('versions', versions)
+        gc.collect()
+        main_reactor, printer = new_printer()
+        watchdog.disarm()
+        printer.restart_watchdog = watchdog
+        res = printer.run()
+        if res in ['exit', 'error_exit']:
+            break
+        if serialhdl._stuck_queues:
+            # A serial disconnect timed out and left its thread running.  The
+            # UARTs are opened exclusive, so reopening them in this process
+            # would fail with EBUSY on every later FIRMWARE_RESTART.  Re-exec
+            # to get a clean process instead.
+            logging.error("serial threads still stuck after restart; "
+                          "re-executing klippy")
+            reexec_klippy(bglogger)
+            return res
+        time.sleep(1.)
+        main_reactor.finalize()
+        main_reactor = printer = None
+        logging.info("Restarting printer")
+        start_args['start_reason'] = res
+    return res
 
 def import_test():
     # Import all optional modules (used as a build test)
@@ -437,23 +472,11 @@ def main():
     # Start Printer() class
     watchdog = RestartWatchdog(RESTART_TIMEOUT,
                                lambda: reexec_klippy(bglogger))
-    while 1:
-        if bglogger is not None:
-            bglogger.clear_rollover_info()
-            bglogger.set_rollover_info('versions', versions)
-        gc.collect()
+    def new_printer():
         main_reactor = reactor.Reactor(gc_checking=True)
-        printer = Printer(main_reactor, bglogger, start_args)
-        watchdog.disarm()
-        printer.restart_watchdog = watchdog
-        res = printer.run()
-        if res in ['exit', 'error_exit']:
-            break
-        time.sleep(1.)
-        main_reactor.finalize()
-        main_reactor = printer = None
-        logging.info("Restarting printer")
-        start_args['start_reason'] = res
+        return main_reactor, Printer(main_reactor, bglogger, start_args)
+    res = run_restart_loop(start_args, bglogger, versions, watchdog,
+                           new_printer)
 
     if bglogger is not None:
         bglogger.stop()
