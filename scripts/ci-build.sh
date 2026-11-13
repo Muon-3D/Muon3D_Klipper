@@ -136,6 +136,16 @@ $PYTHON test/serialqueue/test_reconnect_backoff.py
 $PYTHON test/serialqueue/test_noncritical_shutdown_deadlock.py
 finish_test serialqueue "Test serialqueue fd handling and reconnect back-off"
 
+# MUON: TAP_TRACE per-tap CSV and its summary script (KAN-1361).
+start_test tap_trace "Test TAP_TRACE CSV writer and summary"
+$PYTHON test/tap_path/test_tap_trace.py
+$PYTHON test/tap_path/test_tap_onset.py
+$PYTHON test/tap_path/test_tap_confirm.py
+$PYTHON test/tap_path/test_tap_overtravel.py
+$PYTHON test/tap_path/test_tap_failsafe.py
+$PYTHON test/tap_path/test_y_tap_log.py
+finish_test tap_trace "Test TAP_TRACE CSV writer and summary"
+
 # MUON: a failed tap must stop its load cell sample collector (KAN-463).
 start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
@@ -194,3 +204,9 @@ finish_test klippy "Test invoke klippy (Python3)"
 start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
 $PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
 finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+
+# MUON: the KAN-1361 tap confirmation in batch mode: each stall test ends
+# for the right reason, and breaking the fix makes one of them fail.
+start_test tap_confirm_mutation "Test tap confirmation mutation check"
+$PYTHON test/tap_path/tap_confirm_mutation.py -d ${DICTDIR}
+finish_test tap_confirm_mutation "Test tap confirmation mutation check"

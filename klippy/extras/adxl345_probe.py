@@ -1,6 +1,9 @@
 import logging
+import os
+import tempfile
 import pins
-from . import probe, adxl345, homing
+from . import probe, adxl345, homing, tap_onset, tap_trace, tap_confirm
+from . import y_tap_log
 
 REG_THRESH_TAP = 0x1D
 REG_DUR = 0x21
@@ -168,6 +171,36 @@ class ADXL345Probe:
             'y': self._load_confirm_profile(config, 'y'),
         }
 
+        # KAN-1361: take the recorded tap position from the first
+        # accelerometer sample over the tap threshold, not from the time the
+        # chip's tap logic raised INT.  Off by default.
+        self.tap_trigger_from_samples = config.getboolean(
+            'tap_trigger_from_samples', False)
+        self.tap_onset_window = config.getfloat(
+            'tap_onset_window', 0.06, minval=0.01, maxval=0.5)
+        self._onset_client = None
+        # KAN-1361 diagnostic: TAP_TRACE ENABLE=1 writes every tap of the
+        # traced axes (samples, INT and onset times and positions) to a CSV
+        # in the logs dir.  Off at every start; never changes homing.
+        # Debug harness only (ADXL_TAP_SIMULATE): {axis: [mm, ...]}
+        self._sim_taps = {}
+        self._trace = None
+        self._trace_axes = ''
+        self._trace_pre = 0.06
+        self._trace_post = 0.03
+        self._trace_home = 0
+        self._trace_tap = 0
+        self._trace_phase = 'seek'
+        self._trace_speed = None
+        self._trace_seek_speed = None
+        if (self.tap_trigger_from_samples
+                and not self._adxl_mcu.is_fileoutput()):
+            amap = getattr(self.adxl345, 'axes_map', None)
+            if amap is None or [m[0] for m in amap] != [0, 1, 2]:
+                raise config.error(
+                    "tap_trigger_from_samples needs an identity axes_map"
+                    " on the adxl345 chip")
+
         if self.enable_z_probe:
             self.position_endstop = config.getfloat('z_offset')
         else:
@@ -238,8 +271,19 @@ class ADXL345Probe:
             'homing:homing_move_begin', self._handle_homing_move_begin)
         self.printer.register_event_handler(
             'homing:homing_move_end', self._handle_homing_move_end)
+        self._y_tap_log = y_tap_log.YTapLog(self)
+        self.printer.register_event_handler(
+            'homing:homing_move_error', self._handle_y_move_error)
+        self.printer.register_event_handler(
+            'homing:home_rails_error', self._handle_y_rails_error)
+        self.printer.register_event_handler(
+            'homing:home_rails_complete', self._handle_y_rails_complete)
         self.printer.register_event_handler(
             'homing:home_rails_end', self._handle_home_rails_end)
+        self.printer.register_event_handler(
+            'homing:home_rails_begin', self._handle_home_rails_begin)
+        self.printer.register_event_handler(
+            'klippy:disconnect', self._close_trace)
         self.printer.register_event_handler(
             'gcode:command_error', self._handle_command_error)
 
@@ -276,6 +320,18 @@ class ADXL345Probe:
             self.gcode.register_mux_command(
                 "ADXL_TEST_TAP", "CHIP", None, self.cmd_ADXL_TEST_TAP,
                 desc=self.cmd_ADXL_TEST_TAP_help)
+            self.gcode.register_mux_command(
+                "TAP_TRACE", "CHIP", None, self.cmd_TAP_TRACE,
+                desc=self.cmd_TAP_TRACE_help)
+        self.gcode.register_mux_command(
+            "TAP_TRACE", "CHIP", self.name, self.cmd_TAP_TRACE,
+            desc=self.cmd_TAP_TRACE_help)
+        if self.printer.get_start_args().get('debuginput') is not None:
+            # Batch tests only: there is no stop to tap in the harness.
+            for key in (self.name, None):
+                self.gcode.register_mux_command(
+                    "ADXL_TAP_SIMULATE", "CHIP", key,
+                    self.cmd_ADXL_TAP_SIMULATE)
 
     def _parse_tap_axes(self, tap_axes, errfunc, option_name):
         axes = tap_axes.replace(',', '').replace(' ', '').lower()
@@ -313,19 +369,89 @@ class ADXL345Probe:
         def opt(name, getter, default, **kw):
             base = getter('tap_confirm_%s' % (name,), default, **kw)
             return getter('%s_tap_confirm_%s' % (axis, name), base, **kw)
-        return {
+        profile = {
             'samples': opt('samples', config.getint, 1, minval=1),
             'tolerance': opt('tolerance', config.getfloat, 0.2, above=0.),
             'retries': opt('retries', config.getint, 2, minval=0),
             'retract_dist': opt('retract_dist', config.getfloat, 3.,
                                 above=0.),
+            'overtravel': opt('overtravel', config.getfloat, None),
             'retract_speed': opt('retract_speed', config.getfloat, None,
                                  above=0.),
             'speed': opt('speed', config.getfloat, None, above=0.),
             'seek_retries': opt('seek_retries', config.getint, 1, minval=0),
             'max_seek_dist': opt('max_seek_dist', config.getfloat, None,
                                  above=0.),
+            # KAN-1361: extra retries for a tap that was driven into the
+            # stop (tap_confirm.py), and the width of that class.
+            'stall_retries': opt('stall_retries', config.getint, 0,
+                                 minval=0),
+            'stall_dist': opt('stall_dist', config.getfloat,
+                              self._default_stall_dist(config, axis),
+                              minval=0.),
         }
+        overtravel = profile['overtravel']
+        if overtravel is not None:
+            if overtravel < 0.15:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be at least 0.15mm"
+                    " to leave room for the homing deceleration distance"
+                    % (axis,))
+            if overtravel >= profile['retract_dist']:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be less than"
+                    " tap_confirm_retract_dist" % (axis,))
+            # A blocked rotor slips 2 full steps.  The cap is measured from
+            # the previous trigger, which is already late, so it must stay
+            # under that.
+            full_step = self._full_step_dist(config, axis)
+            if overtravel > full_step + 1e-9:
+                raise config.error(
+                    "%s_tap_confirm_overtravel must be at most 1 full"
+                    " step (%.3fmm) of stepper_%s: a blocked rotor slips"
+                    " 2 full steps before the cap is reached"
+                    % (axis, full_step, axis))
+            if profile['tolerance'] >= overtravel:
+                raise config.error(
+                    "%s_tap_confirm_tolerance must be less than"
+                    " %s_tap_confirm_overtravel: otherwise every capped"
+                    " tap agrees" % (axis, axis))
+        return profile
+
+    def _full_step_dist(self, config, axis):
+        # One full step of the axis' stepper, in mm.  Only needed when an
+        # overtravel cap is configured, so unknown is a config error.
+        name = 'stepper_' + axis
+        if not config.has_section(name):
+            raise config.error(
+                "%s_tap_confirm_overtravel needs a [%s] section to compute"
+                " the full step" % (axis, name))
+        sconfig = config.getsection(name)
+        if sconfig.get('gear_ratio', None, note_valid=False) is not None:
+            raise config.error(
+                "%s_tap_confirm_overtravel cannot be used with gear_ratio on"
+                " %s: the full step cannot be computed" % (axis, name))
+        rd = sconfig.getfloat('rotation_distance', None, note_valid=False)
+        if not rd:
+            raise config.error(
+                "%s_tap_confirm_overtravel needs rotation_distance on %s to"
+                " compute the full step" % (axis, name))
+        return rd / sconfig.getint('full_steps_per_rotation', 200,
+                                   note_valid=False)
+
+    def _default_stall_dist(self, config, axis):
+        # One electrical cycle of the axis' stepper, in mm.
+        name = 'stepper_' + axis
+        if not config.has_section(name):
+            return 0.
+        sconfig = config.getsection(name)
+        if sconfig.get('gear_ratio', None, note_valid=False) is not None:
+            return 0.
+        rd = sconfig.getfloat('rotation_distance', None, note_valid=False)
+        if not rd:
+            return 0.
+        return tap_confirm.cycle_dist(rd, sconfig.getint(
+            'full_steps_per_rotation', 200, note_valid=False))
 
     def _lookup_axis_position_endstop(self, config, axis):
         stepper_name = 'stepper_%s' % (axis,)
@@ -439,6 +565,8 @@ class ADXL345Probe:
         return self.reactor.NEVER
 
     def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
+        if getattr(self, '_stream_stop_error', None):
+            raise self.printer.command_error(self._stream_stop_error)
         if self._tap_mode is not None:
             raise self.printer.command_error(
                 "ADXL345 tap detection already active (%s)" % (self._tap_mode,))
@@ -594,6 +722,8 @@ class ADXL345Probe:
                     if w in hmove.get_mcu_endstops()]
         if not wrappers:
             return
+        if any(w.get_axis() == 'y' for w in wrappers):
+            self._y_tap_log.start(hmove)
         profile = self._merge_profiles(wrappers)
         arm_delay = max([self.axis_homing_arm_delay.get(w.get_axis(), 0.)
                          for w in wrappers])
@@ -601,18 +731,402 @@ class ADXL345Probe:
         self._active_axis_homing_arm_delay = arm_delay
         self._active_axis_homing_arm_print_time = 0.
         self._active_axis_homing_arm_scheduled = False
+        self._trace_speed = getattr(hmove, 'muon_speed',
+                                    self._trace_seek_speed)
+        self._start_onset_client(wrappers, profile)
         self._start_tap(profile, 'axis_homing', defer_arm=arm_delay > 0.)
+
+    def _start_onset_client(self, wrappers, profile):
+        # Stream accelerometer samples during the move so the tap onset can
+        # be located afterwards.  The MCU stop still comes from the INT pin.
+        if getattr(self, '_stream_stop_error', None):
+            self._release_onset_client()
+        self._onset_client = None
+        if len(wrappers) != 1:
+            return
+        axis = wrappers[0].get_axis()
+        if not (self.tap_trigger_from_samples or self._tracing(axis)):
+            return
+        if axis not in ('x', 'y') or self._mask_to_axes(
+                profile['tap_axes_mask']) != axis:
+            return
+        if self._adxl_mcu.is_fileoutput():
+            return
+        try:
+            self._onset_client = self.adxl345.start_internal_client()
+            if self.inverted:
+                # adxl345 measurement start rewrites DATA_FORMAT
+                self.adxl345.set_reg(adxl345.REG_DATA_FORMAT, 0x2B)
+        except Exception:
+            logging.exception("adxl345_probe: tap onset sampling unavailable")
+            self._release_onset_client()
+
+    def _release_onset_client(self):
+        client = self._onset_client
+        if client is None:
+            return
+        client.is_finished = True
+        # The bulk reader drops a finished client, and puts the chip in
+        # standby, from its batch timer.  Wait for that here so its
+        # register I/O cannot interleave with ours ("Unable to obtain
+        # 'spi_transfer_response'", 9 Nov) or blind the next tap.
+        bulk = getattr(self.adxl345, 'batch_bulk', None)
+        if bulk is None:
+            self._onset_client = None
+            return
+        reactor = self.reactor
+        deadline = reactor.monotonic() + 1.
+        while client.handle_batch in bulk.client_cbs or bulk.is_started:
+            now = reactor.monotonic()
+            if now >= deadline:
+                axes = ''.join(w.get_axis() for w in getattr(
+                    self, '_active_axis_homing_wrappers', [])) or 'tap'
+                self._stream_stop_error = (
+                    "adxl345_probe: %s home aborted: accelerometer stream"
+                    " did not stop within 1.0s; a tap armed now could be"
+                    " blind and drive into the stop. Re-run G28; if it"
+                    " repeats, check other ADXL clients (TAP_TRACE,"
+                    " resonance tests)" % (axes,))
+                raise self.printer.command_error(self._stream_stop_error)
+            reactor.pause(now + 0.01)
+        self._onset_client = None
+        self._stream_stop_error = None
+
+    def _apply_tap_onset(self, hmove, wrappers):
+        # Replace the stepper trigger positions with those at the onset of
+        # the tap (tap_trigger_from_samples), and write the tap to the trace
+        # when TAP_TRACE is on. Refinement failures keep the hardware
+        # trigger positions; stream-stop failures must abort the home.
+        client = self._onset_client
+        if client is None:
+            return
+        try:
+            if len(wrappers) != 1:
+                return
+            wrapper = wrappers[0]
+            axis = wrapper.get_axis()
+            tracing = self._tracing(axis)
+            trigger_time = wrapper.last_trigger_time
+            names = [n for es, n in hmove.endstops if es is wrapper]
+            sps = [sp for sp in hmove.stepper_positions
+                   if sp.endstop_name in names]
+            if trigger_time <= 0.:
+                if tracing:
+                    self._trace_write(hmove, sps, axis, None, None, [],
+                                      'int')
+                return
+            wait_to = trigger_time + (self._trace_post if tracing else 0.)
+            reactor = self.reactor
+            deadline = reactor.monotonic() + 0.6
+            while not self._samples_cover(client, wait_to):
+                now = reactor.monotonic()
+                if now >= deadline:
+                    logging.warning("adxl345_probe: %s tap onset: samples"
+                                    " not received in time", axis)
+                    break
+                reactor.pause(now + 0.02)
+            samples = [smp for msg in client.msgs for smp in msg['data']]
+            thresh = self._get_profile(axis)['tap_thresh']
+            onset = None
+            if samples and samples[-1][0] >= trigger_time:
+                onset = tap_onset.find_tap_onset(
+                    samples, axis, thresh, trigger_time,
+                    self.tap_onset_window)
+            int_steps = dict((sp.stepper_name, sp.trig_pos) for sp in sps)
+            applied = 'int'
+            if self.tap_trigger_from_samples:
+                before = [sp.trig_pos for sp in sps]
+                if tap_onset.refine_stepper_positions(sps, onset,
+                                                      trigger_time):
+                    applied = 'onset'
+                    logging.info(
+                        "adxl345_probe: %s tap onset %.6f, INT %.6f (%.2fms"
+                        " later); trig_pos %s -> %s", axis, onset,
+                        trigger_time, (trigger_time - onset) * 1000.,
+                        before, [sp.trig_pos for sp in sps])
+                else:
+                    logging.info("adxl345_probe: %s tap onset not found;"
+                                 " keeping the INT trigger time", axis)
+            if tracing:
+                self._trace_write(hmove, sps, axis, trigger_time, onset,
+                                  samples, applied, int_steps)
+        except Exception:
+            logging.exception("adxl345_probe: tap onset refinement failed")
+        finally:
+            self._release_onset_client()
+
+    # TAP_TRACE (KAN-1361 diagnostic)
+    def _tracing(self, axis):
+        return self._trace is not None and axis in self._trace_axes
+
+    def _axis_pos_at(self, axis, print_time):
+        # Axis position from the raw MCU step counts at print_time, so taps
+        # compare across homing's re-basing of the toolhead position.
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        steps = {}
+        pos = {}
+        for s in kin.get_steppers():
+            n = s.get_name()
+            steps[n] = s.get_past_mcu_position(print_time)
+            pos[n] = steps[n] * s.get_step_dist()
+        return kin.calc_position(pos)['xyz'.index(axis)], steps
+
+    def _axis_pos_from(self, axis, sps, attr):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        by_name = dict((sp.stepper_name, getattr(sp, attr)) for sp in sps)
+        if any(v is None for v in by_name.values()):
+            return None, None
+        pos = {}
+        for s in kin.get_steppers():
+            n = s.get_name()
+            if n in by_name:
+                pos[n] = by_name[n] * s.get_step_dist()
+            else:
+                pos[n] = s.get_mcu_position() * s.get_step_dist()
+        return kin.calc_position(pos)['xyz'.index(axis)], by_name
+
+    def _trace_write(self, hmove, sps, axis, int_time, onset, samples,
+                     applied, int_steps=None):
+        writer = self._trace
+        if writer is None:
+            return
+        try:
+            self._trace_tap += 1
+            profile = self._get_profile(axis)
+            tap = {
+                'home': self._trace_home, 'tap': self._trace_tap,
+                'phase': self._trace_phase, 'axis': axis,
+                'speed': self._trace_speed, 'applied': applied,
+                'int_time': int_time, 'onset_time': onset,
+                'thresh': profile['tap_thresh'],
+                'tap_axes': self._mask_to_axes(profile['tap_axes_mask']),
+            }
+            tap['start_pos_mm'] = self._axis_pos_from(
+                axis, sps, 'start_pos')[0]
+            tap['halt_pos_mm'], tap['halt_steps'] = self._axis_pos_from(
+                axis, sps, 'halt_pos')
+            if int_time is not None:
+                tap['int_pos_mm'], all_int = self._axis_pos_at(axis, int_time)
+                tap['int_steps'] = int_steps or all_int
+            if onset is not None:
+                tap['onset_pos_mm'], tap['onset_steps'] = self._axis_pos_at(
+                    axis, onset)
+            try:
+                self._trace_steppers(tap, sps, int_steps)
+            except Exception:
+                logging.exception("adxl345_probe: TAP_TRACE stepper fields"
+                                  " unavailable")
+            writer.write_tap(tap, samples)
+            logging.info(
+                "adxl345_probe: TAP_TRACE %s home %d tap %d (%s): INT %s,"
+                " onset %s, %s pos %s -> %s", axis, self._trace_home,
+                self._trace_tap, self._trace_phase, int_time, onset,
+                applied, tap.get('onset_pos_mm'), tap.get('int_pos_mm'))
+        except Exception:
+            logging.exception("adxl345_probe: TAP_TRACE write failed")
+
+    def _trace_steppers(self, tap, sps, int_steps):
+        # Per stepper: the distance run to the trigger, the commanded
+        # follow-through after it, the microstep phase of the step count
+        # at the start (after the retract), the trigger and the halt, and
+        # the driver's own MSCNT read back at the halt.  MSCNT counts the
+        # steps the driver took, not where the rotor is: it shows lost
+        # step pulses, never a pole slip.
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        dists = dict((s.get_name(), s.get_step_dist())
+                     for s in kin.get_steppers())
+        travelled, follow = {}, {}
+        phases = {'start': {}, 'int': {}, 'halt': {}}
+        mscnt = {}
+        for sp in sps:
+            name = sp.stepper_name
+            trig = (int_steps or {}).get(name, sp.trig_pos)
+            sd = dists.get(name, 0.)
+            if None in (sp.start_pos, sp.halt_pos, trig):
+                continue
+            travelled[name] = (trig - sp.start_pos) * sd
+            follow[name] = (sp.halt_pos - trig) * sd
+            drv = self._lookup_tmc(name)
+            if drv is None:
+                continue
+            offset, nphases = drv.get_phase_offset()
+            if offset is None:
+                offset = 0
+            for what, pos in (('start', sp.start_pos), ('int', trig),
+                              ('halt', sp.halt_pos)):
+                phases[what][name] = tap_confirm.phase(pos, nphases, offset)
+            try:
+                reg = drv.fields.lookup_register('mscnt', None)
+                if reg is not None:
+                    mscnt[name] = drv.fields.get_field(
+                        'mscnt', drv.mcu_tmc.get_register(reg))
+            except Exception:
+                logging.exception("adxl345_probe: MSCNT read failed")
+        tap['travelled_mm'] = travelled
+        tap['follow_mm'] = follow
+        for what in phases:
+            tap[what + '_phase'] = phases[what]
+        tap['halt_mscnt'] = mscnt
+
+    def _lookup_tmc(self, stepper_name):
+        for name, obj in self.printer.lookup_objects():
+            if (name.startswith('tmc') and name.endswith(' ' + stepper_name)
+                    and hasattr(obj, 'get_phase_offset')):
+                return obj
+        return None
+
+    def _handle_home_rails_begin(self, homing_state, rails):
+        if any(es is self._axis_wrappers['y']
+               for rail in rails for es, name in rail.get_endstops()):
+            self._y_tap_log.begin()
+        if self._trace is None:
+            return
+        for rail in rails:
+            for es, name in rail.get_endstops():
+                if es in self._axis_wrappers.values() and self._tracing(
+                        es.get_axis()):
+                    self._trace_home += 1
+                    self._trace_tap = 0
+                    self._trace_phase = 'seek'
+                    self._trace_seek_speed = rail.get_homing_info().speed
+                    return
+
+    def _trace_dir(self):
+        log_file = self.printer.get_start_args().get('log_file')
+        if log_file:
+            return os.path.dirname(os.path.abspath(log_file))
+        return tempfile.gettempdir()
+
+    def _close_trace(self):
+        writer, self._trace = self._trace, None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                logging.exception("adxl345_probe: TAP_TRACE close failed")
+        return writer
+
+    def cmd_ADXL_TAP_SIMULATE(self, gcmd):
+        # ADXL_TAP_SIMULATE AXIS=y OFFSETS=0.59,0.8: where the
+        # confirm taps of the next home of AXIS trigger, in mm towards the
+        # stop from its first tap.  Taps past the list repeat the stop (0).
+        axis = gcmd.get('AXIS').strip().lower()
+        if axis not in ('x', 'y'):
+            raise gcmd.error("ADXL_TAP_SIMULATE AXIS must be x or y")
+        try:
+            offsets = [float(v) for v in gcmd.get('OFFSETS').split(',')]
+        except ValueError:
+            raise gcmd.error("ADXL_TAP_SIMULATE OFFSETS must be numbers")
+        self._sim_taps[axis] = offsets
+
+    cmd_TAP_TRACE_help = ("KAN-1361 diagnostic: ENABLE=1 records every X/Y"
+                          " tap (samples, INT/onset times and positions) to"
+                          " a CSV in the logs dir; ENABLE=0 closes it")
+
+    def cmd_TAP_TRACE(self, gcmd):
+        enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
+        if enable is None:
+            if self._trace is None:
+                gcmd.respond_info("TAP_TRACE is off")
+            else:
+                gcmd.respond_info(
+                    "TAP_TRACE is on for %s: %d taps in %s"
+                    % (self._trace_axes, self._trace.taps, self._trace.path))
+            return
+        if not enable:
+            writer = self._close_trace()
+            if writer is None:
+                gcmd.respond_info("TAP_TRACE was already off")
+            else:
+                gcmd.respond_info("TAP_TRACE off: %d taps in %s"
+                                  % (writer.taps, writer.path))
+            return
+        axes = gcmd.get('AXES', 'y').strip().lower()
+        if not axes or any(a not in 'xy' for a in axes):
+            raise gcmd.error("TAP_TRACE AXES must be x, y or xy")
+        pre = gcmd.get_float('PRE', 0.06, minval=0.005, maxval=0.5)
+        post = gcmd.get_float('POST', 0.03, minval=0., maxval=0.2)
+        if self._adxl_mcu.is_fileoutput():
+            raise gcmd.error("TAP_TRACE needs a live accelerometer")
+        amap = getattr(self.adxl345, 'axes_map', None)
+        if amap is None or [m[0] for m in amap] != [0, 1, 2]:
+            raise gcmd.error("TAP_TRACE needs an identity axes_map on the"
+                             " adxl345 chip")
+        if self._trace is not None:
+            if (axes, pre, post) == (self._trace_axes, self._trace_pre,
+                                     self._trace_post):
+                gcmd.respond_info("TAP_TRACE already on: %s"
+                                  % (self._trace.path,))
+                return
+            self._close_trace()
+        path = tap_trace.trace_path(self._trace_dir())
+        try:
+            writer = tap_trace.TapTraceWriter(path, pre, post)
+        except (IOError, OSError) as e:
+            raise gcmd.error("TAP_TRACE cannot write %s: %s" % (path, e))
+        self._trace = writer
+        self._trace_axes = axes
+        self._trace_pre = pre
+        self._trace_post = post
+        self._trace_home = 0
+        self._trace_tap = 0
+        self._trace_phase = 'seek'
+        gcmd.respond_info(
+            "TAP_TRACE on for %s (%.0f ms before INT, %.0f ms after): %s."
+            " Streams the accelerometer during traced taps, which sets the"
+            " chip to its streaming rate." % (axes, pre * 1000.,
+                                              post * 1000., path))
+
+    @staticmethod
+    def _samples_cover(client, trigger_time):
+        for msg in reversed(client.msgs):
+            if msg['data']:
+                return msg['data'][-1][0] >= trigger_time
+        return False
 
     def _handle_homing_move_end(self, hmove):
         if not self._active_axis_homing_wrappers:
             return
         hmove_endstops = hmove.get_mcu_endstops()
-        if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
+        if not any(w in hmove_endstops
+                   for w in self._active_axis_homing_wrappers):
             return
+        wrappers = list(self._active_axis_homing_wrappers)
+        hmove.y_tap_raw_steps = {
+            stage: {sp.stepper_name: getattr(sp, attr)
+                    for sp in hmove.stepper_positions}
+            for stage, attr in (('start', 'start_pos'),
+                                ('trigger', 'trig_pos'), ('halt', 'halt_pos'))}
+        error = getattr(hmove, 'move_error', None)
         try:
-            self._stop_tap('axis_homing')
+            try:
+                self._stop_tap('axis_homing')
+            finally:
+                try:
+                    self._apply_tap_onset(hmove, wrappers)
+                finally:
+                    try:
+                        self._release_onset_client()
+                    finally:
+                        self._reset_axis_homing_state()
+        except Exception as e:
+            error = e
+            raise
         finally:
-            self._reset_axis_homing_state()
+            if any(w.get_axis() == 'y' for w in wrappers):
+                self._y_tap_log.record(hmove, error)
+
+    def _handle_y_move_error(self, hmove, error):
+        if not self._y_tap_log.active:
+            return ''
+        self._y_tap_log.record(hmove, error, halted=False)
+        return self._y_tap_log.finish('failed', error)
+
+    def _handle_y_rails_error(self, homing_state, rails, error):
+        return self._y_tap_log.finish('failed', error)
+
+    def _handle_y_rails_complete(self, homing_state, rails):
+        self._y_tap_log.finish('accepted')
 
     def _handle_home_rails_end(self, homing_state, rails):
         # Confirm an X/Y tap home with further agreeing taps before the
@@ -646,6 +1160,9 @@ class ADXL345Probe:
         speed = cfg['speed'] or hi.speed
         retract_speed = cfg['retract_speed'] or hi.retract_speed
         retract_dist = cfg['retract_dist']
+        overtravel = cfg['overtravel']
+        if overtravel is None:
+            overtravel = retract_dist
         arm_delay = self.axis_homing_arm_delay.get(axis, 0.)
         if retract_dist <= speed * arm_delay:
             raise cmderr(
@@ -662,13 +1179,14 @@ class ADXL345Probe:
         step_dists = {s.get_name(): s.get_step_dist() for s in steppers}
 
         # Like HomingMove.check_no_movement(): the debug harness has no
-        # physical stop, so trigger positions never agree there.
+        # physical stop, so trigger positions never agree there.  It
+        # compares the taps given to ADXL_TAP_SIMULATE instead.
         is_debug = self.printer.get_start_args().get('debuginput') is not None
-
-        def spread_mm(a, b):
-            if is_debug:
-                return 0.
-            return max([abs(a[n] - b[n]) * sd for n, sd in step_dists.items()])
+        sim = self._sim_taps.pop(axis, None) if is_debug else None
+        sim_base = dict(homing_state.trigger_mcu_pos)
+        tol = cfg['tolerance']
+        stall_dist = cfg['stall_dist']
+        budget = tap_confirm.Budget(cfg['retries'], cfg['stall_retries'])
 
         def run_homing_move(start_dist, move_speed):
             # Pretend to be start_dist away from the endstop so the move
@@ -679,65 +1197,171 @@ class ADXL345Probe:
             homepos = list(startpos)
             homepos[axis_idx] = pos_endstop
             hmove = homing.HomingMove(self.printer, endstops)
+            hmove.muon_speed = move_speed
             wrapper.last_trigger_time = 0.
             hmove.homing_move(homepos, move_speed, check_triggered=False)
             if wrapper.last_trigger_time <= 0.:
-                return None, start_dist
-            trig = {sp.stepper_name: sp.trig_pos
-                    for sp in hmove.stepper_positions}
+                return None, start_dist, {
+                    'halt': {sp.stepper_name: sp.halt_pos
+                             for sp in hmove.stepper_positions}}
+            sps = hmove.stepper_positions
+            trig = {sp.stepper_name: sp.trig_pos for sp in sps}
+            dirs = tap_confirm.tap_dirs(
+                {sp.stepper_name: sp.start_pos for sp in sps}, trig)
             travelled = max([abs(sp.trig_pos - sp.start_pos)
-                             * step_dists[sp.stepper_name]
-                             for sp in hmove.stepper_positions])
-            return trig, travelled
+                             * step_dists[sp.stepper_name] for sp in sps])
+            info = {
+                'dirs': dirs, 'travelled': travelled,
+                'halt': {sp.stepper_name: sp.halt_pos for sp in sps},
+                'follow': max([abs(sp.halt_pos - sp.trig_pos)
+                               * step_dists[sp.stepper_name] for sp in sps]),
+            }
+            if sim is not None:
+                # Debug harness: the tap lands where the test says, in mm
+                # towards the stop from the first tap.
+                off = sim.pop(0) if sim else 0.
+                trig = {n: sim_base[n] + dirs[n] * int(round(
+                    off / step_dists[n])) for n in trig}
+            return trig, travelled, info
+
+        def compare(prev, trig, info):
+            if is_debug and sim is None:
+                return 0., tap_confirm.AGREE
+            delta = tap_confirm.signed_delta(prev, trig, info['dirs'],
+                                             step_dists)
+            kind = tap_confirm.classify(delta, tol, stall_dist)
+            names = sorted(step_dists)
+            logging.info(
+                "adxl345_probe: %s tap compare: prev %s, new %s, delta"
+                " %+.3fmm (%s), approach %.1fmm/s, travelled %.3fmm,"
+                " follow-through %.3fmm", axis,
+                ' '.join(['%s=%d' % (n, prev[n]) for n in names]),
+                ' '.join(['%s=%d' % (n, trig[n]) for n in names]),
+                delta, kind, speed, info['travelled'], info['follow'])
+            return delta, kind
 
         accepted = [dict(homing_state.trigger_mcu_pos)]
-        retries_left = cfg['retries']
+        history = []
+
+        def positions(tap):
+            return ' '.join('%s=%d(%.5fmm)' % (n, tap[n],
+                           tap[n] * step_dists[n]) for n in sorted(step_dists))
+
+        def summary():
+            return '; taps: initial [%s]; %s' % (
+                positions(homing_state.trigger_mcu_pos), '; '.join(history))
+
         seek_left = cfg['seek_retries']
+        stalls = 0
+        missed = 0
         while len(accepted) < cfg['samples']:
-            # Back off, then re-approach over twice the retract distance.
+            # Cap follow-through to avoid driving into the stop on a missed tap.
             retractpos = list(toolhead.get_position())
             retractpos[axis_idx] = pos_endstop - direction * retract_dist
             toolhead.move(retractpos, retract_speed)
-            trig, travelled = run_homing_move(retract_dist * 2., speed)
-            if trig is None:
-                # Nothing within reach: the previous tap was spurious.
+            self._trace_phase = 'confirm'
+            if axis == 'y' and hasattr(self, '_y_tap_log'):
+                self._y_tap_log.kind = 'confirm'
+            trig, travelled, info = run_homing_move(
+                retract_dist + overtravel, speed)
+            # A capped trigger at the commanded end of the approach (the
+            # steps ended there, the position says nothing) is no
+            # measurement.  Not in the debug harness: it has no physical
+            # stop, and every homing move there ends where its steps end.
+            late = (cfg['overtravel'] is not None and trig is not None
+                    and not is_debug
+                    and travelled >= retract_dist + overtravel
+                    - 0.5 * max(step_dists.values()))
+            if trig is None or late:
+                if late:
+                    kind = 'late'
+                elif cfg['overtravel'] is not None:
+                    kind = 'missed'
+                else:
+                    kind = 'no_trigger'
+                history.append('%s halt [%s]'
+                               ' (trigger delta unavailable,'
+                               ' approach %.3fmm)' % (
+                                   kind,
+                                   positions(info['halt']),
+                                   retract_dist + overtravel))
+                if cfg['overtravel'] is not None:
+                    missed += 1
+                    if not budget.take('missed'):
+                        raise cmderr(
+                            "adxl345_probe: %s home aborted: tap not detected"
+                            " within %.3fmm of the previous tap %d times;"
+                            " either the tap threshold is too high or the"
+                            " previous tap was spurious. Seek not resumed,"
+                            " to avoid driving into the stop."
+                            % (axis, overtravel, missed) + summary())
+                    # Undo the approach rebase so missed taps cannot walk
+                    # the capped endpoint further into the stop on retry.
+                    haltpos = list(toolhead.get_position())
+                    haltpos[axis_idx] += direction * overtravel
+                    toolhead.set_position(haltpos)
+                    continue
+                # No tap within reach; retain the bounded seek fallback.
                 # Resume the seek from here within the travel budget.
                 seek_budget -= travelled
+                capped = ""
                 if seek_left <= 0 or seek_budget <= 0.:
                     raise cmderr(
                         "adxl345_probe: %s home tap not confirmed; no"
                         " contact within %.1fmm of the reported tap"
-                        " and seek retries exhausted"
-                        % (axis, retract_dist))
+                        " and seek retries exhausted%s"
+                        % (axis, retract_dist, capped) + summary())
                 seek_left -= 1
                 seek_dist = seek_budget
-                logging.info("adxl345_probe: %s tap judged spurious,"
+                logging.info("adxl345_probe: %s %s,"
                              " resuming seek for up to %.1fmm",
-                             axis, seek_dist)
-                trig, travelled = run_homing_move(seek_dist, hi.speed)
+                             axis, ("capped approach had no trigger"
+                                    if capped else "tap judged spurious"),
+                             seek_dist)
+                self._trace_phase = 'resume_seek'
+                if axis == 'y' and hasattr(self, '_y_tap_log'):
+                    self._y_tap_log.kind = 'resume'
+                trig, travelled, info = run_homing_move(seek_dist, hi.speed)
                 seek_budget -= travelled
                 if trig is None:
+                    history.append('resume_seek no_trigger halt [%s]'
+                                   ' (trigger delta unavailable)'
+                                   % positions(info['halt']))
                     raise cmderr(
                         "adxl345_probe: %s home failed; no tap within"
-                        " %.1fmm of resumed seek" % (axis, seek_dist))
+                        " %.1fmm of resumed seek%s" % (axis, seek_dist, capped)
+                        + summary())
+                history.append('resume_seek [%s] (new anchor)'
+                               % positions(trig))
                 accepted = [trig]
                 continue
-            spread = spread_mm(accepted[-1], trig)
-            if spread <= cfg['tolerance']:
+            delta, kind = compare(accepted[0], trig, info)
+            history.append('[%s] delta %+.3fmm %s vs anchor [%s]' % (
+                positions(trig), delta, kind, positions(accepted[0])))
+            if kind == tap_confirm.AGREE:
                 accepted.append(trig)
                 continue
-            if retries_left <= 0:
+            # Never accept a pair that differs, however regular the
+            # difference: only two taps at the same raw step count prove
+            # that both stopped at first contact (KAN-1361).
+            if kind == tap_confirm.STALL:
+                stalls += 1
+            if not budget.take(kind):
+                why = ""
+                if kind == tap_confirm.STALL:
+                    why = ("; %d taps were driven into the stop: the tap"
+                           " was not detected at first contact" % (stalls,))
                 raise cmderr(
                     "adxl345_probe: %s home taps disagree by %.3fmm"
-                    " (tolerance %.3fmm) after %d retries"
-                    % (axis, spread, cfg['tolerance'], cfg['retries']))
-            retries_left -= 1
-            logging.info("adxl345_probe: %s taps disagree by %.3fmm,"
-                         " retrying confirmation", axis, spread)
+                    " (tolerance %.3fmm) after %d retries%s"
+                    % (axis, abs(delta), tol, budget.used, why) + summary())
+            logging.info("adxl345_probe: %s taps disagree by %.3fmm (%s),"
+                         " retrying confirmation", axis, abs(delta), kind)
             accepted = [trig]
         homing_state.trigger_mcu_pos.update(accepted[-1])
         logging.info("adxl345_probe: %s home confirmed with %d agreeing"
-                     " taps", axis, len(accepted))
+                     " taps after %d retries (%d driven into the stop)",
+                     axis, len(accepted), budget.used, stalls)
 
     def _handle_command_error(self):
         if self._tap_mode == 'axis_homing':
@@ -745,7 +1369,12 @@ class ADXL345Probe:
                 self._stop_tap('axis_homing')
             except Exception:
                 logging.exception("ADXL345 axis homing cleanup failed")
-            self._reset_axis_homing_state()
+            try:
+                self._release_onset_client()
+            except Exception:
+                logging.exception("ADXL345 onset client release failed")
+            finally:
+                self._reset_axis_homing_state()
         elif self._tap_mode == 'tap_test':
             try:
                 self._stop_tap('tap_test')

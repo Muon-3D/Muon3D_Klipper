@@ -735,7 +735,7 @@ def line_for(entry, end=1):
                    if k == 'ALGORITHM' else '+' if k == 'Z' else 'PAUSE'
                    if k == 'MACRO' else '5'
                    if k == 'LAYER' else 'normal'
-                   if k == 'MODE' else '1,2')
+                   if k == 'MODE' else 'y' if k == 'AXES' else '1,2')
         else:
             val = v.replace('*', 'X')
         if traditional and v == '*':

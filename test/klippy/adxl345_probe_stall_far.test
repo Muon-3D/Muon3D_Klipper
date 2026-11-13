@@ -1,0 +1,7 @@
+# KAN-1361: more than one electrical cycle further is not a stall either.
+CONFIG adxl345_probe_stall.cfg
+DICTIONARY linuxprocess.dict
+SHOULD_FAIL
+
+ADXL_TAP_SIMULATE AXIS=y OFFSETS=1.2,2.4,3.6,3.6
+G28 Y
