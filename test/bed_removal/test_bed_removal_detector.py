@@ -285,6 +285,21 @@ class PausesOnlyWhileAFileIsPrinting(unittest.TestCase):
         self.assertIn("bed_removal_detector:removed",
                       self.m.printer.events)
 
+    def test_event_is_sent_after_heater_off_and_before_the_pause(self):
+        # Under virtual_sdcard the pause waits in the reactor, so listeners
+        # (contact_guard) must hear about the removal before it, but the
+        # heater is zeroed first.
+        seen = []
+        def listener():
+            seen.append((self.m.bed.heater.target,
+                         self.m.pause_resume.pauses_sent))
+        self.m.printer.register_event_handler(
+            "bed_removal_detector:removed", listener)
+        self.m.start_file()
+        self.m.pull_plate()
+        self.assertEqual(seen, [(0., 0)])
+        self.assert_paused()
+
     def test_removal_tells_contact_guard(self):
         # contact_guard drops the known plate height on this event
         self.m.pull_plate()
