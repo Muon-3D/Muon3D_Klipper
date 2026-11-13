@@ -27,9 +27,14 @@
 # limits. Before that, targets are clamped to the axis limits and z_min,
 # and below the notch height (bed_mesh no_go_traverse_z) an XY jog stops at
 # the edge of a bed_mesh no_go_region instead of entering it; a Z jog over
-# the notch stops at the notch height. Any error ends the jog (fail closed):
+# the notch stops at the notch height. With a [contact_guard] a jog starts
+# only while the plate height is known (a lift is not enough for a live
+# drag) and ends if it is lost, and a Z jog stops at the guard's minimum Z
+# for its XY (a jog that starts below it may only go up). Any error ends
+# the jog (fail closed):
 # the queued batches still run (at most max_ahead), nothing more is sent.
 import logging, math
+from . import contact_guard
 
 EPS = 1e-6
 # A batch shorter than this is not worth a trapezoid of its own
@@ -63,6 +68,7 @@ class MuonJog:
         self.reason = ""
         self.sessions = 0
         self.toolhead = self.gcode_move = self.mcu = None
+        self.guard = None
         self.print_stats = self.motion_report = None
         self.timer = self.reactor.register_timer(self._tick)
         self.printer.register_event_handler('klippy:connect',
@@ -100,6 +106,7 @@ class MuonJog:
         self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode_move = self.printer.lookup_object('gcode_move')
         self.mcu = self.printer.lookup_object('mcu')
+        self.guard = self.printer.lookup_object('contact_guard', None)
         self.print_stats = self.printer.lookup_object('print_stats', None)
         self.motion_report = self.printer.lookup_object('motion_report',
                                                         None)
@@ -114,6 +121,16 @@ class MuonJog:
     def _kin(self, eventtime):
         return self.toolhead.get_kinematics().get_status(eventtime)
 
+    def _height_known(self, eventtime, pos):
+        if self.guard is None:
+            return True
+        return self.guard.jog_limits(pos, eventtime=eventtime)[0]
+
+    def _guard_floor(self, eventtime, pos):
+        if self.guard is None:
+            return None
+        return self.guard.jog_limits(pos, eventtime=eventtime)[1]
+
     # Target clamping, in gcode_move.last_position coordinates (G-code
     # plus the G92/offset base), which is what move_with_transform takes
     def _clamp(self, axes, start, target, eventtime):
@@ -122,10 +139,24 @@ class MuonJog:
         lo[2] = max(lo[2], self.z_min)
         out = list(start)
         why = ""
+        floor = None
+        if axes == 'Z':
+            # The guard's minimum Z at this XY (a Z jog never moves XY). A
+            # floor never holds the plate back from rising: a jog that
+            # starts below it may only go up
+            floor = self._guard_floor(eventtime, start)
+            if floor is not None:
+                lo[2] = max(lo[2], floor)
+            lo[2] = min(lo[2], start[2])
         for i in ((0, 1) if axes == 'XY' else (2,)):
             v = min(max(target[i], lo[i]), hi[i])
             if abs(v - target[i]) > EPS:
-                why = "held at the machine's limits"
+                if (i == 2 and floor is not None and v >= floor - EPS
+                        and target[i] < v):
+                    why = ("held at Z%g: the plate is not safe below it"
+                           % (v,))
+                else:
+                    why = "held at the machine's limits"
             out[i] = v
         if not self.regions:
             return out, why
@@ -196,7 +227,8 @@ class MuonJog:
             raise gcmd.error("Not while printing: moving the head would "
                              "ruin the print")
         homed = self._kin(eventtime)['homed_axes']
-        need = 'z' if axes == 'Z' else 'xy'
+        # The plate moves in Z, so a Z jog needs the head's XY known too
+        need = 'xyz' if axes == 'Z' else 'xy'
         if not all(a in homed for a in need):
             raise gcmd.error("Home %s first" % (need.upper(),))
         speed = gcmd.get_float('SPEED', self.max_speed[axes], above=0.)
@@ -213,6 +245,8 @@ class MuonJog:
             s = None
         gm = self.gcode_move
         if s is None:
+            if not self._height_known(eventtime, gm.last_position):
+                raise gcmd.error(contact_guard.REFUSAL_HOME)
             s = {'axes': axes, 'own': list(gm.last_position), 'batches': []}
             self.sessions += 1
         base = gm.base_position
@@ -278,8 +312,12 @@ class MuonJog:
             self._end("a print started")
             return
         homed = self._kin(eventtime)['homed_axes']
-        if not all(a in homed for a in s['axes'].lower()):
+        if not all(a in homed for a in
+                   ('xyz' if s['axes'] == 'Z' else 'xy')):
             self._end("homing was lost")
+            return
+        if not self._height_known(eventtime, gm.last_position):
+            self._end(contact_guard.REFUSAL_HOME)
             return
         est = self.mcu.estimated_print_time(eventtime)
         ahead, ahead_t = self._ahead(s, est)

@@ -24,6 +24,9 @@ sys.path.insert(0, os.path.join(ROOT, 'klippy'))
 
 from extras import muon_jog  # noqa: E402
 from extras import muon_guard  # noqa: E402
+# The real ContactGuard and its fakes (test/contact_guard)
+sys.path.insert(0, os.path.join(ROOT, 'test', 'contact_guard'))
+import test_height_guard as hg  # noqa: E402
 try:
     import serial  # noqa: F401
 except ImportError:
@@ -103,12 +106,26 @@ class Gcode:
 class Kin:
     max_z_velocity = 15.
 
-    def __init__(self):
-        self.homed = 'xyz'
+    homed = 'xyz'
 
     def get_status(self, eventtime):
         return {'axis_minimum': LIMITS[0] + (0.,),
                 'axis_maximum': LIMITS[1] + (0.,), 'homed_axes': self.homed}
+
+
+class GuardKin(Kin):
+    """homed_axes is the real guard rig's, so what a test does to the
+    guard's toolhead is what the jog sees too"""
+    def __init__(self, rig):
+        self.rig = rig
+
+    @property
+    def homed(self):
+        return self.rig.printer.toolhead.homed_axes
+
+    @homed.setter
+    def homed(self, v):
+        self.rig.printer.toolhead.homed_axes = v
 
 
 class Toolhead:
@@ -265,8 +282,11 @@ def core_cfg():
     return cp
 
 
-def make(pos=(100., 100., 20.), notch=True):
+def make(pos=(100., 100., 20.), notch=True, rig=None):
     printer = Printer(pos)
+    if rig is not None:
+        printer.toolhead.kin = GuardKin(rig)
+        printer.objects['contact_guard'] = rig.guard
     cp = core_cfg()
     sections = {'muon_jog': dict(cp.items('muon_jog'))}
     if notch:
@@ -383,7 +403,8 @@ def test_axis_limits():
     p, j = make((100., 100., 5.), notch=False)
     w = Watch(p, (2,))
     w.run(3., refresh=lambda: jog(p, Z='-50', SPEED='10'))
-    check(min(t[2] for t in w.trace) >= -1e-6, "Z stops at z_min 0, not -4")
+    check(min(t[2] for t in w.trace) >= -1e-6,
+          "without a [contact_guard] Z stops at z_min 0, not -4")
     p, j = make((190., 100., 20.))
     w = Watch(p, (0, 1))
     w.run(2., refresh=lambda: jog(p, X='500', Y='-80', SPEED='100'))
@@ -461,7 +482,15 @@ def test_refusals():
             (lambda p: setattr(p.print_stats, 'state', 'printing'),
              {'Z': '30'}, 'printing'),
             (lambda p: setattr(p.toolhead.kin, 'homed', 'xy'),
-             {'Z': '30'}, 'Home Z'),
+             {'Z': '30'}, 'Home XYZ'),
+            (lambda p: setattr(p.toolhead.kin, 'homed', 'z'),
+             {'Z': '30'}, 'Home XYZ'),
+            (lambda p: setattr(p.toolhead.kin, 'homed', 'xz'),
+             {'Z': '30'}, 'Home XYZ'),
+            (lambda p: setattr(p.toolhead.kin, 'homed', 'xy'),
+             {'X': '30'}, None),
+            (lambda p: setattr(p.toolhead.kin, 'homed', 'z'),
+             {'X': '30'}, 'Home XY'),
             (lambda p: None, {'X': '1', 'Z': '30'}, 'not both'),
             (lambda p: None, {}, 'needs a target')):
         p, j = make()
@@ -471,6 +500,10 @@ def test_refusals():
             got = None
         except CommandError as e:
             got = str(e)
+        if word is None:
+            check(got is None and j.session is not None,
+                  "accepted %r" % (params,))
+            continue
         check(got is not None and word in got and j.session is None,
               "refused %r: %r" % (params, got))
 
@@ -513,6 +546,112 @@ def test_real_lookahead_ends_at_rest():
           "real LookAheadQueue.flush(lazy=False) ends the batch at rest")
 
 
+def guarded(pos, mesh=False, homed=True):
+    rig = hg.Rig(z=pos[2], homed=homed, mesh=mesh)
+    p, j = make(pos, notch=False, rig=rig)
+    return rig, p, j
+
+
+def refused(p, **params):
+    try:
+        jog(p, **params)
+    except CommandError as e:
+        return str(e)
+    return None
+
+
+def test_guard_z_floor():
+    # No bed mesh: contact_z 0.1 + unmeshed_margin 2.5
+    rig, p, j = guarded((100., 100., 20.))
+    w = Watch(p, (2,))
+    w.run(4., refresh=lambda: jog(p, Z='-50', SPEED='10'))
+    low = min(t[2] for t in w.trace)
+    check(abs(low - 2.6) < 1e-6 and abs(w.pos()[2] - 2.6) < 1e-6,
+          "no mesh: Z stops at the guard floor 2.6 (low %.3f)" % low)
+    check('Z2.6' in j.session['clamp'], "and says why: %r"
+          % j.session['clamp'])
+    # A probed mesh: contact_z 0.1
+    rig, p, j = guarded((100., 100., 20.), mesh=True)
+    w = Watch(p, (2,))
+    w.run(4., refresh=lambda: jog(p, Z='-50', SPEED='10'))
+    low = min(t[2] for t in w.trace)
+    check(abs(low - 0.1) < 1e-6 and abs(w.pos()[2] - 0.1) < 1e-6,
+          "with a mesh: Z stops at 0.1 (low %.3f)" % low)
+    # The floor never holds the plate back from rising
+    rig, p, j = guarded((100., 100., 1.0))
+    w = Watch(p, (2,))
+    w.run(1., refresh=lambda: jog(p, Z='-50', SPEED='10'))
+    check(min(t[2] for t in w.trace) >= 1.0 - 1e-6
+          and abs(w.pos()[2] - 1.0) < 1e-6,
+          "started below the floor: down goes nowhere")
+    w.run(3., refresh=lambda: jog(p, Z='10', SPEED='10'))
+    check(abs(w.pos()[2] - 10.) < 1e-6,
+          "started below the floor: up is allowed (Z %.2f)" % w.pos()[2])
+    rig, p, j = guarded((100., 100., 0.05), mesh=True)
+    w = Watch(p, (2,))
+    w.run(2., refresh=lambda: jog(p, Z='5', SPEED='10'))
+    check(abs(w.pos()[2] - 5.) < 1e-6,
+          "started below the mesh floor 0.1: up is allowed")
+
+
+def test_guard_start_needs_the_height():
+    rig, p, j = guarded((100., 100., 20.), homed=False)
+    # Z homed flag set but never trusted (a fake home)
+    rig.printer.toolhead.homed_axes = 'xyz'
+    for params in ({'Z': '30'}, {'X': '120', 'Y': '100'}):
+        got = refused(p, **params)
+        check(got == hg.HOME_FIRST and j.session is None,
+              "height unknown refuses %r with the guard text" % (params,))
+    # A lift is not enough for a live drag
+    rig, p, j = guarded((100., 100., 20.), homed=False)
+    hg.g28_xy(rig)
+    rig.printer.toolhead.homed_axes = 'xyz'
+    st = rig.status()
+    check(st['lift_clear'] and not st['z_known'],
+          "the guard is in the lift-only state")
+    for params in ({'Z': '30'}, {'X': '120', 'Y': '100'}):
+        got = refused(p, **params)
+        check(got == hg.HOME_FIRST and j.session is None,
+              "lift-only refuses %r too" % (params,))
+    # Known: starts
+    rig, p, j = guarded((100., 100., 20.))
+    check(refused(p, Z='30') is None and j.session is not None,
+          "height known: the jog starts")
+
+
+def test_guard_height_lost_ends_the_jog():
+    for axes, params in (('Z', {'Z': '150'}),
+                         ('XY', {'X': '180', 'Y': '100'})):
+        rig, p, j = guarded((100., 100., 20.))
+        w = Watch(p, (2,) if axes == 'Z' else (0, 1))
+        w.run(0.5, refresh=lambda: jog(p, SPEED='10', **params))
+        check(j.session is not None, "%s jog is running" % axes)
+        rig.printer.send_event("bed_removal_detector:removed")
+        w.run(0.1)
+        check(j.session is None and j.reason == hg.HOME_FIRST,
+              "%s jog ends when the height is lost: %r" % (axes, j.reason))
+        n = len(p.toolhead.batches)
+        w.run(0.5)
+        check(len(p.toolhead.batches) == n, "and queues nothing more")
+
+
+def test_guard_z_jog_needs_xyz_homed():
+    for homed in ('z', 'xz', 'yz'):
+        rig, p, j = guarded((100., 100., 20.))
+        rig.printer.toolhead.homed_axes = homed
+        got = refused(p, Z='30')
+        check(got is not None and 'Home XYZ' in got and j.session is None,
+              "Z jog refused with only %r homed: %r" % (homed, got))
+    rig, p, j = guarded((100., 100., 20.))
+    jog(p, Z='30', SPEED='10')
+    w = Watch(p, (2,))
+    w.run(0.2)
+    rig.printer.toolhead.homed_axes = 'z'
+    w.run(0.2)
+    check(j.session is None and 'homing was lost' in j.reason,
+          "a running Z jog ends when X or Y is no longer homed")
+
+
 def test_allowlisted():
     cp = core_cfg()
     entries = cp.get('muon_guard', 'client_allow').split('\n')
@@ -532,5 +671,7 @@ if __name__ == '__main__':
     for name, fn in sorted(globals().items()):
         if name.startswith('test_'):
             fn()
+    for f in FAILS:
+        print('FAILED: ' + f)
     print('%d failed' % len(FAILS))
     sys.exit(1 if FAILS else 0)
