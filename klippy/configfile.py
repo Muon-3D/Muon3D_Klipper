@@ -152,6 +152,8 @@ SAFETY_SECTIONS = frozenset([
     'verify_heater',        # thermal runaway detection
     'force_move',           # unhomed, unchecked motion
     'bed_removal_detector', # plate-off detection thresholds
+    'muon_guard',           # the client allowlist and the dev-mode check
+    'contact_guard',        # nozzle-on-plate XY refusal and its off switch
     'mcu',                  # which board is which, and how it is reset
     # Sections that carry executable G-code, or arm a timer that runs it.
     # SAVE_CONFIG never writes any of these -- every configfile.set() caller
