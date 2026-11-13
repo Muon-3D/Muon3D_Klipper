@@ -143,6 +143,7 @@ class FakePrinter:
         self.reactor = reactor
         self.objects = {}
         self.handlers = {}
+        self.events = []
         self.with_sdcard = with_sdcard
 
     def get_reactor(self):
@@ -160,6 +161,10 @@ class FakePrinter:
 
     def register_event_handler(self, event, callback):
         self.handlers.setdefault(event, []).append(callback)
+
+    def send_event(self, event, *params):
+        self.events.append(event)
+        return [cb(*params) for cb in self.handlers.get(event, [])]
 
 
 class FakeConfig:
@@ -265,6 +270,12 @@ class PausesOnlyWhileAFileIsPrinting(unittest.TestCase):
         self.assertEqual(self.m.bed.heater.target, 0.)
         self.assertTrue(self.status()['bedRemoved'])
         self.assertEqual(self.m.gcode.scripts, ['BED_REMOVED'])
+
+    def test_removal_tells_contact_guard(self):
+        # contact_guard drops the known plate height on this event
+        self.m.pull_plate()
+        self.assertIn("bed_removal_detector:removed",
+                      self.m.printer.events)
 
     def test_mid_print_removal_pauses(self):
         # KAN-79: the behaviour that must not regress.

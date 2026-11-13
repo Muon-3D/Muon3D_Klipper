@@ -144,6 +144,7 @@ finish_test load_cell "Test load cell collector is stopped on a failed tap"
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
+$PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
 
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands

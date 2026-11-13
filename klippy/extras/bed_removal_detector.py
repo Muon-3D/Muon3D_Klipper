@@ -108,6 +108,9 @@ class BedRemovalDetector:
 
     def handle_bed_removal(self, eventtime):
         self.bed_removed = True
+        # The plate goes back on wherever it seats: contact_guard no longer
+        # knows its height
+        self.printer.send_event("bed_removal_detector:removed")
         # Remember what the bed was asked for before zeroing it. Nothing else
         # records this, and without it a resume after reattaching continues
         # the print onto a cold plate -- which on ABS or PETG is the warping
