@@ -171,6 +171,67 @@ def test_bad_values_still_error():
     check(r.th.v == MAX_V, "and changes nothing")
 
 
+def test_nan_is_refused_and_changes_nothing():
+    for spelling in ('nan', 'NaN', 'NAN', '-nan', '+nan'):
+        for key in ('VELOCITY', 'ACCEL', 'SQUARE_CORNER_VELOCITY',
+                    'MINIMUM_CRUISE_RATIO'):
+            r = rig()
+            before = (r.th.v, r.th.a, r.th.scv, r.th.mcr)
+            err = r.client('SET_VELOCITY_LIMIT %s=%s' % (key, spelling))
+            check(err is not None and 'Refused' in str(err),
+                  "%s=%s is refused: %r" % (key, spelling, err))
+            check((r.th.v, r.th.a, r.th.scv, r.th.mcr) == before,
+                  "%s=%s leaves the limits alone: %r"
+                  % (key, spelling, (r.th.v, r.th.a, r.th.scv, r.th.mcr)))
+    r = rig()
+    err = r.client('SET_VELOCITY_LIMIT VELOCITY=nan ACCEL=nan')
+    check(err is not None and (r.th.v, r.th.a) == (MAX_V, MAX_A),
+          "VELOCITY=nan ACCEL=nan refused, limits kept: %r" % (err,))
+    # one NaN refuses the whole command, even beside a good value
+    r = rig()
+    err = r.client('SET_VELOCITY_LIMIT VELOCITY=300 ACCEL=nan')
+    check(err is not None and r.th.v == MAX_V,
+          "a NaN beside a good value refuses all of it: %r" % (limits(r),))
+
+
+def test_nan_m204():
+    # The traditional parser splits M204 on letters, so no spelling of nan
+    # reaches a value; every one must still leave the limits unchanged.
+    for spelling in ('nan', 'NaN', '-nan', '+nan'):
+        for line in ('M204 S%s', 'M204 P%s T%s', 'M204 S%s P%s T%s'):
+            r = rig()
+            try:
+                r.client(line % ((spelling,) * line.count('%s')))
+            except Exception:
+                pass
+            check(r.th.a == MAX_A,
+                  "%r leaves ACCEL alone: %r" % (line % ((spelling,) *
+                  line.count('%s')), r.th.a))
+
+
+def test_inf_still_clamps():
+    r = rig()
+    err = r.client('SET_VELOCITY_LIMIT VELOCITY=inf ACCEL=+inf '
+                   'SQUARE_CORNER_VELOCITY=Infinity')
+    check(err is None, "inf is not refused: %r" % (err,))
+    check(limits(r) == (MAX_V, MAX_A, SCV), "inf clamps to the maxima: %r"
+          % (limits(r),))
+
+
+def test_nan_from_a_macro_is_not_this_modules_business():
+    r = rig()
+    r.from_macro('SET_VELOCITY_LIMIT VELOCITY=nan')
+    check(r.th.v != r.th.v, "a macro's NaN reaches the toolhead as before:"
+          " %r" % (r.th.v,))
+
+
+def test_normal_value_still_passes():
+    r = rig()
+    err = r.client('SET_VELOCITY_LIMIT VELOCITY=250 ACCEL=9000')
+    check(err is None and (r.th.v, r.th.a) == (250., 9000.),
+          "a normal value passes: %r %r" % (err, limits(r)))
+
+
 def test_query_still_reports():
     r = rig()
     r.client('SET_VELOCITY_LIMIT')

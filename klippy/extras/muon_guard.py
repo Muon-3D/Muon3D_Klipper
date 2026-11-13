@@ -33,6 +33,7 @@
 # path) is NOT dev mode.
 import fnmatch
 import logging
+import math
 import os
 import re
 import shlex
@@ -103,6 +104,11 @@ CLAMPED = {
                            ('SQUARE_CORNER_VELOCITY',
                             '@square_corner_velocity')),
     'M204': (('S', '@max_accel'), ('P', '@max_accel'), ('T', '@max_accel')),
+}
+# Not clamped, but a NaN in any of these passes the toolhead's range checks
+# (every comparison with NaN is False) and is then stored as the limit.
+NAN_CHECKED = {
+    'SET_VELOCITY_LIMIT': ('MINIMUM_CRUISE_RATIO',),
 }
 
 
@@ -244,6 +250,19 @@ class MuonGuard:
         params = gcmd.get_command_parameters()
         new = dict(params)
         notes = []
+        for key in tuple(k for k, _ in CLAMPED[name]) + NAN_CHECKED.get(
+                name, ()):
+            try:
+                nan = math.isnan(float(params[key]))
+            except (KeyError, ValueError):
+                continue
+            if nan:
+                # NaN is never a request: `nan > lim` is False, so it would
+                # pass the clamp and the toolhead would keep it as the limit.
+                logging.info("muon_guard: refused %s: %s is NaN",
+                             gcmd.get_commandline(), key)
+                raise gcmd.error("Refused: %s, %s is not a number"
+                                 % (name, key))
         try:
             for key, limit in CLAMPED[name]:
                 try:
