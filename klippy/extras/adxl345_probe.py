@@ -1266,9 +1266,10 @@ class ADXL345Probe:
                 retract_dist + overtravel, speed)
             # A capped trigger at the commanded end of the approach (the
             # steps ended there, the position says nothing) is no
-            # measurement.  Debug-harness taps are placed by the test.
+            # measurement.  Not in the debug harness: it has no physical
+            # stop, and every homing move there ends where its steps end.
             late = (cfg['overtravel'] is not None and trig is not None
-                    and sim is None
+                    and not is_debug
                     and travelled >= retract_dist + overtravel
                     - 0.5 * max(step_dists.values()))
             if trig is None or late:
