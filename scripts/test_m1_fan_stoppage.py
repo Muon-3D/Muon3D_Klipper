@@ -25,6 +25,12 @@ FANS = (
      'Power Supply'),
 )
 MAX_STOPS = 3
+# Pass (1-based) of a fan dead from the start on which the routine first
+# fires: pass 1 only records prev_speed, so CPU/MD judge from pass 2 and trip
+# on pass 4; the PSU fan also waits warmup_passes (3), so it trips on pass 6.
+CPU_FIRST = 4
+MD_FIRST = 4
+PSU_FIRST = 6
 
 
 class FanTripsOnce(_M1TestCase):
@@ -51,36 +57,84 @@ class FanTripsOnce(_M1TestCase):
                 if line.startswith('M118') and 'WARNING' in line
                 and word in line]
 
-    def check_one(self, macro, counter, name):
+    def run_pass(self, macro, name):
+        # FAN_STOPPAGE_ROUTINE is only recorded here; the real one pauses a
+        # running print, so do the same when it fires.
+        before = len(self.trips(name))
+        self.m1.run(macro)
+        if len(self.trips(name)) > before:
+            self.m1.print_stats['state'] = 'paused'
+
+    def passes_to_first_trip(self, macro, name, limit=20):
+        # 1-based index of the pass on which the routine first fires
+        for i in range(1, limit + 1):
+            self.run_pass(macro, name)
+            if self.trips(name):
+                return i
+        self.fail("%s never tripped in %d passes" % (macro, limit))
+
+    def check_one(self, macro, counter, name, first_trip):
         status = self.fans[macro]
+        stats = self.m1.print_stats
+        stats['state'] = 'printing'
         status.update(speed=0.5, rpm=0.0)
         self.m1.timeline.clear()
         self.m1.responses.clear()
-        for i in range(12):     # 36 s of a dead fan at the 3 s cadence
-            self.m1.run(macro)
+        # The pass index pins each fan's warm-up: the PSU fan has 3 extra
+        # passes, so changing warmup_passes moves this and fails the test.
+        self.assertEqual(self.passes_to_first_trip(macro, name), first_trip)
+        for i in range(12):     # 36 s more of a dead fan at the 3 s cadence
+            self.run_pass(macro, name)
         self.assertEqual(len(self.trips(name)), 1,
                          "%s tripped %d times" % (macro,
                                                   len(self.trips(name))))
         self.assertEqual(self.m1.macro_vars(macro)[counter], MAX_STOPS)
         self.assertEqual(len(self.warnings(macro)), MAX_STOPS,
                          self.m1.timeline)
+        # The routine paused the print. Still dead and still paused: quiet.
+        stats['state'] = 'paused'
+        for i in range(12):
+            self.m1.run(macro)
+        self.assertEqual(len(self.trips(name)), 1)
+        self.assertEqual(len(self.warnings(macro)), MAX_STOPS)
+        # RESUME onto the still-dead fan: the next pass trips again, with no
+        # new warning, and every pass while it runs on does the same.
+        stats['state'] = 'printing'
+        self.run_pass(macro, name)
+        self.assertEqual(stats['state'], 'paused')
+        self.assertEqual(len(self.trips(name)), 2)
+        self.assertEqual(len(self.warnings(macro)), MAX_STOPS)
+        self.assertEqual(self.m1.macro_vars(macro)[counter], MAX_STOPS)
+        # Paused again (the routine's doing): quiet once more
+        stats['state'] = 'paused'
+        self.m1.run(macro)
+        self.assertEqual(len(self.trips(name)), 2)
         # Healthy again: the counter re-arms, and a new episode trips again
         status['rpm'] = 4000.0
         self.m1.run(macro)
         self.assertEqual(self.m1.macro_vars(macro)[counter], 0)
-        status['rpm'] = 0.0
-        for i in range(12):
+        # A healthy fan in a running print never trips
+        stats['state'] = 'printing'
+        for i in range(5):
             self.m1.run(macro)
         self.assertEqual(len(self.trips(name)), 2)
+        status['rpm'] = 0.0
+        for i in range(2):
+            self.run_pass(macro, name)
+        self.assertEqual(len(self.trips(name)), 2)    # 2 of 3 passes
+        self.run_pass(macro, name)
+        self.assertEqual(len(self.trips(name)), 3)    # 3rd bad pass trips
 
     def test_cpu_fan_trips_once(self):
-        self.check_one('CPU_FAN_CHECK', 'cpu_stop_count', 'CPU')
+        self.check_one('CPU_FAN_CHECK', 'cpu_stop_count', 'CPU', CPU_FIRST)
 
     def test_motor_driver_fan_trips_once(self):
-        self.check_one('MD_FAN_CHECK', 'md_stop_count', 'Motor Drivers')
+        self.check_one('MD_FAN_CHECK', 'md_stop_count', 'Motor Drivers',
+                       MD_FIRST)
 
     def test_psu_fan_trips_once(self):
-        self.check_one('PSU_FAN_CHECK', 'ps_stop_count', 'Power Supply')
+        self.check_one('PSU_FAN_CHECK', 'ps_stop_count', 'Power Supply',
+                       PSU_FIRST)
 
 
 if __name__ == '__main__':
