@@ -746,7 +746,8 @@ def line_for(entry, end=1):
             val = ('PLA' if 'MATERIAL' in k else 'bicubic'
                    if k == 'ALGORITHM' else '+' if k == 'Z' else 'PAUSE'
                    if k == 'MACRO' else '5'
-                   if k == 'LAYER' else '1,2')
+                   if k == 'LAYER' else 'normal'
+                   if k == 'MODE' else '1,2')
         else:
             val = v.replace('*', 'X')
         if traditional and v == '*':
@@ -1758,6 +1759,43 @@ def test_print_start_tokens_cannot_inject():
             continue
         check(rig.client(line) is not None,
               "PRINT_START refused: %s" % (line,))
+
+
+def test_set_print_mode():
+    # Control v4's print-mode cards send SET_PRINT_MODE MODE=<mode>, lower
+    # case. MODE is held to the [fan_modes] modes; bare SET_PRINT_MODE only
+    # reports the mode.
+    with open(CORE_CFG, encoding='utf-8') as f:
+        text = f.read().replace('\r\n', '\n')
+    m = re.search(r'^\[fan_modes\]\n(.*?)(?=^\[|\Z)', text, re.S | re.M)
+    check(m is not None, "core.cfg has a [fan_modes] section")
+    modes = re.search(r'^modes:\s*(.*)$', m.group(1), re.M).group(1)
+    modes = [x.strip() for x in modes.split(',')]
+    check(modes == ['normal', 'quiet', 'turbo'],
+          "[fan_modes] offers normal, quiet, turbo: %r" % (modes,))
+    entries = [e.strip() for e in core_allow().split('\n')
+               if e.strip().startswith('SET_PRINT_MODE')]
+    check(entries == ['SET_PRINT_MODE MODE=~' + '|'.join(modes)],
+          "SET_PRINT_MODE is allowlisted with MODE held to exactly the "
+          "[fan_modes] modes: %r" % (entries,))
+    rig = Rig()
+    for mode in modes:
+        for door in ('webhooks', 'pty', 'file'):
+            line = 'SET_PRINT_MODE MODE=%s' % (mode,)
+            err = rig.client(line, door)
+            check(err is None, "%s passes via %s (%s)" % (line, door, err))
+            check(rig.calls == [line], "and runs: %s" % (line,))
+    check(rig.client('SET_PRINT_MODE') is None,
+          "bare SET_PRINT_MODE (report the mode) passes")
+    for line in ('SET_PRINT_MODE MODE=fast', 'SET_PRINT_MODE MODE=normal2',
+                 'SET_PRINT_MODE MODE=xnormal', 'SET_PRINT_MODE MODE=',
+                 'SET_PRINT_MODE MODE="normal X=1"',
+                 'SET_PRINT_MODE MODE=normal SPEED=1'):
+        err = rig.client(line)
+        check(err is not None and refused_text_ok(err),
+              "unknown mode or extra parameter refused: %s (%r)"
+              % (line, err))
+        check(rig.calls == [], "and nothing ran: %s" % (line,))
 
 
 def main():
