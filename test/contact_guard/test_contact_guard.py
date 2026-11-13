@@ -50,11 +50,26 @@ class FakeConfig:
         return self.printer
     def _get(self, name, default):
         return self.values.get(name, default)
+    def get(self, name, default=None):
+        return self._get(name, default)
+    def error(self, msg):
+        return ConfigError(msg)
+    def _bounded(self, name, v, minval=None, maxval=None, above=None):
+        # As configfile does: out of range is a config error
+        if minval is not None and v < minval:
+            raise ConfigError("%s must have minimum of %s" % (name, minval))
+        if maxval is not None and v > maxval:
+            raise ConfigError("%s must have maximum of %s" % (name, maxval))
+        if above is not None and v <= above:
+            raise ConfigError("%s must be above %s" % (name, above))
+        return v
     def getint(self, name, default=None, minval=None, maxval=None):
-        return int(self._get(name, default))
+        return self._bounded(name, int(self._get(name, default)),
+                             minval, maxval)
     def getfloat(self, name, default=None, minval=None, maxval=None,
                  above=None):
-        return float(self._get(name, default))
+        return self._bounded(name, float(self._get(name, default)),
+                             minval, maxval, above)
 
 
 class FakeReactor:
@@ -131,15 +146,23 @@ class FakeToolhead:
         self.homed_axes = 'xyz'
         self.print_time = 0.    # end of the queued motion
         self.waits = 0
+        self.steppers = [FakeStepper('x', 'stepper_x'),
+                         FakeStepper('y', 'stepper_y'),
+                         FakeStepper('z', 'stepper_z')]
     def get_kinematics(self):
         return self
     def get_steppers(self):
-        return [FakeStepper('x', 'stepper_x'), FakeStepper('y', 'stepper_y'),
-                FakeStepper('z', 'stepper_z')]
+        return list(self.steppers)
+    def stepper(self, axis):
+        return [s for s in self.steppers if s.axis == axis][0]
     def get_status(self, eventtime):
         return {'homed_axes': self.homed_axes}
     def wait_moves(self):
         self.waits += 1
+        # Motion queued ahead (see Rig.z_steps) has now run
+        pending, self.pending = getattr(self, 'pending', []), []
+        for run in pending:
+            run()
     def get_last_move_time(self):
         return self.print_time
     def get_position(self):
@@ -212,6 +235,9 @@ class FakeStepper:
     def __init__(self, axis, name=None):
         self.axis = axis
         self.name = name or 'stepper_' + axis
+        self.mcu_pos = 100000   # raw steps; up is + for z
+    def get_mcu_position(self):
+        return self.mcu_pos
     def get_name(self):
         return self.name
     def is_active_axis(self, axis):
@@ -237,17 +263,17 @@ class FakeStepperEnable:
 
 
 class FakeStepperPosition:
-    def __init__(self, axis, travel):
+    def __init__(self, axis, travel, start=100000):
         # travel > 0 is down (toward the plate), < 0 up
         self.stepper = FakeStepper(axis)
-        self.start_pos = 100000
+        self.start_pos = start
         self.trig_pos = self.start_pos - int(round(travel / 0.0025))
 
 
 class FakeHomingMove:
     """What homing_move_end sees: how far each stepper went to trigger."""
-    def __init__(self, axis='z', travel=5.):
-        self.stepper_positions = [FakeStepperPosition(axis, travel)]
+    def __init__(self, axis='z', travel=5., start=100000):
+        self.stepper_positions = [FakeStepperPosition(axis, travel, start)]
 
 
 class FakeHomingState:
@@ -262,6 +288,10 @@ class Rig:
     def __init__(self, values=None, z=5.):
         self.printer = FakePrinter()
         self.printer.toolhead.position[2] = z
+        # This file tests the load cell contact model, which is no longer
+        # the default move guard (test_height_guard.py tests that)
+        values = dict(values or {})
+        values.setdefault("move_guard", "load_cell")
         self.guard = contact_guard.load_config(
             FakeConfig(self.printer, values))
         self.printer.send_event("klippy:connect")
@@ -302,9 +332,23 @@ class Rig:
             except CommandError:
                 self.printer.send_event("gcode:command_error")
     def homing_move(self, axis='z', travel=5.):
-        hmove = FakeHomingMove(axis, travel)
+        stepper = self.printer.toolhead.stepper(axis)
+        hmove = FakeHomingMove(axis, travel, stepper.mcu_pos)
         self.printer.send_event("homing:homing_move_begin", hmove)
+        stepper.mcu_pos = hmove.stepper_positions[0].trig_pos
         self.printer.send_event("homing:homing_move_end", hmove)
+    def z_steps(self, mm, queued=False):
+        """Move Z behind the guard (toolhead.manual_move); + is up.
+        queued: the steps only happen once the queue runs (wait_moves)"""
+        th = self.printer.toolhead
+        stepper = th.stepper('z')
+
+        def run():
+            stepper.mcu_pos += int(round(mm / 0.0025))
+        if queued:
+            th.pending = getattr(th, 'pending', []) + [run]
+        else:
+            run()
     def set_position(self, at=None):
         # toolhead.set_position marks the trapq at the current print_time;
         # the samples that follow are newer.  print_time is then put back
@@ -457,6 +501,9 @@ class Cmd:
         self.info = []
     def get_int(self, name, default, minval=None, maxval=None):
         return self.params.get(name, default)
+    def get_float(self, name, default, minval=None, maxval=None,
+                  above=None):
+        return self.params.get(name, default)
     def respond_info(self, msg):
         self.info.append(msg)
 
@@ -470,6 +517,61 @@ def test_enable():
     check(r.refused(60, 50, 5) is None, "XY allowed with ENABLE=0")
     r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
     check(r.refused(70, 50, 5) == REFUSAL, "ENABLE=1 refuses again")
+
+
+def test_stand_aside_times_out():
+    # KAN-1940: CUT_FILAMENT stands the guard aside for the cutter press,
+    # ENABLE=0 TIMEOUT=<s>.  Should the macro never get to ENABLE=1, the
+    # guard is back on its own once the timeout has run
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    check(not r.status()['enabled'], "ENABLE=0 TIMEOUT=30 stands aside")
+    check(r.refused(60, 50, 5) is None, "XY allowed while standing aside")
+    r.printer.reactor.now += 29.
+    check(r.refused(62, 50, 5) is None, "still aside before the timeout")
+    r.printer.reactor.now += 2.
+    r.feed(200000, 0.05)            # the stream goes on meanwhile
+    check(r.status()['enabled'], "enabled again after the timeout")
+    check(r.refused(70, 50, 5) == REFUSAL, "and refusing again")
+
+
+def test_stand_aside_ends_on_command_error():
+    # Klipper macros have no try/finally: an error part-way through the cut
+    # (at any macro level, even one PRINT_END's park then catches) leaves no
+    # ENABLE=1 to run.  The error itself ends the stand-aside
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    r.report(CommandError("injected"), levels=3)
+    check(r.status()['enabled'], "a command error ends the stand-aside")
+    check(r.refused(70, 50, 5) == REFUSAL, "and the guard refuses again")
+
+
+def test_stand_aside_ends_on_enable():
+    r = Rig()
+    r.in_contact()
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0, TIMEOUT=30.))
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=1))
+    check(r.refused(70, 50, 5) == REFUSAL, "ENABLE=1 ends the stand-aside")
+    r.guard.cmd_SET_CONTACT_GUARD(Cmd(ENABLE=0))
+    r.printer.reactor.now += 31.
+    r.feed(200000, 0.05)
+    r.report(CommandError("unrelated"))
+    check(not r.status()['enabled'] and r.refused(72, 50, 5) is None,
+          "a plain ENABLE=0 stays off: no stale timeout, errors leave it")
+
+
+def test_stand_aside_timeout_needs_enable_0():
+    r = Rig()
+    for params in ({'TIMEOUT': 30.}, {'ENABLE': 1, 'TIMEOUT': 30.}):
+        try:
+            r.guard.cmd_SET_CONTACT_GUARD(Cmd(**params))
+        except CommandError:
+            pass
+        else:
+            raise AssertionError("TIMEOUT accepted with %s" % (params,))
+    check(r.status()['enabled'], "and nothing changed")
 
 
 def test_drift():
