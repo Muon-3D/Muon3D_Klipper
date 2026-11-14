@@ -183,6 +183,11 @@ start_test bed_removal "Test bed_removal_detector pauses only in the print phase
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 
+# MUON: the unlock retract without FORCE_MOVE, which is off (KAN-380).
+start_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
+$PYTHON test/cold_retract/test_cold_retract.py
+finish_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
+
 # MUON: fan_modes command -> rpm -> duty mapping (ADR 0056).
 start_test fan_modes "Test fan_modes speed table mapping"
 $PYTHON test/fan_modes/test_fan_modes.py
