@@ -31,14 +31,17 @@
 # symlink, and is a readable regular file. Any error, a missing file or any
 # other path (the OEM tree, a second model's config, a client-writable
 # path) is NOT dev mode.
+import collections
 import fnmatch
+import io
 import logging
 import os
 import re
 import shlex
+import threading
 import time
 
-from . import move_limits
+from . import move_limits, print_preflight
 
 DEFAULT_DEV_CONFIG = '/home/printer_data/devmode_custom_config/core.cfg'
 CACHE_SECONDS = 1.
@@ -54,6 +57,9 @@ PRINT_STARTS = ('PRINT_START', 'SDCARD_PRINT_FILE', 'M24')
 
 # Moves a client may send, held to the Z floor and the notch (KAN-1731)
 MOVES = ('G0', 'G1', 'G2', 'G3')
+# A client's print start: the file is scanned first (KAN-1732)
+PREFLIGHT = ('SDCARD_PRINT_FILE', 'M24')
+PREFLIGHT_CACHE = 8
 
 NAME_RE = re.compile(r'^[A-Z0-9_.]+$')
 KEY_RE = re.compile(r'^[A-Z0-9_]+$')
@@ -223,6 +229,8 @@ class MuonGuard:
         entries = config.getlist('client_allow', sep='\n')
         self.rules = parse_allowlist(entries, self.printer.config_error)
         self.refused = 0
+        self.preflight_scans = 0
+        self._preflight_cache = collections.OrderedDict()
         self.last_refusal = ""
         self._cache = None
         self.gcode.register_client_gate(self._gate)
@@ -249,7 +257,7 @@ class MuonGuard:
 
     # Entry gate: called by gcode.py for each command line a client door
     # hands in, before the command runs.
-    def _decide(self, origin, gcmd):
+    def _decide(self, origin, gcmd, stateful=True):
         cmd = gcmd.get_command()
         if not cmd:
             return True, ""
@@ -268,13 +276,13 @@ class MuonGuard:
             if self.gcode.gcode_handlers.get(name) is None:
                 return True, ""
             return False, "'%s' is not on the client allowlist" % (name,)
-        if name in MOVES:
+        if name in MOVES and stateful:
             ok, why = self._check_move(name, self._traditional_params(
                 name, gcmd))
             if not ok:
                 return ok, why
         if any(r['open'] and not r['cons'] for r in rules):
-            return self._check_state(name, {})
+            return self._check_state(name, {}) if stateful else (True, "")
         if self.gcode.is_traditional_gcode(name):
             # the dispatcher also lists the command's own letter and
             # number (G28 -> {'G': '28'}) among the parameters
@@ -285,7 +293,8 @@ class MuonGuard:
             gcmd = self.gcode._get_extended_params(gcmd)
             params = gcmd.get_command_parameters()
         if any(rule_matches(r, params, self._limit) for r in rules):
-            return self._check_state(name, params)
+            return self._check_state(name, params) if stateful else (True,
+                                                                     "")
         return False, ("'%s' is on the client allowlist only with limited "
                        "parameters, and these are not among them" % (name,))
 
@@ -328,6 +337,101 @@ class MuonGuard:
                                    rect[0], rect[2], rect[1], rect[3],
                                    self.no_go_z))
         return True, ""
+
+    # KAN-1732: the file a client's SDCARD_PRINT_FILE / M24 would start,
+    # found the way virtual_sdcard finds it; None when there is nothing to
+    # scan (no such file: virtual_sdcard says so; M24 resuming a pause).
+    def _print_file(self, name, gcmd):
+        vsd = self.printer.lookup_object('virtual_sdcard', None)
+        if vsd is None:
+            return None
+        if name == 'M24':
+            if (vsd.is_active() or vsd.file_position
+                    or vsd.current_file is None):
+                return None
+            return vsd.file_path()
+        fname = self.gcode._get_extended_params(gcmd).get('FILENAME', None)
+        if not fname:
+            return None
+        if fname.startswith('/'):
+            fname = fname[1:]
+        flist = [f[0] for f in vsd.get_file_list(True)]
+        if fname not in flist:
+            fname = dict((f.lower(), f) for f in flist).get(fname.lower())
+            if fname is None:
+                return None
+        return os.path.join(vsd.sdcard_dirname, fname)
+
+    def _file_line_allowed(self, cmd, params, line):
+        rules = self.rules.get(cmd)
+        if rules is not None and any(r['open'] and not r['cons']
+                                     for r in rules):
+            return True, ""
+        gcmd = self.gcode.create_gcode_command(cmd, line.strip(), params)
+        ok, why = self._decide('file', gcmd, stateful=False)
+        return ok, ("%s (dev mode only)" % (why,) if not ok else why)
+
+    def _scan_file(self, path):
+        th = self.printer.lookup_object('toolhead').get_status(0.)
+        lim = print_preflight.Limits(
+            z_floor=self.z_floor, no_go=self.no_go, no_go_z=self.no_go_z,
+            axis_min=tuple(th['axis_minimum'][:2]),
+            axis_max=tuple(th['axis_maximum'][:2]),
+            max_temp={'extruder': self._limit('@extruder_max_temp'),
+                      'heater_bed': self._limit('@bed_max_temp')})
+        with io.open(path, 'r', newline='') as f:
+            return print_preflight.scan(f, lim, self._file_line_allowed)
+
+    # A big file takes seconds to read: scan it on a thread and let the
+    # reactor run (heaters, MCU traffic) until it is done.
+    def _scan_waiting(self, path):
+        result = {}
+        def run():
+            try:
+                result['v'] = self._scan_file(path)
+            except Exception as e:
+                logging.exception("muon_guard: preflight of %s failed", path)
+                result['e'] = e
+        t = threading.Thread(target=run, name="muon_guard preflight",
+                             daemon=True)
+        t.start()
+        reactor = self.printer.get_reactor()
+        while t.is_alive():
+            reactor.pause(reactor.monotonic() + .05)
+            t.join(.001)
+        if 'e' in result:
+            return [(0, '', "the file could not be read (%s)"
+                     % (type(result['e']).__name__,))]
+        return result['v']
+
+    def _preflight(self, name, gcmd):
+        path = self._print_file(name, gcmd)
+        if path is None:
+            return True, ""
+        try:
+            st = os.stat(path)
+            key = (path, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return True, ""
+        found = self._preflight_cache.get(key)
+        if found is None:
+            self.preflight_scans += 1
+            found = self._scan_waiting(path)
+            self._preflight_cache[key] = found
+            while len(self._preflight_cache) > PREFLIGHT_CACHE:
+                self._preflight_cache.popitem(last=False)
+        if not found:
+            return True, ""
+        lineno, line, why = found[0]
+        more = len(found) - 1
+        return False, ("Preflight: %s will not start: line %d `%s` %s%s."
+                       " Re-slice it, or turn on dev mode at the printer to"
+                       " print it anyway" % (
+                           os.path.basename(path), lineno, line, why,
+                           " (and %d more%s)" % (
+                               more, "+" if len(found)
+                               >= print_preflight.MAX_VIOLATIONS else "")
+                           if more else ""))
 
     def _limit(self, name):
         # A live limit from the printer config, e.g. the extruder max_temp.
@@ -386,6 +490,8 @@ class MuonGuard:
             if self._dev_mode()[0]:
                 return
             ok, why = self._decide(origin, gcmd)
+            if ok and gcmd.get_command() in PREFLIGHT:
+                ok, why = self._preflight(gcmd.get_command(), gcmd)
         except Exception:
             logging.exception("muon_guard: client check failed")
             ok = False
@@ -396,7 +502,7 @@ class MuonGuard:
         self.last_refusal = why
         logging.warning("muon_guard: refused %s command: %s (%s)", origin,
                         gcmd.get_commandline(), why)
-        if why.startswith('Saved Z offset'):
+        if why.startswith(('Saved Z offset', 'Preflight')):
             raise gcmd.error(why)
         raise gcmd.error(
             "Refused: %s. Dev mode is off, so a client may only start the "
