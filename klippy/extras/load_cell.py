@@ -5,7 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from . import hx71x
-from . import ads1220
+from . import ads1220, muon_ads1220
 from .bulk_sensor import BatchWebhooksClient
 import collections, itertools, logging
 # We want either Python 3's zip() or Python 2's izip() but NOT 2's zip():
@@ -557,6 +557,7 @@ def load_config(config):
     sensors = {}
     sensors.update(hx71x.HX71X_SENSOR_TYPES)
     sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+    sensors.update(muon_ads1220.MUON_ADS1220_SENSOR_TYPE)
     sensor_class = config.getchoice('sensor_type', sensors)
     return LoadCell(config, sensor_class(config))
 

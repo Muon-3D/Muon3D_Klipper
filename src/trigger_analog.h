@@ -6,5 +6,7 @@
 struct trigger_analog *trigger_analog_oid_lookup(uint8_t oid);
 void trigger_analog_note_error(struct trigger_analog *ta, uint8_t sensor_code);
 void trigger_analog_update(struct trigger_analog *ta, int32_t sample);
+int trigger_analog_is_armed(struct trigger_analog *ta);
+void trigger_analog_note_alive(struct trigger_analog *ta);
 
 #endif // trigger_analog.h
