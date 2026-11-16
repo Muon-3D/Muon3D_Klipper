@@ -17,7 +17,8 @@ klippy/mcu.py and are driven here with the real code:
   failure.
 
 pyserial, cffi and the C helper are not needed: serial, cffi and the
-POSIX-only pty modules are stubbed if missing (a Windows checkout) and chelper.get_ffi is replaced for the stop test.
+POSIX-only pty modules are stubbed if missing (a Windows checkout), and
+chelper.get_ffi is replaced for the stop test.
 
     python3 test/homing_abort/test_toolhead_disconnect.py
 """
