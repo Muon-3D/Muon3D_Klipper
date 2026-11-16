@@ -173,6 +173,20 @@ start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 $PYTHON test/m1_machine/test_m1_machine.py
 finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 
+# MUON: KAN-3370, the Z homing guards. A tare at or past the max-load anchor
+# is refused before any motion; a Z probing move is capped at 40 mm; a Z move
+# in progress is aborted by bed removal or the toolhead MCU disconnecting.
+# test_tare_guard and test_home_z_guards need numpy; test_toolhead_disconnect
+# stubs pyserial, cffi and the pty modules when a Windows checkout lacks them.
+start_test z_homing_guards "Test Z homing guards (KAN-3370)"
+$PYTHON test/load_cell_probe/test_tare_guard.py
+$PYTHON test/homing_abort/test_search_cap.py
+$PYTHON test/homing_abort/test_homing_abort.py
+$PYTHON test/homing_abort/test_home_z_guards.py
+$PYTHON test/homing_abort/test_toolhead_disconnect.py
+$PYTHON test/load_cell_home_z/test_load_cell_home_z.py
+finish_test z_homing_guards "Test Z homing guards (KAN-3370)"
+
 # MUON: a no-go snapped mesh point keeps the mesh on its grid (KAN-468).
 start_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 $PYTHON test/bed_mesh/test_no_go_snap.py

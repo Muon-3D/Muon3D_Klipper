@@ -471,6 +471,47 @@ def test_status(mod):
     print('ok  status values')
 
 
+def test_per_unit_numbers_1116(mod):
+    # The two units' own numbers, 16 Nov 2026, with the shipped core.cfg
+    # trigger (trigger_percent 10, 5% margin) and none of this change's
+    # keys set (no press_direction, no min_tare_headroom_percent).
+    # Unit A: anchor -3010747, normal tares -0.58M to -1.75M.
+    h = make_helper(mod, BOX_REF, trigger_percent=10)
+    assert h.get_press_direction() == -1.
+    assert h.get_min_tare_headroom_percent() == 20.
+    assert (refused(h.get_safety_range, -3244819) or '').startswith(REFUSAL)
+    for tare in (-578000, -1750000):
+        assert refused(h.get_safety_range, tare) is None, tare
+    # Sloe: anchor -1585739, positive tares are the normal side.
+    h = make_helper(mod, SLOE_REF, trigger_percent=10)
+    assert h.get_press_direction() == -1.
+    # +6430616: 8016355 counts of headroom (505.5%), margin 5% of the span
+    # = 400817, so the raw floor is -1585739 + 400817 = -1184922
+    lo, hi, ts = arm(h, 6430616)
+    assert (lo, hi) == (-1184922, SENSOR_MAX_USABLE), (lo, hi)
+    assert ts['scale'] == -1. and ts['trigger_type'] == 'gt', ts
+    # -956775 is its closest approach: 628964 counts = 39.66% of the
+    # anchor, against 20% required (317147 counts).  Allowed, raw floor
+    # -1585739 + int(0.05 * 628964) = -1554291.
+    lo, hi, ts = arm(h, -956775)
+    assert (lo, hi) == (-1554291, SENSOR_MAX_USABLE), (lo, hi)
+    assert ts['scale'] == -1. and ts['trigger_type'] == 'gt', ts
+    assert h.get_tare_headroom(-956775)[1] == 628964
+    # it would be refused only above 39.66%: 40 refuses, 39 allows
+    h40 = make_helper(mod, SLOE_REF, trigger_percent=10,
+                      min_tare_headroom_percent=40)
+    assert (refused(h40.get_safety_range, -956775) or '').startswith(
+        REFUSAL)
+    h39 = make_helper(mod, SLOE_REF, trigger_percent=10,
+                      min_tare_headroom_percent=39)
+    assert refused(h39.get_safety_range, -956775) is None
+    # something resting on the nozzle at tare on Sloe is still refused
+    assert (refused(h.get_safety_range, -1400000) or '').startswith(REFUSAL)
+    assert (refused(h.get_safety_range, -1600000) or '').startswith(REFUSAL)
+    print('ok  per-unit numbers: unit A incident refused, normal allowed; '
+          'Sloe +6430616 and -956775 allowed at 20% (39.66% headroom)')
+
+
 def test_no_inference_left(mod):
     src = open(_paths.patched('klippy/extras/load_cell_probe.py')).read()
     for bad in ('ref_max >= tare_counts', 'ref_max >= zero_counts',
@@ -485,7 +526,8 @@ def main():
              test_good_tare_arms_through_pause_and_tare,
              test_headroom_boundaries, test_boxwood_normal, test_sloe,
              test_mirror_and_explicit, test_contact_guard_direction,
-             test_status, test_no_inference_left]
+             test_status, test_per_unit_numbers_1116,
+             test_no_inference_left]
     for t in tests:
         t(mod)
     print('All %d tare guard tests passed' % len(tests))
