@@ -1875,7 +1875,10 @@ eFuse enable and PGOOD, and the current and power drawn.
 
 #### Z_POWER_RESET
 `Z_POWER_RESET`: Clear a latched fault. The feed comes back up on its own
-if the Z column, lever and plate allow it.
+if the Z column, lever and plate allow it. Refused while a print is
+running (pause or stop it first; a paused print can be reset, then
+resumed). If PGOOD does not rise after the reset the fault latches again
+once, saying the feed did not come back after the reset.
 
 #### Z_POWER_WAIT
 `Z_POWER_WAIT [TIMEOUT=<seconds>]`: Wait up to TIMEOUT (default 2) seconds
