@@ -202,6 +202,7 @@ def main():
                                           len(fakes.CHECKS)))
         os._exit(1)
     print("all %d checks passed" % (len(fakes.CHECKS),))
+    sys.stdout.flush()
     # a deadlocked daemon thread would otherwise keep the process alive
     os._exit(0)
 
