@@ -912,6 +912,7 @@ class TestFaultsAreExplicit(Ready):
     def test_dropped_reason_is_one_plain_sentence(self):
         zp = self.make()
         self.latch(zp)
+        self.tick(zp, 2.1)          # the next poll's decide() keeps it
         self.assertEqual(zp.reason, z_power.DROPPED_REASON)
         self.assertEqual(zp.get_status(3.)['reason'], z_power.DROPPED_REASON)
         self.assertNotIn(' A', zp.reason)
