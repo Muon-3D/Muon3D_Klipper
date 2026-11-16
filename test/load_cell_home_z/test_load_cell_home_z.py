@@ -208,6 +208,84 @@ class Test(unittest.TestCase):
         self.assertIn('samples_tolerance', str(cm.exception))
         self.assertEqual(obj.false_touches, 0)
 
+    # KAN-3370: the safety stops are errors the home must not swallow.
+    # Only "No trigger" on the confirming tap means a false first touch.
+    GUARD_ERRORS = [
+        "Homing aborted: the bed was removed",
+        "Homing aborted: the toolhead disconnected",
+        "Homing aborted: the load on the nozzle exceeded the safety ceiling"
+        " during the Z move",
+        "Homing aborted: the load cell moved the wrong way during the Z"
+        " move",
+        "The nozzle is already under load: check nothing is touching it"
+        " (tare -3244819, max-load reference -3010747, headroom -7.8%,"
+        " need 20.0%)",
+        "Z homing stopped: no contact within 10 mm. Check the bed is"
+        " fitted and nothing is wrong with the nozzle",
+    ]
+
+    def test_guard_errors_on_the_confirming_tap_are_not_retried(self):
+        for msg in self.GUARD_ERRORS:
+            m = Machine()
+            obj, cmd = make(m)
+            real_probe = m.probe
+            calls = []
+
+            def probe(fast, msg=msg, real_probe=real_probe, calls=calls):
+                calls.append(fast)
+                if not fast:
+                    raise CommandError(msg)
+                real_probe(fast)
+            m.probe = probe
+            with self.assertRaises(CommandError) as cm:
+                cmd(FakeGcmd())
+            self.assertEqual(str(cm.exception), msg)
+            # one fast approach, one confirming tap, no second attempt
+            self.assertEqual(calls, [True, False], msg)
+            self.assertEqual(obj.false_touches, 0, msg)
+            self.assertEqual(obj.last_attempts, 1, msg)
+            self.assertEqual(
+                sum(1 for l in m.log
+                    if l.startswith('SET_KINEMATIC_POSITION')), 1, msg)
+            self.assertFalse(m.relative)   # gcode state restored
+
+    def test_guard_errors_on_the_fast_approach_are_not_retried(self):
+        for msg in self.GUARD_ERRORS:
+            m = Machine()
+            obj, cmd = make(m)
+            calls = []
+
+            def probe(fast, msg=msg, calls=calls):
+                calls.append(fast)
+                raise CommandError(msg)
+            m.probe = probe
+            with self.assertRaises(CommandError) as cm:
+                cmd(FakeGcmd())
+            self.assertEqual(str(cm.exception), msg)
+            self.assertEqual(calls, [True], msg)
+            self.assertEqual(obj.last_attempts, 1, msg)
+
+    def test_no_trigger_still_retries_next_to_a_guard_error(self):
+        # the retry still works, and a guard error on the retry's
+        # confirming tap ends the home there
+        m = Machine(real_start=159.5, touches=[159.])
+        obj, cmd = make(m)
+        real_probe = m.probe
+        confirms = []
+
+        def probe(fast):
+            if not fast:
+                confirms.append(1)
+                if len(confirms) == 2:
+                    raise CommandError(self.GUARD_ERRORS[0])
+            real_probe(fast)
+        m.probe = probe
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertEqual(str(cm.exception), self.GUARD_ERRORS[0])
+        self.assertEqual(obj.false_touches, 1)
+        self.assertEqual(obj.last_attempts, 2)
+
     def test_retry_settle_dwells_before_the_retry(self):
         m = Machine(real_start=159.5, touches=[159.])
         obj, cmd = make(m, retry_settle=1.5)

@@ -1516,6 +1516,23 @@ home_xy_position:
 #   positions after Z axis homing. The default is False.
 ```
 
+### [homing]
+
+Limits on homing and probing moves. This section is optional.
+
+```
+[homing]
+#max_search_distance_z: 0
+#   The furthest (in mm) that one Z probing move, including the Z
+#   homing search of a load cell probe, may travel. If the probe has
+#   not triggered by then the move stops with an error ("Z homing
+#   stopped: no contact within N mm") instead of running on to the
+#   axis limit. 0 turns the limit off. X and Y moves are never
+#   limited. The default is 0 (off): a search that starts blind from
+#   a soft-homed Z needs the full travel, so only set this if the
+#   start is known to be close.
+```
+
 ### [homing_override]
 
 Homing override. One may use this mechanism to run a series of g-code
@@ -5991,6 +6008,39 @@ sensor_type:
 #   Raw ADC value for the stable max-load anchor used by
 #   safety_model=preloaded_max. This can be set manually or captured with
 #   LOAD_CELL_CALIBRATE_MAX.
+#press_direction:
+#   -1 or 1: the way pressing on the nozzle moves the raw counts when
+#   safety_model=preloaded_max. The default is the sign of
+#   reference_max_load_counts (the max-load anchor is on the press side of
+#   zero). This is never inferred from the tare. It must be set if
+#   reference_max_load_counts is 0.
+#min_tare_headroom_percent: 20.0
+#   With safety_model=preloaded_max, probing is refused ("The nozzle is
+#   already under load") when the tare is closer to reference_max_load_counts
+#   than this percentage of abs(reference_max_load_counts), or past it. This
+#   catches something resting on the nozzle at tare. 0 to below 100.
+#z_move_abort_ceiling_factor: 2.5
+#   While a Z probing move runs (the Z homing search is one) the host
+#   watches the load cell and ends the move when the load is more than
+#   this many times the trigger's own count delta away from the tare, on
+#   either side, for z_move_abort_confirm_time. It backs up the MCU
+#   trigger, and stops a push even if the trigger never fires. The
+#   move fails with "Homing aborted: the load on the nozzle exceeded the
+#   safety ceiling during the Z move". 0 turns it off, otherwise at
+#   least 1.5. The default is 2.5.
+#z_move_abort_ceiling_counts: 0
+#   An explicit ceiling in raw counts from the tare, used instead of
+#   z_move_abort_ceiling_factor when above 0. The default is 0.
+#z_move_wrong_way_factor: 1.0
+#   Ends the move ("the load cell moved the wrong way during the Z
+#   move") when the load moves away from the press direction by this
+#   many times the trigger's count delta. Only for a directed trigger
+#   (trigger_counts or trigger_percent with safety_model=preloaded_max),
+#   and not on a descent that uses MCUTARE. 0 turns it off, otherwise at
+#   least 0.5. The default is 1.0.
+#z_move_abort_confirm_time: 0.020
+#   How long (in seconds) a limit must hold, in consecutive samples,
+#   before the move is ended. 0.002 to 0.2. The default is 0.020.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

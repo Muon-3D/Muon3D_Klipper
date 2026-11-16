@@ -177,6 +177,29 @@ start_test heater_supply "Test heater_supply and MPC on a simulated bed"
 $PYTHON test/heater_supply/test_heater_supply.py
 finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
 
+# MUON: KAN-3370 probe and homing guards: a loaded tare is refused, a Z
+# probing move is ended by the load backstop or an outside abort, and the
+# Z home retry never swallows either.
+start_test probe_guards "Test load cell probe and homing guards"
+$PYTHON test/load_cell_probe/test_tare_guard.py
+$PYTHON test/load_cell_probe/test_z_load_backstop.py
+$PYTHON test/homing_abort/test_homing_abort.py
+$PYTHON test/homing_abort/test_search_cap.py
+$PYTHON test/load_cell_home_z/test_load_cell_home_z.py
+finish_test probe_guards "Test load cell probe and homing guards"
+
+# MUON: tests the M1 print-start stack added but never ran in CI.
+start_test stack_extras "Test heater hold, tap path and motor tune"
+$PYTHON test/heaters/test_hold_pwm.py
+$PYTHON test/verify_heater/test_tap_hold.py
+$PYTHON test/m1_machine/test_filament_sensor_reconnect.py
+$PYTHON test/motor_tune/test_motor_tune.py
+$PYTHON test/tap_path/test_drip_prime.py
+$PYTHON test/tap_path/test_mcu_tare.py
+$PYTHON test/tap_path/test_retract_first.py
+$PYTHON test/tap_path/test_zlead.py
+finish_test stack_extras "Test heater hold, tap path and motor tune"
+
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
 # outside dev mode, macros and internal sources are not checked (KAN-1730).
 start_test muon_guard "Test muon_guard dev-mode check and client allowlist"

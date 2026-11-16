@@ -406,6 +406,102 @@ class Harness(unittest.TestCase):
                                                       False)[1])
 
 
+class FakeHoming:
+    """What PrinterHoming.abort_active_move records."""
+    def __init__(self, raises=None):
+        self.calls = []
+        self.raises = raises
+    def abort_active_move(self, reason, z_only=True):
+        self.calls.append(reason)
+        if self.raises is not None:
+            raise self.raises
+        return True
+
+
+class HomingPrinter(StubPrinter):
+    def __init__(self, homing):
+        self.homing = homing
+    def lookup_object(self, name, default=None):
+        return self.homing if name == 'homing' else default
+
+
+class TestAbortsZMove(Harness):
+    """KAN-3370: losing the column or the 48 V ends a running Z move."""
+    UNLOCKED_MSG = "the Z column was unlocked"
+    REMOVED_MSG = "the Z column was removed"
+    POWER_MSG = "the Z and bed power was lost"
+
+    def ready(self, homing=None):
+        homing = homing or FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing)
+        self.tick(zp, 1.0)
+        zp.power_good = True
+        self.tick(zp, 1.1)
+        self.assertEqual(zp.state, READY)
+        self.assertEqual(homing.calls, [])
+        return zp, homing
+
+    def test_unlocking_aborts_then_the_power_drop(self):
+        zp, homing = self.ready()
+        self.tick(zp, 1.2, ratio=0.5)
+        self.assertEqual(homing.calls, [self.UNLOCKED_MSG, self.POWER_MSG])
+
+    def test_pulling_the_column_aborts(self):
+        zp, homing = self.ready()
+        self.tick(zp, 1.2, ratio=0.99)
+        self.assertEqual(homing.calls, [self.REMOVED_MSG, self.POWER_MSG])
+
+    def test_pgood_drop_aborts(self):
+        zp, homing = self.ready()
+        zp.power_good = False
+        self.tick(zp, 1.2)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(homing.calls, [self.POWER_MSG])
+
+    def test_inhibit_aborts(self):
+        zp, homing = self.ready()
+        zp.inhibited = True
+        self.tick(zp, 1.2)
+        self.assertEqual(homing.calls, [self.POWER_MSG])
+
+    def test_plate_removal_aborts_on_the_power_drop(self):
+        # bed_removal_detector aborts first on a real printer; this is the
+        # second line of defence when only the power path noticed
+        zp, homing = self.ready()
+        self.tick(zp, 1.2, plate=False)
+        self.assertEqual(homing.calls, [self.POWER_MSG])
+
+    def test_nothing_aborts_without_a_loss(self):
+        zp, homing = self.ready()
+        for t in (1.2, 1.3, 1.4):
+            self.tick(zp, t)
+        self.assertEqual(homing.calls, [])
+        # a first reading and plugging a column in are not losses
+        homing2 = FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing2)
+        self.tick(zp, 1.0, ratio=0.99)            # absent, the first reading
+        self.tick(zp, 1.1, ratio=0.1)             # plugged in and locked
+        self.assertEqual(homing2.calls, [])
+
+    def test_a_failing_abort_does_not_break_the_poll(self):
+        zp, homing = self.ready(FakeHoming(raises=RuntimeError("boom")))
+        self.tick(zp, 1.2, ratio=0.5)
+        self.assertEqual(zp.state, UNLOCKED)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.heater.target, 0.)
+        self.assertIn('ZCHANGE', zp.scripts)
+
+    def test_no_homing_object_is_fine(self):
+        zp = self.make()
+        self.tick(zp, 1.0)
+        zp.power_good = True
+        self.tick(zp, 1.1)
+        self.tick(zp, 1.2, ratio=0.5)
+        self.assertEqual(zp.state, UNLOCKED)
+
+
 class TestBedRemovalDetector(unittest.TestCase):
     """The detector is the single owner of plate presence."""
     def make(self):
