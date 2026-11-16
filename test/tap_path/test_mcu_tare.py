@@ -45,7 +45,8 @@ def load_module(path):
     pkg = types.ModuleType('extras')
     pkg.__path__ = []
     sys.modules['extras'] = pkg
-    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220'):
+    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220',
+              'muon_ads1220'):
         m = types.ModuleType('extras.' + n)
         sys.modules['extras.' + n] = m
         setattr(pkg, n, m)

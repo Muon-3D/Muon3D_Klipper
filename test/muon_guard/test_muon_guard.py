@@ -946,6 +946,7 @@ NOT_FOR_CLIENTS = {
     'FILAMENT_INSERT_GRAB_MORE': 'step of the insert flow',
     'IF_BED_TEMP_ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
     'ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
+    'STEPLOSS_TEST': 'bench tool (macros/debug.cfg), not for clients',
 }
 
 
@@ -975,9 +976,10 @@ def test_every_macro_is_classified():
           % (sorted(underscore_allowed - prompt_targets - panel_sent),))
     check(underscore_allowed == set([
         '_BED_RESUME_NOW', '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
-        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE'])
+        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE',
+        '_RUNOUT_UNLOAD'])
         | panel_sent,
-        "the underscore exceptions are exactly the nine reviewed ones: %r"
+        "the underscore exceptions are exactly the ten reviewed ones: %r"
         % (sorted(underscore_allowed),))
     for name in macros_in_core():
         if name.startswith('_') and name not in underscore_allowed:
