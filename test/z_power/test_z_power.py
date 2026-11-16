@@ -30,6 +30,24 @@ def config_bands():
     return [(band, bands[band]) for band in ('absent', 'unlocked', 'locked')]
 
 
+class TestNoDeadTests(unittest.TestCase):
+    """CI runs this file as a script, so unittest.main() only sees the
+    classes defined above it. Anything below it never runs (KAN-3421).
+    Keep this class first in the file: it cannot catch itself below the
+    guard."""
+    def test_main_guard_is_the_last_statement(self):
+        import ast
+        with open(os.path.abspath(__file__)) as f:
+            body = ast.parse(f.read()).body
+        guards = [i for i, node in enumerate(body) if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "__name__ == '__main__'"]
+        self.assertEqual(len(guards), 1)
+        below = [getattr(node, 'name', type(node).__name__)
+                 for node in body[guards[0] + 1:]]
+        self.assertEqual(below, [], "defined below the __main__ guard, so "
+                         "they never run in CI: %s" % (below,))
+
+
 class TestConfigBands(unittest.TestCase):
     # Ratios from the backboard schematic and the gimlet bench.
     def test_each_lever_state_lands_in_its_band(self):
@@ -157,7 +175,9 @@ class StubReactor:
         cb(0.)
 
 
-class Harness(unittest.TestCase):
+class HarnessFixture:
+    """make() and tick() for the power-up tests. Not a TestCase, so a
+    subclass with its own setup does not re-run the Harness tests."""
     def make(self):
         zp = z_power.ZPower.__new__(z_power.ZPower)
         zp.printer = StubPrinter()
@@ -213,6 +233,8 @@ class Harness(unittest.TestCase):
         zp.detector.plate = plate
         zp._poll(t)
 
+
+class Harness(HarnessFixture, unittest.TestCase):
     def test_power_up_needs_pgood(self):
         zp = self.make()
         self.tick(zp, 1.0)
@@ -558,11 +580,7 @@ class TestBedRemovalDetector(unittest.TestCase):
         self.assertEqual(len(d.window), 1)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
-class TestColumnSettle(Harness):
+class TestColumnSettle(HarnessFixture, unittest.TestCase):
     """The bed thermistor runs through the Z column: with the column out the
     input floats and reads as a plate (sloe, 2026-11-06)."""
     def make(self):
@@ -645,3 +663,7 @@ class TestB1PlateThresholds(unittest.TestCase):
     def test_a_plate_in_a_cool_room_reads_attached(self):
         remove, attach = self.thresholds()
         self.assertLess(attach, 10.)
+
+
+if __name__ == '__main__':
+    unittest.main()
