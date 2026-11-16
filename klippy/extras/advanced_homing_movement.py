@@ -541,6 +541,17 @@ class AxisAdvancedHomingMovement:
 
             pos_after = toolhead.get_position()
             stalled = abs(pos_after[axis_i] - target_axis) > 0.001
+            sim_at = gcmd.get_float('SIM_STALL_AT', None)
+            if (sim_at is not None
+                    and self.printer.get_start_args().get('debuginput')
+                    is not None):
+                # Batch tests only (test/klippy/cut_filament.cfg): a
+                # simulated MCU never triggers an endstop part way, so the
+                # test says where the stop was found. Never on a printer.
+                pos_after = list(pos_after)
+                pos_after[axis_i] = sim_at
+                toolhead.set_position(pos_after)
+                stalled = True
             result['triggered'] = stalled
             if stalled and was_homed:
                 result['position'] = pos_after[axis_i]

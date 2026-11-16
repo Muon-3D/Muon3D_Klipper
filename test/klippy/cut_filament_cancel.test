@@ -1,4 +1,4 @@
-# KAN-1940: CANCEL_PRINT on the first layer. The park lifts off the plate
+# KAN-1940: a cancel on the first layer. The park lifts off the plate
 # before any XY move, then the cut runs at the real Z and completes.
 DICTIONARY atmega2560.dict
 CONFIG cut_filament.cfg
@@ -11,9 +11,21 @@ CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
 ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0
 _CUT_TEST
 
+# CANCEL_PRINT only cleans up after a print (print_stats printing, paused or
+# error): "a second press must not park a head that PRINT_END already parked".
+# Batch mode runs no print, so here it must do nothing: no park, no cut, the
+# guard as it was.
 CANCEL_PRINT
+ASSERT_NOT_CUT
+ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0
 
-# 0.2 + 6 + 44: the lift happened before the cutter, from the real Z
+# What it runs for a print is PRINT_END, here from the first layer (a batch
+# test cannot start an SD print: the G-code input holds the mutex the print
+# needs). The park lifts off the plate before any XY move, then the cut runs
+# at the real Z and completes.
+PRINT_END
+
+# 0.2 + 50: the lift happened before the cutter, from the real Z
 ASSERT_CUT PRESS_Z=50.2 PARK_POS=135.000,63.000,140.000
 CONTACT_GUARD_SIMULATE LOAD=30000 DURATION=0.1
 ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0 MAX_LOAD=1000
