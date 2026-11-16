@@ -85,6 +85,9 @@ class ForceMove:
         stepper_enable = self.printer.lookup_object('stepper_enable')
         stepper_enable.set_motors_enable([stepper_name], False)
     def manual_move(self, stepper, dist, speed, accel=0.):
+        # MUON: this move bypasses the toolhead trapq and leaves the
+        # toolhead position stale; contact_guard stops trusting Z on it
+        self.printer.send_event("force_move:manual_move", stepper)
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         prev_sk = stepper.set_stepper_kinematics(self.stepper_kinematics)

@@ -1,0 +1,24 @@
+# KAN-1940: the guard stands aside only for the cutter press. After
+# CUT_FILAMENT it is enabled, and plate contact during a low-Z XY jog
+# latches it. cut_filament_refuse.test runs the jog itself.
+DICTIONARY atmega2560.dict
+CONFIG cut_filament.cfg
+
+G28
+G90
+G1 X100 Y100 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+_CUT_TEST
+CUT_FILAMENT
+ASSERT_CUT PRESS_Z=20 PARK_POS=135.000,63.000,140.000
+ASSERT_GUARD ENABLED=1
+
+# PARK_PRINTER turned the motors off
+G28
+G1 X100 Y100 Z5 F6000
+G1 Z1 F600
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=200000 DURATION=0.1
+ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=1
+# Lifting Z is always allowed
+G1 Z2 F600

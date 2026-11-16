@@ -1,0 +1,9 @@
+# muon_guard refuses a bounded parameter out of range, though the macro is
+# on the allowlist. Exits with an error.
+DICTIONARY atmega2560.dict
+CONFIG muon_guard.cfg
+SHOULD_FAIL
+
+G28
+BOUNDED_MACRO X=50
+BOUNDED_MACRO X=500

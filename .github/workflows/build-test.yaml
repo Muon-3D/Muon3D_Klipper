@@ -58,3 +58,5 @@ jobs:
       with:
         name: data-dict
         path: ci_build/dict
+        # Debug copy for people to download; the org artifact quota is shared, so do not keep it 90 days.
+        retention-days: 7

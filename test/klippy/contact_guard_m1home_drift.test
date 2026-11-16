@@ -1,0 +1,18 @@
+# Review #86 R4-6: the M1 G28 (homing_override, probe) re-zeroes a false
+# latch with samples flowing inside the override.  Pressing drift past the
+# budget latches with nothing touching; G28 clears it.
+DICTIONARY atmega2560.dict
+CONFIG contact_guard_m1home.cfg
+
+G28
+G90
+G1 X50 Y50 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=30 DRIFT=-9000
+ASSERT_GUARD ACTIVE=1 CONTACT=1
+G28
+G90
+G1 Z20 F600
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ACTIVE=1 CONTACT=0
+G1 X100 Y50 F6000

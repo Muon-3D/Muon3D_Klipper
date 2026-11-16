@@ -41,7 +41,7 @@ INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'fan.cfg',
 # Commands the macros under test send that these files don't define, plus
 # CUT_FILAMENT and LOAD_FILAMENT (filament.cfg's, which only move).
 STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
-         'M118', 'RESPOND', 'FORCE_MOVE', 'SET_STEPPER_ENABLE',
+         'M118', 'RESPOND', 'COLD_RETRACT', 'SET_STEPPER_ENABLE',
          'TEMPERATURE_WAIT', 'RESET_CALIBRATION', '_BED_MESH_INVALIDATE',
          'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'TURN_OFF_HEATERS',
          'CLEAR_PAUSE', 'CUT_FILAMENT', 'LOAD_FILAMENT', 'M190', 'M83',
@@ -162,6 +162,10 @@ class M1:
             'nozzle_wipe_smart': {'stop_temp': 135.0},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
+        # PRINT_START reads the probe's live z_offset (KAN-1730)
+        printer.add_object('load_cell_probe', Status({
+            'z_offset': 0.0, 'z_offset_invalid': False,
+            'z_offset_saved': None}))
         printer.add_object('idle_timeout', Status({'state': 'Printing'}))
         printer.add_object('filament_switch_sensor filament_sensor_toolhead',
                            Status({'filament_detected': False}))
@@ -420,12 +424,16 @@ class HeaterOffBeforeLeds(_M1TestCase):
     # The umbilical unlock press
 
     def test_unlock_press(self):
+        # a press while printing is refused
+        self.m1.print_stats['state'] = 'paused'
         self.arm_unlock()
         self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assert_heater_off_first()
         self.assertIn('SET_LED_EFFECT', self.m1.names())
 
     def test_unlock_press_with_a_raising_led(self):
+        # a press while printing is refused
+        self.m1.print_stats['state'] = 'paused'
         self.arm_unlock()
         self.run_failing('connected',
                          'TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
@@ -452,9 +460,16 @@ class FanStallInAnyState(_M1TestCase):
                          215.)
 
     def test_fan_stall_after_m600_while_idle(self):
-        # PAUSE now refuses with no print (m1_machine, audit F4), so the
-        # stale pause this guards against is set directly.
+        # KAN-1699: an idle PAUSE no longer marks the printer paused, and
+        # m1_machine refuses it with no print. The safety property is
+        # unchanged: a hot-end fan stall cuts the heater whatever the
+        # pause state, so start from a real target.
         self.m1.print_stats['state'] = 'standby'
+        self.m1.run('M104 S200')
+        self.assertEqual(self.m1.extruder['target'], 200.)
+        self.m1.run('PAUSE')
+        self.assertFalse(self.m1.pause_resume['is_paused'])
+        # And with a stale pause left set directly.
         self.m1.pause_resume['is_paused'] = True
         self.m1.run('FAN_STOPPAGE_ROUTINE FAN_NAME="Hotend"')
         self.assertEqual(self.m1.extruder['target'], 0.)
@@ -541,8 +556,10 @@ class HeaterOffBeforeAnything(_M1TestCase):
         self.assertEqual(self.m1.extruder['target'], 0.)
 
     def test_unlock_press_when_the_retract_raises(self):
+        # a press while printing is refused
+        self.m1.print_stats['state'] = 'paused'
         self.arm_unlock()
-        self.m1.raising.add('FORCE_MOVE')
+        self.m1.raising.add('COLD_RETRACT')
         self.run_failing_stub('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assertEqual(self.m1.extruder['target'], 0.)
         # And RELEASE still knows to put the heat back.
@@ -1406,6 +1423,8 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
 
     def setUp(self):
         super().setUp()
+        # a press while printing is refused
+        self.m1.print_stats['state'] = 'paused'
         self.arm_unlock()
 
     def press(self):
@@ -1479,6 +1498,8 @@ class UnlockReleaseRestoresOnce(_FanCheckTestCase):
         self.m1.run('TOOLHEAD_DISCONNECT')
         presses.reconnect()
         self.m1.run('TOOLHEAD_CONNECT')
+        # a press while printing is refused
+        self.m1.print_stats['state'] = 'paused'
         self.arm_unlock()
         self.m1.run('CANCEL_PRINT')
         self.m1.print_stats['state'] = 'standby'

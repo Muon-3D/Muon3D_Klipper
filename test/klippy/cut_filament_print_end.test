@@ -1,0 +1,21 @@
+# KAN-1940: a homed PRINT_END cuts the filament at its real Z. The cutter
+# press reads far above the contact threshold, and nothing is refused: Z
+# stays homed through the cut and the park, and the guard is enabled and
+# not latched afterwards.
+DICTIONARY atmega2560.dict
+CONFIG cut_filament.cfg
+
+G28
+G90
+G1 X100 Y100 Z20 F6000
+CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
+ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0
+_CUT_TEST
+
+PRINT_END
+
+# _PRINT_END_PARK lifts 6 then 50 mm before the cut; Z_PARK parks at 140
+ASSERT_CUT PRESS_Z=70 PARK_POS=135.000,63.000,140.000
+# The cutter's residual was re-zeroed: the same reading is now no load
+CONTACT_GUARD_SIMULATE LOAD=30000 DURATION=0.1
+ASSERT_GUARD ENABLED=1 ACTIVE=1 CONTACT=0 MAX_LOAD=1000

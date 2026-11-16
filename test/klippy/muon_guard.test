@@ -1,0 +1,15 @@
+# muon_guard: allowlisted commands pass, and the macro's inside is not
+# checked even though SET_GCODE_VARIABLE is not on the list (KAN-1730).
+DICTIONARY atmega2560.dict
+CONFIG muon_guard.cfg
+
+G28
+G90
+G1 X10 Y10 F6000
+M114
+CLIENT_MACRO
+BOUNDED_MACRO X=50
+BOUNDED_MACRO
+G21
+M486 S0
+; a comment line is not a command

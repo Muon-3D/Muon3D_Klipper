@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import subprocess
+import subprocess, tempfile
 import sys, os, zlib, logging, math
 import serialhdl, msgproto, pins, chelper, clocksync
 
@@ -740,17 +740,27 @@ class MCURestartHelper:
         # close". The non-critical reconnect loop runs this every 2-30 s for
         # as long as the toolhead is unplugged, including during the park
         # move that TOOLHEAD_DISCONNECT starts.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
-        deadline = self._reactor.monotonic() + SWDIO_OPENOCD_TIMEOUT
-        while proc.poll() is None:
-            if self._reactor.monotonic() > deadline:
-                proc.kill()
-                proc.wait()
-                raise subprocess.TimeoutExpired(cmd, SWDIO_OPENOCD_TIMEOUT)
-            self._reactor.pause(self._reactor.monotonic() + 0.010)
-        output = proc.stdout.read()
-        proc.stdout.close()
+        # Output goes to a temporary file, not a pipe: nothing reads a pipe
+        # while the process runs, so a full one would block openocd and look
+        # like the timeout below.
+        with tempfile.TemporaryFile(mode='w+') as out:
+            proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                    text=True)
+            try:
+                deadline = self._reactor.monotonic() + SWDIO_OPENOCD_TIMEOUT
+                while proc.poll() is None:
+                    if self._reactor.monotonic() > deadline:
+                        raise subprocess.TimeoutExpired(
+                            cmd, SWDIO_OPENOCD_TIMEOUT)
+                    self._reactor.pause(self._reactor.monotonic() + 0.010)
+            finally:
+                # A timeout, or klippy leaving while this greenlet waits,
+                # must not leave openocd holding the SWD adapter.
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            out.seek(0)
+            output = out.read()
         if output:
             logging.info("openocd output: %s", output.strip())
         if proc.returncode:
@@ -901,22 +911,30 @@ class MCUConnectHelper:
         event_type = params['#name']
         if self.is_non_critical:
             # Treat as a soft disconnect; don't take the whole printer down.
-            # The same dump a critical mcu's shutdown logs: the clock it
-            # stopped at and the last messages sent to it, which is what
-            # names the command behind "Timer too close".
-            logging.info("Non-critical MCU '%s' reported %s: %s (treating as disconnect)"
-                         " at clock %s\n%s\n%s",
-                         self._name, event_type, self._shutdown_msg,
-                         shutdown_clock, self._clocksync.dump_debug(),
-                         self._serial.dump_debug())
             # This runs on the serial thread, inside SerialReader.lock. The
             # disconnect unregisters the 'clock' response (which takes that
             # same, non-reentrant lock) and joins this thread, so calling it
             # here deadlocked the thread and then the reactor with it: the
             # whole host froze mid-print. Hand it to the reactor instead,
-            # as the critical path does with invoke_async_shutdown.
+            # as the critical path does with invoke_async_shutdown. Schedule
+            # it before the dump below, so a dump that raises cannot leave
+            # the mcu shut down but never disconnected.
             self._reactor.register_async_callback(
                 lambda e: self.handle_non_critical_disconnect())
+            # The same dump a critical mcu's shutdown logs: the clock it
+            # stopped at and the last messages sent to it, which is what
+            # names the command behind "Timer too close".
+            try:
+                debug = "\n%s\n%s" % (self._clocksync.dump_debug(),
+                                      self._serial.dump_debug())
+            except Exception:
+                logging.exception("Non-critical MCU '%s' shutdown dump failed",
+                                  self._name)
+                debug = ""
+            logging.info("Non-critical MCU '%s' reported %s: %s"
+                         " (treating as disconnect) at clock %s%s",
+                         self._name, event_type, self._shutdown_msg,
+                         shutdown_clock, debug)
             return
         self._printer.invoke_async_shutdown(
             "MCU shutdown", {"reason": msg, "mcu": self._name,
