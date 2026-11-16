@@ -49,9 +49,17 @@ class FakeHeater:
     def __init__(self):
         self.temp = 60.
         self.target = 60.
+        # feat/m1-print-start's detector decides on fresh raw samples: it
+        # appends last_temp each time last_temp_time moves on
+        self.last_temp = 60.
+        self.last_temp_time = 0.
 
     def get_temp(self, eventtime):
         return self.temp, self.target
+
+    def new_sample(self, temp):
+        self.temp = self.last_temp = temp
+        self.last_temp_time += 0.3
 
     def set_temp(self, degrees):
         self.target = degrees
@@ -107,8 +115,8 @@ def make_detector(printer):
 
 
 def feed_removal(det, heater):
-    heater.temp = REMOVED
     for _ in range(5):
+        heater.new_sample(REMOVED)
         det.check_bed_temperature(100.)
 
 
@@ -188,8 +196,10 @@ def test_c4_bed_removal_calls_the_abort():
           % (BED_REMOVED_MSG, err))
     check(rig.toolhead.travelled_mm == 4, "C4: move stopped at 4 mm")
     check(heater.target == 0.0, "C4: bed heater still goes off")
-    check("bed_removal_detector:removed" in rig.printer.events,
-          "C4: the removed event still fires")
+    # (master's "bed_removal_detector:removed" event does not exist on
+    # feat/m1-print-start, so there is nothing to assert about it here)
+    check(det.bed_removed and det.restore_target == 60.,
+          "C4: removal handling still records the removal")
     # b) the exact call
     calls = []
 
@@ -212,10 +222,9 @@ def test_c4_bed_removal_calls_the_abort():
     rig3.printer.objects['homing'] = BrokenHoming()
     det, heater, gcode = make_detector(rig3.printer)
     feed_removal(det, heater)
-    check(heater.target == 0.0 and
-          "bed_removal_detector:removed" in rig3.printer.events
-          and det.bed_removed,
-          "C4: a failing abort still lets the heater-off and event run")
+    check(heater.target == 0.0 and det.bed_removed
+          and det.restore_target == 60.,
+          "C4: a failing abort still lets the heater-off and the rest run")
     # d) no homing object at all (older configs, other tests)
     rig4 = Rig()
     del rig4.printer.objects['homing']

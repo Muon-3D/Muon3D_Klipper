@@ -56,7 +56,8 @@ def load_module(path):
     pkg = types.ModuleType('extras')
     pkg.__path__ = []
     sys.modules['extras'] = pkg
-    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220'):
+    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220',
+              'muon_ads1220'):
         m = types.ModuleType('extras.' + n)
         sys.modules['extras.' + n] = m
         setattr(pkg, n, m)
@@ -190,6 +191,10 @@ class FakePrinter(object):
 
     def lookup_object(self, name):
         return FakeToolhead()
+
+    def send_event(self, event, *params):
+        # feat/m1-print-start's tap_begin / tap_end events
+        pass
 
 
 class FakeSos(object):
