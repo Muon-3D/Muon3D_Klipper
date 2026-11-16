@@ -18,6 +18,7 @@ sys.path.insert(0, KLIPPY)
 
 from extras import m1_machine  # noqa: E402
 from extras.m1_machine import missing, activity  # noqa: E402
+from extras import z_power  # noqa: E402
 
 READY = {'column': 'locked', 'bed_power': 'ready', 'plate': 'present',
          'toolhead': 'connected', 'hotend': 'ntc', 'filament': 'present',
@@ -1111,6 +1112,50 @@ class TestFilePrinting(unittest.TestCase):
         self.assertTrue(m.m1.file_printing(0))
         m.pr.is_paused = True
         self.assertFalse(m.m1.file_printing(0))
+
+
+class TestBedPowerFaultReason(unittest.TestCase):
+    """KAN-3334: the panel reads z_power's reason as bed_power_reason and
+    'bed_power_fault' from faults(); the reason is one plain sentence."""
+    def fault_machine(self, fault, fault_reason):
+        m = Machine()
+        _state, reason, _en = z_power.decide('locked', True, fault, False,
+                                             fault_reason)
+        m.zp.status.update(state='fault', reason=reason)
+        return m
+
+    def test_pgood_drop_reads_as_one_plain_sentence(self):
+        m = self.fault_machine('PGOOD dropped (eFuse tripped, peak 2.10 A'
+                               ' over 2 s)', z_power.DROPPED_REASON)
+        c = m.m1.conditions(0)
+        self.assertEqual(c['bed_power'], 'fault')
+        self.assertEqual(c['bed_power_reason'], z_power.DROPPED_REASON)
+        self.assertEqual(c['bed_power_reason'],
+                         "Bed power cut out. Check the plate is seated and"
+                         " its connector is clean, then reset bed power.")
+        for engineering in ('0.00 A', 'PGOOD', 'eFuse'):
+            self.assertNotIn(engineering, c['bed_power_reason'])
+        self.assertIn('bed_power_fault', m.m1.faults(c))
+
+    def test_did_not_come_back_after_a_reset(self):
+        m = self.fault_machine('PGOOD did not rise after the reset within'
+                               ' 2.00s (0.00 A peak)',
+                               z_power.NO_RETURN_REASON)
+        c = m.m1.conditions(0)
+        self.assertEqual(c['bed_power_reason'], z_power.NO_RETURN_REASON)
+        self.assertIn('bed_power_fault', m.m1.faults(c))
+
+    def test_other_faults_keep_the_old_reason_and_the_fault_key(self):
+        m = self.fault_machine('overcurrent: 5.80 A over 5.00 A', None)
+        c = m.m1.conditions(0)
+        self.assertIn('overcurrent', c['bed_power_reason'])
+        self.assertIn('Z_POWER_RESET', c['bed_power_reason'])
+        self.assertEqual(m.m1.faults(c), ['bed_power_fault'])
+
+    def test_a_glitch_alone_is_not_a_fault(self):
+        m = Machine()
+        m.zp.status.update(pgood_glitches=3)
+        self.assertEqual(m.m1.faults(m.m1.conditions(0)), [])
 
 
 class TestStatus(unittest.TestCase):

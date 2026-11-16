@@ -4885,7 +4885,10 @@ must rise within `power_good_timeout` of enabling, and a later PGOOD drop,
 a current above `max_current`, or current drawn with the bed heater off
 latch a fault that holds the feed off until `Z_POWER_RESET`. The status
 object reports `state`, `reason`, `z`, `plate_present`, `enabled`,
-`power_good`, `present_ratio`, `current` (A), `power` (W) and `fault`.
+`power_good`, `present_ratio`, `current` (A), `power` (W), `fault`,
+`fault_detail` (the peak current and recent PGOOD polls at the fault),
+`pgood_glitches` (PGOOD lows that came back before a fault latched),
+`last_pgood_glitch` and `last_pgood_glitch_age` (s).
 
 ```
 [z_power]
@@ -4929,6 +4932,12 @@ present_locked_range:
 #   outlasts the TPS16630's own start-up limit (thermal regulation up to
 #   1.5 s, then a 13 ms PGOOD deglitch). The fault text gives the highest
 #   IMON current seen while waiting.
+#power_good_drop_samples: 3
+#   Consecutive polls (0.1 s apart) PGOOD must stay low while the path is
+#   ready before a "PGOOD dropped" fault latches. A shorter low is counted
+#   as a glitch and logged, and the feed stays on. 1 latches on the first
+#   low poll. A low within power_good_timeout of PGOOD first coming up is
+#   treated as part of the start-up, not as a drop.
 #plate_settle_time: 2.0
 #   Seconds the Z column must be plugged in before the plate reading
 #   counts. The bed thermistor input floats while the column is out.

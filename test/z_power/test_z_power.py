@@ -145,16 +145,35 @@ class StubDetector:
 
 class StubPrinter:
     command_error = CommandError
+    def __init__(self):
+        self.objects = {}
     def is_shutdown(self):
         return False
     def lookup_object(self, name, default=None):
-        return default
+        return self.objects.get(name, default)
 
 
 class StubReactor:
     NEVER = 9e99
     def register_callback(self, cb):
         cb(0.)
+    def monotonic(self):
+        return 0.
+
+
+class StubPrintStats:
+    def __init__(self):
+        self.state = 'standby'
+    def get_status(self, eventtime):
+        return {'state': self.state}
+
+
+class StubGcmd:
+    error = CommandError
+    def __init__(self):
+        self.out = []
+    def respond_info(self, msg):
+        self.out.append(msg)
 
 
 class Harness(unittest.TestCase):
@@ -171,6 +190,8 @@ class Harness(unittest.TestCase):
         zp.present_ratio = None
         zp.bands = BANDS
         zp.z_band = z_power.Debounce(1)
+        zp._init_pgood_state(z_power.DROP_SAMPLES)
+        zp.xy_requires_column = True
         zp.current = None
         zp.raw_current = None
         zp.current_offset = None
@@ -282,13 +303,16 @@ class Harness(unittest.TestCase):
         self.assertIn('? A peak', zp.fault)
 
     def test_pgood_drop_after_ready_latches_fault(self):
+        # One low poll latches with drop_samples = 1, the behaviour before
+        # KAN-3334, once the start-up settle (0.5 s here) is over.
         zp = self.make()
+        zp.drop_samples = 1
         self.tick(zp, 1.0)
         zp.power_good = True
         self.tick(zp, 1.1)
         zp.heater.set_temp(60.)
         zp.power_good = False
-        self.tick(zp, 1.2)
+        self.tick(zp, 1.7)
         self.assertEqual(zp.state, FAULT)
         self.assertFalse(zp.enabled)
         self.assertEqual(zp.heater.target, 0.)
@@ -556,6 +580,354 @@ class TestBedRemovalDetector(unittest.TestCase):
         for et in range(5):
             d.check_bed_temperature(float(et))
         self.assertEqual(len(d.window), 1)
+
+
+class Ready(Harness):
+    """A path brought up and READY at t=1.1; the start-up settle (the
+    harness's power_good_timeout, 0.5 s) ends at 1.6."""
+    def up(self, zp):
+        self.tick(zp, 1.0)
+        zp.power_good = True
+        self.tick(zp, 1.1)
+        self.assertEqual(zp.state, READY)
+
+    def poll_pgood(self, zp, levels, t0=2.0, step=0.1):
+        """One poll per level (True/False) from t0; returns the next time."""
+        t = t0
+        for level in levels:
+            zp.power_good = level
+            self.tick(zp, t)
+            t += step
+        return t
+
+    def enable_writes(self, zp):
+        return [v for _t, v in zp.mcu_enable.writes]
+
+
+class TestPgoodDebounce(Ready):
+    def test_defaults(self):
+        self.assertEqual(z_power.DROP_SAMPLES, 3)
+        self.assertEqual(self.make().drop_samples, 3)
+
+    def test_single_low_does_not_latch_and_is_counted_and_logged(self):
+        zp = self.make()
+        self.up(zp)
+        with self.assertLogs(level='WARNING') as logs:
+            self.poll_pgood(zp, [False, True])
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertTrue(zp.enabled)
+        self.assertEqual(self.enable_writes(zp), [1])   # never switched off
+        self.assertEqual(zp.glitches, 1)
+        self.assertAlmostEqual(zp.last_glitch, 2.1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('PGOOD glitch #1', logs.output[0])
+        st = zp.get_status(2.6)
+        self.assertEqual(st['pgood_glitches'], 1)
+        self.assertEqual(st['last_pgood_glitch_age'], 0.5)
+        self.assertEqual(st['state'], READY)
+
+    def test_glitch_line_carries_the_diagnostics(self):
+        zp = self.make()
+        zp.heater.last_temp = 41.5
+        self.up(zp)
+        zp.raw_current, zp.current_offset = 2.5, 0.
+        with self.assertLogs(level='WARNING') as logs:
+            self.poll_pgood(zp, [True, False, True])
+        line = logs.output[0]
+        for text in ('peak 2.50 A', 'now 2.50 A', 'Z_PRESENT 0.100',
+                     'bed 41.5 C', '0@0.1s', '1@0.0s'):
+            self.assertIn(text, line)
+
+    def test_n_consecutive_lows_latch_with_diagnostics(self):
+        zp = self.make()
+        self.up(zp)
+        zp.heater.set_temp(60.)
+        zp.raw_current, zp.current_offset = 3.0, 0.
+        self.poll_pgood(zp, [True, True], t0=2.0)
+        zp.raw_current = 0.
+        with self.assertLogs(level='ERROR') as logs:
+            self.poll_pgood(zp, [False, False], t0=2.2)
+            self.assertEqual(zp.state, READY)     # two lows: not yet
+            self.assertIsNone(zp.fault)
+            self.tick(zp, 2.4)
+        self.assertEqual(zp.state, FAULT)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.heater.target, 0.)
+        self.assertIn('FAULT', zp.scripts)
+        # The old first words are kept; the peak is higher than "now" (0).
+        self.assertTrue(zp.fault.startswith('PGOOD dropped (eFuse tripped, '))
+        self.assertIn('peak 3.00 A', zp.fault)
+        self.assertNotIn('0.00 A)', zp.fault)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('now 0.00 A, peak 3.00 A over 2 s', logs.output[0])
+        self.assertIn('0@0.0s', logs.output[0])
+        self.assertEqual(zp.glitches, 0)
+
+    def test_n_minus_one_lows_then_a_high_does_not_latch(self):
+        zp = self.make()
+        self.up(zp)
+        self.poll_pgood(zp, [False, False, True])
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertEqual(zp.glitches, 1)
+
+    def test_lows_separated_by_highs_never_accumulate(self):
+        zp = self.make()
+        self.up(zp)
+        self.poll_pgood(zp, [False, True] * 10)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertEqual(zp.glitches, 10)
+        self.assertEqual(self.enable_writes(zp), [1])
+
+    def test_drop_samples_one_is_the_old_behaviour(self):
+        zp = self.make()
+        zp.drop_samples = 1
+        self.up(zp)
+        self.poll_pgood(zp, [False])
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.glitches, 0)
+
+    def test_glitch_log_is_rate_limited_but_counted(self):
+        zp = self.make()
+        self.up(zp)
+        with self.assertLogs(level='WARNING') as logs:
+            self.poll_pgood(zp, [False, True] * 20)    # 4 s of chatter
+        self.assertEqual(zp.glitches, 20)
+        self.assertEqual(len(logs.output), 1)
+        # After the interval the next glitch is logged, saying how many
+        # were not.
+        with self.assertLogs(level='WARNING') as logs:
+            self.poll_pgood(zp, [False, True],
+                            t0=2.0 + z_power.GLITCH_LOG_INTERVAL)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('19 more not logged', logs.output[0])
+
+    def test_config_option_defaults_and_minimum(self):
+        class Cfg:
+            def getint(self, name, default, minval=None):
+                self.asked = (name, default, minval)
+                return default
+        cfg = Cfg()
+        zp = self.make()
+        zp._init_pgood_state(cfg.getint('power_good_drop_samples',
+                                        z_power.DROP_SAMPLES, minval=1))
+        self.assertEqual(cfg.asked, ('power_good_drop_samples', 3, 1))
+        src = open(os.path.join(KLIPPY, 'extras', 'z_power.py')).read()
+        self.assertIn("config.getint('power_good_drop_samples',", src)
+        self.assertIn('minval=1', src.split('power_good_drop_samples')[1]
+                      .split(')')[0])
+
+
+class TestStartUpBlanking(Ready):
+    def test_a_low_inside_the_settle_is_not_dropped(self):
+        zp = self.make()
+        zp.drop_samples = 1          # the strictest setting still holds
+        self.up(zp)
+        zp.heater.set_temp(60.)
+        self.poll_pgood(zp, [False], t0=1.2)           # 0.1 s after READY
+        self.assertIsNone(zp.fault)
+        self.assertEqual(zp.state, POWERING)
+        self.assertTrue(zp.enabled)
+        self.assertEqual(zp.heater.target, 0.)         # heating refused
+        self.assertEqual(zp.glitches, 0)
+
+    def test_a_low_inside_the_settle_that_recovers_goes_ready(self):
+        zp = self.make()
+        self.up(zp)
+        self.poll_pgood(zp, [False, True], t0=1.2)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+
+    def test_a_low_that_stays_latches_did_not_rise_not_dropped(self):
+        zp = self.make()
+        self.up(zp)
+        self.poll_pgood(zp, [False], t0=1.2)
+        # The start-up wait runs from the low, as from an enable
+        # (power_good_timeout is 0.5 s here).
+        self.tick(zp, 1.2 + 0.45)
+        self.assertEqual(zp.state, POWERING)
+        self.tick(zp, 1.2 + 0.55)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('PGOOD did not rise within 0.50s', zp.fault)
+        self.assertNotIn('dropped', zp.fault)
+
+    def test_after_the_settle_a_low_is_judged(self):
+        zp = self.make()
+        zp.drop_samples = 1
+        self.up(zp)
+        self.poll_pgood(zp, [False], t0=1.7)           # settle ended 1.6
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('PGOOD dropped', zp.fault)
+
+    def test_settle_is_not_restarted_by_a_recovered_low(self):
+        zp = self.make()
+        zp.drop_samples = 1
+        self.up(zp)
+        self.poll_pgood(zp, [False, True], t0=1.5)     # inside, recovers
+        self.assertEqual(zp.state, READY)
+        self.poll_pgood(zp, [False], t0=1.7)           # past the original end
+        self.assertEqual(zp.state, FAULT)
+
+    def test_power_good_timeout_still_times_the_first_rise(self):
+        zp = self.make()
+        self.tick(zp, 1.0)
+        self.tick(zp, 1.0 + z_power.PIN_MIN_TIME + 0.45)
+        self.assertEqual(zp.state, POWERING)
+        self.tick(zp, 1.0 + z_power.PIN_MIN_TIME + 0.55)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('PGOOD did not rise within', zp.fault)
+        self.assertNotIn('after the reset', zp.fault)
+
+    def test_re_enable_after_the_plate_flickers_waits_for_pgood(self):
+        # Stale-READY check: PGOOD falls when the FET goes off, so a quick
+        # off/on does not read READY from the old high.
+        zp = self.make()
+        self.up(zp)
+        self.tick(zp, 1.2, plate=False)
+        zp.power_good = False                # the FET went off
+        self.tick(zp, 1.3)                   # plate back: enable again
+        self.tick(zp, 1.4)
+        self.assertEqual(zp.state, POWERING)
+        self.assertEqual(self.enable_writes(zp), [1, 0, 1])
+
+
+class TestFaultsAreExplicit(Ready):
+    def latch(self, zp):
+        self.up(zp)
+        zp.drop_samples = 1
+        self.poll_pgood(zp, [False], t0=2.0)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_no_automatic_re_enable_after_a_latch(self):
+        zp = self.make()
+        self.latch(zp)
+        writes = list(zp.mcu_enable.writes)
+        self.poll_pgood(zp, [True] * 30, t0=2.1)   # PGOOD back, all good
+        self.assertEqual(zp.state, FAULT)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.mcu_enable.writes, writes)
+        self.assertEqual(self.enable_writes(zp)[-1], 0)
+
+    def test_reset_clears_and_the_feed_comes_back(self):
+        zp = self.make()
+        self.latch(zp)
+        zp.printer.objects['print_stats'] = StubPrintStats()
+        gcmd = StubGcmd()
+        zp.cmd_Z_POWER_RESET(gcmd)
+        self.assertIsNone(zp.fault)
+        self.assertIsNone(zp.fault_detail)
+        self.assertIn('Cleared Z power fault', gcmd.out[0])
+        zp.power_good = False
+        self.tick(zp, 3.0)
+        self.assertEqual(zp.state, POWERING)
+        self.assertEqual(self.enable_writes(zp)[-1], 1)
+
+    def test_reset_is_refused_while_printing(self):
+        zp = self.make()
+        self.latch(zp)
+        stats = StubPrintStats()
+        zp.printer.objects['print_stats'] = stats
+        stats.state = 'printing'
+        writes = list(zp.mcu_enable.writes)
+        with self.assertRaises(CommandError) as ctx:
+            zp.cmd_Z_POWER_RESET(StubGcmd())
+        self.assertEqual(str(ctx.exception), z_power.PRINTING_RESET_ERROR)
+        self.assertTrue(zp.fault)
+        self.tick(zp, 3.0)
+        self.assertEqual(zp.state, FAULT)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.mcu_enable.writes, writes)
+
+    def test_reset_is_allowed_when_not_printing(self):
+        for state in ('paused', 'standby', 'complete', 'cancelled', 'error'):
+            zp = self.make()
+            self.latch(zp)
+            stats = StubPrintStats()
+            stats.state = state
+            zp.printer.objects['print_stats'] = stats
+            zp.cmd_Z_POWER_RESET(StubGcmd())
+            self.assertIsNone(zp.fault, state)
+
+    def test_reset_without_print_stats_counts_as_not_printing(self):
+        zp = self.make()
+        self.latch(zp)
+        zp.cmd_Z_POWER_RESET(StubGcmd())
+        self.assertIsNone(zp.fault)
+
+    def reset_and_enable(self, zp):
+        self.latch(zp)
+        zp.cmd_Z_POWER_RESET(StubGcmd())
+        zp.power_good = False
+        self.tick(zp, 3.0)                       # re-enabled
+        self.assertEqual(zp.state, POWERING)
+
+    def test_pgood_that_does_not_return_after_a_reset_says_so_once(self):
+        zp = self.make()
+        self.reset_and_enable(zp)
+        with self.assertLogs(level='ERROR') as logs:
+            self.tick(zp, 3.0 + z_power.PIN_MIN_TIME + 0.55)
+            self.assertEqual(zp.state, FAULT)
+            self.assertEqual(zp.reason, z_power.NO_RETURN_REASON)
+            self.assertIn('PGOOD did not rise after the reset',
+                          zp.fault)
+            self.assertIsNotNone(zp.fault_detail)
+            writes = list(zp.mcu_enable.writes)
+            for t in (4.0, 4.1, 4.2, 6.0, 9.0):
+                self.tick(zp, t)
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.reason, z_power.NO_RETURN_REASON)
+        self.assertEqual(zp.mcu_enable.writes, writes)   # no second try
+        self.assertEqual(zp.scripts.count('FAULT'), 2)   # the first + this
+
+    def test_the_no_return_text_is_not_the_other_two(self):
+        self.assertNotEqual(z_power.NO_RETURN_REASON, z_power.DROPPED_REASON)
+        self.assertIn('did not come back', z_power.NO_RETURN_REASON)
+        self.assertNotIn('did not come back', z_power.DROPPED_REASON)
+
+    def test_pgood_that_returns_after_a_reset_goes_ready_clean(self):
+        zp = self.make()
+        zp.glitches = 4
+        self.latch(zp)
+        zp.low_polls = 2
+        zp.cmd_Z_POWER_RESET(StubGcmd())
+        self.assertEqual(zp.low_polls, 0)
+        zp.power_good = False
+        self.tick(zp, 3.0)
+        zp.power_good = True
+        self.tick(zp, 3.2)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertEqual(zp.low_polls, 0)
+        self.assertEqual(zp.glitches, 4)          # the evidence is kept
+        self.poll_pgood(zp, [True], t0=4.0)       # past the settle
+        self.assertFalse(zp.after_reset)
+        # A later drop is "dropped", not "did not come back"
+        zp.drop_samples = 1
+        self.poll_pgood(zp, [False], t0=4.1)
+        self.assertEqual(zp.reason, z_power.DROPPED_REASON)
+
+    def test_dropped_reason_is_one_plain_sentence(self):
+        zp = self.make()
+        self.latch(zp)
+        self.assertEqual(zp.reason, z_power.DROPPED_REASON)
+        self.assertEqual(zp.get_status(3.)['reason'], z_power.DROPPED_REASON)
+        self.assertNotIn(' A', zp.reason)
+        self.assertNotIn('PGOOD', zp.reason)
+        self.assertEqual(zp.reason.count('. '), 1)
+        self.assertTrue(zp.reason.endswith('.'))
+        self.assertIn('PGOOD dropped', zp.fault)
+        self.assertIn('peak', zp.get_status(3.)['fault_detail'])
+
+    def test_other_faults_keep_their_old_reason(self):
+        zp = self.make()
+        self.up(zp)
+        zp.latch_fault('boom')
+        self.tick(zp, 2.0)
+        self.assertIn('Z_POWER_RESET', zp.reason)
+        self.assertIn('boom', zp.reason)
 
 
 if __name__ == '__main__':

@@ -32,6 +32,7 @@
 # never rises or drops is all this module can see; the IMON current at that
 # moment is logged with the fault to tell a short (current at the limit) from
 # an input-window or enable fault (no current).
+import collections
 import logging
 
 POLL_INTERVAL = 0.1
@@ -52,6 +53,19 @@ POWER_GOOD_TIMEOUT = 2.0
 # so the detector has fresh samples from the column (the thermistor reports
 # every 0.3 s and the detector averages two).
 PLATE_SETTLE_TIME = 2.0
+# KAN-3334: a PGOOD low seen while READY is a trip only once it has lasted
+# this many consecutive polls (POLL_INTERVAL apart). One low poll followed
+# by a high one is a glitch: counted and logged, never latched. 1 is the
+# old behaviour (the first low poll latches).
+DROP_SAMPLES = 3
+# The fault and glitch log lines carry the peak IMON current over this
+# long and the last PGOOD_HISTORY PGOOD polls. The current at the moment
+# of a trip is often 0.00 A (the FET is already off), so the peak is what
+# says whether the eFuse was loaded.
+PEAK_WINDOW = 2.0
+PGOOD_HISTORY = 10
+# At most one glitch line in the log per this long; the rest are counted.
+GLITCH_LOG_INTERVAL = 10.0
 
 # States, in the order the path comes up
 ABSENT = 'absent'           # no Z column on the connector
@@ -78,18 +92,28 @@ REASONS = {
     FAULT: "bed power fault: %s. Check the bed and its cable, then run"
            " Z_POWER_RESET",
 }
+# One plain sentence for the panel (m1_machine's bed_power_reason), used
+# in place of REASONS[FAULT] for the faults that have one. The engineering
+# detail (peak current, PGOOD history) is in fault_detail and the log.
+DROPPED_REASON = ("Bed power cut out. Check the plate is seated and its"
+                  " connector is clean, then reset bed power.")
+NO_RETURN_REASON = ("Bed power did not come back after the reset. Check the"
+                    " plate and its connector.")
+PRINTING_RESET_ERROR = "Pause or stop the print before resetting bed power."
 
 
-def decide(z_band, plate_present, fault, inhibited):
+def decide(z_band, plate_present, fault, inhibited,
+           fault_reason=None):
     """Pure decision: (state before PGOOD confirmation, reason, enable).
 
     z_band is 'absent', 'unlocked', 'locked' or None (no matching band).
-    plate_present is True, False or None (no reading yet). Returns the
+    plate_present is True, False or None (no reading yet). fault_reason
+    is the plain sentence for the fault, if it has one. Returns the
     state the path should be in if PGOOD behaves; the caller turns
     'powering' into 'ready' once PGOOD confirms.
     """
     if fault:
-        return FAULT, REASONS[FAULT] % (fault,), False
+        return FAULT, fault_reason or REASONS[FAULT] % (fault,), False
     if inhibited:
         return INHIBITED, REASONS[INHIBITED], False
     if z_band == 'absent':
@@ -167,6 +191,9 @@ class ZPower:
             lo, hi = self._get_range(config, 'present_%s_range' % (band,))
             self.bands.append((band, (lo, hi)))
         self.z_band = Debounce(config.getint('present_samples', 3, minval=1))
+        # PGOOD drop debounce while READY (see DROP_SAMPLES)
+        self._init_pgood_state(config.getint('power_good_drop_samples',
+                                             DROP_SAMPLES, minval=1))
         # IMON current (optional). IMON reads a small non-zero value with
         # the feed off (~0.11 A equivalent on gimlet), so the zero is learnt
         # while the enable is off and subtracted while it is on.
@@ -244,6 +271,21 @@ class ZPower:
                                desc=self.cmd_Z_POWER_WAIT_help)
         gcode.register_command('Z_POWER_REQUIRE', self.cmd_Z_POWER_REQUIRE,
                                desc=self.cmd_Z_POWER_REQUIRE_help)
+    def _init_pgood_state(self, drop_samples):
+        self.drop_samples = drop_samples
+        self.low_polls = 0
+        self.glitches = 0
+        self.last_glitch = None
+        self.glitch_log_time = None
+        self.glitch_unlogged = 0
+        # When the start-up blanking ends (set when PGOOD first comes up
+        # after an enable), and whether the enable follows a reset
+        self.settle_end = None
+        self.after_reset = False
+        self.pgood_history = collections.deque(maxlen=PGOOD_HISTORY)
+        self.current_history = collections.deque()
+        self.fault_reason = None
+        self.fault_detail = None
     def _get_range(self, config, option):
         vals = config.getfloatlist(option, count=2)
         lo, hi = vals
@@ -338,12 +380,86 @@ class ZPower:
         self.enabled = value
         logging.info("%s: 48V_Z %s", self.name, "on" if value else "off")
         return eventtime + (print_time - est)
-    def _latch_fault(self, reason, eventtime):
+    def _latch_fault(self, reason, eventtime, plain=None, detail=None):
         if self.fault:
             return
         self.fault = reason
-        logging.error("%s: fault: %s", self.name, reason)
+        self.fault_reason = plain
+        self.fault_detail = detail
+        self.after_reset = False
+        logging.error("%s: fault: %s%s", self.name, reason,
+                      " | " + detail if detail else "")
         self._run_template(self.fault_template)
+    def _record(self, eventtime):
+        """Keep the recent PGOOD polls and IMON readings for the fault and
+        glitch log lines."""
+        self.pgood_history.append((eventtime, self.power_good))
+        hist = self.current_history
+        if self.current is not None:
+            hist.append((eventtime, self.current))
+        while hist and eventtime - hist[0][0] > PEAK_WINDOW:
+            hist.popleft()
+    def _peak(self):
+        return max([c for _t, c in self.current_history] or [None])
+    def _diagnostics(self, eventtime):
+        """One line: what the eFuse and the bed looked like just now."""
+        peak = self._peak()
+        ratio = self.present_ratio
+        temp = getattr(self.heater, 'last_temp', None)
+        polls = " ".join("%d@%.1fs" % (v, eventtime - t)
+                         for t, v in self.pgood_history)
+        return ("now %s A, peak %s A over %.0f s, Z_PRESENT %s, bed %s C,"
+                " PGOOD (value@age) %s"
+                % (self._amps(self.current), self._amps(peak), PEAK_WINDOW,
+                   "?" if ratio is None else "%.3f" % (ratio,),
+                   "?" if temp is None else "%.1f" % (temp,), polls))
+    def _glitch(self, eventtime):
+        """PGOOD was low for fewer polls than drop_samples, then came back."""
+        self.glitches += 1
+        self.last_glitch = eventtime
+        last = self.glitch_log_time
+        if last is not None and eventtime - last < GLITCH_LOG_INTERVAL:
+            self.glitch_unlogged += 1
+            return
+        logging.warning(
+            "%s: PGOOD glitch #%d (low %d of %d polls, not latched%s) | %s",
+            self.name, self.glitches, self.low_polls, self.drop_samples,
+            ", %d more not logged" % (self.glitch_unlogged,)
+            if self.glitch_unlogged else "", self._diagnostics(eventtime))
+        self.glitch_log_time = eventtime
+        self.glitch_unlogged = 0
+    def _pgood_low(self, eventtime, state, reason):
+        """PGOOD is low on a path that was READY: (state, reason, enable)."""
+        if self.settle_end is not None and eventtime < self.settle_end:
+            # The eFuse's start-up may still be settling (see
+            # POWER_GOOD_TIMEOUT), so this is not a trip. Wait for PGOOD as
+            # for a start-up: heating is refused meanwhile, and PGOOD
+            # that never returns latches "did not rise" as usual.
+            logging.info("%s: PGOOD low %.2fs before the start-up settle"
+                         " ends; waiting", self.name,
+                         self.settle_end - eventtime)
+            self.powering_since = eventtime
+            self.start_peak = 0.
+            return state, reason, True
+        self.low_polls += 1
+        if self.low_polls < self.drop_samples:
+            # Not yet a trip. The eFuse has already cut the feed if it
+            # tripped, so nothing is heated meanwhile; a latch zeroes the
+            # heater target through _transition.
+            return READY, "bed power is on", True
+        self._latch_fault("PGOOD dropped (eFuse tripped, peak %s A over"
+                          " %.0f s)" % (self._amps(self._peak()),
+                                        PEAK_WINDOW), eventtime,
+                          DROPPED_REASON, self._diagnostics(eventtime))
+        return FAULT, self.fault_reason, False
+    def _pgood_high(self, eventtime):
+        if self.settle_end is None:
+            self.settle_end = eventtime + self.power_good_timeout
+        elif eventtime >= self.settle_end:
+            self.after_reset = False
+        if self.low_polls:
+            self._glitch(eventtime)
+            self.low_polls = 0
     def latch_fault(self, reason):
         """Latch a fault found elsewhere (e.g. [heater_supply])."""
         self._latch_fault(reason, self.reactor.monotonic())
@@ -379,34 +495,48 @@ class ZPower:
             self._check_z_change(band)
         self.plate = plate = self._plate_present(band, eventtime)
         self._update_current()
+        self._record(eventtime)
         if self.enabled:
             self._check_current(eventtime)
         state, reason, enable = decide(band, plate, self.fault,
-                                       self.inhibited)
+                                       self.inhibited, self.fault_reason)
         if enable:
             if not self.enabled:
                 self.powering_since = self._set_enable(True, eventtime)
                 self.start_peak = 0.
+                self.settle_end = None
+                self.low_polls = 0
             elif self.power_good:
                 state, reason = READY, "bed power is on"
                 self.powering_since = None
+                self._pgood_high(eventtime)
             elif self.powering_since is None:
-                # PGOOD dropped after the path was up: the eFuse turned its
-                # FET off (overload, thermal, UVLO or OVP).
-                self._latch_fault("PGOOD dropped (eFuse tripped, %s A)"
-                                  % (self._amps(self.current),), eventtime)
-                state, reason, enable = FAULT, self.fault, False
+                # PGOOD low after the path was up: the eFuse turned its FET
+                # off (overload, thermal, UVLO or OVP), or it is a glitch.
+                state, reason, enable = self._pgood_low(eventtime, state,
+                                                        reason)
             else:
                 if self.current is not None:
                     self.start_peak = max(self.start_peak, self.current)
                 if eventtime - self.powering_since > self.power_good_timeout:
-                    self._latch_fault(
-                        "PGOOD did not rise within %.2fs (%s A peak)"
-                        % (self.power_good_timeout,
-                           self._amps(self.start_peak
-                                      if self.current is not None
-                                      else None)), eventtime)
-                    state, reason, enable = FAULT, self.fault, False
+                    amps = self._amps(self.start_peak
+                                      if self.current is not None else None)
+                    if self.after_reset:
+                        self._latch_fault(
+                            "PGOOD did not rise after the reset within"
+                            " %.2fs (%s A peak)"
+                            % (self.power_good_timeout, amps), eventtime,
+                            NO_RETURN_REASON, self._diagnostics(eventtime))
+                    else:
+                        self._latch_fault(
+                            "PGOOD did not rise within %.2fs (%s A peak)"
+                            % (self.power_good_timeout, amps), eventtime,
+                            None, self._diagnostics(eventtime))
+                    state, reason, enable = (FAULT, self.fault_reason
+                                             or self.fault, False)
+        else:
+            self.low_polls = 0
+            self.after_reset = False
         self._set_enable(enable, eventtime)
         self._transition(state, reason, eventtime)
         return eventtime + POLL_INTERVAL
@@ -482,6 +612,9 @@ class ZPower:
                 return volts
         return self.supply_voltage
     def get_status(self, eventtime):
+        glitch_age = None
+        if self.last_glitch is not None and eventtime is not None:
+            glitch_age = round(eventtime - self.last_glitch, 1)
         power = None
         if self.current is not None:
             power = round(self.current * self._supply_voltage(eventtime), 1)
@@ -497,7 +630,11 @@ class ZPower:
                 'current': (None if self.current is None
                             else round(self.current, 3)),
                 'power': power,
-                'fault': self.fault}
+                'fault': self.fault,
+                'fault_detail': self.fault_detail,
+                'pgood_glitches': self.glitches,
+                'last_pgood_glitch': self.last_glitch,
+                'last_pgood_glitch_age': glitch_age}
     # Commands
     cmd_Z_POWER_STATUS_help = "Report the Z column and bed power path"
     def cmd_Z_POWER_STATUS(self, gcmd):
@@ -506,16 +643,28 @@ class ZPower:
         gcmd.respond_info(
             "Z power: %s%s\n"
             "Z_PRESENT ratio %s -> %s | plate %s | enable %s | PGOOD %s\n"
-            "current %s A | power %s W"
+            "current %s A | power %s W | PGOOD glitches %d"
             % (st['state'], " (%s)" % st['reason'] if st['reason'] else "",
                "-" if ratio is None else "%.3f" % (ratio,), st['z'],
                st['plate_present'], int(st['enabled']),
-               int(st['power_good']), st['current'], st['power']))
+               int(st['power_good']), st['current'], st['power'],
+               st['pgood_glitches']))
     cmd_Z_POWER_RESET_help = "Clear a latched Z power fault"
     def cmd_Z_POWER_RESET(self, gcmd):
+        # Not mid-print: if the cause is still there the fault re-latches
+        # within a second. A paused print is recoverable (reset, resume).
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is not None and stats.get_status(
+                self.reactor.monotonic()).get('state') == 'printing':
+            raise gcmd.error(PRINTING_RESET_ERROR)
         if self.fault:
             gcmd.respond_info("Cleared Z power fault: %s" % (self.fault,))
-        self.fault = None
+        # A reset that clears a fault re-enables the feed: if PGOOD does not
+        # rise, say so (NO_RETURN_REASON), not "dropped" or "did not rise".
+        self.after_reset = bool(self.fault)
+        self.fault = self.fault_reason = self.fault_detail = None
+        self.low_polls = 0
+        self.settle_end = None
         self.over_since = self.idle_over_since = None
     cmd_Z_POWER_INHIBIT_help = "Hold 48V_Z off (ENABLE=1) or release it"
     def cmd_Z_POWER_INHIBIT(self, gcmd):
