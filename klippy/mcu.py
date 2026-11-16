@@ -330,7 +330,26 @@ class TriggerDispatch:
     def stop(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_stop(self._trdispatch)
-        res = [trsync.stop() for trsync in self._trsyncs]
+        res = []
+        first_error = None
+        for trsync in self._trsyncs:
+            # KAN-3370: a non-critical MCU that has gone away (the toolhead
+            # unplugged during a Z move) must not stop the other MCUs'
+            # trsyncs from being stopped, or the Z stepper is left to run
+            # on its queued steps
+            try:
+                res.append(trsync.stop())
+            except Exception as e:
+                mcu = trsync.get_mcu()
+                if not getattr(mcu, "non_critical_disconnected", False):
+                    if first_error is None:
+                        first_error = e
+                    continue
+                logging.info("trsync stop on offline MCU '%s': %s",
+                             mcu.get_name(), e)
+                res.append(MCU_trsync.REASON_COMMS_TIMEOUT)
+        if first_error is not None:
+            raise first_error
         err_res = [r for r in res if r >= MCU_trsync.REASON_COMMS_TIMEOUT]
         if err_res:
             return err_res[0]

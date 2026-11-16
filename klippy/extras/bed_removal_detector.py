@@ -136,6 +136,18 @@ class BedRemovalDetector:
             # reheat on resume would silently do nothing.
             self.restore_target = target
         self.bed_heater.set_temp(0.0)
+        # KAN-3370: a Z homing or probe move in progress is driving the bed
+        # into whatever is in the way (Boxwood, Nov 2026: a 164 mm search
+        # lifted the bed off its mount).  Stop it now; the HOMING_GATE macro
+        # only looks at this flag before a move starts.  A move that does not
+        # involve Z is left alone.
+        try:
+            homing = self.printer.lookup_object('homing', None)
+            abort = getattr(homing, 'abort_active_move', None)
+            if abort is not None:
+                abort("the bed was removed")
+        except Exception:
+            self.log.exception('aborting the active homing move failed')
         # Stop feeding the file immediately, the way filament_switch_sensor
         # does on runout: the pause half of pause_resume has to take effect
         # now, not whenever the macro below wins the gcode mutex, because

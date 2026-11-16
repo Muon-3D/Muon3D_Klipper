@@ -1516,6 +1516,21 @@ home_xy_position:
 #   positions after Z axis homing. The default is False.
 ```
 
+### [homing]
+
+Limits on homing and probing moves. This section is optional.
+
+```
+[homing]
+#max_search_distance_z: 40.0
+#   The furthest (in mm) that one Z probing move, including the Z
+#   homing search of a load cell probe, may travel. If the probe has
+#   not triggered by then the move stops with an error ("Z homing
+#   stopped: no contact within N mm") instead of running on to the
+#   axis limit. 0 turns the limit off. X and Y moves are never
+#   limited. The default is 40.
+```
+
 ### [homing_override]
 
 Homing override. One may use this mechanism to run a series of g-code
@@ -6072,6 +6087,17 @@ sensor_type:
 #   Raw ADC value for the stable max-load anchor used by
 #   safety_model=preloaded_max. This can be set manually or captured with
 #   LOAD_CELL_CALIBRATE_MAX.
+#press_direction:
+#   -1 or 1: the way pressing on the nozzle moves the raw counts when
+#   safety_model=preloaded_max. The default is the sign of
+#   reference_max_load_counts (the max-load anchor is on the press side of
+#   zero). This is never inferred from the tare. It must be set if
+#   reference_max_load_counts is 0.
+#min_tare_headroom_percent: 20.0
+#   With safety_model=preloaded_max, probing is refused ("The nozzle is
+#   already under load") when the tare is closer to reference_max_load_counts
+#   than this percentage of abs(reference_max_load_counts), or past it. This
+#   catches something resting on the nozzle at tare. 0 to below 100.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than
