@@ -773,9 +773,17 @@ class ZLoadBackstop:
                          " move could be aborted", reason)
 
     def get_status(self):
+        # The *_counts are the limits of the descent in progress (0 until
+        # one arms); the rest is what is configured, readable at any time,
+        # so an install can be checked with no probe having run.
         return {'z_backstop_ceiling_counts': self._ceiling,
                 'z_backstop_wrong_way_counts': self._wrong,
-                'z_backstop_fired': self.last_fired}
+                'z_backstop_fired': self.last_fired,
+                'z_backstop_ceiling_factor': self._ceiling_factor,
+                'z_backstop_ceiling_counts_config':
+                    self._ceiling_counts_param,
+                'z_backstop_wrong_way_factor': self._wrong_way_factor,
+                'z_backstop_confirm_time': self._confirm_time}
 
 
 # Execute probing moves using the MCU_trigger_analog
@@ -1306,6 +1314,27 @@ class LoadCellPrinterProbe:
                               config_helper)
         probe.ProbeVirtualEndstopDeprecation(config)
         self._printer.add_object('probe', self)
+        self._printer.register_event_handler("klippy:connect",
+                                             self._log_guard_settings)
+
+    def _log_guard_settings(self):
+        # One line in klippy.log with what the KAN-3370 guards are set to,
+        # for checking an install with no motion (see also get_status).
+        try:
+            # Not get_status(): at connect the MCU may not answer yet
+            st = self._load_cell_probing_move._z_watch.get_status()
+            logging.info(
+                "load_cell_probe: press_direction %s, min_tare_headroom %g%%"
+                ", Z backstop: ceiling %g x delta (fixed %d counts, 0 = off)"
+                ", wrong way %g x delta (0 = off), confirm %g s",
+                self._get_status_press_direction(),
+                self._config_helper.get_min_tare_headroom_percent(),
+                st['z_backstop_ceiling_factor'],
+                st['z_backstop_ceiling_counts_config'],
+                st['z_backstop_wrong_way_factor'],
+                st['z_backstop_confirm_time'])
+        except Exception:
+            logging.exception("load_cell_probe: guard settings unreadable")
 
     def get_probe_params(self, gcmd=None):
         return self._param_helper.get_probe_params(gcmd)

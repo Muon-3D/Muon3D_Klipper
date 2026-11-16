@@ -313,6 +313,61 @@ def test_abort_before_the_drip_starts():
           "setup abort: endstop still cleaned up")
 
 
+def test_status_shows_what_is_wired_before_any_move():
+    """KAN-3387 aid: a hand install is checked from status and one log line
+    at connect, with no motion."""
+    import logging
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            logging.Handler.__init__(self)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+    cap = Capture()
+    logging.getLogger().addHandler(cap)
+    logging.getLogger().setLevel(logging.INFO)
+    try:
+        bare = Rig()
+        bare.printer.send_event('klippy:connect')
+        st = bare.phoming.get_status(0.)
+        check(st == {'max_search_distance_z': 0.,
+                     'abort_on_disconnect': False,
+                     'abort_on_disconnect_mcus': [],
+                     'abort_sources': []},
+              "status with nothing wired: cap off, no sources (%r)" % (st,))
+        check(any("Z search cap 0 mm" in l and "abort_on_disconnect False"
+                  in l and "(nothing)" in l for l in cap.lines),
+              "the connect log line says the same (%r)" % (cap.lines,))
+
+        cap.lines[:] = []
+        rig = Rig(options={'max_search_distance_z': 25.})
+        for name in ('bed_removal_detector', 'load_cell_probe', 'z_power'):
+            rig.printer.objects[name] = object()
+        rig.printer.objects['mcu toolhead'] = FakeMcuObject('toolhead', True)
+        rig.printer.objects['mcu'] = FakeMcuObject('mcu', False)
+        rig.printer.send_event('klippy:connect')
+        st = rig.phoming.get_status(0.)
+        check(st['max_search_distance_z'] == 25.,
+              "the configured cap is shown (%r)" % (st,))
+        check(st['abort_on_disconnect'] is True
+              and st['abort_on_disconnect_mcus'] == ['mcu toolhead'],
+              "abort_on_disconnect is True, for the non-critical MCU only")
+        check(st['abort_sources'] == [
+            'bed_removal_detector', 'load_cell_probe', 'z_power',
+            'non_critical_disconnect: mcu toolhead'],
+            "every abort source is named (%r)" % (st['abort_sources'],))
+        check(any("Z search cap 25 mm" in l and "abort_on_disconnect True"
+                  in l and "bed_removal_detector" in l and "z_power" in l
+                  for l in cap.lines),
+              "one log line at connect states them (%r)" % (cap.lines,))
+        check(rig.phoming.active_moves == [] and rig.toolhead.drip_calls
+              == [], "reading the status moved nothing")
+    finally:
+        logging.getLogger().removeHandler(cap)
+
+
 def main():
     test_c1_abort_during_active_z_homing_move()
     test_c2_abort_with_no_active_move()
@@ -321,6 +376,7 @@ def main():
     test_c5_toolhead_disconnect_calls_the_abort()
     test_c6_probing_move_is_aborted_too()
     test_abort_before_the_drip_starts()
+    test_status_shows_what_is_wired_before_any_move()
     fakes.finish()
 
 

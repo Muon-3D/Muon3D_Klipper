@@ -721,6 +721,65 @@ def integ_move(mod, rig, cell, tare, delta):
     return m
 
 
+def test_10_configured_limits_are_in_status_and_the_log(mod):
+    """KAN-3387 aid: the armed limits can be read before any probe ran."""
+    import logging
+    import types
+    w, cell, homing = make_watch(mod)
+    st = w.get_status()
+    want = {'z_backstop_ceiling_counts': 0, 'z_backstop_wrong_way_counts': 0,
+            'z_backstop_fired': None, 'z_backstop_ceiling_factor': 2.5,
+            'z_backstop_ceiling_counts_config': 0,
+            'z_backstop_wrong_way_factor': 1.0,
+            'z_backstop_confirm_time': 0.02}
+    assert st == want, st
+    w2, cell2, homing2 = make_watch(
+        mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,
+        z_move_abort_confirm_time=0.05, z_move_abort_ceiling_counts=70000)
+    st = w2.get_status()
+    assert st['z_backstop_ceiling_factor'] == 3.0, st
+    assert st['z_backstop_wrong_way_factor'] == 0.75, st
+    assert st['z_backstop_confirm_time'] == 0.05, st
+    assert st['z_backstop_ceiling_counts_config'] == 70000, st
+    assert st['z_backstop_ceiling_counts'] == 0, st
+    # arming changes the descent's counts, never the configured values
+    w2.arm(0., -800000, 221075, -1.)
+    st = w2.get_status()
+    assert st['z_backstop_ceiling_counts'] == 70000, st
+    assert st['z_backstop_wrong_way_counts'] == int(0.75 * 221075), st
+    assert st['z_backstop_ceiling_factor'] == 3.0, st
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            logging.Handler.__init__(self)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+    cap = Capture()
+    root = logging.getLogger()
+    old = root.level
+    root.addHandler(cap)
+    root.setLevel(logging.INFO)
+    try:
+        p = object.__new__(mod.LoadCellPrinterProbe)
+        p._config_helper = tg.make_helper(mod, BOX_REF,
+                                          trigger_counts=20000)
+        p._load_cell_probing_move = types.SimpleNamespace(_z_watch=w2)
+        p._log_guard_settings()
+    finally:
+        root.removeHandler(cap)
+        root.setLevel(old)
+    line = [l for l in cap.lines if l.startswith('load_cell_probe:')]
+    assert len(line) == 1, cap.lines
+    for part in ('press_direction -1', 'min_tare_headroom 20%',
+                 'ceiling 3 x delta (fixed 70000 counts',
+                 'wrong way 0.75 x delta', 'confirm 0.05 s'):
+        assert part in line[0], (part, line[0])
+    print('ok  10 configured factors and confirm time in status before any '
+          'probe; one log line states them')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -730,7 +789,8 @@ def main():
              test_5_start_time_and_disarm, test_6_mcutare_and_directionless,
              test_7_watcher_failure_fails_safe,
              test_8_integration_with_real_homing,
-             test_9_muon_ads1220_cadence]
+             test_9_muon_ads1220_cadence,
+             test_10_configured_limits_are_in_status_and_the_log]
     failed = []
     for t in tests:
         try:

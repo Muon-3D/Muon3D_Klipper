@@ -22,8 +22,9 @@
 #     -- and publishes one status: the activity, the conditions, and for
 #     each action the reason codes (ADR 0051) of what is missing.
 #   * MACHINE_WAIT_READY is the start gate: PRINT_START calls it first, and it
-#     waits, with one live checklist prompt, until everything a print needs
-#     is there. It does not fail on the first missing item.
+#     waits, with a live checklist in status (gate) and the console, until
+#     everything a print needs is there. It does not fail on the first
+#     missing item.
 #   * MACHINE_REQUIRE is the resume gate: it refuses, with the same checklist,
 #     and the checklist then follows the machine while it stays paused.
 #   * MACHINE_HEAT_WAIT is a heater wait that ends with an error when the thing
@@ -213,6 +214,13 @@ def activity(ps_state, is_paused, gate, preparing, faults, plate_cleared,
     return 'idle'
 
 
+def _duration(seconds):
+    """'15 min' or '90 s', for the wait timeouts' error text."""
+    if seconds >= 120:
+        return "%d min" % (seconds // 60,)
+    return "%d s" % (seconds,)
+
+
 def checklist_lines(miss):
     return [REASONS.get(code, code) for code in miss]
 
@@ -228,6 +236,13 @@ class M1Machine:
         # pushed half way or a plate seated twice does not start the print.
         self.settle_time = config.getfloat('settle_time', 3., minval=0.)
         self.gate_timeout = config.getfloat('gate_timeout', 1800., minval=0.)
+        # MACHINE_HEAT_WAIT gives up after this long (0 = never), so a heater
+        # that is held or cannot gain does not stall PRINT_START or RESUME
+        # without a word. 15 min is an estimate, not a measurement: a cold
+        # bed on 170 W and a hot end on 192 W should both get there in a
+        # few minutes, and verify_heater already stops a heater that is not
+        # gaining. The clock starts at the wait, not at the M140/M104.
+        self.heat_timeout = config.getfloat('heat_timeout', 900., minval=0.)
         # A paused print's bed stays at target this long, then goes off
         # (audit 6.3). The hot end goes off at the pause itself (PAUSE).
         self.pause_bed_off_time = config.getfloat('pause_bed_off_time',
@@ -268,6 +283,7 @@ class M1Machine:
         self.plate_cleared = True      # see _track_plate
         self.plate_off_since_end = False
         self.last_plate = None
+        self.bed_fault = False         # z_power's fault was latched
         self.job_targets = {'bed': 0., 'hotend': 0.}
         self.pause_reason = None
         self.paused_at = None
@@ -462,6 +478,7 @@ class M1Machine:
                 if t > 0.:
                     self.job_targets[key] = t
         self._track_plate(c['plate'])
+        self._track_bed_fault(c)
         if c['toolhead'] == 'disconnected' and self.toolhead_connects:
             # Not before the first connect: at a Klipper start the deferred
             # MCU reads disconnected until it comes up.
@@ -485,6 +502,20 @@ class M1Machine:
             self._clear_pause()
             self._end_prompt('pause')
             self._end_prompt('gate')
+
+    def _track_bed_fault(self, c):
+        # KAN-3387: z_power's latched fault stands until Z_POWER_RESET (or a
+        # restart), and its macro (_Z_POWER_FAULT, bed.cfg) puts up a "Bed
+        # power fault" prompt that nothing ended. When the fault clears,
+        # end it. It is not this module's prompt (B-8), so this is the one
+        # exception, and the only time it ends a prompt it did not show.
+        # If a pause prompt of its own was up under it, it is shown again
+        # with the checklist as it now is.
+        fault = c.get('bed_power') == 'fault'
+        if self.bed_fault and not fault:
+            self._send(["prompt_end"])
+            self.prompt = None
+        self.bed_fault = fault
 
     def _track_plate(self, plate):
         if plate == self.last_plate:
@@ -647,7 +678,9 @@ class M1Machine:
         self._refuse_latched(gcmd, action, miss)
         # Run by hand from the console there is no job to be cancelled.
         in_job = self.ps_state(eventtime) in ('printing', 'paused')
-        self.gate = {'action': action, 'missing': miss, 'since': start}
+        self.gate = {'action': action, 'missing': miss, 'since': start,
+                     'timeout': timeout,
+                     'deadline': start + timeout if timeout else None}
         gcmd.respond_info("Waiting to %s: %s"
                           % (action, "; ".join(checklist_lines(miss))))
         self._run_led('LED_WARNING')
@@ -692,18 +725,17 @@ class M1Machine:
                     if miss:
                         gcmd.respond_info("Still waiting: %s" % (
                             "; ".join(checklist_lines(miss)),))
+                # No prompt here: the panel shows the gate itself from
+                # status (m1_machine.gate), and a button-less macro prompt
+                # renders with Resume and Cancel buttons. The console has
+                # the checklist (respond_info above).
                 if miss:
                     met_since = None
-                    self._show('gate', "Waiting to start",
-                               ["The print starts by itself once:"]
-                               + ["- " + t for t in checklist_lines(miss)]
-                               + ["Cancel the print to stop waiting."], [])
                 else:
                     if met_since is None:
                         met_since = eventtime
-                        self._show('gate', "Ready", [
-                            "Starting in %d seconds." % (round(settle),)],
-                            [])
+                        gcmd.respond_info("Starting in %d seconds"
+                                          % (round(settle),))
                     if eventtime - met_since >= settle:
                         break
                 if timeout and eventtime - start >= timeout:
@@ -789,12 +821,20 @@ class M1Machine:
         stops = HEAT_STOPS.get(name, HEAT_STOPS['extruder'])
         if self.batch:
             return
+        timeout = gcmd.get_float('TIMEOUT', self.heat_timeout, minval=0.)
         check_abort = getattr(self.gcode, 'check_abort', None)
-        eventtime = self.reactor.monotonic()
+        start = eventtime = self.reactor.monotonic()
         while not self.printer.is_shutdown():
             temp, target = heater.get_temp(eventtime)
             if temp >= minimum:
                 return
+            if timeout and eventtime - start >= timeout:
+                # Like the start gate's timeout: an error, so PRINT_START
+                # or RESUME ends and the print goes to error.
+                raise gcmd.error(
+                    "%s did not reach %.0f C within %s (at %.1f C, target"
+                    " %.0f C). Check the heater and try again." % (
+                        name, minimum, _duration(timeout), temp, target))
             # B-7: a wait whose heater was switched off, or whose plate,
             # column or toolhead went away, can never finish. End it.
             if target < minimum:
@@ -892,11 +932,25 @@ class M1Machine:
             'cooling': self.cooling is not None,
             'job_targets': dict(self.job_targets),
             'saved_fan': self.saved_fan,
-            'gate': (None if self.gate is None else
-                     {'action': self.gate['action'],
-                      'missing': list(self.gate['missing']),
-                      'since': self.gate['since']}),
+            'gate': self._gate_status(eventtime),
         }
+
+    def _gate_status(self, eventtime):
+        g = self.gate
+        if g is None:
+            return None
+        # since and deadline are on the host's monotonic clock, the one
+        # reactor.monotonic() reads and status's eventtime uses. It is not
+        # wall time, so a panel shows `remaining` (deadline - eventtime at
+        # this read), which needs no clock of its own.
+        deadline = g['deadline']
+        return {'action': g['action'],
+                'missing': list(g['missing']),
+                'since': g['since'],
+                'timeout': g['timeout'],
+                'deadline': deadline,
+                'remaining': (None if deadline is None
+                              else max(0., deadline - eventtime))}
 
 
 def load_config(config):

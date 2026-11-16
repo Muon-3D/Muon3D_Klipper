@@ -352,6 +352,12 @@ class PrinterHoming:
             minval=0.)
         # Homing/probing moves in progress (KAN-3370 abort)
         self.active_moves = []
+        # What was wired at connect, for status and the log (read with no
+        # motion, to check an install): the non-critical MCUs whose
+        # disconnect aborts a Z move, and every source that can call
+        # abort_active_move().
+        self.disconnect_mcus = []
+        self.abort_sources = []
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
     def _handle_connect(self):
@@ -366,6 +372,25 @@ class PrinterHoming:
                 continue
             self.printer.register_event_handler(
                 get_name(), self._handle_non_critical_disconnect)
+            self.disconnect_mcus.append(name)
+        # The other sources call abort_active_move() themselves: the plate
+        # pulled, the load cell's Z backstop, the bed power lost.
+        self.abort_sources = [
+            name for name in ('bed_removal_detector', 'load_cell_probe',
+                              'z_power')
+            if self.printer.lookup_object(name, None) is not None]
+        self.abort_sources += ['non_critical_disconnect: ' + n
+                               for n in self.disconnect_mcus]
+        logging.info(
+            "homing: Z search cap %g mm (0 = off); abort_on_disconnect %s;"
+            " a Z move can be aborted by: %s", self.max_search_distance_z,
+            bool(self.disconnect_mcus),
+            ", ".join(self.abort_sources) or "(nothing)")
+    def get_status(self, eventtime):
+        return {'max_search_distance_z': self.max_search_distance_z,
+                'abort_on_disconnect': bool(self.disconnect_mcus),
+                'abort_on_disconnect_mcus': list(self.disconnect_mcus),
+                'abort_sources': list(self.abort_sources)}
     def _handle_non_critical_disconnect(self):
         self.abort_active_move("the toolhead disconnected")
     def note_move_active(self, hmove, active):

@@ -409,10 +409,13 @@ class TestStartGate(unittest.TestCase):
         # Locked at +8, held for the 3 s settle time.
         self.assertGreaterEqual(m.reactor.now - t0, 11.)
         self.assertLess(m.reactor.now - t0, 12.)
-        text = ' '.join(o for o in m.prompts())
+        # KAN-3387: the checklist is on the console and in status, never a
+        # macro prompt (a button-less one rendered with Resume and Cancel).
+        text = ' '.join(m.gcode.out)
         self.assertIn('Lock the Z column', text)
         self.assertIn('Fit the build plate', text)
-        self.assertEqual(m.prompts()[-1], '// action:prompt_end')
+        self.assertIn('// Starting in 3 seconds', m.gcode.out)
+        self.assertEqual(m.prompts(), [])
         self.assertIn('LED_WARNING', m.gcode.scripts)
         self.assertIsNone(m.m1.gate)
 
@@ -463,7 +466,9 @@ class TestStartGate(unittest.TestCase):
         m.run('MACHINE_WAIT_READY', ACTION='print')
         self.assertGreaterEqual(m.reactor.now - t0, 14.)
         self.assertEqual(m.gcode.scripts.count('_GATE_FILAMENT_GRAB'), 2)
-        text = ' '.join(m.prompts())
+        # Said on the console, not in a prompt (the gate shows none).
+        self.assertEqual(m.prompts(), [])
+        text = ' '.join(m.gcode.out)
         self.assertIn('Filament not grabbed', text)
 
     def test_filament_already_in_is_not_grabbed(self):
@@ -494,7 +499,7 @@ class TestStartGate(unittest.TestCase):
         with self.assertRaises(CommandError):
             m.run('MACHINE_WAIT_READY', ACTION='print')
         self.assertIsNone(m.m1.gate)
-        self.assertEqual(m.prompts()[-1], '// action:prompt_end')
+        self.assertEqual(m.prompts(), [])
 
     def test_times_out(self):
         m = Machine(gate_timeout=60.)
@@ -503,6 +508,56 @@ class TestStartGate(unittest.TestCase):
         with self.assertRaises(CommandError) as e:
             m.run('MACHINE_WAIT_READY', ACTION='print')
         self.assertIn('Load filament', str(e.exception))
+
+    def _gate_seen(self, m, at):
+        seen = []
+        m.reactor.schedule(at, lambda: seen.append(
+            (m.reactor.now, m.m1.get_status(m.reactor.now)['gate'])))
+        return seen
+
+    def test_gate_status_has_timeout_deadline_and_remaining(self):
+        # KAN-3387: the panel shows the time left from status.
+        m = Machine(gate_timeout=600., settle_time=3.)
+        m.start_print()
+        m.detector.present = False
+        m.reactor.schedule(40., lambda: setattr(m.detector, 'present', True))
+        t0 = m.reactor.now
+        seen = self._gate_seen(m, 10.)
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        now, gate = seen[0]
+        self.assertEqual(set(gate), {'action', 'missing', 'since', 'timeout',
+                                     'deadline', 'remaining'})
+        self.assertEqual(gate['action'], 'print')
+        self.assertEqual(gate['missing'], ['plate_absent'])
+        self.assertEqual(gate['since'], t0)
+        self.assertEqual(gate['timeout'], 600.)
+        self.assertEqual(gate['deadline'], t0 + 600.)
+        self.assertAlmostEqual(gate['remaining'], t0 + 600. - now)
+        self.assertIsNone(m.m1.get_status(m.reactor.now)['gate'])
+
+    def test_gate_without_a_timeout_has_no_deadline(self):
+        m = Machine(gate_timeout=0.)
+        m.start_print()
+        m.detector.present = False
+        m.reactor.schedule(20., lambda: setattr(m.detector, 'present', True))
+        seen = self._gate_seen(m, 5.)
+        m.run('MACHINE_WAIT_READY', ACTION='print')
+        gate = seen[0][1]
+        self.assertEqual(gate['timeout'], 0.)
+        self.assertIsNone(gate['deadline'])
+        self.assertIsNone(gate['remaining'])
+
+    def test_gate_remaining_counts_down(self):
+        m = Machine(gate_timeout=60.)
+        m.start_print()
+        m.detector.present = False
+        a = self._gate_seen(m, 10.)
+        b = self._gate_seen(m, 30.)
+        with self.assertRaises(CommandError):
+            m.run('MACHINE_WAIT_READY', ACTION='print')
+        self.assertLess(b[0][1]['remaining'], a[0][1]['remaining'])
+        self.assertGreater(b[0][1]['remaining'], 0.)
+        self.assertIsNone(m.m1.get_status(m.reactor.now)['gate'])
 
     def test_print_cancel_aborts_it(self):
         # KAN-382: pause_resume/cancel requests an abort, which every wait
@@ -903,6 +958,61 @@ class TestHeatWait(unittest.TestCase):
         m.reactor.schedule(5., lambda: setattr(bed, 'temp', 60.))
         m.run('MACHINE_HEAT_WAIT', HEATER='heater_bed', MINIMUM=59)
 
+    def test_times_out_with_a_clear_error(self):
+        # A heater that never gets there (held, or cannot gain) used to wait
+        # for ever. The default is 15 min.
+        m = Machine()
+        bed = m.heaters.heaters['heater_bed']
+        bed.target = 60.
+        t0 = m.reactor.now
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_HEAT_WAIT', HEATER='heater_bed', MINIMUM=59)
+        self.assertIn('heater_bed did not reach 59 C within 15 min',
+                      str(e.exception))
+        self.assertIn('at 25.0 C, target 60 C', str(e.exception))
+        self.assertGreaterEqual(m.reactor.now - t0, 900.)
+        self.assertLess(m.reactor.now - t0, 902.)
+
+    def test_timeout_is_configurable_and_a_command_option(self):
+        m = Machine(heat_timeout=30.)
+        he = m.heaters.heaters['extruder']
+        he.target = 215.
+        t0 = m.reactor.now
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_HEAT_WAIT', HEATER='extruder', MINIMUM=214)
+        self.assertIn('within 30 s', str(e.exception))
+        self.assertLess(m.reactor.now - t0, 32.)
+        t0 = m.reactor.now
+        with self.assertRaises(CommandError):
+            m.run('MACHINE_HEAT_WAIT', HEATER='extruder', MINIMUM=214,
+                  TIMEOUT=10)
+        self.assertLess(m.reactor.now - t0, 12.)
+
+    def test_arriving_before_the_timeout_is_not_an_error(self):
+        m = Machine(heat_timeout=30.)
+        bed = m.heaters.heaters['heater_bed']
+        bed.target = 60.
+        m.reactor.schedule(25., lambda: setattr(bed, 'temp', 59.5))
+        m.run('MACHINE_HEAT_WAIT', HEATER='heater_bed', MINIMUM=59)
+
+    def test_zero_timeout_waits_as_before(self):
+        m = Machine(heat_timeout=0.)
+        bed = m.heaters.heaters['heater_bed']
+        bed.target = 60.
+        m.reactor.schedule(5000., lambda: setattr(bed, 'temp', 59.5))
+        m.run('MACHINE_HEAT_WAIT', HEATER='heater_bed', MINIMUM=59)
+
+    def test_plate_pulled_still_ends_it_before_the_timeout(self):
+        m = Machine(heat_timeout=300.)
+        bed = m.heaters.heaters['heater_bed']
+        bed.target = 60.
+        t0 = m.reactor.now
+        m.reactor.schedule(5., lambda: setattr(m.detector, 'present', False))
+        with self.assertRaises(CommandError) as e:
+            m.run('MACHINE_HEAT_WAIT', HEATER='heater_bed', MINIMUM=59)
+        self.assertIn('Fit the build plate', str(e.exception))
+        self.assertLess(m.reactor.now - t0, 10.)
+
     def test_abortable(self):
         m = Machine()
         he = m.heaters.heaters['extruder']
@@ -910,6 +1020,85 @@ class TestHeatWait(unittest.TestCase):
         m.reactor.schedule(3., lambda: setattr(m.gcode, 'abort', 'cancel'))
         with self.assertRaises(CommandError):
             m.run('MACHINE_HEAT_WAIT', HEATER='extruder', MINIMUM=214)
+
+
+class TestBedFaultPrompt(unittest.TestCase):
+    """KAN-3387: _Z_POWER_FAULT's "Bed power fault" prompt (a macro's, not
+    this module's) used to outlive the fault. It ends when the fault clears,
+    which is z_power's state leaving 'fault' (Z_POWER_RESET)."""
+
+    def fault(self, m):
+        m.zp.status.update(state='fault', reason='over current')
+        m.poll()
+
+    def clear(self, m):
+        m.zp.status.update(state='ready', reason='')
+        m.poll()
+
+    def test_the_prompt_ends_when_the_fault_clears(self):
+        m = Machine()
+        self.fault(m)
+        # what the macro shows
+        m.gcode.respond_raw('// action:prompt_begin Bed power fault')
+        self.assertEqual(m.gcode.out[-1],
+                         '// action:prompt_begin Bed power fault')
+        self.poll_and_check_none(m)
+        self.clear(m)
+        self.assertEqual(m.prompts()[-1], '// action:prompt_end')
+
+    def poll_and_check_none(self, m):
+        m.poll()
+        self.assertNotIn('// action:prompt_end', m.gcode.out)
+
+    def test_a_standing_fault_ends_nothing(self):
+        m = Machine()
+        self.fault(m)
+        m.poll()
+        m.reactor.now += 30.
+        m.poll()
+        self.assertEqual(m.prompts(), [])
+
+    def test_no_fault_no_prompt_end(self):
+        m = Machine()
+        m.poll()
+        self.clear(m)
+        self.assertEqual(m.prompts(), [])
+
+    def test_only_the_clearing_ends_it_once(self):
+        m = Machine()
+        self.fault(m)
+        self.clear(m)
+        self.clear(m)
+        m.poll()
+        self.assertEqual(m.prompts().count('// action:prompt_end'), 1)
+        self.fault(m)
+        self.clear(m)
+        self.assertEqual(m.prompts().count('// action:prompt_end'), 2)
+
+    def test_a_paused_print_gets_its_own_prompt_back(self):
+        # Paused for the plate when the fault came: the checklist lists it,
+        # and when it clears the checklist is shown again, Resume now there.
+        m = Machine()
+        m.start_print()
+        m.poll()
+        m.pr.is_paused = True
+        m.ps.status['state'] = 'paused'
+        m.detector.present = False
+        m.run('MACHINE_PAUSED', REASON='plate_removed')
+        self.fault(m)
+        text = m.last_prompt_text()
+        self.assertIn('prompt_text - Bed power fault: check the bed and its'
+                      ' cable, then run Z_POWER_RESET', text)
+        m.detector.present = True
+        m.poll()
+        self.assertNotIn('prompt_footer_button Resume|RESUME|primary',
+                         m.last_prompt_text())
+        self.clear(m)
+        out = m.prompts()
+        end = len(out) - 1 - out[::-1].index('// action:prompt_end')
+        self.assertIn('// action:prompt_footer_button Resume|RESUME|primary',
+                      out[end:])
+        self.assertEqual(out[-1], '// action:prompt_show')
 
 
 class TestFilePrinting(unittest.TestCase):
