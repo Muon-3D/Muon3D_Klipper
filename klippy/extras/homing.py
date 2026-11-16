@@ -8,7 +8,10 @@ import logging, math
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
 ENDSTOP_SAMPLE_COUNT = 4
-DEFAULT_MAX_SEARCH_DISTANCE_Z = 40.
+# KAN-3370: off by default.  The M1 starts its Z search blind from a
+# soft-homed Z, so no distance short of the full travel is safe for every
+# start; a printer that knows its start may set a cap in [homing].
+DEFAULT_MAX_SEARCH_DISTANCE_Z = 0.
 
 # Return a completion that completes when all completions in a list complete
 def multi_complete(printer, completions):
@@ -96,6 +99,12 @@ class HomingMove:
         # longer) at a stage that can be aborted, or was already aborted.
         if not self._abortable or self._abort_reason is not None:
             return False
+        for c in self._trigger_completions:
+            if c.test():
+                # An endstop already ended the move (a probe that has
+                # triggered, or failed): it is not an abort, and a normal
+                # trigger must never be reported as one
+                return False
         self._abort_reason = reason
         self._complete_triggers()
         return True
@@ -336,8 +345,8 @@ class PrinterHoming:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('G28', self.cmd_G28)
         # KAN-3370: the furthest a Z probing move (the M1's Z homing search
-        # is one) may travel in one go.  0 turns the cap off.  Z only: X/Y
-        # homing travel is never limited here.
+        # is one) may travel in one go.  0 (the default) turns the cap off.
+        # Z only: X/Y homing travel is never limited here.
         self.max_search_distance_z = config.getfloat(
             'max_search_distance_z', DEFAULT_MAX_SEARCH_DISTANCE_Z,
             minval=0.)

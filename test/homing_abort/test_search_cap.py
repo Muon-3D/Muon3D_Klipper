@@ -4,7 +4,10 @@ The M1 homes Z with PROBE from a soft-homed Z of 160 down to z_min -4: a
 164 mm search.  On Boxwood a probe fault meant it never triggered and the
 whole 164 mm lifted the bed off its mount.  A normal home travels 0.4 to
 30 mm.  PrinterHoming.probing_move now limits the Z travel to
-max_search_distance_z (default 40 mm; 0 is off) and says why it stopped.
+max_search_distance_z and says why it stopped.  The cap is OFF by default
+(0): the M1's Z search is blind from a soft-homed Z=160 and a re-home from
+the Z140 park needs about 140 mm, so a 40 mm cap broke a normal G28.  Every
+test that exercises capping sets 40 explicitly.
 
 Drives the real HomingMove and PrinterHoming with fakes (see fakes.py).
 Constants are written out here, not imported from the code under test.
@@ -31,7 +34,11 @@ class FakeScope:
         self.in_scope = in_scope
 
 
+CAP40 = {'max_search_distance_z': 40}
+
+
 def homing_rig(**kw):
+    kw.setdefault('options', CAP40)
     rig = Rig(**kw)
     rig.printer.objects['homing_scope'] = FakeScope(True)
     return rig
@@ -60,7 +67,7 @@ def test_b1_z_search_is_capped_at_40mm():
     check(rig.toolhead.pos[2] == 120.0,
           "B1: toolhead Z is where the steppers stopped, 120")
     # Outside a G28 scope the wording says probing, the cap still holds
-    rig = Rig(start=160.)
+    rig = Rig(start=160., options=CAP40)
     res, err = run(lambda: probe(rig))
     check(err == PROBE_MSG, "B1: outside G28 error is %r (got %r)"
           % (PROBE_MSG, err))
@@ -76,10 +83,18 @@ def test_b2_cap_off_uses_the_full_travel():
           % (rig.toolhead.drip_calls[0][0][2],))
     check(rig.toolhead.travelled_mm == 164, "B2: travelled the full 164 mm")
     check(err == STOCK_MSG, "B2: stock error text (got %r)" % (err,))
-    # The code default (no option) is 40
-    rig = homing_rig(start=160.)
-    check(rig.phoming.max_search_distance_z == 40.0,
-          "B2: default max_search_distance_z is 40")
+    # The code default (no option) is off, and it runs the full travel
+    rig = homing_rig(start=160., options={})
+    check(rig.phoming.max_search_distance_z == 0.0,
+          "B2: default max_search_distance_z is 0 (off)")
+    res, err = run(lambda: probe(rig))
+    check(rig.toolhead.drip_calls[0][0][2] == -4.0
+          and rig.toolhead.travelled_mm == 164 and err == STOCK_MSG,
+          "B2: with no option a blind 160 -> -4 search runs the full 164 mm")
+    rig = homing_rig(start=140., options={})
+    res, err = run(lambda: probe(rig))
+    check(rig.toolhead.travelled_mm == 144 and err == STOCK_MSG,
+          "B2: a re-home from the Z140 park is not capped by default")
 
 
 def test_b3_x_and_y_travel_is_unchanged():
@@ -115,7 +130,7 @@ def test_b3_x_and_y_travel_is_unchanged():
 
 
 def test_b4_trigger_within_the_cap_homes_normally():
-    for opts in ({}, {'max_search_distance_z': 0}):
+    for opts in ({}, {'max_search_distance_z': 0}, CAP40):
         tag = "cap %s" % (opts.get('max_search_distance_z', 'default'),)
         rig = homing_rig(start=160., trigger_after_mm=12, options=opts)
         res, err = run(lambda: probe(rig))
@@ -125,7 +140,7 @@ def test_b4_trigger_within_the_cap_homes_normally():
         check(rig.toolhead.travelled_mm == 12,
               "B4 %s: stopped at the 12 mm trigger" % (tag,))
         check(rig.endstops[0].triggered, "B4 %s: endstop triggered" % (tag,))
-    rig = homing_rig(start=160., trigger_after_mm=39)
+    rig = homing_rig(start=160., trigger_after_mm=39, options=CAP40)
     res, err = run(lambda: probe(rig))
     check(err is None and abs(res[2] - 121.0) < 1e-9,
           "B4: a trigger at 39 mm, just inside the cap, is fine")

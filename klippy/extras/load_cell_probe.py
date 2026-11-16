@@ -498,6 +498,10 @@ class LoadCellProbeConfigHelper:
                 'trigger_type': trigger_type,
                 'trigger_value': int(trigger_counts),
                 'trigger_mode': 'counts',
+                # for the Z load backstop: the armed delta in counts, and
+                # the press direction when the trigger is directed
+                'trigger_delta_counts': int(trigger_counts),
+                'press_direction': direction,
             }
         trigger_percent = self.get_trigger_percent(gcmd)
         if trigger_percent is not None:
@@ -528,6 +532,8 @@ class LoadCellProbeConfigHelper:
                 'trigger_type': "gt",
                 'trigger_value': int(trigger_counts),
                 'trigger_mode': 'percent',
+                'trigger_delta_counts': int(trigger_counts),
+                'press_direction': direction,
             }
         # Fall back to grams-based trigger logic
         trigger_val = self.get_trigger_force_grams(gcmd)
@@ -548,6 +554,9 @@ class LoadCellProbeConfigHelper:
             'trigger_type': "abs_ge",
             'trigger_value': int(trigger_frac_grams),
             'trigger_mode': 'grams',
+            # abs_ge fires in either direction, so there is no press side
+            'trigger_delta_counts': abs(trigger_delta_counts),
+            'press_direction': None,
         }
 
     # calculate 1/counts_per_gram
@@ -559,6 +568,190 @@ class LoadCellProbeConfigHelper:
         if counts_per_gram >= (1<<29):
             raise OverflowError("counts_per_gram value is too large to filter")
         return 1. / counts_per_gram
+
+
+# KAN-3370 guard D: host-side load backstop for Z probing moves.
+#
+# The M1's Z homing and probe descents are blind searches: if the MCU
+# trigger never fires (a wrong tare, a wrong trigger direction) the move
+# runs on and pushes the bed up.  This watches the load cell samples on the
+# host for the length of the descent and ends the move through
+# PrinterHoming.abort_active_move() on either of two signs, whatever the
+# MCU thinks:
+#   (a) WRONG WAY: the load moved away from the tare on the side opposite
+#       the press by more than z_move_wrong_way_factor x the trigger delta
+#       (the count delta the probe's own trigger is armed with).  Only for
+#       a directed trigger ("gt"); an abs_ge trigger (grams mode, the
+#       reference_tare model) already fires on either side, so there is no
+#       wrong side to watch.
+#   (b) CEILING: |load - tare| above the ceiling on either side.  In the
+#       press direction it is a backstop behind the MCU trigger and the raw
+#       range; in the other it covers a sensor that has gone the wrong way.
+# Either needs z_move_abort_confirm_time (20 ms) of consecutive samples, so
+# one noisy sample never aborts a home.  20 ms is longer than the half
+# period of the cell's 48 Hz ring (contact_guard uses the same reasoning).
+#
+# SIZING (counts; trigger_percent 10 of |anchor - tare| is the MCU trigger):
+#   Boxwood, anchor -3010747: tare -578000 -> delta 243275;
+#     tare -1750000 -> delta 126075.   Sloe, anchor -1585739: tare +200000
+#     -> delta 178574.
+#   The ceiling is 2.5 x delta: 608000 / 315000 / 446000.  The trigger
+#   stops the steppers within about a millisecond of the sample that arms
+#   it, so a normal tap overshoots by a small fraction of one delta and
+#   never reaches 2.5 x; the MCU trigger wins by a wide margin.
+#   The ceiling is relative to the armed delta, not to the anchor, on
+#   purpose.  A fixed share of abs(anchor) cannot tell the 16 Nov Boxwood
+#   incident (contact loads of 197994 to 289639 counts) from a normal tap
+#   (243275 at tare -578000).  Relative to the delta it can: the incident
+#   tare -3244819 is PAST the anchor -3010747, so its delta is 10% of the
+#   234072 counts between them = 23407, and the ceiling is 58517, under a
+#   third of the smallest contact load that was recorded.
+#   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
+#   against a delta of 178574, so noise is under 4% of the limit.
+# MCUTARE: the MCU zeroes itself on the first descent sample and the host
+#   only has _approx_tare, which note_baseline() lets move by at most
+#   MAX_BASELINE_DRIFT_COUNTS (100000) a tap.  That error is most of a
+#   126075-count delta, so rule (a) is OFF under MCUTARE; the ceiling stays
+#   on, because 2.5 x delta minus 100000 is still 1.7 x the smallest delta.
+class ZLoadBackstop:
+    REASON_WRONG_WAY = "the load cell moved the wrong way during the Z move"
+    REASON_CEILING = ("the load on the nozzle exceeded the safety ceiling "
+                      "during the Z move")
+    REASON_FAILED = "the load watch failed during the Z move"
+    MIN_CONSECUTIVE = 3
+
+    def __init__(self, config, printer, load_cell):
+        self._printer = printer
+        self._load_cell = load_cell
+        self._ceiling_factor = config.getfloat(
+            'z_move_abort_ceiling_factor', 2.5, minval=0.)
+        if 0. < self._ceiling_factor < 1.5:
+            raise config.error("z_move_abort_ceiling_factor must be 0 (off)"
+                               " or at least 1.5, so it stays above the "
+                               "trigger")
+        self._ceiling_counts_param = config.getint(
+            'z_move_abort_ceiling_counts', 0, minval=0)
+        self._wrong_way_factor = config.getfloat(
+            'z_move_wrong_way_factor', 1., minval=0.)
+        if 0. < self._wrong_way_factor < 0.5:
+            raise config.error("z_move_wrong_way_factor must be 0 (off) or "
+                               "at least 0.5")
+        self._confirm_time = config.getfloat(
+            'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
+        self._armed = False
+        self._registered = False    # our client is on the load cell
+        self._start_time = 0.
+        self._tare = 0
+        self._direction = None
+        self._ceiling = 0
+        self._wrong = 0
+        self._need = self.MIN_CONSECUTIVE
+        self._over_run = 0
+        self._wrong_run = 0
+        self.last_fired = None
+
+    def is_armed(self):
+        return self._armed
+
+    def get_limits(self):
+        return self._ceiling, self._wrong
+
+    # Start watching a descent.  Only samples stamped at or after
+    # start_time (print_time, as the sample timestamps are) are judged.
+    def arm(self, start_time, tare_counts, trigger_delta, press_direction,
+            mcutare=False):
+        self.disarm()
+        self.last_fired = None
+        sps = self._load_cell.get_sensor().get_samples_per_second()
+        need = max(self.MIN_CONSECUTIVE,
+                   int(math.ceil(self._confirm_time * sps)))
+        ceiling = 0
+        if self._ceiling_counts_param > 0:
+            ceiling = self._ceiling_counts_param
+        elif self._ceiling_factor > 0. and trigger_delta:
+            ceiling = int(self._ceiling_factor * abs(trigger_delta))
+        wrong = 0
+        if (press_direction in (-1, 1) and trigger_delta
+                and self._wrong_way_factor > 0. and not mcutare):
+            wrong = int(self._wrong_way_factor * abs(trigger_delta))
+        self._start_time = start_time
+        self._tare = tare_counts
+        self._direction = press_direction
+        self._ceiling = ceiling
+        self._wrong = wrong
+        self._need = need
+        self._over_run = self._wrong_run = 0
+        if not ceiling and not wrong:
+            return
+        self._armed = True
+        if not self._registered:
+            # One client for good: the load cell drops it (False) at the
+            # first batch after the watch ends, and arm() adds it again.
+            self._load_cell.add_client(self._on_batch)
+            self._registered = True
+
+    def disarm(self):
+        self._armed = False
+
+    def _on_batch(self, msg):
+        # Runs in the sensor's batch timer: it never raises.  False drops
+        # the client from the load cell.
+        if not self._armed:
+            self._registered = False
+            return False
+        try:
+            for sample in msg['data']:
+                if sample[0] < self._start_time:
+                    continue
+                reason = self._judge(sample[2])
+                if reason is not None:
+                    self._fire(reason)
+                    self._registered = False
+                    return False
+            return True
+        except Exception:
+            logging.exception("load_cell_probe: the Z load watch failed")
+            self._fire(self.REASON_FAILED)
+            self._registered = False
+            return False
+
+    def _judge(self, counts):
+        dev = counts - self._tare
+        if self._ceiling and abs(dev) > self._ceiling:
+            self._over_run += 1
+        else:
+            self._over_run = 0
+        if self._wrong and dev * self._direction < -self._wrong:
+            self._wrong_run += 1
+        else:
+            self._wrong_run = 0
+        if self._over_run >= self._need:
+            return self.REASON_CEILING
+        if self._wrong_run >= self._need:
+            return self.REASON_WRONG_WAY
+        return None
+
+    def _fire(self, reason):
+        self._armed = False
+        try:
+            homing = self._printer.lookup_object('homing')
+            done = homing.abort_active_move(reason)
+        except Exception:
+            logging.exception("load_cell_probe: could not abort the Z move")
+            return
+        if done:
+            self.last_fired = reason
+            logging.warning("load_cell_probe: Z move aborted: %s (tare %i,"
+                            " ceiling %i, wrong way %i)", reason,
+                            self._tare, self._ceiling, self._wrong)
+        else:
+            logging.info("load_cell_probe: Z load watch tripped (%s) but no"
+                         " move could be aborted", reason)
+
+    def get_status(self):
+        return {'z_backstop_ceiling_counts': self._ceiling,
+                'z_backstop_wrong_way_counts': self._wrong,
+                'z_backstop_fired': self.last_fired}
 
 
 # Execute probing moves using the MCU_trigger_analog
@@ -591,6 +784,14 @@ class LoadCellProbingMove:
         self._safety_min = 0
         self._safety_max = 0
         self._trigger_mode = 'grams'
+        # KAN-3370 guard D
+        self._z_watch = ZLoadBackstop(config, self._printer, load_cell_inst)
+
+    # Class defaults so a move built without __init__ (tests) is inert
+    _z_watch = None
+    _trigger_delta = None
+    _trigger_press_dir = None
+    _collect_start_time = None
 
     def _start_collector(self):
         toolhead = self._printer.lookup_object('toolhead')
@@ -610,6 +811,8 @@ class LoadCellProbingMove:
             print_time = toolhead.get_last_move_time()
         collector = self._load_cell.get_collector()
         collector.start_collecting(min_time=print_time)
+        # where the descent that follows starts, in sample time
+        self._collect_start_time = print_time
         return collector
 
     def _log_tare(self, tare_counts):
@@ -665,6 +868,8 @@ class LoadCellProbingMove:
         self._mcu_trigger_analog.set_trigger(
             trigger_setup['trigger_type'], trigger_setup['trigger_value'])
         self._trigger_mode = trigger_setup['trigger_mode']
+        self._trigger_delta = trigger_setup.get('trigger_delta_counts')
+        self._trigger_press_dir = trigger_setup.get('press_direction')
         logging.debug(
             "load_cell_probe: tare=%i raw_range=[%i,%i] trigger_mode=%s",
             tare_counts, safety_min, safety_max, self._trigger_mode)
@@ -709,6 +914,8 @@ class LoadCellProbingMove:
         self._mcu_trigger_analog.set_trigger(
             trigger_setup['trigger_type'], trigger_setup['trigger_value'])
         self._trigger_mode = trigger_setup['trigger_mode']
+        self._trigger_delta = trigger_setup.get('trigger_delta_counts')
+        self._trigger_press_dir = trigger_setup.get('press_direction')
 
     MAX_BASELINE_DRIFT_COUNTS = 100000
 
@@ -772,9 +979,11 @@ class LoadCellProbingMove:
         self._config_helper.validate_probe_setup(gcmd)
         # tare the sensor just before probing
         _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
+        _used_mcutare = False
         if _mcutare and self._approx_tare is not None \
                 and self._nozzle_is_clear():
             self._mcu_tare(gcmd)
+            _used_mcutare = True
         else:
             self._pause_and_tare(gcmd)
         # get params for the homing move
@@ -792,6 +1001,12 @@ class LoadCellProbingMove:
         phoming = self._printer.lookup_object('homing')
         # start collector after tare samples are consumed
         collector = self._start_collector()
+        # KAN-3370 guard D: watch the load for the length of the descent
+        watch = self._z_watch
+        if watch is not None:
+            watch.arm(self._collect_start_time, self._tare_counts,
+                      self._trigger_delta, self._trigger_press_dir,
+                      mcutare=_used_mcutare)
         # do homing move
         try:
             epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
@@ -801,6 +1016,10 @@ class LoadCellProbingMove:
             # must stop it here or it collects for the life of klippy.
             collector.stop_collecting()
             raise
+        finally:
+            # never left armed, whatever way the move ended
+            if watch is not None:
+                watch.disarm()
         # Where this tap actually stopped.  _nozzle_is_clear() needs it to
         # decide whether the next descent may take a relative MCU zero.
         self._last_trigger_z = epos[2]
@@ -820,13 +1039,16 @@ class LoadCellProbingMove:
 
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
-        return {
+        status = {
             'tare_counts': self._tare_counts,
             'raw_safety_min': self._safety_min,
             'raw_safety_max': self._safety_max,
             'trigger_mode': self._trigger_mode,
             'last_trigger_time': trig_time,
         }
+        if self._z_watch is not None:
+            status.update(self._z_watch.get_status())
+        return status
 
 
 # Perform a single complete tap
