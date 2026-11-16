@@ -41,6 +41,10 @@ class PauseResume:
         # answers "Print already paused" - fan and bed faults included.
         self.is_paused = self.sd_paused = self.pause_command_sent = False
     def _handle_cancel_request(self, web_request):
+        # Muon: run_script() below waits for the gcode mutex, which a
+        # PRINT_START in progress holds for minutes.  Stop it first.
+        if self.is_sd_active():
+            self.v_sd.request_cancel()
         self.gcode.run_script("CANCEL_PRINT")
     def _handle_pause_request(self, web_request):
         self.gcode.run_script("PAUSE")
@@ -98,7 +102,10 @@ class PauseResume:
         self.is_paused = self.pause_command_sent = False
     cmd_CANCEL_PRINT_help = ("Cancel the current print")
     def cmd_CANCEL_PRINT(self, gcmd):
-        if self.is_sd_active() or self.sd_paused:
+        # A cancel_pending print has already stopped its work timer, so
+        # is_sd_active() is False for it, but its file is still open.
+        if (self.is_sd_active() or self.sd_paused
+                or (self.v_sd is not None and self.v_sd.is_cancel_pending())):
             self.v_sd.do_cancel()
         else:
             gcmd.respond_info("action:cancel")

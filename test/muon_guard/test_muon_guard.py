@@ -824,7 +824,7 @@ def test_virtual_sdcard_lines():
     path = os.path.join(ROOT, 'klippy', 'extras', 'virtual_sdcard.py')
     with open(path, encoding='utf-8') as f:
         src = f.read()
-    check("self.gcode.run_client_script(line, 'file')" in src,
+    check("self.gcode.run_client_script(line, 'file', abortable=True)" in src,
           "virtual_sdcard sends each file line in as a 'file' client line")
     check("self.gcode.run_script(self.on_error_gcode.render())" in src,
           "virtual_sdcard keeps on_error_gcode internal")

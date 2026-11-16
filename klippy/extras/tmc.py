@@ -436,7 +436,13 @@ class TMCCommandHelper:
             if hold_current is None:
                 hold_current = req_hold_cur
             toolhead = self.printer.lookup_object('toolhead')
-            print_time = toolhead.get_last_move_time()
+            # The SPI write waits for print_time (it reads back what it
+            # wrote). get_last_move_time() primes a drained queue
+            # BUFFER_TIME_START (0.25 s) out; the drip lead is 0.1 s and is
+            # identical when moves are queued.
+            start_time = getattr(toolhead, 'get_drip_start_time',
+                                 toolhead.get_last_move_time)
+            print_time = start_time()
             ch.set_current(run_current, hold_current, print_time)
             prev_cur, prev_hold_cur, req_hold_cur, max_cur = ch.get_current()
         # Report values

@@ -29,15 +29,15 @@ from test_m1_heater_before_leds import _M1TestCase  # noqa: E402
 
 # What PRINT_START calls that M1 doesn't stub. The mesh macros are recorded
 # so the test can read the region they are handed.
-RECORDED = ('_BED_MESH_PLAN', '_BED_MESH_ENSURE', '_HOTEND_RAMP_UNDER_MESH',
+RECORDED = ('_BED_MESH_PLAN', '_BED_MESH_ENSURE', 'BED_MESH_CLEAR',
             'BED_MESH_PROFILE', 'SET_PRINT_STATS_INFO', 'M73', 'M140',
             'NOZZLE_WIPE_SMART', 'FINETUNE_RESONANCE',
-            'IF_BED_TEMP_ANTI_OOZE_NOZZLE_DOCK', 'ANTI_OOZE_NOZZLE_DOCK',
+            'ANTI_OOZE_NOZZLE_DOCK',
             '_SAVE_CONFIG_IF_PENDING', 'SET_GCODE_OFFSET')
 
 # core/M1/core.cfg [bed_mesh].
 BED = (10.0, 7.0, 190.0, 170.0)
-NOTCH = (75.0, 0.0, 125.0, 34.0)
+NOTCH = (45.0, 0.0, 128.0, 30.0)
 # Below this the nozzle is purging, or about to.
 PURGE_HEIGHT = 1.0
 SKIPPED = 'PURGE_LINE: no purge lane was planned'
@@ -77,6 +77,10 @@ class PurgeLine(_M1TestCase):
             .get_status(0)['settings']['bed_mesh']
         settings['no_go_region_1_min'] = [NOTCH[0], NOTCH[1]]
         settings['no_go_region_1_max'] = [NOTCH[2], NOTCH[3]]
+        # PRINT_START refuses to start without filament at the toolhead.
+        self.m1.printer.lookup_object(
+            'filament_switch_sensor filament_sensor_toolhead') \
+            .get_status(0)['filament_detected'] = True
 
     def tearDown(self):
         self.m1.responses[:] = [r for r in self.m1.responses
@@ -185,24 +189,24 @@ class PurgeLine(_M1TestCase):
         self.assertEqual(params(plan)['PROBE_COUNT'], '3,3')
 
     def test_lane_steps_left_of_the_notch(self):
-        # 6 mm in front of this part is y 34, the notch's back edge.
-        region, part = self.run_part((60, 40), (100, 80))
+        # 6 mm in front of this part is y 26, in the notch's rows.
+        region, part = self.run_part((40, 32), (100, 80))
         x0, x1, y, toward = self.lane()
-        self.assertEqual(y, 34.0)
+        self.assertEqual(y, 26.0)
         self.assertLessEqual(x1, NOTCH[0])
         self.assert_purge_probed(region, part)
 
     def test_the_simulator_case(self):
         # test/klippy/print_start_phase.test runs this one in klippy.
         region, part = self.run_part((50, 20), (140, 98))
-        self.assertEqual(self.lane(), [13.0, 73.0, 14.0, 1])
-        self.assertEqual(region, (13.0, 14.0, 140.0, 98.0))
+        self.assertEqual(self.lane(), [10.0, 43.0, 14.0, 1])
+        self.assertEqual(region, (10.0, 14.0, 140.0, 98.0))
         self.assert_purge_probed(region, part)
 
     def test_lane_steps_right_of_the_notch(self):
-        region, part = self.run_part((110, 40), (150, 80))
+        region, part = self.run_part((110, 32), (150, 80))
         x0, x1, y, toward = self.lane()
-        self.assertEqual(y, 34.0)
+        self.assertEqual(y, 26.0)
         self.assertGreaterEqual(x0, NOTCH[2])
         self.assertLessEqual(x1, BED[2])
         self.assert_purge_probed(region, part)

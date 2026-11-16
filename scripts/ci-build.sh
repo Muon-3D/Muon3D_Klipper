@@ -150,11 +150,32 @@ start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
 finish_test load_cell "Test load cell collector is stopped on a failed tap"
 
+# MUON: the tap register bytes adxl345_probe writes, ADXL345 (A1) and
+# LIS2DW12 (B1). File-output klippy tests drop every register write.
+start_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+$PYTHON test/adxl345_probe/test_accel_tap_chip.py
+finish_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 $PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
+
+# MUON: B1 shared load cell / hotend ADS1220: the mcu's no-DRDY sampling
+# against a modelled chip, hotend detection, range limits, heater hold.
+start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+$PYTHON test/muon_ads1220/test_muon_ads1220.py
+finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+# MUON: B1 Z/bed power path decisions and fault latching.
+start_test z_power "Test z_power decisions"
+$PYTHON test/z_power/test_z_power.py
+finish_test z_power "Test z_power decisions"
+
+# MUON: bed heater live supply power, resistance learning and heater check.
+start_test heater_supply "Test heater_supply and MPC on a simulated bed"
+$PYTHON test/heater_supply/test_heater_supply.py
+finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
 
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
 # outside dev mode, macros and internal sources are not checked (KAN-1730).
@@ -182,6 +203,10 @@ finish_test m600 "Test M600 with no print only prompts"
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+# MUON: M1 machine state, start/resume gates and heat waits (m1_machine).
+start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
+$PYTHON test/m1_machine/test_m1_machine.py
+finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 
 # MUON: the unlock retract without FORCE_MOVE, which is off (KAN-380).
 start_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
@@ -208,6 +233,13 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: cancelling a print while PRINT_START runs. Real reactor, gcode and
+# virtual_sdcard, no MCU: the batch-mode .test files above cannot send a
+# webhook from a second greenlet, which is the whole of the case.
+start_test print_cancel "Test cancel during PRINT_START"
+$PYTHON test/print_cancel/test_cancel_during_print_start.py
+finish_test print_cancel "Test cancel during PRINT_START"
 
 # MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
 # (KAN-1940); batch mode exits on any error, so this reads the log.

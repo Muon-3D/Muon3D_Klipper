@@ -1,0 +1,1148 @@
+# Accelerometer tap endstops and probe
+#
+# X/Y (and optionally Z) endstops from the tap interrupt of a toolhead
+# accelerometer. Named accelerometer_probe until the M1 B1 moved to a
+# LIS2DW12; that name still loads this module (accelerometer_probe.py).
+import logging
+import pins
+from . import probe, homing, accel_tap_chip
+
+TAP_AXIS_BITS = accel_tap_chip.TAP_AXIS_BITS
+VALID_TAP_AXES = ''.join(TAP_AXIS_BITS.keys())
+
+ADXL345_REST_TIME = .1
+TAP_TEST_SAMPLE_TIME = .000015
+TAP_TEST_SAMPLE_COUNT = 4
+TAP_TEST_REST_TIME = .001
+
+
+class AccelTapEndstop:
+    def __init__(self, owner, axis, mcu_endstop, position_endstop=None):
+        self._owner = owner
+        self._axis = axis
+        self._mcu_endstop = mcu_endstop
+        self._position_endstop = position_endstop
+        self.last_trigger_time = 0.
+
+    def get_axis(self):
+        return self._axis
+
+    def get_mcu(self):
+        return self._mcu_endstop.get_mcu()
+
+    def add_stepper(self, stepper):
+        self._mcu_endstop.add_stepper(stepper)
+
+    def get_steppers(self):
+        return self._mcu_endstop.get_steppers()
+
+    def home_start(self, print_time, sample_time, sample_count, rest_time,
+                   triggered=True):
+        print_time = self._owner._adjust_home_start_print_time(
+            self, print_time)
+        return self._mcu_endstop.home_start(
+            print_time, sample_time, sample_count, rest_time,
+            triggered=triggered)
+
+    def home_wait(self, home_end_time):
+        self.last_trigger_time = self._mcu_endstop.home_wait(home_end_time)
+        return self.last_trigger_time
+
+    def query_endstop(self, print_time):
+        return self._mcu_endstop.query_endstop(print_time)
+
+    # Interface for probe.HomingViaProbeHelper (used by z wrapper)
+    def multi_probe_begin(self):
+        if self._axis == 'z':
+            self._owner.multi_probe_begin()
+
+    def multi_probe_end(self):
+        if self._axis == 'z':
+            self._owner.multi_probe_end()
+
+    def probe_prepare(self, hmove):
+        if self._axis == 'z':
+            self._owner.probe_prepare(hmove)
+
+    def probe_finish(self, hmove):
+        if self._axis == 'z':
+            self._owner.probe_finish(hmove)
+
+    def get_position_endstop(self):
+        if self._position_endstop is None:
+            raise self._owner.printer.command_error(
+                "accelerometer_probe:%s_virtual_endstop does not define"
+                " position_endstop" % (self._axis,))
+        return self._position_endstop
+
+
+class AccelerometerProbe:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.enable_z_probe = config.getboolean('enable_z_probe', False)
+        self.phoming = None
+
+        # Optional activate/deactivate scripts for z probing.
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.activate_gcode = gcode_macro.load_template(
+            config, 'activate_gcode', '')
+        self.deactivate_gcode = gcode_macro.load_template(
+            config, 'deactivate_gcode', '')
+
+        int_pin = config.get('int_pin').strip()
+        self.inverted = False
+        if int_pin.startswith('!'):
+            self.inverted = True
+            int_pin = int_pin[1:].strip()
+        if int_pin not in ('int1', 'int2'):
+            raise config.error("int_pin must be either 'int1' or 'int2'")
+
+        # The chip section ([adxl345] or [lis2dw]) picks the tap backend.
+        accel = self.printer.lookup_object(config.get('chip', 'adxl345'))
+        self._adxl_mcu = accel.mcu
+        regs = accel
+        if self._adxl_mcu.is_fileoutput():
+            regs = accel_tap_chip.FileOutputRegs(self._adxl_mcu)
+        self.adxl345 = regs
+        self.tap_chip = accel_tap_chip.lookup_tap_chip(
+            config, accel, regs, int_pin, self.inverted)
+        self.chip_name = self.tap_chip.name
+        self.probe_pin = config.get('probe_pin')
+        self.disable_fans = [f.strip() for f in
+                             config.get("disable_fans", "").split(",")
+                             if f.strip()]
+        self._saved_fans = {}
+
+        # Configure per-axis tap profiles.
+        default_tap_thresh = config.getfloat('tap_thresh', 5000.,
+                                             **self._thresh_limits())
+        default_tap_dur = config.getfloat('tap_dur', 0.01,
+                                          **self._dur_limits())
+        default_tap_axes = config.get('tap_axes', 'xyz')
+
+        self.tap_profiles = {
+            'x': self._load_tap_profile(
+                config, 'x', default_tap_thresh, default_tap_dur, 'x'),
+            'y': self._load_tap_profile(
+                config, 'y', default_tap_thresh, default_tap_dur, 'y'),
+            'z': self._load_tap_profile(
+                config, 'z', default_tap_thresh, default_tap_dur,
+                default_tap_axes),
+        }
+        for axis in 'xyz':
+            desc = self.tap_chip.describe_profile(self.tap_profiles[axis])
+            if desc:
+                logging.info("accelerometer_probe %s profile%s", axis, desc)
+        # Delay interrupt arming so startup jerk does not immediately trigger.
+        default_homing_arm_delay = config.getfloat(
+            'homing_tap_arm_delay', 0.030, minval=0., maxval=1.0)
+        self.axis_homing_arm_delay = {
+            'x': config.getfloat('x_homing_tap_arm_delay',
+                                 default_homing_arm_delay,
+                                 minval=0., maxval=1.0),
+            'y': config.getfloat('y_homing_tap_arm_delay',
+                                 default_homing_arm_delay,
+                                 minval=0., maxval=1.0),
+            'z': config.getfloat('z_homing_tap_arm_delay',
+                                 default_homing_arm_delay,
+                                 minval=0., maxval=1.0),
+        }
+
+        # Optional multi-tap confirmation for X/Y homing (KAN-197).
+        self.tap_confirm = {
+            'x': self._load_confirm_profile(config, 'x'),
+            'y': self._load_confirm_profile(config, 'y'),
+        }
+        for axis, cfg in self.tap_confirm.items():
+            if cfg['samples'] > 1:
+                self._check_no_homing_retract(config, axis)
+
+        if self.enable_z_probe:
+            self.position_endstop = config.getfloat('z_offset')
+        else:
+            self.position_endstop = config.getfloat('z_offset', 0.)
+
+        # Klipper rails will ask custom endstops for position_endstop.
+        # Provide axis positions from stepper config for X/Y virtual endstops.
+        self.axis_position_endstops = {
+            'x': self._lookup_axis_position_endstop(config, 'x'),
+            'y': self._lookup_axis_position_endstop(config, 'y'),
+        }
+
+        # Setup three logical endstops on the same physical INT pin.
+        share_type = "accelerometer_probe:%s" % (config.get_name(),)
+        ppins = self.printer.lookup_object('pins')
+        self._mcu_endstops = {}
+        for axis in ('x', 'y', 'z'):
+            pin_params = ppins.lookup_pin(self.probe_pin, can_invert=True,
+                                          can_pullup=True,
+                                          share_type=share_type)
+            mcu = pin_params['chip']
+            self._mcu_endstops[axis] = mcu.setup_pin('endstop', pin_params)
+
+        self._z_wrapper = AccelTapEndstop(
+            self, 'z', self._mcu_endstops['z'], self.position_endstop)
+        self._axis_wrappers = {
+            'x': AccelTapEndstop(
+                self, 'x', self._mcu_endstops['x'],
+                self.axis_position_endstops['x']),
+            'y': AccelTapEndstop(
+                self, 'y', self._mcu_endstops['y'],
+                self.axis_position_endstops['y']),
+        }
+
+        name_parts = config.get_name().split()
+        self.base_name = name_parts[0]
+        self.name = name_parts[-1]
+        self.pin_chip_name = self.base_name
+        if len(name_parts) > 1:
+            self.pin_chip_name = "%s_%s" % (self.base_name, self.name)
+        ppins.register_chip(self.pin_chip_name, self)
+
+        self._tap_mode = None
+        self._tap_was_measuring = False
+        self.reactor = self.printer.get_reactor()
+        self._tap_enable_pending = False
+        self._tap_enable_mode = None
+        self._tap_enable_minclock = 0
+        self._tap_enable_timer = self.reactor.register_timer(
+            self._handle_tap_enable_timer, self.reactor.NEVER)
+        # The delayed arm (a reactor timer) and a tap setup or teardown can
+        # otherwise run their SPI sequences at the same time: their
+        # transfers on the one chip lose each other's responses, and the
+        # arm can land after the disarm. Every chip sequence holds this.
+        self._tap_mutex = self.reactor.mutex()
+        # Bumped by every _start_tap; a delayed arm scheduled in an earlier
+        # tap session is stale and must not arm this one.
+        self._tap_session = 0
+        self._tap_enable_session = 0
+        self._active_axis_homing_wrappers = []
+        self._active_axis_homing_arm_delay = 0.
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
+        self._in_multi_probe = False
+        self._adxl_initialized = False
+        # Set from homing:home_rails_begin when the home will be confirmed:
+        # its tap moves then keep the tap set up past their end, and the
+        # confirmation tears it down on the motion clock (_stop_tap_queued).
+        self._defer_tap_stop = False
+        # A print_time for the next _start_tap to use instead of a host
+        # flush, dwell and re-primed move time (consumed once).
+        self._queued_tap_print_time = None
+
+        self._register_mux_commands(config)
+        self.printer.register_event_handler('klippy:connect', self.init_adxl)
+        if getattr(self._adxl_mcu, 'is_non_critical', False):
+            self.printer.register_event_handler(
+                self._adxl_mcu.get_non_critical_reconnect_event_name(),
+                self._handle_adxl_reconnect)
+            self.printer.register_event_handler(
+                self._adxl_mcu.get_non_critical_disconnect_event_name(),
+                self._handle_adxl_disconnect)
+        self.printer.register_event_handler(
+            'homing:homing_move_begin', self._handle_homing_move_begin)
+        self.printer.register_event_handler(
+            'homing:homing_move_end', self._handle_homing_move_end)
+        self.printer.register_event_handler(
+            'homing:home_rails_begin', self._handle_home_rails_begin)
+        self.printer.register_event_handler(
+            'homing:home_rails_end', self._handle_home_rails_end)
+        self.printer.register_event_handler(
+            'gcode:command_error', self._handle_command_error)
+
+        if self.enable_z_probe:
+            # Current Klipper API requires explicit parameter + homing helpers.
+            self.cmd_helper = probe.ProbeCommandHelper(
+                config, self, self._z_wrapper.query_endstop)
+            self.probe_offsets = probe.ProbeOffsetsHelper(config)
+            self.param_helper = probe.ProbeParameterHelper(config)
+            self.homing_helper = probe.HomingViaProbeHelper(
+                config, self._z_wrapper, self.probe_offsets, self.param_helper)
+            self.probe_session = probe.ProbeSessionHelper(
+                config, self.param_helper,
+                self.homing_helper.start_probe_session)
+            self.printer.add_object('probe', self)
+        else:
+            self.cmd_helper = None
+            self.probe_offsets = None
+            self.param_helper = None
+            self.homing_helper = None
+            self.probe_session = None
+
+    def _register_mux_commands(self, config):
+        self.gcode.register_mux_command(
+            "SET_ACCEL_PROBE", "CHIP", self.name, self.cmd_SET_ACCEL_PROBE,
+            desc=self.cmd_SET_ACCEL_PROBE_help)
+        self.gcode.register_mux_command(
+            "ADXL_TEST_TAP", "CHIP", self.name, self.cmd_ADXL_TEST_TAP,
+            desc=self.cmd_ADXL_TEST_TAP_help)
+        if len(config.get_name().split()) == 1:
+            self.gcode.register_mux_command(
+                "SET_ACCEL_PROBE", "CHIP", None, self.cmd_SET_ACCEL_PROBE,
+                desc=self.cmd_SET_ACCEL_PROBE_help)
+            self.gcode.register_mux_command(
+                "ADXL_TEST_TAP", "CHIP", None, self.cmd_ADXL_TEST_TAP,
+                desc=self.cmd_ADXL_TEST_TAP_help)
+
+    def _parse_tap_axes(self, tap_axes, errfunc, option_name):
+        axes = tap_axes.replace(',', '').replace(' ', '').lower()
+        if not axes:
+            raise errfunc("%s may not be empty" % (option_name,))
+        mask = 0
+        for axis in axes:
+            if axis not in TAP_AXIS_BITS:
+                raise errfunc(
+                    "%s must contain only [%s], got '%s'"
+                    % (option_name, VALID_TAP_AXES, tap_axes))
+            mask |= TAP_AXIS_BITS[axis]
+        return mask
+
+    def _mask_to_axes(self, mask):
+        return ''.join([a for a in 'xyz' if mask & TAP_AXIS_BITS[a]])
+
+    def _thresh_limits(self):
+        return {'minval': self.tap_chip.thresh_min,
+                'maxval': self.tap_chip.thresh_max}
+
+    def _dur_limits(self):
+        return {'above': self.tap_chip.dur_above,
+                'maxval': self.tap_chip.dur_max}
+
+    def _load_tap_profile(self, config, axis, default_thresh, default_dur,
+                          default_tap_axes):
+        tap_thresh = config.getfloat('%s_tap_thresh' % (axis,),
+                                     default_thresh, **self._thresh_limits())
+        tap_dur = config.getfloat('%s_tap_dur' % (axis,), default_dur,
+                                  **self._dur_limits())
+        tap_axes = config.get('%s_tap_axes' % (axis,), default_tap_axes)
+        tap_axes_mask = self._parse_tap_axes(
+            tap_axes, config.error, '%s_tap_axes' % (axis,))
+        return {
+            'tap_thresh': tap_thresh,
+            'tap_dur': tap_dur,
+            'tap_axes_mask': tap_axes_mask,
+        }
+
+    def _check_no_homing_retract(self, config, axis):
+        # The confirmation does its own retract and re-tap. Klipper's second
+        # home (homing_retract_dist, 5 mm by default) would run first and
+        # double the taps, so a confirmed axis must have it off.
+        section = 'stepper_%s' % (axis,)
+        if not config.has_section(section):
+            return
+        retract = config.getsection(section).getfloat(
+            'homing_retract_dist', 5., minval=0.)
+        if retract:
+            raise config.error(
+                "accelerometer_probe: %s tap confirmation needs"
+                " homing_retract_dist: 0 in [%s] (it is %g); the"
+                " confirmation does its own retract and re-tap"
+                % (axis, section, retract))
+
+    def _load_confirm_profile(self, config, axis):
+        def opt(name, getter, default, **kw):
+            base = getter('tap_confirm_%s' % (name,), default, **kw)
+            return getter('%s_tap_confirm_%s' % (axis, name), base, **kw)
+        return {
+            'samples': opt('samples', config.getint, 1, minval=1),
+            'tolerance': opt('tolerance', config.getfloat, 0.2, above=0.),
+            'retries': opt('retries', config.getint, 2, minval=0),
+            'retract_dist': opt('retract_dist', config.getfloat, 3.,
+                                above=0.),
+            'retract_speed': opt('retract_speed', config.getfloat, None,
+                                 above=0.),
+            'speed': opt('speed', config.getfloat, None, above=0.),
+            'seek_retries': opt('seek_retries', config.getint, 1, minval=0),
+            'max_seek_dist': opt('max_seek_dist', config.getfloat, None,
+                                 above=0.),
+        }
+
+    def _lookup_axis_position_endstop(self, config, axis):
+        stepper_name = 'stepper_%s' % (axis,)
+        if not config.has_section(stepper_name):
+            raise config.error(
+                "Missing [%s] for accelerometer_probe:%s_virtual_endstop"
+                % (stepper_name, axis))
+        return config.getsection(stepper_name).getfloat('position_endstop')
+
+    def _get_profile(self, axis):
+        return self.tap_profiles[axis]
+
+    def _set_profile_regs(self, profile, minclock=0):
+        self.tap_chip.set_profile(profile, minclock=minclock)
+
+    def _merge_profiles(self, wrappers):
+        profiles = [self._get_profile(w.get_axis()) for w in wrappers]
+        tap_axes_mask = 0
+        tap_thresh = self.tap_chip.thresh_min
+        tap_dur = 0.
+        for p in profiles:
+            tap_axes_mask |= p['tap_axes_mask']
+            tap_thresh = max(tap_thresh, p['tap_thresh'])
+            tap_dur = max(tap_dur, p['tap_dur'])
+        return {
+            'tap_axes_mask': tap_axes_mask,
+            'tap_thresh': tap_thresh,
+            'tap_dur': tap_dur,
+        }
+
+    def _try_clear_tap(self, minclock=0):
+        chip = self.tap_chip
+        tries = 8
+        while tries > 0:
+            val = chip.read_source(minclock=minclock)
+            if not chip.source_has_tap(val):
+                return True
+            tries -= 1
+        return False
+
+    def _reset_axis_homing_state(self):
+        self._active_axis_homing_wrappers = []
+        self._active_axis_homing_arm_delay = 0.
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
+
+    def _eventtime_from_print_time(self, print_time):
+        now = self.reactor.monotonic()
+        est_print_time = self._adxl_mcu.estimated_print_time(now)
+        return now + max(0., print_time - est_print_time)
+
+    def _schedule_tap_enable(self, mode, arm_print_time):
+        self._tap_enable_session = self._tap_session
+        self._tap_enable_pending = True
+        self._tap_enable_mode = mode
+        self._tap_enable_minclock = self._adxl_mcu.print_time_to_clock(
+            arm_print_time)
+        self.reactor.update_timer(
+            self._tap_enable_timer,
+            self._eventtime_from_print_time(arm_print_time))
+
+    def _adjust_home_start_print_time(self, wrapper, print_time):
+        if self._tap_mode != 'axis_homing':
+            return print_time
+        if wrapper not in self._active_axis_homing_wrappers:
+            return print_time
+        arm_delay = self._active_axis_homing_arm_delay
+        if arm_delay <= 0.:
+            return print_time
+        if not self._active_axis_homing_arm_scheduled:
+            arm_print_time = print_time + arm_delay
+            self._active_axis_homing_arm_print_time = arm_print_time
+            self._active_axis_homing_arm_scheduled = True
+            self._schedule_tap_enable('axis_homing', arm_print_time)
+        return self._active_axis_homing_arm_print_time
+
+    def _cancel_tap_enable_timer(self):
+        self._tap_enable_minclock = 0
+        if not self._tap_enable_pending:
+            return
+        self._tap_enable_pending = False
+        self._tap_enable_mode = None
+        self.reactor.update_timer(self._tap_enable_timer, self.reactor.NEVER)
+
+    def _handle_tap_enable_timer(self, eventtime):
+        if not self._tap_enable_pending:
+            return self.reactor.NEVER
+        self._tap_enable_pending = False
+        mode = self._tap_enable_mode
+        minclock = self._tap_enable_minclock
+        self._tap_enable_mode = None
+        self._tap_enable_minclock = 0
+        session = self._tap_enable_session
+        with self._tap_mutex:
+            if self._tap_mode != mode or self._tap_session != session:
+                # Stopped, or a newer tap set up, while this waited.
+                return self.reactor.NEVER
+            chip = self.tap_chip
+            try:
+                # Drop startup motion events that happened during arm delay.
+                chip.read_source(minclock=minclock)
+                if not self._try_clear_tap(minclock=minclock):
+                    raise self.printer.command_error(
+                        "%s tap active before delayed arm" % (self.chip_name,))
+                chip.arm(minclock=minclock)
+            except Exception as e:
+                logging.exception("Failed delayed %s tap arm", self.chip_name)
+                self.printer.invoke_shutdown(
+                    "%s delayed tap arm failed: %s" % (self.chip_name, str(e)))
+        return self.reactor.NEVER
+
+    def _start_tap(self, profile, mode, arm_delay=0., defer_arm=False):
+        if self._tap_mode is not None:
+            raise self.printer.command_error(
+                "%s tap detection already active (%s)"
+                % (self.chip_name, self._tap_mode))
+        self.adxl345.check_connected()
+        chip = self.tap_chip
+        toolhead = self.printer.lookup_object('toolhead')
+        with self._tap_mutex:
+            self._tap_session += 1
+            was_measuring = True
+            queued_time = self._queued_tap_print_time
+            self._queued_tap_print_time = None
+            try:
+                if queued_time is None:
+                    toolhead.flush_step_generation()
+                    toolhead.dwell(ADXL345_REST_TIME)
+                    print_time = toolhead.get_last_move_time()
+                else:
+                    # Confirmation: the retract is already queued and this
+                    # time is past the rest after the last impact, so the chip
+                    # is set up while the carriage retracts.
+                    print_time = queued_time
+                clock = self._adxl_mcu.print_time_to_clock(print_time)
+                chip.disarm(minclock=clock)
+                chip.read_source()
+                self._set_profile_regs(profile, minclock=clock)
+                was_measuring = chip.power_up(minclock=clock)
+                if not self._try_clear_tap():
+                    raise self.printer.command_error(
+                        "%s tap triggered before move, reduce sensitivity."
+                        % (self.chip_name,))
+                self._cancel_tap_enable_timer()
+                if defer_arm:
+                    pass
+                elif arm_delay > 0.:
+                    self._tap_enable_session = self._tap_session
+                    self._tap_enable_pending = True
+                    self._tap_enable_mode = mode
+                    self.reactor.update_timer(self._tap_enable_timer,
+                                              self.reactor.monotonic() + arm_delay)
+                else:
+                    chip.arm(minclock=clock)
+            except Exception:
+                self._cancel_tap_enable_timer()
+                try:
+                    chip.disarm()
+                except Exception:
+                    logging.exception("Unable to disable %s interrupt",
+                                      self.chip_name)
+                try:
+                    chip.power_restore(was_measuring)
+                except Exception:
+                    logging.exception("Unable to restore %s power state",
+                                      self.chip_name)
+                raise
+            self._tap_was_measuring = was_measuring
+            self._tap_mode = mode
+
+    def _stop_tap(self, mode):
+        if self._tap_mode is None:
+            return
+        if mode is not None and self._tap_mode != mode:
+            return
+        with self._tap_mutex:
+            chip = self.tap_chip
+            toolhead = self.printer.lookup_object('toolhead')
+            try:
+                self._cancel_tap_enable_timer()
+                # The disarm is an SPI transfer that waits for its print_time.
+                # dwell()/get_last_move_time() prime that BUFFER_TIME_START
+                # (0.25 s) out on a drained queue, which left the toolhead still
+                # for ~0.35 s after every tap move. The drip lead (toolhead.py,
+                # as homing.py uses it) is 0.1 s; fall back where it is absent.
+                drip_dwell = getattr(toolhead, 'drip_dwell', toolhead.dwell)
+                start_time = getattr(toolhead, 'get_drip_start_time',
+                                     toolhead.get_last_move_time)
+                # The rest lets an impact ring down before the tap flag is
+                # checked. A move that ended without a tap (a protected
+                # back-off that met nothing) has no impact to wait out.
+                if self._tap_fired_in_move():
+                    drip_dwell(ADXL345_REST_TIME)
+                print_time = start_time()
+                clock = self._adxl_mcu.print_time_to_clock(print_time)
+                chip.disarm(minclock=clock)
+                chip.power_restore(self._tap_was_measuring, minclock=clock)
+                if not self._try_clear_tap():
+                    raise self.printer.command_error(
+                        "%s tap still active after move, reduce sensitivity."
+                        % (self.chip_name,))
+            finally:
+                self._tap_mode = None
+                self._tap_was_measuring = False
+
+    def _tap_fired_in_move(self):
+        # Whether a tap endstop of the homing move just ended triggered.
+        # home_wait() leaves last_trigger_time at the trigger, or 0 (or -1)
+        # when the move ended without one. Outside an axis homing move
+        # (tap test, Z probe) assume an impact.
+        wrappers = self._active_axis_homing_wrappers
+        if not wrappers:
+            return True
+        return any(w.last_trigger_time > 0. for w in wrappers)
+
+    def _stop_tap_queued(self, print_time):
+        # _stop_tap timed on the motion clock instead of a host dwell: the
+        # disarm and the tap-flag check run at print_time (the impact plus
+        # the rest), while a retract queued before this call moves.
+        if self._tap_mode is None:
+            return
+        with self._tap_mutex:
+            chip = self.tap_chip
+            try:
+                self._cancel_tap_enable_timer()
+                clock = self._adxl_mcu.print_time_to_clock(print_time)
+                chip.disarm(minclock=clock)
+                chip.power_restore(self._tap_was_measuring, minclock=clock)
+                if not self._try_clear_tap(minclock=clock):
+                    raise self.printer.command_error(
+                        "%s tap still active after move, reduce sensitivity."
+                        % (self.chip_name,))
+            finally:
+                self._tap_mode = None
+                self._tap_was_measuring = False
+
+    def _set_fan_disabled(self, disable):
+        if not self.disable_fans:
+            return
+        eventtime = self.printer.get_reactor().monotonic()
+        if disable:
+            for fan_name in self.disable_fans:
+                if fan_name in self._saved_fans:
+                    continue
+                fan_obj = self.printer.lookup_object(fan_name, None)
+                if fan_obj is None:
+                    logging.warning("Unknown fan '%s' in disable_fans",
+                                    fan_name)
+                    continue
+                if hasattr(fan_obj, 'fan_speed'):
+                    self._saved_fans[fan_name] = ('fan_speed',
+                                                  fan_obj.fan_speed)
+                    fan_obj.fan_speed = 0.
+                    if hasattr(fan_obj, 'fan'):
+                        fan_obj.fan.set_speed(0.)
+                elif hasattr(fan_obj, 'fan'):
+                    prev_speed = fan_obj.fan.get_status(eventtime)['speed']
+                    self._saved_fans[fan_name] = ('fan', prev_speed)
+                    fan_obj.fan.set_speed(0.)
+                else:
+                    logging.warning("disable_fans object '%s' is unsupported",
+                                    fan_name)
+        else:
+            for fan_name, (stype, sval) in list(self._saved_fans.items()):
+                fan_obj = self.printer.lookup_object(fan_name, None)
+                if fan_obj is None:
+                    continue
+                if stype == 'fan_speed' and hasattr(fan_obj, 'fan_speed'):
+                    fan_obj.fan_speed = sval
+                    if hasattr(fan_obj, 'fan'):
+                        fan_obj.fan.set_speed(sval)
+                elif stype == 'fan' and hasattr(fan_obj, 'fan'):
+                    fan_obj.fan.set_speed(sval)
+            self._saved_fans.clear()
+
+    def _lookup_axis_wrapper(self, axis, gcmd=None):
+        axis = axis.lower()
+        if axis in self._axis_wrappers:
+            return self._axis_wrappers[axis]
+        if axis == 'z':
+            if not self.enable_z_probe:
+                if gcmd is not None:
+                    raise gcmd.error("AXIS=Z requires enable_z_probe: True")
+                raise self.printer.command_error(
+                    "AXIS=Z requires enable_z_probe: True")
+            return self._z_wrapper
+        if gcmd is not None:
+            raise gcmd.error("AXIS must be X, Y, or Z")
+        raise self.printer.command_error("AXIS must be X, Y, or Z")
+
+    def _wait_for_tap(self, wrapper, timeout):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        wrapper.home_start(print_time, TAP_TEST_SAMPLE_TIME,
+                           TAP_TEST_SAMPLE_COUNT, TAP_TEST_REST_TIME,
+                           triggered=True)
+        trigger_time = wrapper.home_wait(print_time + timeout)
+        return trigger_time > 0.
+
+    def setup_pin(self, pin_type, pin_params):
+        if pin_type != 'endstop':
+            raise pins.error("accelerometer_probe virtual pins are only endstops")
+        if pin_params['invert'] or pin_params['pullup']:
+            raise pins.error("accelerometer_probe virtual pins may not invert/pullup")
+        pin_name = pin_params['pin']
+        if pin_name == 'x_virtual_endstop':
+            return self._axis_wrappers['x']
+        if pin_name == 'y_virtual_endstop':
+            return self._axis_wrappers['y']
+        if pin_name == 'z_virtual_endstop':
+            if not self.enable_z_probe:
+                raise pins.error("enable_z_probe must be true for z_virtual_endstop")
+            return self._z_wrapper
+        raise pins.error(
+            "Unknown accelerometer_probe virtual pin '%s' (expected"
+            " x_virtual_endstop, y_virtual_endstop, or z_virtual_endstop)"
+            % (pin_name,))
+
+    def _handle_homing_move_begin(self, hmove):
+        wrappers = [w for w in self._axis_wrappers.values()
+                    if w in hmove.get_mcu_endstops()]
+        if not wrappers:
+            return
+        profile = self._merge_profiles(wrappers)
+        arm_delay = max([self.axis_homing_arm_delay.get(w.get_axis(), 0.)
+                         for w in wrappers])
+        self._active_axis_homing_wrappers = wrappers
+        self._active_axis_homing_arm_delay = arm_delay
+        self._active_axis_homing_arm_print_time = 0.
+        self._active_axis_homing_arm_scheduled = False
+        self._start_tap(profile, 'axis_homing', defer_arm=arm_delay > 0.)
+
+    def _handle_homing_move_end(self, hmove):
+        if not self._active_axis_homing_wrappers:
+            return
+        hmove_endstops = hmove.get_mcu_endstops()
+        if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
+            return
+        try:
+            if not (self._defer_tap_stop
+                    and self._tap_mode == 'axis_homing'):
+                self._stop_tap('axis_homing')
+        finally:
+            self._reset_axis_homing_state()
+
+    def _confirmed_tap_wrapper(self, rails):
+        # The wrapper of a single-axis tap home that is confirmed, or None.
+        matches = []
+        for rail in rails:
+            for es, name in rail.get_endstops():
+                if es in self._axis_wrappers.values():
+                    matches.append(es)
+        if len(matches) != 1:
+            return None
+        if self.tap_confirm[matches[0].get_axis()]['samples'] <= 1:
+            return None
+        return matches[0]
+
+    def _handle_home_rails_begin(self, homing_state, rails):
+        self._defer_tap_stop = self._confirmed_tap_wrapper(rails) is not None
+        self._queued_tap_print_time = None
+
+    def _handle_home_rails_end(self, homing_state, rails):
+        # Confirm an X/Y tap home with further agreeing taps before the
+        # position is trusted (KAN-197).
+        matches = []
+        for rail in rails:
+            for es, name in rail.get_endstops():
+                if es in self._axis_wrappers.values():
+                    matches.append((rail, es))
+        if not matches:
+            return
+        if len(matches) > 1:
+            logging.warning("accelerometer_probe: tap confirmation skipped for"
+                            " simultaneous multi-axis home")
+            return
+        rail, wrapper = matches[0]
+        axis = wrapper.get_axis()
+        cfg = self.tap_confirm[axis]
+        if cfg['samples'] <= 1:
+            return
+        try:
+            self._confirm_axis_home(homing_state, rail, wrapper, cfg)
+        finally:
+            self._defer_tap_stop = False
+            self._queued_tap_print_time = None
+            if self._tap_mode == 'axis_homing':
+                # The last tap: its teardown, at the rest after its impact.
+                self._stop_tap_queued(
+                    wrapper.last_trigger_time + ADXL345_REST_TIME)
+
+    def _confirm_axis_home(self, homing_state, rail, wrapper, cfg):
+        toolhead = self.printer.lookup_object('toolhead')
+        cmderr = self.printer.command_error
+        axis = wrapper.get_axis()
+        axis_idx = 'xyz'.index(axis)
+        hi = rail.get_homing_info()
+        direction = 1. if hi.positive_dir else -1.
+        pos_endstop = hi.position_endstop
+        speed = cfg['speed'] or hi.speed
+        retract_speed = cfg['retract_speed'] or hi.retract_speed
+        retract_dist = cfg['retract_dist']
+        arm_delay = self.axis_homing_arm_delay.get(axis, 0.)
+        if retract_dist <= speed * arm_delay:
+            raise cmderr(
+                "accelerometer_probe: %s_tap_confirm_retract_dist (%.2fmm) must"
+                " exceed the distance covered during the tap arm delay"
+                " (%.1fmm/s * %.3fs = %.2fmm)"
+                % (axis, retract_dist, speed, arm_delay, speed * arm_delay))
+        range_min, range_max = rail.get_range()
+        seek_budget = cfg['max_seek_dist']
+        if seek_budget is None:
+            seek_budget = range_max - range_min
+        endstops = rail.get_endstops()
+        steppers = wrapper.get_steppers()
+        step_dists = {s.get_name(): s.get_step_dist() for s in steppers}
+
+        # Like HomingMove.check_no_movement(): the debug harness has no
+        # physical stop, so tap travels never agree there.
+        is_debug = self.printer.get_start_args().get('debuginput') is not None
+
+        def run_homing_move(start_dist, move_speed):
+            # Pretend to be start_dist away from the endstop so the move
+            # has room to reach it, then home towards position_endstop.
+            startpos = list(toolhead.get_position())
+            startpos[axis_idx] = pos_endstop - direction * start_dist
+            toolhead.set_position(startpos)
+            homepos = list(startpos)
+            homepos[axis_idx] = pos_endstop
+            hmove = homing.HomingMove(self.printer, endstops)
+            wrapper.last_trigger_time = 0.
+            hmove.homing_move(homepos, move_speed, check_triggered=False)
+            if wrapper.last_trigger_time <= 0.:
+                return None, start_dist
+            trig = {sp.stepper_name: sp.trig_pos
+                    for sp in hmove.stepper_positions}
+            travelled = max([abs(sp.trig_pos - sp.start_pos)
+                             * step_dists[sp.stepper_name]
+                             for sp in hmove.stepper_positions])
+            return trig, travelled
+
+        # Confirmation taps are compared by how far each one travelled from
+        # its retract point, not by where it triggered. Driven into the stop,
+        # the steppers keep stepping until the tap interrupt fires, and those
+        # steps are lost against the stop. So each tap triggers about
+        # speed * interrupt latency beyond the one before (0.35-0.45 mm at
+        # 20 mm/s, about 1 mm at 60 mm/s on the M1 B1) while the axis stops in
+        # the same place, and absolute trigger positions never agree. The
+        # travel from a fixed retract does not carry that creep.
+        #
+        # `samples` counts every tap, the seek tap included. The seek tap came
+        # from far away and has no comparable travel, so samples=2 is the seek
+        # tap and one confirmation: it proves the stop is there (a spurious
+        # seek tap finds nothing within 2 * retract_dist) and sets the
+        # position, with nothing to compare. From samples=3 the confirmations
+        # must also agree with each other by travel.
+        taps = []   # confirmation taps: (trigger mcu positions, travel mm)
+        retries_left = cfg['retries']
+        seek_left = cfg['seek_retries']
+        while len(taps) < cfg['samples'] - 1:
+            # Back off, then re-approach over twice the retract distance.
+            retractpos = list(toolhead.get_position())
+            retractpos[axis_idx] = pos_endstop - direction * retract_dist
+            # Retract first (as probe.py's LIFTLAST lifts before it
+            # reports): the homing move ended with a set_position(), so a
+            # plain move() would be primed BUFFER_TIME_START (0.25 s) out;
+            # short_prime_move (toolhead.py, for exactly this retract)
+            # primes it with the 0.1 s drip lead, and get_drip_start_time()
+            # flushes it now. Only then the tap teardown and the next setup,
+            # at the impact plus the rest on the motion clock, so they run
+            # while the carriage retracts instead of with it on the stop.
+            getattr(toolhead, 'short_prime_move', toolhead.move)(
+                retractpos, retract_speed)
+            getattr(toolhead, 'get_drip_start_time',
+                    toolhead.get_last_move_time)()
+            tap_time = wrapper.last_trigger_time + ADXL345_REST_TIME
+            self._stop_tap_queued(tap_time)
+            self._queued_tap_print_time = tap_time
+            trig, travelled = run_homing_move(retract_dist * 2., speed)
+            if trig is None:
+                # No tap: the move ended with the tap still set up.
+                self._stop_tap('axis_homing')
+                self._queued_tap_print_time = None
+                # Nothing within reach: the previous tap was spurious.
+                # Resume the seek from here within the travel budget.
+                seek_budget -= travelled
+                if seek_left <= 0 or seek_budget <= 0.:
+                    raise cmderr(
+                        "accelerometer_probe: %s home tap not confirmed; no"
+                        " contact within %.1fmm of the reported tap"
+                        " and seek retries exhausted"
+                        % (axis, retract_dist))
+                seek_left -= 1
+                seek_dist = seek_budget
+                logging.info("accelerometer_probe: %s tap judged spurious,"
+                             " resuming seek for up to %.1fmm",
+                             axis, seek_dist)
+                trig, travelled = run_homing_move(seek_dist, hi.speed)
+                seek_budget -= travelled
+                if trig is None:
+                    self._stop_tap('axis_homing')
+                    raise cmderr(
+                        "accelerometer_probe: %s home failed; no tap within"
+                        " %.1fmm of resumed seek" % (axis, seek_dist))
+                # A new seek tap: confirmation starts again from it.
+                taps = []
+                continue
+            if taps:
+                spread = 0. if is_debug else abs(travelled - taps[-1][1])
+                if spread > cfg['tolerance']:
+                    if retries_left <= 0:
+                        raise cmderr(
+                            "accelerometer_probe: %s home taps disagree by %.3fmm"
+                            " (tolerance %.3fmm) after %d retries"
+                            % (axis, spread, cfg['tolerance'],
+                               cfg['retries']))
+                    retries_left -= 1
+                    logging.info("accelerometer_probe: %s taps disagree by %.3fmm,"
+                                 " retrying confirmation", axis, spread)
+                    taps = [(trig, travelled)]
+                    continue
+            taps.append((trig, travelled))
+        homing_state.trigger_mcu_pos.update(taps[-1][0])
+        logging.info("accelerometer_probe: %s home confirmed with %d taps"
+                     " (confirmation travel %s mm)", axis, len(taps) + 1,
+                     ", ".join("%.3f" % (t,) for _, t in taps))
+
+    def _handle_command_error(self):
+        self._defer_tap_stop = False
+        self._queued_tap_print_time = None
+        if self._tap_mode == 'axis_homing':
+            try:
+                self._stop_tap('axis_homing')
+            except Exception:
+                logging.exception("%s axis homing cleanup failed",
+                                  self.chip_name)
+            self._reset_axis_homing_state()
+        elif self._tap_mode == 'tap_test':
+            try:
+                self._stop_tap('tap_test')
+            except Exception:
+                logging.exception("%s tap test cleanup failed", self.chip_name)
+        elif self._tap_mode == 'probe':
+            try:
+                self._stop_tap('probe')
+            except Exception:
+                logging.exception("%s probe cleanup failed", self.chip_name)
+            if not self._in_multi_probe:
+                self._set_fan_disabled(False)
+            try:
+                self.deactivate_gcode.run_gcode_from_command()
+            except Exception:
+                logging.exception("%s deactivate_gcode failed", self.chip_name)
+
+    def init_adxl(self):
+        self.phoming = self.printer.lookup_object('homing')
+        if (getattr(self._adxl_mcu, 'is_non_critical', False)
+                and getattr(self._adxl_mcu, 'non_critical_disconnected', False)):
+            self._adxl_initialized = False
+            logging.info("%s probe init deferred: MCU '%s' is disconnected",
+                         self.chip_name, self._adxl_mcu.get_name())
+            return
+        self.adxl345.check_connected()
+        self.tap_chip.init(self._get_profile('z'))
+        self._try_clear_tap()
+        self._adxl_initialized = True
+
+    def _handle_adxl_reconnect(self):
+        try:
+            self.init_adxl()
+        except Exception:
+            # Do not fail global reconnect flow on ADXL init errors.
+            logging.exception("%s probe reconnect init failed", self.chip_name)
+
+    def _handle_adxl_disconnect(self):
+        self._adxl_initialized = False
+        self._tap_mode = None
+        self._tap_was_measuring = False
+        self._reset_axis_homing_state()
+        if not self._in_multi_probe:
+            self._set_fan_disabled(False)
+
+    # Probe interface (z probing only)
+    def _require_z_probe(self):
+        if not self.enable_z_probe:
+            raise self.printer.command_error(
+                "Z probe interface disabled in [accelerometer_probe]")
+
+    def multi_probe_begin(self):
+        self._require_z_probe()
+        self._in_multi_probe = True
+        self._set_fan_disabled(True)
+
+    def multi_probe_end(self):
+        self._require_z_probe()
+        self._set_fan_disabled(False)
+        self._in_multi_probe = False
+
+    def probing_move(self, pos, speed):
+        self._require_z_probe()
+        return self.phoming.probing_move(self._z_wrapper, pos, speed)
+
+    def probe_prepare(self, hmove):
+        self._require_z_probe()
+        self.activate_gcode.run_gcode_from_command()
+        try:
+            self._start_tap(self._get_profile('z'), 'probe')
+        except Exception:
+            try:
+                self.deactivate_gcode.run_gcode_from_command()
+            except Exception:
+                logging.exception("%s deactivate_gcode failed", self.chip_name)
+            raise
+        if not self._in_multi_probe:
+            self._set_fan_disabled(True)
+
+    def probe_finish(self, hmove):
+        self._require_z_probe()
+        try:
+            self._stop_tap('probe')
+        finally:
+            self.deactivate_gcode.run_gcode_from_command()
+            if not self._in_multi_probe:
+                self._set_fan_disabled(False)
+
+    def get_position_endstop(self):
+        self._require_z_probe()
+        return self.position_endstop
+
+    def get_probe_params(self, gcmd=None):
+        self._require_z_probe()
+        return self.param_helper.get_probe_params(gcmd)
+
+    def get_offsets(self, gcmd=None):
+        self._require_z_probe()
+        return self.probe_offsets.get_offsets(gcmd)
+
+    def get_status(self, eventtime):
+        if self.cmd_helper is None:
+            return {
+                'tap_mode': self._tap_mode,
+                'chip_type': self.chip_name,
+                'profiles': {
+                    axis: self._profile_status(p)
+                    for axis, p in self.tap_profiles.items()
+                },
+            }
+        return self.cmd_helper.get_status(eventtime)
+
+    def _profile_status(self, p):
+        # *_effective: what the chip's registers can actually represent.
+        eff = self.tap_chip.effective(p)
+        return {
+            'tap_thresh': p['tap_thresh'],
+            'tap_dur': p['tap_dur'],
+            'tap_axes': self._mask_to_axes(p['tap_axes_mask']),
+            'tap_thresh_effective': eff['tap_thresh'],
+            'tap_dur_effective': eff['tap_dur'],
+        }
+
+    def start_probe_session(self, gcmd):
+        self._require_z_probe()
+        return self.probe_session.start_probe_session(gcmd)
+
+    cmd_SET_ACCEL_PROBE_help = (
+        "Configure accelerometer tap profiles for X/Y endstops and optional"
+        " Z probe. "
+        "Params: AXIS=<X|Y|Z|ALL> TAP_THRESH=<mm/s^2> TAP_DUR=<s> "
+        "TAP_AXES=<xyz combination> HOMING_TAP_ARM_DELAY=<s>"
+    )
+
+    cmd_ADXL_TEST_TAP_help = (
+        "Wait for physical ADXL tap interrupts on a selected axis profile. "
+        "Params: AXIS=<X|Y|Z> TAPS=<count> TIMEOUT=<s> QUIET_TIME=<s> "
+        "[TAP_THRESH=<mm/s^2> TAP_DUR=<s> TAP_AXES=<xyz>]"
+    )
+
+    def cmd_SET_ACCEL_PROBE(self, gcmd):
+        axis = gcmd.get('AXIS', 'ALL').lower()
+        if axis not in ('x', 'y', 'z', 'all'):
+            raise gcmd.error("AXIS must be X, Y, Z, or ALL")
+        params = gcmd.get_command_parameters()
+        has_thresh = 'TAP_THRESH' in params
+        has_dur = 'TAP_DUR' in params
+        has_axes = 'TAP_AXES' in params
+        has_homing_arm_delay = 'HOMING_TAP_ARM_DELAY' in params
+        if self._tap_mode is not None and (has_thresh or has_dur or has_axes
+                                           or has_homing_arm_delay):
+            raise gcmd.error(
+                "Can not update tap settings while homing/probing move is active")
+
+        targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
+        new_thresh = None
+        new_dur = None
+        new_axes_mask = None
+        if has_thresh:
+            new_thresh = gcmd.get_float('TAP_THRESH', **self._thresh_limits())
+        if has_dur:
+            new_dur = gcmd.get_float('TAP_DUR', **self._dur_limits())
+        if has_axes:
+            axes = gcmd.get('TAP_AXES')
+            new_axes_mask = self._parse_tap_axes(axes, gcmd.error, 'TAP_AXES')
+        new_homing_arm_delay = None
+        if has_homing_arm_delay:
+            new_homing_arm_delay = gcmd.get_float(
+                'HOMING_TAP_ARM_DELAY', minval=0., maxval=1.0)
+
+        for target in targets:
+            profile = self._get_profile(target)
+            if new_thresh is not None:
+                profile['tap_thresh'] = new_thresh
+            if new_dur is not None:
+                profile['tap_dur'] = new_dur
+            if new_axes_mask is not None:
+                profile['tap_axes_mask'] = new_axes_mask
+            if new_homing_arm_delay is not None:
+                self.axis_homing_arm_delay[target] = new_homing_arm_delay
+
+        lines = []
+        for a in 'xyz':
+            p = self._get_profile(a)
+            lines.append(
+                "%s profile %s: tap_thresh=%.3f tap_dur=%.6f tap_axes=%s"
+                " homing_tap_arm_delay=%.4f%s"
+                % (self.chip_name, a.upper(), p['tap_thresh'], p['tap_dur'],
+                   self._mask_to_axes(p['tap_axes_mask']),
+                   self.axis_homing_arm_delay.get(a, 0.),
+                   self.tap_chip.describe_profile(p)))
+        gcmd.respond_info("\n".join(lines))
+
+    def cmd_ADXL_TEST_TAP(self, gcmd):
+        if self._tap_mode is not None:
+            raise gcmd.error(
+                "ADXL tap detection is busy (%s)" % (self._tap_mode,))
+        axis = gcmd.get('AXIS', 'X')
+        wrapper = self._lookup_axis_wrapper(axis, gcmd)
+        axis = wrapper.get_axis()
+        taps = gcmd.get_int('TAPS', 3, minval=1, maxval=50)
+        timeout = gcmd.get_float('TIMEOUT', 30., above=0.)
+        quiet_time = gcmd.get_float('QUIET_TIME', 0.2, minval=0.)
+        params = gcmd.get_command_parameters()
+
+        profile = dict(self._get_profile(axis))
+        if 'TAP_THRESH' in params:
+            profile['tap_thresh'] = gcmd.get_float(
+                'TAP_THRESH', **self._thresh_limits())
+        if 'TAP_DUR' in params:
+            profile['tap_dur'] = gcmd.get_float(
+                'TAP_DUR', **self._dur_limits())
+        if 'TAP_AXES' in params:
+            profile['tap_axes_mask'] = self._parse_tap_axes(
+                gcmd.get('TAP_AXES'), gcmd.error, 'TAP_AXES')
+
+        gcmd.respond_info(
+            "ADXL_TEST_TAP: axis=%s taps=%d timeout=%.2fs quiet=%.2fs "
+            "tap_thresh=%.3f tap_dur=%.6f tap_axes=%s%s"
+            % (axis.upper(), taps, timeout, quiet_time,
+               profile['tap_thresh'], profile['tap_dur'],
+               self._mask_to_axes(profile['tap_axes_mask']),
+               self.tap_chip.describe_profile(profile)))
+
+        reactor = self.printer.get_reactor()
+        for tap_num in range(taps):
+            self._start_tap(profile, 'tap_test')
+            source = None
+            try:
+                did_trigger = self._wait_for_tap(wrapper, timeout)
+                if did_trigger:
+                    # Which chip axis fired: the axes_map check (LIS2DW12).
+                    source = self.tap_chip.describe_trigger()
+            finally:
+                self._stop_tap('tap_test')
+            if not did_trigger:
+                raise gcmd.error(
+                    "ADXL_TEST_TAP timed out waiting for tap %d/%d on axis %s"
+                    % (tap_num + 1, taps, axis.upper()))
+            gcmd.respond_info("ADXL_TEST_TAP: tap %d/%d detected%s"
+                              % (tap_num + 1, taps,
+                                 " (%s)" % (source,) if source else ""))
+            if quiet_time > 0. and tap_num + 1 < taps:
+                reactor.pause(reactor.monotonic() + quiet_time)
+
+
+def load_config(config):
+    return AccelerometerProbe(config)
+
+
+def load_config_prefix(config):
+    return AccelerometerProbe(config)

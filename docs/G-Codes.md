@@ -966,6 +966,29 @@ updated. If TEMPLATE is an empty string then this command will clear
 any previous template assigned to the LED (one can then use `SET_LED`
 commands to manage the LED's color settings).
 
+### [muon_ads1220]
+
+The following commands are available when a
+[muon_ads1220 config section](Config_Reference.md#muon-b1-shared-ads1220-muon_ads1220)
+is enabled.
+
+#### MUON_ADC_STATS
+`MUON_ADC_STATS CHIP=<name>`: Report how the mcu has been sampling
+the chip since it was configured: new conversions, repeated codes, held
+copies and empty slots, late reads (a conversion may have been lost),
+temperature reads, reads taken while a probe was armed, timer overruns,
+stalls and the hotend excitation mode. While the load cell is streaming
+it also reports the chip's measured conversion rate (and so its internal
+oscillator error) and the rate delivered after temperature slices.
+
+#### MUON_HOTEND_STATUS
+`MUON_HOTEND_STATUS HEATER=<heater>`: Report the detected hotend type,
+the detection state and the last sensor resistance.
+
+#### MUON_HOTEND_DETECT
+`MUON_HOTEND_DETECT HEATER=<heater>`: Re-run hotend type detection. The
+heater must be off.
+
 ### [load_cell]
 
 The following commands are enabled if a
@@ -1129,7 +1152,7 @@ is enabled.
 #### EXTRUDER_HOMING_MOVE
 `EXTRUDER_HOMING_MOVE EXTRUDER=config_name DISTANCE=<distance>
 [SPEED=<speed>] [ACCEL=<accel>] [STOP_ON_ENDSTOP=[1|2|-1|-2]]
-[SET_POSITION=<pos>]`: This command runs a bounded move on the
+[SET_POSITION=<pos>] [BLANK=<mm>]`: This command runs a bounded move on the
 configured extruder stepper. The move will stop early if the endstop
 reports the requested state. Use `STOP_ON_ENDSTOP=1` to stop on a
 triggered endstop and raise an error if it never triggers. Use
@@ -1137,7 +1160,9 @@ triggered endstop and raise an error if it never triggers. Use
 to complete without error if it never triggers. Use `-1` or `-2` to
 stop when the endstop reports "not triggered". The optional
 `SET_POSITION` parameter updates the logical extruder position after
-the move completes, which is useful for homing-style workflows. This
+the move completes, which is useful for homing-style workflows. The
+optional `BLANK` parameter ignores the endstop for that many mm at the
+start of the move (default: the section's `blank_distance`). This
 command always waits for the move to finish before continuing. If the
 corresponding `[extruder_homing]` section sets
 `min_extrude_temp_override`, that lower threshold applies to this
@@ -1778,6 +1803,91 @@ print.
 
 #### SDCARD_RESET_FILE
 `SDCARD_RESET_FILE`: Unload file and clear SD state.
+
+### [raise_error]
+
+#### RAISE_ERROR
+`RAISE_ERROR MSG=<text>`: Stop the running script with the error `<text>`.
+Available when a [raise_error config section](Config_Reference.md#raise_error)
+is enabled.
+
+### [m1_machine]
+
+The following commands are available when an
+[m1_machine config section](Config_Reference.md#m1_machine) is enabled.
+
+#### MACHINE_WAIT_READY
+`MACHINE_WAIT_READY [ACTION=print] [TIMEOUT=<seconds>] [SETTLE=<seconds>]`:
+Wait until nothing ACTION needs is missing, showing one prompt that lists
+every missing item and updates as they are fixed. Continues by itself once
+everything has held for SETTLE seconds. Fails at once on a latched fault
+(its acknowledgement is a gcode command that cannot run during the wait),
+after TIMEOUT, or when a print cancel aborts it. PRINT_START runs it first.
+
+#### MACHINE_REQUIRE
+`MACHINE_REQUIRE ACTION=<action> [WAIT=<seconds>]`: Fail unless nothing
+ACTION needs is missing, after waiting up to WAIT seconds (at most 10). For
+`ACTION=resume` on a paused print the checklist prompt then follows the
+machine and offers Resume once it is complete. RESUME runs it first.
+
+#### MACHINE_HEAT_WAIT
+`MACHINE_HEAT_WAIT HEATER=<heater> MINIMUM=<temperature>`: Like
+TEMPERATURE_WAIT, but fails when the heater's target drops below MINIMUM or
+what it heats goes away: for `heater_bed` the plate or the locked column,
+for the hot end the toolhead, its sensor, or the fan.
+
+#### MACHINE_PAUSED
+`MACHINE_PAUSED REASON=<code> [FAN=<0..1>]`: Called by PAUSE. Records a new
+pause, its reason and the part-fan speed to restore, and starts the
+cool-down: a part fan that was on stays at that speed while the hot end is
+above `pause_cool_temp`, otherwise it goes off. On a pause already recorded it only
+replaces a `user` reason.
+
+#### MACHINE_PAUSE_REASON
+`MACHINE_PAUSE_REASON REASON=<code>`: Set why the print is paused.
+
+#### MACHINE_RESUMED
+`MACHINE_RESUMED`: Called by RESUME. Ends the pause record and its prompt.
+
+#### MACHINE_TOOLHEAD_CONNECTED
+`MACHINE_TOOLHEAD_CONNECTED`: Called by TOOLHEAD_CONNECT. Sets the status
+field `toolhead_hotplug`: true after a disconnect, or for a first connect
+more than `toolhead_startup_grace` seconds after Klipper became ready;
+false for the toolhead MCU coming up at a Klipper start.
+
+#### MACHINE_PLATE_CLEAR
+`MACHINE_PLATE_CLEAR`: Say the plate is clear of the last print, so a new
+print may start without the plate being taken off and refitted.
+
+#### MACHINE_STATUS
+`MACHINE_STATUS`: Report the activity, the conditions, and what each action
+is missing.
+
+### [z_power]
+
+The following commands are available when a
+[z_power config section](Config_Reference.md#z_power) is enabled.
+
+#### Z_POWER_STATUS
+`Z_POWER_STATUS`: Report the bed power path state and why, the Z_PRESENT
+ADC ratio and the band it falls in, whether a plate is detected, the
+eFuse enable and PGOOD, and the current and power drawn.
+
+#### Z_POWER_RESET
+`Z_POWER_RESET`: Clear a latched fault. The feed comes back up on its own
+if the Z column, lever and plate allow it.
+
+#### Z_POWER_WAIT
+`Z_POWER_WAIT [TIMEOUT=<seconds>]`: Wait up to TIMEOUT (default 2) seconds
+for bed power to come up. Never an error.
+
+#### Z_POWER_REQUIRE
+`Z_POWER_REQUIRE [MSG=<text>]`: Raise an error, with the reason bed power
+is off, unless it is on. Used by PRINT_START to stop a print cleanly.
+
+#### Z_POWER_INHIBIT
+`Z_POWER_INHIBIT [ENABLE=<0|1>]`: Hold the feed off (`ENABLE=1`, the
+default) for service, or release it (`ENABLE=0`).
 
 ### [z_thermal_adjust]
 

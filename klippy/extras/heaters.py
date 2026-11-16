@@ -24,6 +24,15 @@ AMBIENT_TEMP = 25.
 PID_PARAM_BASE = 255.
 MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
+# MUON: the least time from a pwm update still queued to a hold's "off".
+# The host's serial queue holds a pwm command back until the mcu has reached
+# the previous one's clock (minclock), so an "off" at that same clock leaves
+# only when it is due and arrives late: "Timer too close" on the toolhead.
+# A tap hold on sloe did this on 2026-11-12, when the tap began within 0.1 s
+# of a PID update (the shutdown dump shows it). The gap gives the "off" the
+# usual 0.1 s to arrive.
+# set_pwm does not need it: its updates are a report interval apart.
+PWM_QUEUE_GAP = 0.100
 
 class Heater:
     def __init__(self, config, sensor):
@@ -55,6 +64,12 @@ class Heater:
         # pwm caching
         self.next_pwm_time = 0.
         self.last_pwm_value = 0.
+        self.last_pwm_time = 0.
+        # Named holds that force the heater off (see hold_pwm)
+        self.pwm_holds = {}
+        # Host time the last hold was released, for verify_heater, which
+        # samples once a second and so would miss most short holds.
+        self.last_hold_release = None
         # Setup control algorithm sub-class
         # algos = {'watermark': ControlBangBang, 'pid': ControlPID}
         # algo = config.getchoice('control', algos)
@@ -145,13 +160,15 @@ class Heater:
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
     def set_pwm(self, read_time, value):
-        if self.target_temp <= 0. or read_time > self.verify_mainthread_time:
+        if (self.target_temp <= 0. or read_time > self.verify_mainthread_time
+                or self.pwm_holds):
             value = 0.
         if ((read_time < self.next_pwm_time or not self.last_pwm_value)
             and abs(value - self.last_pwm_value) < 0.05):
             # No significant change in value - can suppress update
             return
-        pwm_time = read_time + self.pwm_delay
+        pwm_time = max(read_time + self.pwm_delay, self.last_pwm_time)
+        self.last_pwm_time = pwm_time
         self.next_pwm_time = (pwm_time + MAX_HEAT_TIME
                               - (3. * self.pwm_delay + 0.001))
         self.last_pwm_value = value
@@ -184,6 +201,38 @@ class Heater:
         #logging.debug("temp: %.3f %f = %f", read_time, temp)
     def _handle_shutdown(self):
         self.verify_mainthread_time = -999.
+    # MUON: a hold forces the heater off from print_time until it is
+    # released, without changing target_temp, so control resumes where it
+    # was. A sensor uses it to keep heater switching out of a measurement,
+    # or (with refuse_msg) to refuse heating while it cannot be trusted.
+    # print_time=None only records the hold: for a heater whose mcu is
+    # gone and so has already turned the pin off itself.
+    def hold_pwm(self, name, print_time=None, refuse_msg=None):
+        with self.lock:
+            self.pwm_holds[name] = refuse_msg
+            if print_time is None:
+                self.last_pwm_value = 0.
+                return
+            if not self.last_pwm_value:
+                return
+            pwm_time = max(print_time, self.last_pwm_time + PWM_QUEUE_GAP)
+            if pwm_time > print_time:
+                logging.info("%s: hold '%s' off moved %.0f ms to go after"
+                             " a queued update", self.name, name,
+                             (pwm_time - print_time) * 1000.)
+            self.last_pwm_time = pwm_time
+            self.last_pwm_value = 0.
+            self.next_pwm_time = 0.
+            self.mcu_pwm.set_pwm(pwm_time, 0.)
+    def release_pwm(self, name):
+        with self.lock:
+            if name in self.pwm_holds:
+                del self.pwm_holds[name]
+                self.last_hold_release = self.printer.get_reactor().monotonic()
+    def get_last_hold_release(self):
+        return self.last_hold_release
+    def get_pwm_holds(self):
+        return dict(self.pwm_holds)
     # External commands
     def get_name(self):
         return self.name
@@ -198,6 +247,10 @@ class Heater:
             raise self.printer.command_error(
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
+        if degrees:
+            for refuse_msg in self.pwm_holds.values():
+                if refuse_msg:
+                    raise self.printer.command_error(refuse_msg)
         with self.lock:
             if degrees != 0.0 and hasattr(self.control, "check_valid"):
                 self.control.check_valid()
@@ -458,6 +511,7 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+            gcode.check_abort()
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
@@ -482,12 +536,14 @@ class PrinterHeaters:
         else:
             sensor = self.printer.lookup_object(sensor_name)
         toolhead = self.printer.lookup_object("toolhead")
+        gcode = self.printer.lookup_object("gcode")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
             temp, target = sensor.get_temp(eventtime)
             if temp >= min_temp and temp <= max_temp:
                 return
+            gcode.check_abort()
             print_time = toolhead.get_last_move_time()
             gcmd.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)

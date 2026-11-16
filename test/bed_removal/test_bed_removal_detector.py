@@ -56,6 +56,13 @@ class FakeHeater:
     def __init__(self):
         self.temp = ATTACHED
         self.target = ATTACHED
+        # The detector samples last_temp each time last_temp_time moves on,
+        # as a real heater's temperature callback advances it.
+        self.last_temp_time = 0.
+
+    @property
+    def last_temp(self):
+        return self.temp
 
     def get_temp(self, eventtime):
         return self.temp, self.target
@@ -231,6 +238,7 @@ class Machine:
         self.bed.heater.temp = temp
         for _ in range(count):
             self.reactor.now += 0.1
+            self.bed.heater.last_temp_time = self.reactor.now
             self.detector.check_bed_temperature(self.reactor.now)
 
     def pull_plate(self):
