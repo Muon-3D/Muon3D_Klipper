@@ -26,7 +26,11 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-MACROS = os.path.join(ROOT, 'core', 'M1', 'macros')
+# MUON_M1_CONFIG_DIR points every test_m1_*.py at another config tree
+# (core/M1-B0, relative to the repo root or absolute). Default: core/M1.
+CONFIG_DIR = os.path.join(ROOT, os.environ.get('MUON_M1_CONFIG_DIR')
+                          or os.path.join('core', 'M1'))
+MACROS = os.path.join(CONFIG_DIR, 'macros')
 sys.path.insert(0, os.path.join(ROOT, 'klippy'))
 
 import configfile  # noqa: E402

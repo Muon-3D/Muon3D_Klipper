@@ -332,7 +332,10 @@ def check(klippy_dir, config_dir):
 
 def main():
     klippy_dir = os.path.join(ROOT, 'klippy')
-    config_dir = os.path.join(ROOT, 'core')
+    # Optional argument: another config directory (core/M1-B0), relative to
+    # the repo root or absolute. Default: all of core/.
+    config_dir = os.path.join(ROOT, sys.argv[1] if len(sys.argv) > 1
+                              else 'core')
     for path in (klippy_dir, config_dir):
         if not os.path.isdir(path):
             sys.stderr.write("missing directory: %s\n" % path)

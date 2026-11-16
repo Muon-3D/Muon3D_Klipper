@@ -88,6 +88,30 @@ finish_test check_m1_armed_hooks "Check M1 armed hooks"
 
 
 ######################################################################
+# B0 config (core/M1-B0) under this tree's klippy
+######################################################################
+
+# The B0 board (unit Boxwood: tmc2130, ads1220, adxl345) keeps master's
+# config, copied to core/M1-B0, and runs under the same klippy/ as the B1
+# core/M1. The checkers take the config directory as an argument. The
+# scripts/b0 and test/b0 tests are master's, which assert B0's behaviour
+# (core/M1's versions assert B1's: the start gate, m1_machine, z_power).
+start_test b0_config "Check B0 config"
+$PYTHON scripts/check_macro_config.py core/M1-B0
+$PYTHON scripts/check_macro_status_keys.py core/M1-B0
+$PYTHON scripts/check_m1_armed_hooks.py core/M1-B0
+$PYTHON scripts/b0/test_m1_led_modes.py
+$PYTHON scripts/b0/test_m1_heater_before_leds.py
+$PYTHON scripts/b0/test_m1_purge_line.py
+$PYTHON scripts/b0/test_m1_fan_stoppage.py
+$PYTHON scripts/b0/test_m1_print_start_z_offset.py
+$PYTHON scripts/b0/test_m1_unlock_guard_offset.py
+$PYTHON test/b0/test_muon_guard.py
+$PYTHON test/b0/test_cold_retract.py
+finish_test b0_config "Check B0 config"
+
+
+######################################################################
 # Check for whitespace errors
 ######################################################################
 
@@ -185,6 +209,9 @@ $PYTHON test/load_cell_probe/test_tare_guard.py
 $PYTHON test/load_cell_probe/test_z_load_backstop.py
 $PYTHON test/homing_abort/test_homing_abort.py
 $PYTHON test/homing_abort/test_search_cap.py
+$PYTHON test/homing_abort/test_toolhead_disconnect.py
+$PYTHON test/landing/test_landing_resolutions.py
+$PYTHON test/landing/test_abort_mid_print_start.py
 $PYTHON test/load_cell_home_z/test_load_cell_home_z.py
 finish_test probe_guards "Test load cell probe and homing guards"
 
