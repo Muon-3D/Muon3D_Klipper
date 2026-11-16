@@ -477,11 +477,17 @@ class TestAbortsZMove(Harness):
         self.assertEqual(homing.calls, [self.REMOVED_MSG, self.POWER_MSG])
 
     def test_pgood_drop_aborts(self):
+        # KAN-3334: past the start-up settle (0.5 s here), and latching on
+        # the first low poll (drop_samples = 1). The abort is on the first
+        # low poll and again as the path leaves READY; this fake records
+        # every call, the real abort_active_move returns False the second
+        # time (see TestFirstSampleAbort).
         zp, homing = self.ready()
+        zp.drop_samples = 1
         zp.power_good = False
-        self.tick(zp, 1.2)
+        self.tick(zp, 1.7)
         self.assertEqual(zp.state, FAULT)
-        self.assertEqual(homing.calls, [self.POWER_MSG])
+        self.assertEqual(homing.calls, [self.POWER_MSG, self.POWER_MSG])
 
     def test_inhibit_aborts(self):
         zp, homing = self.ready()
@@ -929,6 +935,86 @@ class TestFaultsAreExplicit(Ready):
         self.tick(zp, 2.0)
         self.assertIn('Z_POWER_RESET', zp.reason)
         self.assertIn('boom', zp.reason)
+
+
+class TestFirstSampleAbort(Ready):
+    """The agreed design (KAN-3370 with KAN-3334): an active Z move is
+    aborted on the FIRST low PGOOD poll; only the latch is debounced."""
+    MSG = "the Z and bed power was lost"
+
+    def ready(self, homing=None):
+        homing = homing or FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing)
+        self.up(zp)
+        return zp, homing
+
+    def test_first_low_aborts_once_without_a_latch(self):
+        zp, homing = self.ready()
+        with self.assertLogs(level='WARNING') as logs:
+            self.poll_pgood(zp, [False], t0=2.0)
+            self.assertEqual(homing.calls, [self.MSG])
+            self.assertEqual(zp.state, READY)
+            self.assertIsNone(zp.fault)
+            self.assertTrue(zp.enabled)
+            self.poll_pgood(zp, [True], t0=2.1)
+        self.assertEqual(homing.calls, [self.MSG])
+        self.assertEqual(zp.glitches, 1)          # counted
+        self.assertEqual(len(logs.output), 1)     # and logged
+        self.assertIn('PGOOD glitch #1', logs.output[0])
+        self.assertEqual(self.enable_writes(zp), [1])
+
+    def test_three_lows_abort_on_the_first_and_latch_on_the_third(self):
+        zp, homing = self.ready()
+        self.poll_pgood(zp, [False], t0=2.0)
+        self.assertEqual(homing.calls, [self.MSG])
+        self.poll_pgood(zp, [False], t0=2.1)
+        self.assertEqual(homing.calls, [self.MSG])    # not once per poll
+        self.assertIsNone(zp.fault)
+        self.poll_pgood(zp, [False], t0=2.2)
+        self.assertEqual(zp.state, FAULT)
+        # The latch leaves READY and asks again (FakeHoming records every
+        # call; the real abort_active_move returns False for a move
+        # already aborted, homing.py HomingMove.abort), so two here, and
+        # never one per low poll.
+        self.assertEqual(homing.calls, [self.MSG, self.MSG])
+
+    def test_a_low_in_the_start_up_settle_aborts_on_the_first_poll(self):
+        zp, homing = self.ready()
+        self.poll_pgood(zp, [False], t0=1.2)
+        # First poll: the low sample, and the READY exit to POWERING
+        self.assertEqual(homing.calls, [self.MSG, self.MSG])
+        self.assertEqual(zp.state, POWERING)
+        self.assertIsNone(zp.fault)
+        self.poll_pgood(zp, [False], t0=1.3)
+        self.assertEqual(homing.calls, [self.MSG, self.MSG])  # no more
+
+    def test_each_new_low_run_aborts_again(self):
+        zp, homing = self.ready()
+        self.poll_pgood(zp, [False, True, False, True], t0=2.0)
+        self.assertEqual(homing.calls, [self.MSG, self.MSG])
+        self.assertEqual(zp.glitches, 2)
+
+    def test_no_z_move_active_changes_nothing(self):
+        # abort_active_move returns False with no move to stop
+        class Idle(FakeHoming):
+            def abort_active_move(self, reason, z_only=True):
+                self.calls.append(reason)
+                return False
+        zp, homing = self.ready(Idle())
+        self.poll_pgood(zp, [False, True], t0=2.0)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertEqual(zp.glitches, 1)
+        self.poll_pgood(zp, [False, False, False], t0=3.0)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(self.enable_writes(zp), [1, 0])
+
+    def test_a_failing_abort_does_not_stop_the_debounce(self):
+        zp, homing = self.ready(FakeHoming(raises=RuntimeError("boom")))
+        self.poll_pgood(zp, [False, True], t0=2.0)
+        self.assertEqual(zp.state, READY)
+        self.assertEqual(zp.glitches, 1)
 
 
 if __name__ == '__main__':

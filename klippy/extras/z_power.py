@@ -274,6 +274,7 @@ class ZPower:
     def _init_pgood_state(self, drop_samples):
         self.drop_samples = drop_samples
         self.low_polls = 0
+        self.low_run = False
         self.glitches = 0
         self.last_glitch = None
         self.glitch_log_time = None
@@ -430,6 +431,15 @@ class ZPower:
         self.glitch_unlogged = 0
     def _pgood_low(self, eventtime, state, reason):
         """PGOOD is low on a path that was READY: (state, reason, enable)."""
+        if not self.low_run:
+            # KAN-3370: an active Z move is stopped on the FIRST low poll,
+            # before the debounce or the start-up settle decide anything.
+            # A false abort costs one re-home; a late one drives a bed
+            # that has lost its 48 V. Only the latch below is debounced.
+            # abort_active_move is idempotent (False once aborted), so
+            # the _transition call at the latch is a no-op.
+            self.low_run = True
+            self._abort_z_move("the Z and bed power was lost")
         if self.settle_end is not None and eventtime < self.settle_end:
             # The eFuse's start-up may still be settling (see
             # POWER_GOOD_TIMEOUT), so this is not a trip. Wait for PGOOD as
@@ -453,6 +463,7 @@ class ZPower:
                           DROPPED_REASON, self._diagnostics(eventtime))
         return FAULT, self.fault_reason, False
     def _pgood_high(self, eventtime):
+        self.low_run = False
         if self.settle_end is None:
             self.settle_end = eventtime + self.power_good_timeout
         elif eventtime >= self.settle_end:
@@ -506,6 +517,7 @@ class ZPower:
                 self.start_peak = 0.
                 self.settle_end = None
                 self.low_polls = 0
+                self.low_run = False
             elif self.power_good:
                 state, reason = READY, "bed power is on"
                 self.powering_since = None
@@ -536,6 +548,7 @@ class ZPower:
                                              or self.fault, False)
         else:
             self.low_polls = 0
+            self.low_run = False
             self.after_reset = False
         self._set_enable(enable, eventtime)
         self._transition(state, reason, eventtime)
@@ -664,6 +677,7 @@ class ZPower:
         self.after_reset = bool(self.fault)
         self.fault = self.fault_reason = self.fault_detail = None
         self.low_polls = 0
+        self.low_run = False
         self.settle_end = None
         self.over_since = self.idle_over_since = None
     cmd_Z_POWER_INHIBIT_help = "Hold 48V_Z off (ENABLE=1) or release it"
