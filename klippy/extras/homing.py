@@ -343,6 +343,8 @@ class PrinterHoming:
             minval=0.)
         # Homing/probing moves in progress (KAN-3370 abort)
         self.active_moves = []
+        # Non-critical MCUs whose disconnect aborts a Z move (status)
+        self.abort_on_disconnect = []
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
     def _handle_connect(self):
@@ -357,6 +359,15 @@ class PrinterHoming:
                 continue
             self.printer.register_event_handler(
                 get_name(), self._handle_non_critical_disconnect)
+            self.abort_on_disconnect.append(name)
+        logging.info("homing: Z search cap %g mm (0 = off); a Z move aborts"
+                     " on bed removal and on the disconnect of: %s",
+                     self.max_search_distance_z,
+                     ", ".join(self.abort_on_disconnect) or "(no MCU)")
+    def get_status(self, eventtime):
+        # What the KAN-3370 guards are set to, readable with no motion
+        return {'max_search_distance_z': self.max_search_distance_z,
+                'abort_on_disconnect': list(self.abort_on_disconnect)}
     def _handle_non_critical_disconnect(self):
         self.abort_active_move("the toolhead disconnected")
     def note_move_active(self, hmove, active):

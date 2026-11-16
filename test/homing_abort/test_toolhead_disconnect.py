@@ -69,6 +69,10 @@ def test_event_name_comes_from_the_real_mcu():
     wire(rig, reactor, dl.make_reader(reactor))
     check(EVENT in rig.phoming.printer.handlers,
           "D1: PrinterHoming listens for %r" % (EVENT,))
+    st = rig.phoming.get_status(0.)
+    check(st == {'max_search_distance_z': 40.,
+                 'abort_on_disconnect': ['mcu toolhead']},
+          "D1: status shows the cap and the guarded MCU (got %r)" % (st,))
 
 
 def test_disconnect_from_the_reactor_aborts_the_move():
