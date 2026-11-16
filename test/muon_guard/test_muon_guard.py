@@ -213,14 +213,29 @@ class FakeConfig:
     def getfloat(self, name, default=configfile.sentinel, minval=None,
                  maxval=None, above=None):
         return float(self.get(name, default))
-    def getlist(self, name, default=configfile.sentinel, sep=',',
-                count=None):
-        value = self.get(name, default)
+    def _parsed(self, name, default, sep, count, parser):
+        # Like klippy: only a value read from the config is split and
+        # parsed; a default is returned exactly as the caller wrote it.
+        if name not in self.values:
+            if default is configfile.sentinel:
+                self.get(name)
+            return default
+        value = self.values[name]
         if isinstance(value, (list, tuple)):
             return list(value)
         if len(value.strip()) == 0:
             return []
-        return [p.strip() for p in value.split(sep)]
+        res = [parser(p.strip()) for p in value.split(sep)]
+        if count is not None and len(res) != count:
+            raise ConfigError("Option '%s' in section 'muon_guard' must have"
+                              " %d elements" % (name, count))
+        return res
+    def getlist(self, name, default=configfile.sentinel, sep=',',
+                count=None):
+        return self._parsed(name, default, sep, count, str)
+    def getfloatlist(self, name, default=configfile.sentinel, sep=',',
+                     count=None):
+        return self._parsed(name, default, sep, count, float)
 
 
 def read_core_section(name='muon_guard'):
@@ -243,6 +258,17 @@ def core_allow():
 class FakeGcodeMove:
     def __init__(self):
         self.homing_position = [0., 0., 0., 0.]
+        self.base_position = [0., 0., 0., 0.]
+        self.last_position = [0., 0., 0., 0.]
+        self.absolute_coord = True
+
+
+class FakeToolhead:
+    """Not homed: the KAN-1731 move limits apply only once homed."""
+    homed = ''
+
+    def get_status(self, eventtime):
+        return {'homed_axes': self.homed}
 
 
 class FakeConfigStatus:
@@ -289,6 +315,7 @@ class Rig:
         self.printer.add_object('configfile', self.cfg)
         self.gm = FakeGcodeMove()
         self.printer.add_object('gcode_move', self.gm)
+        self.printer.add_object('toolhead', FakeToolhead())
         self.probe = FakeProbe(0.)
         self.pending_z = None
         self.disk_z_offset = 0.       # the z_offset in the saved config
