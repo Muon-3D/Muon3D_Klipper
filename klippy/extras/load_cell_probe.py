@@ -266,6 +266,14 @@ class LoadCellProbeConfigHelper:
             default=0, minval=0, maxval=(1 << 30))
         self._trigger_percent_param = floatParamHelper(config,
             'trigger_percent', default=None, above=0., maxval=100.0)
+        # KAN-3370: the side of the tare the press moves toward is a fact
+        # about the unit, never inferred from the tare.
+        self._press_direction = config.getint('press_direction',
+                                              default=None)
+        if self._press_direction not in (None, -1, 1):
+            raise config.error("press_direction must be -1 or 1")
+        self._min_tare_headroom_percent = config.getfloat(
+            'min_tare_headroom_percent', 20., minval=0., below=100.)
         self._force_safety_limit_param = intParamHelper(config,
             'force_safety_limit', minval=100, maxval=5000, default=2000)
 
@@ -285,6 +293,67 @@ class LoadCellProbeConfigHelper:
         cfg = self._printer.lookup_object('configfile')
         cfg.set(self._config_name, 'reference_max_load_counts',
                 "%i" % (self._reference_max_load_counts,))
+
+    # Class defaults so a helper built without __init__ (tests) is safe
+    _press_direction = None
+    _min_tare_headroom_percent = 20.
+
+    def get_min_tare_headroom_percent(self):
+        return self._min_tare_headroom_percent
+
+    # The direction (-1. or 1.) that pressing on the nozzle moves the raw
+    # counts.  Only for safety_model=preloaded_max.  Configured, else the
+    # sign of reference_max_load_counts: the anchor is the fully loaded
+    # reading, so it lies on the press side of ADC zero.
+    def get_press_direction(self):
+        if self._press_direction is not None:
+            return float(self._press_direction)
+        ref_max = self._reference_max_load_counts
+        if ref_max is None:
+            raise self._printer.command_error(
+                "Missing reference_max_load_counts. Run "
+                "LOAD_CELL_CALIBRATE_MAX first.")
+        if ref_max == 0:
+            raise self._printer.command_error(
+                "reference_max_load_counts is 0, so the press direction "
+                "is unknown: set press_direction to -1 or 1")
+        return 1. if ref_max > 0 else -1.
+
+    # Counts between the tare and the anchor, positive while the tare is
+    # on the unloaded side of the anchor.  Returns
+    # (press_direction, headroom_counts, headroom_percent_of_anchor)
+    def get_tare_headroom(self, tare_counts):
+        direction = self.get_press_direction()
+        ref_max = self._reference_max_load_counts
+        headroom = int(direction * (ref_max - tare_counts))
+        percent = 100. * headroom / max(1, abs(ref_max))
+        return direction, headroom, percent
+
+    # KAN-3370: refuse before any motion when the nozzle is already
+    # loaded.  Independent of the trigger mode and of counts_per_gram.
+    # 20% default: the smallest normal headroom seen is one unit's worst
+    # tare of -1750000 against an anchor of -3010747, which leaves
+    # 1260747 = 42% of the anchor; another unit's normal tares leave about
+    # 113% (about 75% after its known tare shift); the incident was -7.8%.
+    # 20% is half the smallest normal headroom, so normal tares keep a 2x
+    # margin, and a nozzle preloaded to within a fifth of the calibrated
+    # maximum is refused.  The percent margin below shrinks to nothing as
+    # the tare nears the anchor, hence the floor relative to abs(anchor).
+    def check_tare_headroom(self, tare_counts, gcmd=None):
+        if self._safety_model != self.SAFETY_MODEL_PRELOADED_MAX:
+            return
+        direction, headroom, percent = self.get_tare_headroom(tare_counts)
+        ref_max = self._reference_max_load_counts
+        margin = self.get_max_load_safety_margin_counts(tare_counts, gcmd)
+        floor = int(self._min_tare_headroom_percent / 100. * abs(ref_max))
+        required = max(margin, floor)
+        if headroom <= required:
+            raise self._printer.command_error(
+                "The nozzle is already under load: check nothing is "
+                "touching it (tare %i, max-load reference %i, headroom "
+                "%.1f%%, need %.1f%%)"
+                % (tare_counts, ref_max, percent,
+                   100. * required / max(1, abs(ref_max))))
 
     def get_max_load_safety_margin_counts(self, tare_counts, gcmd=None):
         # Keep explicit raw-count override for compatibility and direct control.
@@ -361,15 +430,15 @@ class LoadCellProbeConfigHelper:
             raise cmd_err(
                 "Missing reference_max_load_counts. Run "
                 "LOAD_CELL_CALIBRATE_MAX first.")
+        self.check_tare_headroom(tare_counts, gcmd)
         margin = self.get_max_load_safety_margin_counts(tare_counts, gcmd)
         sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
-        if tare_counts <= ref_max:
-            # Allow unrestricted drift on the low side and limit travel
-            # toward the calibrated max-load anchor.
+        if self.get_press_direction() > 0:
+            # Pressing raises the counts: limit travel toward the anchor
+            # and allow unrestricted drift on the other side.
             safety_min = sensor_min + 1
             safety_max = ref_max - margin
         else:
-            # Invert direction if tare is above the max-load anchor.
             safety_min = ref_max + margin
             safety_max = sensor_max - 1
         return int(safety_min), int(safety_max)
@@ -415,8 +484,7 @@ class LoadCellProbeConfigHelper:
             trigger_type = "abs_ge"
             direction = None
             if self._safety_model == self.SAFETY_MODEL_PRELOADED_MAX:
-                ref_max = self._reference_max_load_counts
-                direction = 1. if ref_max >= tare_counts else -1.
+                direction = self.get_press_direction()
                 scale = direction
                 trigger_type = "gt"
             max_delta = self._get_max_delta_before_raw_range(
@@ -440,7 +508,7 @@ class LoadCellProbeConfigHelper:
                 raise cmd_err("trigger_percent is only supported with "
                               "safety_model=preloaded_max")
             ref_max = self._reference_max_load_counts
-            direction = 1. if ref_max >= tare_counts else -1.
+            direction = self.get_press_direction()
             span_counts = abs(int(ref_max - tare_counts))
             if span_counts <= 0:
                 cmd_err = self._printer.command_error
@@ -546,6 +614,22 @@ class LoadCellProbingMove:
         collector.start_collecting(min_time=print_time)
         return collector
 
+    def _log_tare(self, tare_counts):
+        helper = self._config_helper
+        if helper.get_safety_model() != helper.SAFETY_MODEL_PRELOADED_MAX:
+            return
+        try:
+            direction, headroom, percent = helper.get_tare_headroom(
+                tare_counts)
+        except Exception as e:
+            logging.info("load_cell_probe: tare=%i headroom unknown: %s",
+                         tare_counts, e)
+            return
+        logging.info("load_cell_probe: tare=%i anchor=%i headroom=%i "
+                     "(%.1f%%) press_direction=%i", tare_counts,
+                     helper.get_reference_max_load_counts(), headroom,
+                     percent, int(direction))
+
     # pauses for the last move to complete and then
     # sets the endstop tare value and range
     def _pause_and_tare(self, gcmd):
@@ -556,6 +640,10 @@ class LoadCellProbingMove:
         tare_samples = check_sensor_errors(results, self._printer)
         tare_counts = int(round(
             np.average(np.array(tare_samples)[:, 2].astype(float))))
+        # KAN-3370: refuse a loaded nozzle before the bad zero is stored
+        # anywhere (load cell, approximate tare) or sent to the MCU
+        self._log_tare(tare_counts)
+        self._config_helper.check_tare_headroom(tare_counts, gcmd)
         # update sos_filter with any gcode parameter changes
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         # update the load cell so it reflects the new tare value
@@ -605,6 +693,7 @@ class LoadCellProbingMove:
         # The raw-range guard is computed from the approximate zero but is
         # checked on the MCU against the RAW sample, before the filter, so
         # it still bounds force no matter what zero the MCU picks.
+        self._log_tare(tare_counts)
         safety_min, safety_max = self._config_helper.get_safety_range(
             tare_counts, gcmd)
         self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
@@ -986,9 +1075,25 @@ class LoadCellPrinterProbe:
         ref_max = helper.get_reference_max_load_counts()
         if (helper.get_safety_model() == helper.SAFETY_MODEL_PRELOADED_MAX
                 and ref_max is not None):
-            # The direction the probe's own trigger uses
-            return 1. if ref_max >= zero_counts else -1.
+            # The direction the trigger uses: fixed, not inferred from
+            # where the zero is.  This is called from contact_guard's
+            # sample path, so an unknown direction (anchor 0, no
+            # press_direction) must not raise here; probing refuses it.
+            try:
+                return helper.get_press_direction()
+            except self._printer.command_error:
+                pass
         return self._load_cell.invert
+
+    def _get_status_press_direction(self):
+        helper = self._config_helper
+        if (helper.get_safety_model() != helper.SAFETY_MODEL_PRELOADED_MAX
+                or helper.get_reference_max_load_counts() is None):
+            return None
+        try:
+            return int(helper.get_press_direction())
+        except Exception:
+            return None
 
     def get_status(self, eventtime):
         status = self._cmd_helper.get_status(eventtime)
@@ -999,6 +1104,9 @@ class LoadCellPrinterProbe:
             'safety_model': self._config_helper.get_safety_model(),
             'reference_max_load_counts':
                 self._config_helper.get_reference_max_load_counts(),
+            'press_direction': self._get_status_press_direction(),
+            'min_tare_headroom_percent':
+                self._config_helper.get_min_tare_headroom_percent(),
         })
         return status
 
