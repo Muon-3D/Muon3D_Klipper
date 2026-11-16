@@ -212,6 +212,9 @@ $PYTHON test/homing_abort/test_search_cap.py
 $PYTHON test/homing_abort/test_toolhead_disconnect.py
 $PYTHON test/landing/test_landing_resolutions.py
 $PYTHON test/landing/test_abort_mid_print_start.py
+# SIM_STALL_AT (a batch-only seam in AXIS_PROTECTED_MOVE) does nothing
+# unless klippy was started with -i, which no printer does.
+$PYTHON test/landing/test_sim_stall_seam.py
 $PYTHON test/load_cell_home_z/test_load_cell_home_z.py
 finish_test probe_guards "Test load cell probe and homing guards"
 
@@ -283,6 +286,18 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: klippy STARTS on the shipped board configs. Every test above loads
+# a small test config; this loads the real core/M1/core.cfg (B1) and
+# core/M1-B0/core.cfg (B0) in batch mode with stand-ins for the files
+# outside the repo, against the rp2040 and linuxprocess dictionaries built
+# above, and fails on an unknown option or section, a bad pin, or any
+# config error. --selftest proves it fails on those, so it cannot pass
+# vacuously.
+start_test real_config "Test klippy starts on the shipped M1 configs"
+$PYTHON scripts/test_real_config.py --selftest -d ${DICTDIR} core/M1 core/M1-B0
+$PYTHON scripts/test_real_config.py -d ${DICTDIR} core/M1 core/M1-B0
+finish_test real_config "Test klippy starts on the shipped M1 configs"
 
 # MUON: cancelling a print while PRINT_START runs. Real reactor, gcode and
 # virtual_sdcard, no MCU: the batch-mode .test files above cannot send a
