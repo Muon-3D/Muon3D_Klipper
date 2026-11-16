@@ -49,6 +49,13 @@ class FakeHeater:
     def __init__(self):
         self.temp = 60.
         self.target = 60.
+        # The detector decides on fresh samples: it takes last_temp each
+        # time last_temp_time moves on.
+        self.last_temp_time = 0.
+
+    @property
+    def last_temp(self):
+        return self.temp
 
     def get_temp(self, eventtime):
         return self.temp, self.target
@@ -108,7 +115,8 @@ def make_detector(printer):
 
 def feed_removal(det, heater):
     heater.temp = REMOVED
-    for _ in range(5):
+    for i in range(5):
+        heater.last_temp_time = 100. + 0.3 * i
         det.check_bed_temperature(100.)
 
 

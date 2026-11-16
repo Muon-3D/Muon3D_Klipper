@@ -413,6 +413,19 @@ class ZPower:
     @staticmethod
     def _amps(current):
         return "?" if current is None else "%.2f" % (current,)
+    def _abort_z_move(self, reason):
+        # KAN-3370: a Z homing or probing move in progress is driving a
+        # bed and column that just lost their footing or their power.
+        # Stop it now; the homing macros only check the lock before a move
+        # starts. A move that does not involve Z is left alone.
+        try:
+            homing = self.printer.lookup_object('homing', None)
+            abort = getattr(homing, 'abort_active_move', None)
+            if abort is not None:
+                abort(reason)
+        except Exception:
+            logging.exception("%s: aborting the active homing move failed",
+                              self.name)
     def _check_z_change(self, band):
         if band == self.last_band or (band is None and not self.band_seen):
             return
@@ -424,6 +437,10 @@ class ZPower:
             return
         logging.info("%s: Z column %s -> %s", self.name,
                      previous or 'unknown', band or 'unknown')
+        if band == 'absent':
+            self._abort_z_move("the Z column was removed")
+        elif band == 'unlocked':
+            self._abort_z_move("the Z column was unlocked")
         self._run_template(self.z_change_template)
     def _transition(self, state, reason, eventtime):
         prev = self.state
@@ -433,7 +450,10 @@ class ZPower:
         logging.info("%s: %s -> %s (%s)", self.name, prev, state, reason)
         if prev != READY:
             return
-        # The path just went down: stop heating. What a print does about it
+        # The path just went down: whatever Z move is running has lost the
+        # column's 48 V (or the bed's), so stop it.
+        self._abort_z_move("the Z and bed power was lost")
+        # Stop heating. What a print does about it
         # belongs to whatever went away -- the plate (bed_removal_detector),
         # the Z column (z_change_gcode) or a fault (fault_gcode) -- so
         # lost_gcode is only for the path being held off by hand.

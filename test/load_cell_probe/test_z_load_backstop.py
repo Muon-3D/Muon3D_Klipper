@@ -36,7 +36,7 @@ BOX_REF = -3010747
 SLOE_REF = -1585739
 INCIDENT_TARE = -3244819
 SPEED = 15.             # mm/s, the Z homing search speed
-SPS = 2000              # [load_cell_probe] sample_rate in core/M1/core.cfg
+SPS = 2000              # nominal; the M1 really runs 1977 (test 9)
 
 # Trigger deltas (counts) at trigger_percent 10 of |anchor - tare|
 DELTA_BOX_578 = 243275      # span 2432747
@@ -144,9 +144,9 @@ def first_abort_sample(mod, tare, direction, delta, counts, t0=10.,
     seen = []
     orig = w._judge
 
-    def judge(c):
+    def judge(c, t=None):
         seen.append(c)
-        return orig(c)
+        return orig(c, t)
     w._judge = judge
     w.arm(t0, tare, delta, direction)
     feed_until_abort(cell, homing, t0, counts, sps)
@@ -630,6 +630,77 @@ def test_8_integration_with_real_homing(mod):
     print('ok  8c abort_active_move after the trigger returns False')
 
 
+def test_9_muon_ads1220_cadence(mod):
+    # [muon_ads1220 toolhead] runs the ADS1220 at 2000 SPS turbo: a
+    # conversion is 2072 tCLK of 4.096 MHz = 0.5059 ms, so sps = 1977.
+    # The host polls every 20 ms (about 40 samples per batch).  Slots of a
+    # temperature read are fillers the host drops, so the stream has holes
+    # but the timestamps stay on the fixed grid.  Rows are LoadCell's
+    # [time, grams, counts, tare], as in the other tests.
+    sps = 1977
+    tare = -800000
+    over = tare - 552688       # past the ceiling, 2.5 x DELTA_BOX_800
+    period = 1. / sps
+    t0 = 10.
+    first = t0 + 100 * period  # the first over-ceiling slot
+
+    def stream(keep, flips=()):
+        counts = [tare] * 100 + [over] * 400
+        for i in flips:
+            counts[i] = tare
+        return [[t0 + i * period, None, c, None]
+                for i, c in enumerate(counts) if keep(i)]
+
+    def run(rs):
+        """(abort reasons, time of the sample that confirmed it, run
+        length then, first sample time of that run)"""
+        w, cell, homing = make_watch(mod, sps=sps)
+        w.arm(t0, tare, DELTA_BOX_800, -1.)
+        assert w._need == 40, w._need   # ceil(0.020 x 1977)
+        fired = []
+        orig = w._judge
+
+        def judge(c, t=None):
+            r = orig(c, t)
+            if r is not None:
+                fired.append((t, w._over_run, w._over_t0))
+            return r
+        w._judge = judge
+        for i in range(0, len(rs), 40):
+            cell.feed(rs[i:i + 40])
+        return homing.calls, (fired[0] if fired else None)
+    # (a) a clean stream: the 40th over-ceiling sample, 19.7 ms after the
+    # first, confirms by count (the 20 ms span is one period further on)
+    calls, f = run(stream(lambda i: True))
+    assert calls == [CEILING_REASON], calls
+    assert f[1] == 40 and abs(f[0] - (first + 39 * period)) < 1e-9, f
+    # (b) every other slot missing (988 effective sps): the 20 ms span
+    # confirms on the 21st kept sample, long before 40 samples (40.5 ms)
+    calls, f = run(stream(lambda i: i < 100 or i % 2 == 0))
+    assert calls == [CEILING_REASON], calls
+    assert f[1] < 40 and 0.020 <= f[0] - first < 0.0225, f
+    # (c) a 5 ms hole (a blind temperature read: 10 slots) inside the run
+    # does not restart it
+    calls, f = run(stream(lambda i: not 130 <= i < 140))
+    assert calls == [CEILING_REASON], calls
+    assert f[1] < 40 and 0.020 <= f[0] - first < 0.0215, f
+    assert abs(f[2] - first) < 1e-9, f
+    # (d) one good sample inside the run restarts it
+    calls, f = run(stream(lambda i: True, flips=(130,)))
+    assert calls == [CEILING_REASON], calls
+    assert abs(f[2] - (t0 + 131 * period)) < 1e-9, f
+    # (e) a long hole alone never confirms: the time rule still needs
+    # MIN_CONSECUTIVE samples
+    w, cell, homing = make_watch(mod, sps=sps)
+    w.arm(t0, tare, DELTA_BOX_800, -1.)
+    cell.feed([[t0, None, over, None], [t0 + 0.05, None, over, None]])
+    assert homing.calls == [], homing.calls
+    cell.feed([[t0 + 0.0501, None, over, None]])
+    assert homing.calls == [CEILING_REASON], homing.calls
+    print('ok  9 muon_ads1220 1977 sps / 20 ms batches: 40 samples, holes '
+          'and half-rate streams confirm on the 20 ms span')
+
+
 def integ_move(mod, rig, cell, tare, delta):
     m = tg.make_move(mod, tg.make_helper(mod, BOX_REF, trigger_percent=10),
                      tare)
@@ -658,7 +729,8 @@ def main():
              test_4_single_spike_and_consecutive,
              test_5_start_time_and_disarm, test_6_mcutare_and_directionless,
              test_7_watcher_failure_fails_safe,
-             test_8_integration_with_real_homing]
+             test_8_integration_with_real_homing,
+             test_9_muon_ads1220_cadence]
     failed = []
     for t in tests:
         try:

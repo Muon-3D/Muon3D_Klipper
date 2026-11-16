@@ -595,6 +595,11 @@ class LoadCellProbeConfigHelper:
 # Either needs z_move_abort_confirm_time (20 ms) of consecutive samples, so
 # one noisy sample never aborts a home.  20 ms is longer than the half
 # period of the cell's 48 Hz ring (contact_guard uses the same reasoning).
+# "20 ms" is both a count (ceil(20 ms x sps) samples in a row) and a span:
+# the watch also fires when the run of bad samples has lasted 20 ms by
+# the samples' own timestamps, so a stream with holes in it (the
+# muon_ads1220 drops the slots of a temperature read) or a rate below the
+# nominal one confirms as soon as it would on a clean stream.
 #
 # SIZING (counts; trigger_percent 10 of |anchor - tare| is the MCU trigger):
 #   Boxwood, anchor -3010747: tare -578000 -> delta 243275;
@@ -653,6 +658,8 @@ class ZLoadBackstop:
         self._need = self.MIN_CONSECUTIVE
         self._over_run = 0
         self._wrong_run = 0
+        self._over_t0 = None    # timestamp of the first sample of the run
+        self._wrong_t0 = None
         self.last_fired = None
 
     def is_armed(self):
@@ -686,6 +693,7 @@ class ZLoadBackstop:
         self._wrong = wrong
         self._need = need
         self._over_run = self._wrong_run = 0
+        self._over_t0 = self._wrong_t0 = None
         if not ceiling and not wrong:
             return
         self._armed = True
@@ -708,7 +716,7 @@ class ZLoadBackstop:
             for sample in msg['data']:
                 if sample[0] < self._start_time:
                     continue
-                reason = self._judge(sample[2])
+                reason = self._judge(sample[2], sample[0])
                 if reason is not None:
                     self._fire(reason)
                     self._registered = False
@@ -720,19 +728,30 @@ class ZLoadBackstop:
             self._registered = False
             return False
 
-    def _judge(self, counts):
+    def _confirmed(self, run, t0, t):
+        if run >= self._need:
+            return True
+        return (t is not None and t0 is not None
+                and run >= self.MIN_CONSECUTIVE
+                and t - t0 >= self._confirm_time)
+
+    def _judge(self, counts, t=None):
         dev = counts - self._tare
         if self._ceiling and abs(dev) > self._ceiling:
+            if not self._over_run:
+                self._over_t0 = t
             self._over_run += 1
         else:
             self._over_run = 0
         if self._wrong and dev * self._direction < -self._wrong:
+            if not self._wrong_run:
+                self._wrong_t0 = t
             self._wrong_run += 1
         else:
             self._wrong_run = 0
-        if self._over_run >= self._need:
+        if self._confirmed(self._over_run, self._over_t0, t):
             return self.REASON_CEILING
-        if self._wrong_run >= self._need:
+        if self._confirmed(self._wrong_run, self._wrong_t0, t):
             return self.REASON_WRONG_WAY
         return None
 
@@ -895,6 +914,9 @@ class LoadCellProbingMove:
         _fresh.start_collecting(min_time=_now)
         check_sensor_errors(_fresh.collect_min(1), self._printer)
         tare_counts = self._approx_tare
+        # KAN-3370: note_baseline moves _approx_tare without a check, so
+        # refuse a loaded nozzle before the load cell takes the zero
+        self._config_helper.check_tare_headroom(tare_counts, gcmd)
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         self._load_cell.tare(tare_counts)
         self._tare_counts = tare_counts

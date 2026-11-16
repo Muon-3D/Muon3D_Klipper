@@ -56,7 +56,8 @@ def load_module(path):
     pkg = types.ModuleType('extras')
     pkg.__path__ = []
     sys.modules['extras'] = pkg
-    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220'):
+    for n in ('probe', 'trigger_analog', 'load_cell', 'hx71x', 'ads1220',
+              'muon_ads1220'):
         m = types.ModuleType('extras.' + n)
         sys.modules['extras.' + n] = m
         setattr(pkg, n, m)
@@ -191,6 +192,9 @@ class FakePrinter(object):
     def lookup_object(self, name):
         return FakeToolhead()
 
+    def send_event(self, event, *params):
+        pass
+
 
 class FakeSos(object):
     def __init__(self, log):
@@ -306,6 +310,8 @@ def test_incident_nothing_sent(mod):
         m = make_move(mod, h, BOX_INCIDENT_TARE)
         msg = refused(m._mcu_tare, None)
         assert msg == INCIDENT_TEXT, 'mcu_tare not refused (%s)' % (name,)
+        assert m._load_cell.tared_to is None, (
+            'mcu_tare stored the loaded zero in the load cell (%s)' % (name,))
         assert m._mcu_trigger_analog.log == [], (
             'mcu was sent %r by _mcu_tare (%s)'
             % (m._mcu_trigger_analog.log, name))
