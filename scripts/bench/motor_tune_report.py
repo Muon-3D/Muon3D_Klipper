@@ -55,7 +55,8 @@ def section_noise(res, w):
         w("- %s: %d runs, |shift| max %.3f mm, mean %.3f mm\n"
           % (tag, len(rows), max(vals), mean(vals)))
     w("\nA STEPLOSS run passes when both motors' shift is within"
-      " max(0.1 mm, 1.5x the max above). A full step is 0.2 mm, a pole slip 0.8 mm.\n\n")
+      " max(0.1 mm, 1.5x the max above). A full step is 0.2 mm,"
+      " a pole slip 0.8 mm.\n\n")
 
 
 SHAPER_RE = re.compile(r"Fitted shaper '(\w+)' frequency = ([\d.]+) Hz"
@@ -105,7 +106,8 @@ def section_resonance(res, w):
 
 def section_stealth(samples, res, w):
     w("## StealthChop headroom (PWM_SCALE_SUM vs speed)\n\n"
-      "StealthChop holds the current only while PWM_SCALE_SUM (0-1023 on the TMC2241) has room;"
+      "StealthChop holds the current only while PWM_SCALE_SUM"
+      " (0-1023 on the TMC2241) has room;"
       " where it flattens there is no voltage left. Switch to SpreadCycle"
       " well below that (about 70-80 %).\n\n")
     rows = [s for s in samples if s.get('label') == 'stealth_sweep']

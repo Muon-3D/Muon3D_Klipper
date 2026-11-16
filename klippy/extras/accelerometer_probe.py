@@ -507,8 +507,9 @@ class AccelerometerProbe:
                     self._tap_enable_session = self._tap_session
                     self._tap_enable_pending = True
                     self._tap_enable_mode = mode
-                    self.reactor.update_timer(self._tap_enable_timer,
-                                              self.reactor.monotonic() + arm_delay)
+                    self.reactor.update_timer(
+                        self._tap_enable_timer,
+                        self.reactor.monotonic() + arm_delay)
                 else:
                     chip.arm(minclock=clock)
             except Exception:
@@ -658,9 +659,11 @@ class AccelerometerProbe:
 
     def setup_pin(self, pin_type, pin_params):
         if pin_type != 'endstop':
-            raise pins.error("accelerometer_probe virtual pins are only endstops")
+            raise pins.error(
+                "accelerometer_probe virtual pins are only endstops")
         if pin_params['invert'] or pin_params['pullup']:
-            raise pins.error("accelerometer_probe virtual pins may not invert/pullup")
+            raise pins.error(
+                "accelerometer_probe virtual pins may not invert/pullup")
         pin_name = pin_params['pin']
         if pin_name == 'x_virtual_endstop':
             return self._axis_wrappers['x']
@@ -668,7 +671,8 @@ class AccelerometerProbe:
             return self._axis_wrappers['y']
         if pin_name == 'z_virtual_endstop':
             if not self.enable_z_probe:
-                raise pins.error("enable_z_probe must be true for z_virtual_endstop")
+                raise pins.error(
+                    "enable_z_probe must be true for z_virtual_endstop")
             return self._z_wrapper
         raise pins.error(
             "Unknown accelerometer_probe virtual pin '%s' (expected"
@@ -693,7 +697,8 @@ class AccelerometerProbe:
         if not self._active_axis_homing_wrappers:
             return
         hmove_endstops = hmove.get_mcu_endstops()
-        if not any(w in hmove_endstops for w in self._active_axis_homing_wrappers):
+        if not any(w in hmove_endstops
+                   for w in self._active_axis_homing_wrappers):
             return
         try:
             if not (self._defer_tap_stop
@@ -869,12 +874,14 @@ class AccelerometerProbe:
                 if spread > cfg['tolerance']:
                     if retries_left <= 0:
                         raise cmderr(
-                            "accelerometer_probe: %s home taps disagree by %.3fmm"
+                            "accelerometer_probe: %s home taps disagree"
+                            " by %.3fmm"
                             " (tolerance %.3fmm) after %d retries"
                             % (axis, spread, cfg['tolerance'],
                                cfg['retries']))
                     retries_left -= 1
-                    logging.info("accelerometer_probe: %s taps disagree by %.3fmm,"
+                    logging.info("accelerometer_probe: %s taps disagree"
+                                 " by %.3fmm,"
                                  " retrying confirmation", axis, spread)
                     taps = [(trig, travelled)]
                     continue
@@ -914,7 +921,8 @@ class AccelerometerProbe:
     def init_adxl(self):
         self.phoming = self.printer.lookup_object('homing')
         if (getattr(self._adxl_mcu, 'is_non_critical', False)
-                and getattr(self._adxl_mcu, 'non_critical_disconnected', False)):
+                and getattr(self._adxl_mcu, 'non_critical_disconnected',
+                            False)):
             self._adxl_initialized = False
             logging.info("%s probe init deferred: MCU '%s' is disconnected",
                          self.chip_name, self._adxl_mcu.get_name())
@@ -1046,7 +1054,8 @@ class AccelerometerProbe:
         if self._tap_mode is not None and (has_thresh or has_dur or has_axes
                                            or has_homing_arm_delay):
             raise gcmd.error(
-                "Can not update tap settings while homing/probing move is active")
+                "Can not update tap settings while homing/probing"
+                " move is active")
 
         targets = ['x', 'y', 'z'] if axis == 'all' else [axis]
         new_thresh = None

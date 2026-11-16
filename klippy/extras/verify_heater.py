@@ -85,7 +85,8 @@ class HeaterCheck:
         temp, target = self.heater.get_temp(eventtime)
         if (target > 0. and temp < target - self.hysteresis
                 and self._recently_held(eventtime)):
-            if self.approaching_target and self.goal_systime != self.printer.get_reactor().NEVER:
+            if (self.approaching_target
+                    and self.goal_systime != self.printer.get_reactor().NEVER):
                 self.goal_systime += 1.
             self.recovery_goal = temp + self.heating_gain
             if target != self.last_target and not self.approaching_target:
