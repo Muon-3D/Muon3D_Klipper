@@ -56,6 +56,7 @@ jobs:
     - name: Upload micro-controller data dictionaries
       uses: actions/upload-artifact@v4
       with:
+        retention-days: 3
         name: data-dict
         path: ci_build/dict
         # Debug copy for people to download; the org artifact quota is shared, so do not keep it 90 days.
