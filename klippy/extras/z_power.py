@@ -19,9 +19,12 @@
 #
 # It also gates X/Y motion on the column: folded, the Z axis sits in the
 # path of the X/Y gantry, so a G-code move in X or Y is refused unless the
-# column is plugged in (locked or not). Z needs no lock to move (the lift
-# before an X/Y home, the park at the top); only Z homing, which macros gate
-# on the lock, and anything that trusts a Z position need it locked.
+# column is plugged in (locked or not), or its reading is in no band after a
+# fitted one with no absent reading since (the lever passing through; the
+# status key xy_allowed, which the homing macros read, stays strict). Z needs
+# no lock to move (the lift before an X/Y home, the park at the top); only Z
+# homing, which macros gate on the lock, and anything that trusts a Z
+# position need it locked.
 #
 # The eFuse is a TPS16630 (TI SLVSET9G). The enable output drives its SHDN#
 # pin: high turns the FET on with the dVdT ramp, low turns it off and resets
@@ -127,11 +130,17 @@ def decide(z_band, plate_present, fault, inhibited,
     return POWERING, REASONS[POWERING], True
 
 
-def xy_allowed(z_band, required=True):
+def xy_allowed(z_band, required=True, was_fitted=False):
     """Whether X/Y may move: the Z column plugged in, locked or not. An
-    unrecognised or not yet read column refuses, so the gate fails closed.
+    unrecognised or not yet read column refuses, so the gate fails closed,
+    except for a reading in no band (z_band None) that follows a fitted
+    one with no absent reading since: the lever passing through, which must
+    not strand a PAUSE's park or a cancel's cut half done. An absent
+    column, or one never seen fitted since start-up, still refuses.
     """
-    return (not required) or z_band in (UNLOCKED, 'locked')
+    if not required or z_band in (UNLOCKED, 'locked'):
+        return True
+    return z_band is None and was_fitted
 
 
 def classify_band(ratio, bands):
@@ -250,6 +259,8 @@ class ZPower:
             config, 'z_change_gcode', '')
         self.last_band = None
         self.band_seen = False
+        # The last KNOWN band was a fitted one (see xy_allowed)
+        self.column_was_fitted = False
         # Production: no X/Y move without the column (see the top). A
         # development unit run without a column sets this False.
         self.xy_requires_column = config.getboolean('xy_requires_column',
@@ -330,7 +341,8 @@ class ZPower:
         moves_xy = (abs(newpos[0] - last[0]) > 1e-6
                     or abs(newpos[1] - last[1]) > 1e-6)
         if moves_xy and not xy_allowed(self.z_band.value,
-                                       self.xy_requires_column):
+                                       self.xy_requires_column,
+                                       self.column_was_fitted):
             band = self.z_band.value
             reason = REASONS[ABSENT if band == ABSENT else UNKNOWN]
             raise self.printer.command_error(
@@ -504,6 +516,10 @@ class ZPower:
             band = self.z_band.update(classify_band(self.present_ratio,
                                                     self.bands))
             self._check_z_change(band)
+            if band == ABSENT:
+                self.column_was_fitted = False
+            elif band in (UNLOCKED, 'locked'):
+                self.column_was_fitted = True
         self.plate = plate = self._plate_present(band, eventtime)
         self._update_current()
         self._record(eventtime)
@@ -584,6 +600,12 @@ class ZPower:
             self._abort_z_move("the Z column was removed")
         elif band == 'unlocked':
             self._abort_z_move("the Z column was unlocked")
+        elif band is None:
+            # The reading is in no band and, being the debounced value, has
+            # stayed there for present_samples polls: the lever is part way
+            # (or the sensor is wrong) while Z may be moving. Once per run:
+            # this branch is the change into unknown, not each poll in it.
+            self._abort_z_move("the Z column position is unknown")
         self._run_template(self.z_change_template)
     def _transition(self, state, reason, eventtime):
         prev = self.state

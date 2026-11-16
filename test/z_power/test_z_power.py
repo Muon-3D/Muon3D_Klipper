@@ -103,6 +103,17 @@ class TestXyAllowed(unittest.TestCase):
         for band in ('absent', None, 'locked'):
             self.assertTrue(z_power.xy_allowed(band, required=False), band)
 
+    def test_unknown_after_a_fitted_column_allows(self):
+        self.assertTrue(z_power.xy_allowed(None, was_fitted=True))
+
+    def test_unknown_never_fitted_or_after_absent_refuses(self):
+        self.assertFalse(z_power.xy_allowed(None, was_fitted=False))
+        self.assertFalse(z_power.xy_allowed(None))
+
+    def test_absent_and_unrecognised_refuse_even_after_fitted(self):
+        for band in ('absent', 'something_else'):
+            self.assertFalse(z_power.xy_allowed(band, was_fitted=True), band)
+
 
 class TestBandsAndDebounce(unittest.TestCase):
     def test_classify(self):
@@ -239,6 +250,7 @@ class HarnessFixture:
         zp.z_change_template = 'ZCHANGE'
         zp.last_band = None
         zp.band_seen = False
+        zp.column_was_fitted = False
         # Install the interlock the way _handle_connect does
         raw = zp.heater.set_temp
         def guarded(degrees):
@@ -1122,6 +1134,227 @@ class TestB1PlateThresholds(unittest.TestCase):
     def test_a_plate_in_a_cool_room_reads_attached(self):
         remove, attach = self.thresholds()
         self.assertLess(attach, 10.)
+
+
+class TestUnknownColumnAbort(HarnessFixture, unittest.TestCase):
+    """A reading in no band that outlasts the present_samples debounce
+    aborts an active Z move, once per run of unknown readings."""
+    MSG = "the Z column position is unknown"
+    POWER_MSG = "the Z and bed power was lost"
+    UNKNOWN = 0.3          # in no band of BANDS
+
+    def make(self):
+        zp = HarnessFixture.make(self)
+        zp.z_band = z_power.Debounce(3)
+        return zp
+
+    def column(self, zp, ratio, polls, t):
+        for _ in range(polls):
+            t += 0.1
+            self.tick(zp, t, ratio=ratio)
+        return t
+
+    def locked(self, homing=None):
+        # Locked and powering, never READY, so only the column's own
+        # aborts can be seen (READY adds the power-drop abort).
+        homing = homing or FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing)
+        t = self.column(zp, 0.1, 3, 1.0)
+        self.assertEqual(zp.z_band.value, 'locked')
+        self.assertEqual(zp.state, POWERING)
+        self.assertEqual(homing.calls, [])
+        return zp, homing, t
+
+    def test_unknown_for_the_debounce_aborts_once(self):
+        zp, homing, t = self.locked()
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertIsNone(zp.z_band.value)
+        self.assertEqual(homing.calls, [self.MSG])
+
+    def test_not_before_the_debounce_count(self):
+        zp, homing, t = self.locked()
+        self.column(zp, self.UNKNOWN, 2, t)
+        self.assertEqual(homing.calls, [])
+        self.column(zp, self.UNKNOWN, 1, t + 0.2)
+        self.assertEqual(homing.calls, [self.MSG])
+
+    def test_a_flicker_shorter_than_the_debounce_is_ignored(self):
+        zp, homing, t = self.locked()
+        t = self.column(zp, self.UNKNOWN, 2, t)
+        self.column(zp, 0.1, 3, t)
+        self.assertEqual(zp.z_band.value, 'locked')
+        self.assertEqual(homing.calls, [])
+
+    def test_a_long_unknown_run_aborts_once(self):
+        zp, homing, t = self.locked()
+        self.column(zp, self.UNKNOWN, 40, t)
+        self.assertEqual(homing.calls, [self.MSG])
+
+    def test_a_new_run_aborts_again(self):
+        zp, homing, t = self.locked()
+        t = self.column(zp, self.UNKNOWN, 3, t)
+        t = self.column(zp, 0.1, 3, t)
+        self.assertEqual(homing.calls, [self.MSG])
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertEqual(homing.calls, [self.MSG, self.MSG])
+
+    def test_ready_adds_the_power_drop_abort_after_it(self):
+        homing = FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing)
+        t = self.column(zp, 0.1, 3, 1.0)
+        zp.power_good = True
+        t = self.column(zp, 0.1, 1, t)
+        self.assertEqual(zp.state, READY)
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertEqual(zp.state, UNKNOWN)
+        self.assertEqual(homing.calls, [self.MSG, self.POWER_MSG])
+
+    def test_startup_unknown_is_not_a_change(self):
+        homing = FakeHoming()
+        zp = self.make()
+        zp.printer = HomingPrinter(homing)
+        self.column(zp, self.UNKNOWN, 5, 1.0)
+        self.assertEqual(homing.calls, [])
+
+    def test_the_other_handling_is_unchanged(self):
+        zp, homing, t = self.locked()
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertEqual(zp.state, UNKNOWN)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.scripts.count('ZCHANGE'), 1)
+        self.assertIsNone(zp.fault)
+
+    def test_a_failing_abort_does_not_break_the_poll(self):
+        zp, homing, t = self.locked(FakeHoming(raises=RuntimeError("boom")))
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertEqual(homing.calls, [self.MSG])
+        self.assertEqual(zp.state, UNKNOWN)
+        self.assertEqual(zp.scripts.count('ZCHANGE'), 1)
+
+    def test_no_homing_object_is_fine(self):
+        zp = self.make()
+        t = self.column(zp, 0.1, 3, 1.0)
+        self.column(zp, self.UNKNOWN, 3, t)
+        self.assertEqual(zp.state, UNKNOWN)
+
+
+class StubTransform:
+    def __init__(self):
+        self.moves = []
+    def get_position(self):
+        return [0., 0., 0., 0.]
+    def move(self, newpos, speed):
+        self.moves.append(list(newpos))
+
+
+class TestXyGateAfterAFittedColumn(HarnessFixture, unittest.TestCase):
+    """XY is allowed in a reading in no band only after a fitted one with
+    no absent reading since. Z_PRESENT ratios: 0.1 locked, 0.5 unlocked,
+    0.99 absent, 0.3 in no band."""
+    def make(self):
+        zp = HarnessFixture.make(self)
+        zp.next_transform = StubTransform()
+        zp.last_position = [0., 0., 0., 0.]
+        return zp
+
+    def run_readings(self, zp, ratios):
+        for i, ratio in enumerate(ratios):
+            self.tick(zp, 1.0 + 0.1 * i, ratio=ratio)
+
+    def xy(self, zp):
+        zp.last_position = [0., 0., 0., 0.]
+        zp.move([10., 10., 0., 0.], 100.)
+        return zp.next_transform.moves[-1]
+
+    def refused(self, zp):
+        n = len(zp.next_transform.moves)
+        with self.assertRaises(CommandError) as ctx:
+            zp.last_position = [0., 0., 0., 0.]
+            zp.move([10., 10., 0., 0.], 100.)
+        self.assertEqual(len(zp.next_transform.moves), n)
+        return str(ctx.exception)
+
+    def test_locked_then_unknown_allows_xy(self):
+        zp = self.make()
+        self.run_readings(zp, [0.1, 0.3])
+        self.assertIsNone(zp.z_band.value)
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+
+    def test_unlocked_then_unknown_allows_xy(self):
+        zp = self.make()
+        self.run_readings(zp, [0.5, 0.3])
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+
+    def test_absent_then_unknown_refuses(self):
+        zp = self.make()
+        self.run_readings(zp, [0.99, 0.3])
+        self.assertIn("Cannot move X or Y", self.refused(zp))
+
+    def test_startup_unknown_refuses_with_the_same_text(self):
+        zp = self.make()
+        self.run_readings(zp, [0.3, 0.3, 0.3])
+        self.assertEqual(self.refused(zp), "Cannot move X or Y: %s"
+                         % (z_power.REASONS[UNKNOWN],))
+
+    def test_unread_refuses(self):
+        zp = self.make()
+        self.assertIn("Cannot move X or Y", self.refused(zp))
+
+    def test_fitted_unknown_absent_refuses_again(self):
+        zp = self.make()
+        self.run_readings(zp, [0.1, 0.3])
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+        self.run_readings(zp, [0.99])
+        self.assertEqual(self.refused(zp), "Cannot move X or Y: %s"
+                         % (z_power.REASONS[ABSENT],))
+
+    def test_absent_stays_refused_through_unknown_until_refitted(self):
+        zp = self.make()
+        self.run_readings(zp, [0.1, 0.99, 0.3])
+        self.assertIn("Cannot move X or Y", self.refused(zp))
+        self.run_readings(zp, [0.5, 0.3])
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+
+    def test_fitted_unknown_fitted_allows_xy(self):
+        zp = self.make()
+        self.run_readings(zp, [0.1, 0.3, 0.5])
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+        self.run_readings(zp, [0.1])
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+
+    def test_the_status_key_the_homing_macros_read_stays_strict(self):
+        zp = self.make()
+        self.run_readings(zp, [0.1, 0.3])
+        self.assertFalse(zp.get_status(2.0)['xy_allowed'])
+
+    def test_a_z_only_move_never_asked(self):
+        zp = self.make()
+        zp.last_position = [5., 5., 0., 0.]
+        zp.move([5., 5., 10., 0.], 100.)      # no reading at all: Z is free
+        self.assertEqual(zp.next_transform.moves[-1], [5., 5., 10., 0.])
+
+    def test_a_print_whose_lever_passes_through_unknown_can_park(self):
+        # Locked and READY while printing; the reading leaves every band
+        # for the debounce (3 polls here) and the path drops. Today that is
+        # state UNKNOWN with the heater off; the PAUSE's park (X/Y) goes
+        # through instead of leaving the pause half done.
+        zp = self.make()
+        zp.z_band = z_power.Debounce(3)
+        for t in (1.0, 1.1, 1.2):
+            self.tick(zp, t, ratio=0.1)
+        zp.power_good = True
+        self.tick(zp, 1.3, ratio=0.1)
+        self.assertEqual(zp.state, READY)
+        for t in (1.4, 1.5, 1.6):
+            self.tick(zp, t, ratio=0.3)
+        self.assertEqual(zp.state, UNKNOWN)
+        self.assertFalse(zp.enabled)
+        self.assertIsNone(zp.z_band.value)
+        self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
+        self.run_readings(zp, [0.99, 0.99, 0.99])
+        self.assertIn("Cannot move X or Y", self.refused(zp))
 
 
 if __name__ == '__main__':

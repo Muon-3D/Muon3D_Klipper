@@ -592,6 +592,35 @@ class B5ForceMove(unittest.TestCase):
                         text.index('SET_STEPPER_ENABLE'))
 
 
+# --- z_power: an unknown column reading pauses a print -------------------
+class ColumnChangedMacro(unittest.TestCase):
+    """printer.z_power.z is None when the reading matches no band.  A plain
+    default("unknown") leaves None alone, so the macro took its "locked"
+    branch and a print carried on with the bed unpowered."""
+    BED = os.path.join(MACROS, 'bed.cfg')
+
+    def lines(self, z, job):
+        opts = section(self.BED, 'gcode_macro _Z_COLUMN_CHANGED')
+        text = '\n'.join(l.strip() for l in opts['gcode'].split('\n'))
+        env = jinja2.Environment('{%', '%}', '{', '}')
+        out = env.from_string(text).render(
+            printer={'z_power': {'z': z}, 'print_stats': {'state': job}},
+            params={}, action_respond_info=lambda msg: '')
+        return [l.strip() for l in out.split('\n') if l.strip()]
+
+    def test_unknown_pauses_a_running_print(self):
+        self.assertEqual(self.lines(None, 'printing'),
+                         ['PAUSE REASON=column_unlocked'])
+
+    def test_unlocked_pauses_a_running_print(self):
+        self.assertEqual(self.lines('unlocked', 'printing'),
+                         ['PAUSE REASON=column_unlocked'])
+
+    def test_locked_does_not_pause(self):
+        self.assertNotIn('PAUSE REASON=column_unlocked',
+                         self.lines('locked', 'printing'))
+
+
 # --- KAN-3387: the start gate shows no macro prompt ---------------------
 class StartGateHasNoMacroPrompt(unittest.TestCase):
     def test_m1_machine_shows_no_gate_prompt(self):
