@@ -20,8 +20,10 @@
 # It also gates X/Y motion on the column: folded, the Z axis sits in the
 # path of the X/Y gantry, so a G-code move in X or Y is refused unless the
 # column is plugged in (locked or not), or its reading is in no band after a
-# fitted one with no absent reading since (the lever passing through; the
-# status key xy_allowed, which the homing macros read, stays strict). Z needs
+# fitted one with no absent reading since (the lever passing through). The
+# status key xy_allowed follows the same rule as the gate, so the panel and
+# the gate agree; xy_home_allowed stays strict and is what X/Y homing reads
+# (a home must not start on a lever part way). Z needs
 # no lock to move (the lift before an X/Y home, the park at the top); only Z
 # homing, which macros gate on the lock, and anything that trusts a Z
 # position need it locked.
@@ -657,7 +659,10 @@ class ZPower:
                 'reason': self.reason,
                 'z': self.z_band.value,
                 'xy_allowed': xy_allowed(self.z_band.value,
-                                         self.xy_requires_column),
+                                         self.xy_requires_column,
+                                         self.column_was_fitted),
+                'xy_home_allowed': xy_allowed(self.z_band.value,
+                                              self.xy_requires_column),
                 'plate_present': self.plate,
                 'enabled': self.enabled,
                 'power_good': self.power_good,

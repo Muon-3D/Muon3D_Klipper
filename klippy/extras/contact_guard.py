@@ -159,6 +159,8 @@ class ContactGuard:
             'lift_clear_min', 5.0,
             minval=self.contact_z + self.unmeshed_margin)
         self.bed_mesh = None
+        # Looked up at connect; None until then (and if there is none)
+        self.bed_detector = None
         # The mesh that was loaded when the bed was last removed: it no
         # longer describes the plate, whatever it says
         self.stale_mesh = None

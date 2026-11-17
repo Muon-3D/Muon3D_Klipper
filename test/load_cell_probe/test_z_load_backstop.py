@@ -728,7 +728,8 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
     w, cell, homing = make_watch(mod)
     st = w.get_status()
     want = {'z_backstop_ceiling_counts': 0, 'z_backstop_wrong_way_counts': 0,
-            'z_backstop_fired': None, 'z_backstop_ceiling_factor': 2.5,
+            'z_backstop_fired': None, 'z_backstop_armed_rules': 'none',
+            'z_backstop_ceiling_factor': 2.5,
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
             'z_backstop_confirm_time': 0.02}
@@ -780,6 +781,114 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
           'probe; one log line states them')
 
 
+class LogCapture(object):
+    """Collects (level, message) of the root logger while in a with."""
+
+    def __enter__(self):
+        import logging
+
+        class Handler(logging.Handler):
+            def __init__(h, out):
+                logging.Handler.__init__(h)
+                h.out = out
+
+            def emit(h, record):
+                h.out.append((record.levelname, record.getMessage()))
+        self.lines = []
+        self.handler = Handler(self.lines)
+        self.root = logging.getLogger()
+        self.old = self.root.level
+        self.root.addHandler(self.handler)
+        self.root.setLevel(logging.INFO)
+        return self
+
+    def __exit__(self, *exc):
+        self.root.removeHandler(self.handler)
+        self.root.setLevel(self.old)
+
+    def of(self, level):
+        return [m for lv, m in self.lines
+                if lv == level and m.startswith('load_cell_probe:')
+                and 'Z load backstop' in m]
+
+
+def test_11_arming_is_logged_and_deduped(mod):
+    """The watch must say in klippy.log when it is not armed, and which
+    rules are armed; a bed mesh must not repeat either line."""
+    # Both rules: one info note, then silence while nothing changes
+    w, cell, homing = make_watch(mod)
+    with LogCapture() as cap:
+        for _ in range(5):
+            w.arm(0., -800000, 221075, -1.)
+    notes = cap.of('INFO')
+    assert len(notes) == 1, cap.lines
+    assert 'ceiling 552687 counts' in notes[0], notes[0]
+    assert 'wrong way 221075 counts' in notes[0], notes[0]
+    assert not cap.of('WARNING'), cap.lines
+    assert w.get_status()['z_backstop_armed_rules'] == 'ceiling+wrong_way'
+    # a different limit (the tare moves every tap of a mesh) is not a
+    # change of rules: no new note, and the new limits are in status
+    with LogCapture() as cap:
+        w.arm(0., -1750000, 126075, -1.)
+        w.arm(0., -1750000, 126075, -1.)
+    assert not cap.of('INFO'), cap.lines
+    assert w.get_limits() == (315187, 126075), w.get_limits()
+    # MCUTARE: ceiling only, the wrong-way rule off and said so
+    w, cell, homing = make_watch(mod)
+    with LogCapture() as cap:
+        w.arm(0., -800000, 221075, -1., mcutare=True)
+    notes = cap.of('INFO')
+    assert len(notes) == 1, cap.lines
+    assert 'ceiling 552687 counts' in notes[0], notes[0]
+    assert 'wrong way off (MCUTARE' in notes[0], notes[0]
+    assert w.get_status()['z_backstop_armed_rules'] == 'ceiling'
+    assert w.get_limits() == (552687, 0)
+    # Not armed: no trigger delta at all
+    w, cell, homing = make_watch(mod)
+    with LogCapture() as cap:
+        for _ in range(50):
+            w.arm(0., -800000, None, -1.)
+    warns = cap.of('WARNING')
+    assert len(warns) == 1, cap.lines
+    assert 'NOT armed' in warns[0], warns[0]
+    assert 'no trigger delta (None)' in warns[0], warns[0]
+    assert not w.is_armed()
+    assert w.get_status()['z_backstop_armed_rules'] == 'none'
+    # a different reason (delta 0 is not None) warns again, once
+    with LogCapture() as cap:
+        for _ in range(5):
+            w.arm(0., -800000, 0, -1.)
+    assert len(cap.of('WARNING')) == 1, cap.lines
+    assert 'no trigger delta (0)' in cap.of('WARNING')[0], cap.lines
+    # armed in between: the state changed, so the same reason warns again
+    with LogCapture() as cap:
+        w.arm(0., -800000, 221075, -1.)
+        w.arm(0., -800000, 0, -1.)
+        w.arm(0., -800000, 0, -1.)
+    assert len(cap.of('WARNING')) == 1, cap.lines
+    assert len(cap.of('INFO')) == 1, cap.lines
+    # Both factors 0: not armed, and the reason names the factors
+    w, cell, homing = make_watch(mod, z_move_abort_ceiling_factor=0.,
+                                 z_move_wrong_way_factor=0.)
+    with LogCapture() as cap:
+        w.arm(0., -800000, 221075, -1.)
+        w.arm(0., -800000, 221075, -1.)
+    warns = cap.of('WARNING')
+    assert len(warns) == 1, cap.lines
+    assert 'z_move_abort_ceiling_factor is 0' in warns[0], warns[0]
+    assert 'z_move_wrong_way_factor is 0' in warns[0], warns[0]
+    assert w.get_status()['z_backstop_armed_rules'] == 'none'
+    assert w.get_limits() == (0, 0)
+    # wrong-way only (ceiling off) reports itself
+    w, cell, homing = make_watch(mod, z_move_abort_ceiling_factor=0.)
+    with LogCapture() as cap:
+        w.arm(0., -800000, 221075, -1.)
+    assert 'ceiling off (' in cap.of('INFO')[0], cap.lines
+    assert w.get_status()['z_backstop_armed_rules'] == 'wrong_way'
+    print('ok  11 not-armed warns once per reason, armed note only on a '
+          'change, armed rules in status')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -790,7 +899,8 @@ def main():
              test_7_watcher_failure_fails_safe,
              test_8_integration_with_real_homing,
              test_9_muon_ads1220_cadence,
-             test_10_configured_limits_are_in_status_and_the_log]
+             test_10_configured_limits_are_in_status_and_the_log,
+             test_11_arming_is_logged_and_deduped]
     failed = []
     for t in tests:
         try:

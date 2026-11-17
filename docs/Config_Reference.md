@@ -4951,7 +4951,10 @@ present_locked_range:
 #   home) unless the Z column is plugged in, locked or not: folded,
 #   the Z axis is in the gantry's path. Set False only on a
 #   development unit run without a column. The status object reports
-#   the result as `xy_allowed`.
+#   the result as `xy_allowed`, which follows the move gate (a reading in
+#   no band after a fitted column, with no absent reading since, still
+#   allows moves). `xy_home_allowed` is the strict form (column locked
+#   or unlocked only) that X/Y homing should read.
 ```
 
 ### [m1_machine]

@@ -286,6 +286,18 @@ class B2ContactGuardConnect(unittest.TestCase):
         self.assertIsNone(guard.bed_mesh)
         self.assertTrue(guard._may_refuse(printer.reactor.monotonic()))
 
+    def test_constructed_but_not_connected_has_no_detector(self):
+        import test_contact_guard as tcg
+        from extras import contact_guard
+        printer = tcg.FakePrinter()
+        guard = contact_guard.load_config(tcg.FakeConfig(
+            printer, {'move_guard': 'load_cell'}))
+        self.assertIsNone(guard.bed_detector)
+        self.assertIsNone(guard.bed_mesh)
+        # a probe set but no connect yet: the detector read must not raise
+        guard.probe = object()
+        guard._may_refuse(printer.reactor.monotonic())
+
 
 # --- B3 -------------------------------------------------------------------
 class Reactor:
