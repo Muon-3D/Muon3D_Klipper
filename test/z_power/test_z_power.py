@@ -10,7 +10,7 @@ sys.path.insert(0, KLIPPY)
 
 from extras import z_power  # noqa: E402
 from extras.z_power import (ABSENT, UNLOCKED, UNKNOWN, NO_PLATE, POWERING,
-                            READY, INHIBITED, FAULT)  # noqa: E402
+                            READY, INHIBITED, FAULT, RECOVERING)  # noqa: E402
 
 BANDS = [('absent', (0.90, 1.0)), ('unlocked', (0.40, 0.60)),
          ('locked', (0.0, 0.20))]
@@ -1412,6 +1412,200 @@ class TestStatusAgreesWithTheGate(HarnessFixture, unittest.TestCase):
         self.assertTrue(st['xy_allowed'])
         self.assertTrue(st['xy_home_allowed'])
 
+
+class TestIdleRecovery(Ready):
+    """KAN-3955: a PGOOD drop with the bed idle is recovered, not latched."""
+    def idle(self):
+        zp = self.make()
+        zp.raw_current, zp.current_offset = 0., 0.
+        self.up(zp)
+        return zp
+
+    def run_to(self, zp, t_from, t_to, level):
+        """One poll per 0.1 s from t_from to t_to, PGOOD at level."""
+        zp.power_good = level
+        for tenth in range(int(round(t_from * 10)),
+                           int(round(t_to * 10)) + 1):
+            self.tick(zp, tenth / 10.)
+
+    def blip(self, zp, t0=2.0):
+        """PGOOD low from t0 until the debounce acts (3 polls)."""
+        self.run_to(zp, t0, t0 + 0.2, False)
+
+    def test_idle_blip_recovers_with_no_fault(self):
+        zp = self.idle()
+        with self.assertLogs(level='WARNING') as logs:
+            self.blip(zp)
+            self.assertEqual(zp.state, RECOVERING)
+            self.assertIsNone(zp.fault)
+            self.assertFalse(zp.enabled)
+            self.assertNotEqual(zp.state, READY)
+            # Off for 2 s, then one re-enable
+            self.run_to(zp, 2.3, 4.1, False)
+            self.assertFalse(zp.enabled)
+            self.run_to(zp, 4.2, 4.3, True)
+            self.assertTrue(zp.enabled)
+            self.assertEqual(zp.state, RECOVERING)
+            self.run_to(zp, 4.4, 9.2, True)
+            self.assertEqual(zp.state, RECOVERING)     # held under 5 s
+            self.run_to(zp, 9.3, 9.4, True)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertNotIn('FAULT', zp.scripts)
+        self.assertEqual(zp.pgood_idle_recoveries, 1)
+        self.assertEqual(self.enable_writes(zp), [1, 0, 1])
+        self.assertTrue(any('idle PGOOD recovery #1 done' in line
+                            and 'PGOOD (value@age)' in line
+                            for line in logs.output))
+        # Back to normal: heating works again
+        zp.heater.set_temp(60.)
+        self.assertEqual(zp.heater.target, 60.)
+
+    def test_counter_and_time_are_in_status(self):
+        zp = self.idle()
+        st = zp.get_status(2.0)
+        self.assertEqual(st['pgood_idle_recoveries'], 0)
+        self.assertIsNone(st['last_pgood_idle_recovery'])
+        self.blip(zp)
+        self.run_to(zp, 2.3, 4.1, False)
+        self.run_to(zp, 4.2, 9.5, True)
+        st = zp.get_status(9.5)
+        self.assertEqual(st['state'], READY)
+        self.assertEqual(st['pgood_idle_recoveries'], 1)
+        self.assertIsNotNone(st['last_pgood_idle_recovery'])
+        self.assertIsNone(st['fault'])
+
+    def test_set_temp_refused_while_recovering(self):
+        zp = self.idle()
+        self.blip(zp)
+        self.assertEqual(zp.state, RECOVERING)
+        with self.assertRaises(CommandError):
+            zp.heater.set_temp(60.)
+        self.assertEqual(zp.heater.target, 0.)
+        # Still refused once the feed is back but not yet held
+        self.run_to(zp, 2.3, 4.1, False)
+        self.run_to(zp, 4.2, 5.0, True)
+        self.assertEqual(zp.state, RECOVERING)
+        with self.assertRaises(CommandError):
+            zp.heater.set_temp(60.)
+        self.assertEqual(zp.state, RECOVERING)
+
+    def test_target_set_around_the_recovery_escalates(self):
+        zp = self.idle()
+        self.blip(zp)
+        zp.heater.target = 50.     # bypassing the guard
+        self.tick(zp, 2.3)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.heater.target, 0.)
+        self.assertIn('FAULT', zp.scripts)
+
+    def test_recovery_fails_if_pgood_does_not_return(self):
+        zp = self.idle()
+        self.blip(zp)
+        self.run_to(zp, 2.3, 4.2, False)
+        self.assertEqual(zp.state, RECOVERING)
+        self.run_to(zp, 4.3, 5.0, False)    # past power_good_timeout 0.5
+        self.assertEqual(zp.state, FAULT)
+        self.assertFalse(zp.enabled)
+        self.assertIn('idle recovery failed', zp.fault)
+        self.assertIn('FAULT', zp.scripts)
+        self.assertEqual(zp.pgood_idle_recoveries, 0)
+
+    def test_recovery_fails_if_pgood_falls_again_in_the_hold(self):
+        zp = self.idle()
+        self.blip(zp)
+        self.run_to(zp, 2.3, 4.1, False)
+        self.run_to(zp, 4.2, 6.0, True)
+        self.assertEqual(zp.state, RECOVERING)
+        self.run_to(zp, 6.1, 6.1, False)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('fell again', zp.fault)
+
+    def recover(self, zp, t):
+        self.blip(zp, t)
+        self.assertEqual(zp.state, RECOVERING)
+        self.run_to(zp, t + 0.3, t + 2.1, False)
+        self.run_to(zp, t + 2.2, t + 7.6, True)
+        self.assertEqual(zp.state, READY)
+
+    def test_too_many_blips_in_the_window_fault(self):
+        zp = self.idle()
+        t = 2.0
+        for _n in range(3):
+            self.recover(zp, t)
+            t += 10.
+        self.assertEqual(zp.pgood_idle_recoveries, 3)
+        self.blip(zp, t)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('PGOOD dropped', zp.fault)
+        self.assertFalse(zp.enabled)
+
+    def test_blips_outside_the_window_do_not_add_up(self):
+        zp = self.idle()
+        zp.idle_recovery_window = 15.
+        t = 2.0
+        for _n in range(5):
+            self.recover(zp, t)
+            t += 10.
+        self.assertEqual(zp.pgood_idle_recoveries, 5)
+
+    def test_blip_while_heating_faults_as_before(self):
+        zp = self.idle()
+        zp.heater.set_temp(60.)
+        zp.heater.power = 1.0
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.heater.target, 0.)
+        self.assertEqual(zp.pgood_idle_recoveries, 0)
+
+    def test_blip_with_a_warm_bed_faults(self):
+        zp = self.idle()
+        zp.heater.last_temp = 55.
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_blip_while_printing_or_paused_faults(self):
+        for pstate in ('printing', 'paused'):
+            zp = self.idle()
+            stats = zp.printer.objects['print_stats'] = StubPrintStats()
+            stats.state = pstate
+            self.blip(zp)
+            self.assertEqual(zp.state, FAULT, pstate)
+
+    def test_blip_after_recent_bed_current_faults(self):
+        zp = self.idle()
+        zp.raw_current = 1.5
+        self.tick(zp, 1.9)
+        zp.raw_current = 0.
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_without_a_current_reading_it_is_not_idle(self):
+        zp = self.make()
+        self.up(zp)
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_max_zero_disables_recovery(self):
+        zp = self.idle()
+        zp.idle_recovery_max = 0
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_plate_removed_during_recovery_cancels_it(self):
+        zp = self.idle()
+        self.blip(zp)
+        self.tick(zp, 2.3, plate=False)
+        self.assertEqual(zp.state, NO_PLATE)
+        self.assertIsNone(zp.recovery)
+        self.assertIsNone(zp.fault)
+
+    def test_reset_is_still_refused_while_printing(self):
+        zp = self.idle()
+        stats = zp.printer.objects['print_stats'] = StubPrintStats()
+        stats.state = 'printing'
+        with self.assertRaises(CommandError):
+            zp.cmd_Z_POWER_RESET(StubGcmd())
 
 if __name__ == '__main__':
     unittest.main()
