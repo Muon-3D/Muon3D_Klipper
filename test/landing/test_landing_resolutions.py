@@ -529,6 +529,23 @@ class B4HomingCurrent(unittest.TestCase):
             'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6',
             'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8'])
 
+    def test_the_cut_stop_find_taps_at_06_on_y(self):
+        # KAN-3813: one tap towards Y min with no confirming tap. At the
+        # Y homing current (0.8 A) it tapped 0.8 mm after arming on sloe.
+        lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(),
+                       {'Y': '0.6'})
+        self.assertEqual(lines, [
+            'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6',
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6'])
+        find = macro_lines(os.path.join(MACROS, 'filament.cfg'),
+                           '_CUT_FILAMENT_FIND_STOP')
+        calls = [l.strip() for l in find
+                 if l.strip().startswith('_HOMING_CURRENT')]
+        self.assertEqual(calls, [
+            '_HOMING_CURRENT Y='
+            '{printer["gcode_macro _HOMING_CURRENT"].current}',
+            '_HOMING_CURRENT RESTORE=1'])
+
     def test_restore_puts_both_run_currents_back(self):
         lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(),
                        {'RESTORE': '1'})
