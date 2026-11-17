@@ -247,6 +247,11 @@ start_test homing_scope "Test homing_scope"
 $PYTHON test/homing_scope/test_homing_scope.py
 finish_test homing_scope "Test homing_scope"
 
+# MUON: Home All stows the bed; every internal G28 passes STOW=0 (KAN-3811).
+start_test home_stow "Test Home All stows the bed"
+$PYTHON test/home_stow/test_home_all_stow.py
+finish_test home_stow "Test Home All stows the bed"
+
 # MUON: M600 with no print only prompts; PAUSE restores absolute mode (KAN-1699).
 start_test m600 "Test M600 with no print only prompts"
 $PYTHON test/m600/test_m600_no_print.py
