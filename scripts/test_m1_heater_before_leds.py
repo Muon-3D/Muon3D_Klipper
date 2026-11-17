@@ -52,7 +52,9 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'MACHINE_WAIT_READY', 'MACHINE_REQUIRE', 'MACHINE_HEAT_WAIT',
          'MACHINE_PAUSED',
          'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED', 'MACHINE_PLATE_CLEAR',
-         'MACHINE_TOOLHEAD_CONNECTED')
+         'MACHINE_TOOLHEAD_CONNECTED',
+         # position.cfg's and homing.cfg's, which only move (KAN-3813).
+         'Z_PARK', '_HOMING_CURRENT')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
            'PID_CALIBRATE', 'PROBE_CALIBRATE')
@@ -97,13 +99,36 @@ class FailingLedEffect:
 
 
 class M1:
-    def __init__(self, variables_file, restore_startup=True, latched=False):
+    def __init__(self, variables_file, restore_startup=True, latched=False,
+                 real_cut=False, stop_at=-6.8, guard=False,
+                 real_currents=False):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
         self.gcode = gcode.GCodeDispatch(printer)
         printer.add_object('gcode', self.gcode)
         self.responses = []
-        self.gcode.register_output_handler(self.responses.append)
+        self.gcode.register_output_handler(self._output)
+        # real_cut: run filament.cfg's CUT_FILAMENT as it ships, with the
+        # Y tap told where it found the stop (KAN-3813).
+        # real_currents: and homing.cfg's _HOMING_CURRENT as it ships, so
+        # the X/Y currents the macros set can be read back (SET_TMC_CURRENT
+        # lines in the timeline). guard: a contact_guard that records
+        # SET_CONTACT_GUARD and keeps its enabled flag.
+        stubs = STUBS
+        self.real_cut = real_cut
+        self.real_currents = real_currents
+        if real_cut:
+            stubs = tuple(n for n in STUBS if n != 'CUT_FILAMENT') + (
+                'PARK_PRINTER', 'SET_TMC_CURRENT')
+        if real_currents:
+            stubs = tuple(n for n in stubs if n != '_HOMING_CURRENT')
+        self.stubs = stubs
+        self.stop_at = stop_at
+        self.amove = {'last': {
+            'command': None, 'axis': None, 'direction': None,
+            'homed': False, 'triggered': False, 'position': None,
+            'count': 0}}
+        printer.add_object('advanced_homing_movement', Status(self.amove))
         self.macro = gcode_macro.PrinterGCodeMacro(FakeConfig(
             printer, None, 'gcode_macro'))
         printer.add_object('gcode_macro', self.macro)
@@ -160,6 +185,10 @@ class M1:
             'load_cell_probe': {'z_offset': 0.0},
             # The anti-ooze temperature PRINT_START holds (nozzle_wipe.cfg).
             'nozzle_wipe_smart': {'stop_temp': 135.0},
+            # CUT_FILAMENT's tap speed and the currents it restores
+            'stepper_y': {'homing_speed': 60.0},
+            'tmc2241 stepper_x': {'run_current': 0.8},
+            'tmc2241 stepper_y': {'run_current': 0.8},
             'bed_mesh': {'mesh_min': [10.0, 7.0],
                          'mesh_max': [190.0, 170.0]}}}))
         # PRINT_START reads the probe's live z_offset (KAN-1730)
@@ -191,8 +220,16 @@ class M1:
         self.raising_lines = set()
 
         self.timeline = []
-        for name in STUBS + RENAMED:
+        for name in stubs + RENAMED:
             self.gcode.register_command(name, self._record)
+        self.guard = {'enabled': True, 'move_guard': 'height'}
+        if guard:
+            printer.add_object('contact_guard', Status(self.guard))
+            self.gcode.register_command('SET_CONTACT_GUARD',
+                                        self._set_guard)
+        if real_cut:
+            self.gcode.register_command('AXIS_PROTECTED_MOVE',
+                                        self._protected_move)
         self.gcode.register_command('M104', self._m104)
         self.gcode.register_command('SET_HEATER_TEMPERATURE', self._set_heater)
         self.gcode.register_command('STOP_LED_EFFECTS', self._stop_leds)
@@ -206,7 +243,7 @@ class M1:
             config = FakeConfig(printer, fileconfig, section)
             kind, _, name = section.partition(' ')
             if kind == 'gcode_macro':
-                if name.upper() in STUBS:
+                if name.upper() in stubs:
                     continue
                 obj = gcode_macro.GCodeMacro(config)
             elif kind == 'print_end_park':
@@ -218,6 +255,15 @@ class M1:
             else:
                 continue
             printer.add_object(section, obj)
+        if real_currents:
+            path = os.path.join(MACROS, 'homing.cfg')
+            with open(path) as f:
+                reader = configfile.ConfigFileReader()
+                homing = reader.build_fileconfig_with_includes(
+                    f.read(), path)
+            name = 'gcode_macro _HOMING_CURRENT'
+            printer.add_object(name, gcode_macro.GCodeMacro(
+                FakeConfig(printer, homing, name)))
         printer.send_event('klippy:connect')
         printer.send_event('klippy:ready')
         if restore_startup:
@@ -232,6 +278,39 @@ class M1:
             if timer[0] == 1.:
                 timer[0] = self.reactor.NEVER
         self.reactor.advance(2.)
+
+    def _output(self, msg):
+        self.responses.append(msg)
+        if self.real_cut and msg.startswith('!!'):
+            # Where the error line came among the commands
+            self.timeline.append(msg)
+
+    def _protected_move(self, gcmd):
+        # What advanced_homing_movement publishes for a tap that stopped at
+        # stop_at on a homed Y (a move to Y min that found a stop).
+        self.timeline.append(gcmd.get_commandline())
+        self.amove['last'] = {
+            'command': 'AXIS_PROTECTED_MOVE', 'axis': 'y',
+            'direction': 'min', 'homed': True, 'triggered': True,
+            'position': self.stop_at, 'count': 1}
+
+    def _set_guard(self, gcmd):
+        self.timeline.append(gcmd.get_commandline())
+        enable = gcmd.get_int('ENABLE', None)
+        if enable is not None:
+            self.guard['enabled'] = bool(enable)
+
+    def currents(self):
+        """The last SET_TMC_CURRENT value of each stepper, in the order
+        they were set: {stepper: [amps, ...]}."""
+        out = {}
+        for line in self.timeline:
+            words = line.split()
+            if words[0] == 'SET_TMC_CURRENT':
+                args = dict(w.split('=') for w in words[1:])
+                out.setdefault(args['STEPPER'], []).append(
+                    float(args['CURRENT']))
+        return out
 
     def _latch_set(self, gcmd):
         self.latch_status['latched'] = True
@@ -1609,9 +1688,12 @@ class CancelParkTests(_M1TestCase):
         self.assertIsNotNone(m.first_led())
         self.assertLess(names.index('TURN_OFF_HEATERS'), names.index('G0'))
         self.assertNotIn('CUT_FILAMENT', names)
-        self.assertEqual(names.count('G0'), 2)  # lift, then refused XY
-        self.assertEqual([r for r in m.responses if r.startswith('!!')],
-                         ['!! G0: failing on purpose'])
+        # lift, the refused XY, then KAN-3813's safe park of what is left
+        self.assertEqual(names.count('G0'), 3)
+        errors = [r for r in m.responses if r.startswith('!!')]
+        self.assertEqual(len(errors), 2, errors)
+        self.assertEqual(errors[0], '!! G0: failing on purpose')
+        self.assertIn('stopped early', errors[1])
         m.responses[:] = [r for r in m.responses if not r.startswith('!!')]
         self.assertTrue(any('parking skipped' in r for r in m.responses),
                         m.responses)
@@ -1619,6 +1701,285 @@ class CancelParkTests(_M1TestCase):
         self.assertEqual(unlock['e_was_enabled'], 0)
         self.assertEqual(unlock['changed_hotend_target'], 0)
 
+
+class RefusedCutStillParks(_M1TestCase):
+    """KAN-3813: sloe, 17 Nov. The cut's Y tap stopped at 3.22, outside
+    the -9.5 to -5.0 window, so the cut was refused, and PRINT_END then
+    skipped the park too: the head was left over the print at Z50. A
+    refused cut must still park, then say so."""
+
+    CUT_ERROR = ('CUT_FILAMENT: the Y back stop is at 3.22, outside -9.5 to '
+                 '-5.0, so the cut won\'t line up with the nub.')
+
+    def make(self, stop_at, **kw):
+        kw.setdefault('guard', True)
+        self.m1 = M1(self.variables_file, real_cut=True, stop_at=stop_at,
+                     **kw)
+        return self.m1
+
+    def errors(self):
+        # PRINT_END's report. (The cut's own error also comes out as "!!"
+        # lines, one per macro level it unwinds through, and is logged.)
+        return [r for r in self.m1.responses if 'stopped early' in r]
+
+    def drop_errors(self):
+        # tearDown wants no error line left; each test has checked its own
+        m = self.m1
+        m.responses[:] = [r for r in m.responses if not r.startswith('!!')]
+        self.log.records.clear()
+
+    def test_a_stop_outside_the_window_still_parks(self):
+        m = self.make(3.22)
+        m.run('PRINT_END')
+        t = m.timeline
+        names = m.names()
+        # The refusal came from the cut: the tap ran, the cut did not
+        self.assertIn('AXIS_PROTECTED_MOVE AXIS=Y DIR=MIN DIST=20.0 '
+                      'SPEED=60.0', t)
+        self.assertIsNone(m.macro_vars('CUT_FILAMENT')['last_stop_y'])
+        self.assertNotIn('SET_TMC_CURRENT', names)
+        self.assertNotIn('PARK_PRINTER', names)
+        # Heaters and fan off first, as for any end
+        self.assertLess(names.index('TURN_OFF_HEATERS'),
+                        names.index('AXIS_PROTECTED_MOVE'))
+        self.assertLess(names.index('M107'), names.index('Z_PARK'))
+        # The park, in order: current back, Z up, to the park spot; then
+        # the report; then the motors off
+        tap = names.index('AXIS_PROTECTED_MOVE')
+        safe = t.index('_HOMING_CURRENT RESTORE=1', tap + 2)
+        zpark = t.index('Z_PARK')
+        xy = t.index('G0 X135 Y63 F4800')
+        err = [i for i, line in enumerate(t) if 'stopped early' in line]
+        self.assertEqual(len(err), 1, t)
+        m84 = names.index('M84')
+        self.assertTrue(tap < safe < zpark < xy < err[0] < m84, t)
+        # Nothing that homes or sets a position
+        for banned in ('G28', 'SET_KINEMATIC_POSITION'):
+            self.assertNotIn(banned, names[tap + 1:])
+        # The report is an error line and says what happened
+        text = self.errors()[0]
+        self.assertIn(self.CUT_ERROR, text)
+        self.assertIn('stopped early', text)
+        self.assertNotIn('Error evaluating', text)
+        # Cleanup after it
+        self.assertIn('RESTORE_GCODE_STATE NAME=STATE_PRINT_END', t)
+        self.assertEqual(m.print_stats['state'], 'printing')
+        self.assertTrue(any('parking skipped' in r for r in m.responses))
+        status = m.printer.lookup_object('print_end_park').get_status(0)
+        self.assertTrue(status['failed'])
+        self.drop_errors()
+
+    def test_y_moves_out_first_when_the_head_is_near_the_back(self):
+        m = self.make(3.22)
+        m.toolhead['position']['y'] = 3.22
+        m.run('PRINT_END')
+        t = m.timeline
+        # Out in +Y before X moves, as the cut does
+        out = t.index('G1 Y10 F4800')
+        self.assertLess(out, t.index('G0 X135 Y63 F4800'))
+        self.assertLess(t.index('Z_PARK'), out)
+        self.drop_errors()
+
+    def test_the_guard_is_back_and_zeroed_after_the_move_out(self):
+        # The tap stood the guard aside. The safe park puts it back first
+        # (before anything that can raise), then lifts, moves out of the
+        # nub's reach, and only then re-zeroes (as _CUT_FILAMENT_CUT does):
+        # a zero taken at the nub is a zero taken pressed.
+        m = self.make(3.22)
+        m.toolhead['position']['y'] = 3.22
+        m.run('PRINT_END')
+        t = m.timeline
+        tap = m.names().index('AXIS_PROTECTED_MOVE')
+        self.assertIn('SET_CONTACT_GUARD ENABLE=0 TIMEOUT=60', t[:tap])
+        on = t.index('SET_CONTACT_GUARD ENABLE=1', tap)
+        zpark = t.index('Z_PARK')
+        out = t.index('G1 Y10 F4800')
+        zero = t.index('SET_CONTACT_GUARD REZERO=1 TRY=1')
+        xy = t.index('G0 X135 Y63 F4800')
+        self.assertTrue(on < zpark < out < zero < xy, t)
+        self.assertTrue(m.guard['enabled'])
+        self.drop_errors()
+
+    def test_away_from_the_back_it_zeroes_after_the_lift(self):
+        m = self.make(3.22)
+        m.run('PRINT_END')
+        t = m.timeline
+        self.assertNotIn('G1 Y10 F4800', t)
+        tap = m.names().index('AXIS_PROTECTED_MOVE')
+        on = t.index('SET_CONTACT_GUARD ENABLE=1', tap)
+        zero = t.index('SET_CONTACT_GUARD REZERO=1 TRY=1')
+        self.assertTrue(on < t.index('Z_PARK') < zero
+                        < t.index('G0 X135 Y63 F4800'), t)
+        self.assertTrue(m.guard['enabled'])
+        self.drop_errors()
+
+    def test_the_stop_find_taps_y_at_06_and_a_y_home_runs_at_08(self):
+        # KAN-3813: the tap's Y current is CUT_FILAMENT's tap_current_y, its
+        # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y, 0.8.
+        m = self.make(-6.8, real_currents=True)
+        m.run('PRINT_END')
+        cur = m.currents()
+        # tap, restore, the cut's burst, restore
+        self.assertEqual(cur['stepper_x'], [0.6, 0.8, 2.0, 0.8])
+        self.assertEqual(cur['stepper_y'], [0.6, 0.8, 2.0, 0.8])
+        m.timeline.clear()
+        m.run('_HOMING_CURRENT')
+        cur = m.currents()
+        self.assertEqual(cur['stepper_x'], [0.6])
+        self.assertEqual(cur['stepper_y'], [0.8])
+
+    def test_a_cut_move_that_fails_puts_the_run_currents_back(self):
+        # The press runs both motors at the 2.0 A burst. In the driver the
+        # burst lasts until a lower SET_TMC_CURRENT (tmc2241.py), or until
+        # burst_time. A press that raises never reaches the macro's own
+        # restore: the safe park's _HOMING_CURRENT RESTORE=1 must end it.
+        m = self.make(-6.8, real_currents=True)
+        m.raising_lines.add('G1 X130.5')
+        m.run('PRINT_END')
+        cur = m.currents()
+        for axis in ('stepper_x', 'stepper_y'):
+            self.assertEqual(cur[axis], [0.6, 0.8, 2.0, 0.8], axis)
+        t = m.timeline
+        burst = t.index('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=2.0')
+        self.assertLess(burst, t.index('G1 X130.5 Y-5.8 F600'))
+        self.assertTrue(m.printer.lookup_object('print_end_park')
+                        .get_status(0)['failed'])
+        self.assertTrue(m.guard['enabled'])
+        self.drop_errors()
+
+    def test_unhomed_xy_parks_z_only(self):
+        m = self.make(3.22)
+        m.toolhead['homed_axes'] = 'z'
+        m.run('PRINT_END')
+        t = m.timeline
+        self.assertIn('Z_PARK', t)
+        self.assertNotIn('G0 X135 Y63 F4800', t)
+        # The guard is back, and zeroed after the lift
+        self.assertLess(t.index('SET_CONTACT_GUARD ENABLE=1'),
+                        t.index('Z_PARK'))
+        self.assertLess(t.index('Z_PARK'),
+                        t.index('SET_CONTACT_GUARD REZERO=1 TRY=1'))
+        self.assertTrue(m.guard['enabled'])
+        # (CUT_FILAMENT homes X itself, before the refusal; the safe park
+        # does not home)
+        after = m.names()[m.names().index('!!'):]
+        self.assertNotIn('G28', after)
+        self.assertIn('M84', t)
+        self.drop_errors()
+
+    def test_unhomed_z_moves_nothing(self):
+        m = self.make(3.22)
+        m.toolhead['homed_axes'] = 'xy'
+        m.run('PRINT_END')
+        t = m.timeline
+        self.assertNotIn('Z_PARK', t)
+        self.assertNotIn('G0 X135 Y63 F4800', t)
+        self.assertIn('M84', t)
+        self.assertEqual(len(self.errors()), 1)
+        # Nothing moves, but the guard that stood aside for the tap is
+        # back, and nothing is zeroed (it needs Z homed)
+        tap = m.names().index('AXIS_PROTECTED_MOVE')
+        self.assertIn('SET_CONTACT_GUARD ENABLE=1', t[tap:])
+        self.assertNotIn('SET_CONTACT_GUARD REZERO=1 TRY=1', t)
+        self.assertNotIn('G1 Y10 F4800', t)
+        self.assertTrue(m.guard['enabled'])
+        self.drop_errors()
+
+    def test_a_refused_safe_park_still_reaches_the_cleanup(self):
+        m = self.make(3.22)
+        m.raising.add('Z_PARK')
+        m.run('PRINT_END')
+        t = m.timeline
+        self.assertIn('M84', t)
+        self.assertIn('RESTORE_GCODE_STATE NAME=STATE_PRINT_END', t)
+        self.assertTrue(any('safe park was refused too' in r
+                            for r in m.responses), m.responses)
+        self.assertEqual(len(self.errors()), 1)
+        self.drop_errors()
+
+    def test_a_stop_in_the_window_cuts_and_parks_as_before(self):
+        m = self.make(-6.8)
+        m.run('PRINT_END')
+        names = m.names()
+        # The cut ran: its stroke at the cutter current, then its own park
+        self.assertEqual(names.count('SET_TMC_CURRENT'), 4)
+        self.assertIn('PARK_PRINTER', names)
+        self.assertEqual(m.macro_vars('CUT_FILAMENT')['last_stop_y'], -6.8)
+        # Nothing for the safe park to do: no second park, no report
+        self.assertNotIn('Z_PARK', names)
+        self.assertEqual(self.errors(), [])
+        self.assertFalse(any('parking skipped' in r for r in m.responses))
+        self.assertLess(names.index('PARK_PRINTER'), names.index('M84'))
+        status = m.printer.lookup_object('print_end_park').get_status(0)
+        self.assertFalse(status['failed'])
+
+    WARNING = 'The filament cut at the end of the last print did not finish'
+
+    def start(self, m):
+        # PRINT_START runs as far as this harness takes it; the warning is
+        # its first output, and the start must not stop at it
+        m.timeline.clear()
+        try:
+            m.run('PRINT_START BED=65 EXTRUDER=215 MATERIAL=PLA')
+        except gcode.CommandError:
+            pass
+        warned = [i for i, line in enumerate(m.timeline)
+                  if self.WARNING in line]
+        return warned
+
+    def test_the_next_print_start_warns_after_a_refused_cut(self):
+        m = self.make(3.22)
+        m.run('PRINT_END')
+        self.drop_errors()
+        m.print_stats['state'] = 'printing'
+        warned = self.start(m)
+        self.assertEqual(len(warned), 1, m.timeline)
+        self.assertTrue(m.timeline[warned[0]].startswith(
+            'RESPOND TYPE=error '), m.timeline[warned[0]])
+        # The start went on past the warning, and did not raise it
+        self.assertGreater(len(m.timeline), warned[0] + 5, m.timeline)
+        self.assertIn('M104', m.names()[warned[0]:])
+        self.log.records.clear()
+        m.responses.clear()
+
+    def test_print_start_is_quiet_after_a_cut_that_finished(self):
+        m = self.make(-6.8)
+        m.run('PRINT_END')
+        m.print_stats['state'] = 'printing'
+        self.assertEqual(self.start(m), [])
+        self.assertIn('M104', m.names())
+        self.log.records.clear()
+        m.responses.clear()
+
+    def test_the_next_park_clears_it(self):
+        # `failed` is reset when the next PRINT_END's park starts, so the
+        # warning shows on the start between the two and no longer
+        m = self.make(3.22)
+        m.run('PRINT_END')
+        self.drop_errors()
+        park = m.printer.lookup_object('print_end_park')
+        self.assertTrue(park.get_status(0)['failed'])
+        m.stop_at = -6.8
+        m.amove['last']['position'] = None
+        m.run('PRINT_END')
+        self.assertFalse(park.get_status(0)['failed'])
+        m.print_stats['state'] = 'printing'
+        self.assertEqual(self.start(m), [])
+        self.log.records.clear()
+        m.responses.clear()
+
+    def test_a_cancel_with_a_refused_cut_finishes_the_cancel(self):
+        m = self.make(3.22)
+        m.run('CANCEL_PRINT')
+        t = m.timeline
+        self.assertEqual(m.print_stats['state'], 'cancelled')
+        self.assertFalse(m.pause_resume['is_paused'])
+        self.assertLess(t.index('Z_PARK'), t.index('M84'))
+        self.assertIn('RESTORE_GCODE_STATE NAME=STATE_PRINT_END', t)
+        self.assertIsNotNone(m.first_led())
+        self.assertGreater(t.index('M84'), t.index('CANCEL_PRINT_BASE'))
+        self.assertEqual(len(self.errors()), 1)
+        self.drop_errors()
 
 
 class BedRemovedOutsideThePrintPhase(_M1TestCase):

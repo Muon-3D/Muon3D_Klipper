@@ -316,3 +316,9 @@ finish_test print_cancel "Test cancel during PRINT_START"
 start_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
 $PYTHON test/contact_guard/test_cut_filament_error.py ${DICTDIR}
 finish_test cut_filament_error "Test CUT_FILAMENT error re-enables contact_guard"
+
+# MUON: a refused cut (the Y back stop outside its window) still parks and
+# reports (KAN-3813); reads the log like the test above.
+start_test cut_filament_bad_stop "Test refused CUT_FILAMENT still parks"
+$PYTHON test/contact_guard/test_cut_filament_bad_stop.py ${DICTDIR}
+finish_test cut_filament_bad_stop "Test refused CUT_FILAMENT still parks"
