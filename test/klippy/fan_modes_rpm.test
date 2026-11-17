@@ -1,0 +1,18 @@
+# Tests for fan_modes with a speed_table (ADR 0056)
+DICTIONARY atmega2560.dict
+CONFIG fan_modes_rpm.cfg
+
+; A small command still starts the blower, at the table's first duty
+SET_PART_FAN SPEED=0.01
+SET_PART_FAN SPEED=0.5
+SET_PART_FAN SPEED=1
+
+; Switching mode re-applies the command and reports the target rpm
+SET_PRINT_MODE MODE=quiet
+SET_PRINT_MODE MODE=turbo
+SET_PRINT_MODE MODE=normal
+
+; Off, and the raw path is untouched
+SET_PART_FAN SPEED=0
+M106 S128
+M107

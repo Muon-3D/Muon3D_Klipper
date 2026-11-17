@@ -374,7 +374,14 @@ def test_heater_hold_and_refuse():
     assert h.mcu_pwm.events == [(10.2, 0.6)]
     # A tap hold turns it off at once (not after the next reading) ...
     h.hold_pwm('tap', 10.05)
-    assert h.mcu_pwm.events[-1] == (10.2, 0.), h.mcu_pwm.events
+    # The queued update is at 10.2 (10. + the 0.2 s pwm delay), so the "off"
+    # goes at least 0.1 s after it, at 10.3, not at its clock (4b595e2e: an
+    # "off" on the update's own clock reached the mcu late, "Timer too
+    # close"). The 0.1 and 10.3 are written out on purpose.
+    off_time, off_value = h.mcu_pwm.events[-1]
+    assert off_value == 0., h.mcu_pwm.events
+    assert off_time >= 10.2 + 0.1 - 1e-6, h.mcu_pwm.events
+    assert abs(off_time - 10.3) < 1e-6, h.mcu_pwm.events
     # ... and keeps control from turning it back on
     h.set_pwm(10.2, 0.8)
     assert h.mcu_pwm.events[-1][1] == 0.

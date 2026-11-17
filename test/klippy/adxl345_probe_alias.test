@@ -1,0 +1,7 @@
+# The old [adxl345_probe] section and pin names still load and home
+CONFIG adxl345_probe_alias.cfg
+DICTIONARY linuxprocess.dict
+
+G28 X
+G28 Y
+G28

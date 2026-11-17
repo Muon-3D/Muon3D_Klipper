@@ -1,10 +1,36 @@
 import logging
+import math
 
 import chelper
 from . import force_move
 from . import homing as homing_mod
 
 FORCE_ENABLE_SETTLE_TIME = 0.050
+
+
+def blank_time(distance, speed, accel, blank):
+    """Seconds from the start of a move until it has covered `blank` mm.
+
+    The move is the trapezoid force_move.calc_move_time() describes. A blank
+    at or past the end of the move gives the whole move's duration.
+    """
+    distance = abs(distance)
+    if blank <= 0. or not distance:
+        return 0.
+    axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
+        distance, speed, accel)
+    accel_d = .5 * cruise_v * accel_t
+    cruise_d = cruise_v * cruise_t
+    if blank >= distance:
+        return 2. * accel_t + cruise_t
+    if blank <= accel_d:
+        return math.sqrt(2. * blank / accel)
+    if blank <= accel_d + cruise_d:
+        return accel_t + (blank - accel_d) / cruise_v
+    # In the deceleration: solve d = v*t - a*t^2/2 for the time into it.
+    rem = blank - accel_d - cruise_d
+    t = (cruise_v - math.sqrt(max(0., cruise_v**2 - 2. * accel * rem))) / accel
+    return accel_t + cruise_t + t
 
 
 class ExtruderHoming:
@@ -19,6 +45,8 @@ class ExtruderHoming:
             'accel', 0., minval=0.)
         self.min_extrude_temp_override = config.getfloat(
             'min_extrude_temp_override', None)
+        self.blank_distance = config.getfloat('blank_distance', 0.,
+                                              minval=0.)
         self.next_cmd_time = 0.
         self.commanded_pos = 0.
         self.last_halt_position = 0.
@@ -177,11 +205,24 @@ class ExtruderHoming:
         self.commanded_pos = movepos
         return movetime + accel_t + cruise_t + accel_t
 
-    def _do_homing_move(self, distance, speed, accel, stop_on_endstop):
+    def _do_homing_move(self, distance, speed, accel, stop_on_endstop,
+                        blank=0.):
         self.homing_accel = accel
         pos = [self.commanded_pos + distance, 0., 0., 0.]
         endstops = [(self.mcu_endstop, self.query_name)]
         hmove = homing_mod.HomingMove(self.printer, endstops, self)
+        # BLANK: the endstop is not watched until the move has covered that
+        # many mm. The move starts HOMING_START_DELAY after the endstop is
+        # armed (homing.py), so the check starts that much later too. The
+        # endstop object itself is kept, not wrapped: tmc.py's virtual
+        # endstop recognises its own homing moves by identity.
+        delay = blank_time(distance, speed, accel, blank)
+        if delay:
+            delay += homing_mod.HOMING_START_DELAY
+            home_start = self.mcu_endstop.home_start
+            def blanked_home_start(print_time, *args, **kwargs):
+                return home_start(print_time + delay, *args, **kwargs)
+            self.mcu_endstop.home_start = blanked_home_start
         try:
             hmove.homing_move(pos, speed, probe_pos=True,
                               triggered=stop_on_endstop > 0,
@@ -191,6 +232,9 @@ class ExtruderHoming:
                 raise self.printer.command_error(
                     "Homing failed due to printer shutdown")
             raise
+        finally:
+            if delay:
+                del self.mcu_endstop.home_start
         return self.commanded_pos
 
     cmd_EXTRUDER_HOMING_MOVE_help = (
@@ -205,17 +249,18 @@ class ExtruderHoming:
         speed = gcmd.get_float('SPEED', self.velocity, above=0.)
         accel = gcmd.get_float('ACCEL', self.accel, minval=0.)
         set_position = gcmd.get_float('SET_POSITION', None)
+        blank = gcmd.get_float('BLANK', self.blank_distance, minval=0.)
         self._check_can_move(distance)
         logging.info("EXTRUDER_HOMING_MOVE %s distance=%.6f speed=%.6f"
-                     " accel=%.6f stop=%d set_position=%s",
+                     " accel=%.6f stop=%d set_position=%s blank=%.3f",
                      self.target_name, distance, speed, accel,
-                     stop_on_endstop, set_position)
+                     stop_on_endstop, set_position, blank)
         did_enable = self._force_enable()
         old_trapq = self._begin_manual_session()
         start_pos = self.commanded_pos
         try:
             move_end_pos = self._do_homing_move(distance, speed, accel,
-                                                stop_on_endstop)
+                                                stop_on_endstop, blank)
             if set_position is not None:
                 self._set_stepper_position(set_position)
         finally:

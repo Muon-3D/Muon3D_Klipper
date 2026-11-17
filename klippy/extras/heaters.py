@@ -24,6 +24,15 @@ AMBIENT_TEMP = 25.
 PID_PARAM_BASE = 255.
 MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
+# MUON: the least time from a pwm update still queued to a hold's "off".
+# The host's serial queue holds a pwm command back until the mcu has reached
+# the previous one's clock (minclock), so an "off" at that same clock leaves
+# only when it is due and arrives late: "Timer too close" on the toolhead.
+# A tap hold on sloe did this on 2026-11-12, when the tap began within 0.1 s
+# of a PID update (the shutdown dump shows it). The gap gives the "off" the
+# usual 0.1 s to arrive.
+# set_pwm does not need it: its updates are a report interval apart.
+PWM_QUEUE_GAP = 0.100
 
 class Heater:
     def __init__(self, config, sensor):
@@ -58,6 +67,9 @@ class Heater:
         self.last_pwm_time = 0.
         # Named holds that force the heater off (see hold_pwm)
         self.pwm_holds = {}
+        # Host time the last hold was released, for verify_heater, which
+        # samples once a second and so would miss most short holds.
+        self.last_hold_release = None
         # Setup control algorithm sub-class
         # algos = {'watermark': ControlBangBang, 'pid': ControlPID}
         # algo = config.getchoice('control', algos)
@@ -203,14 +215,22 @@ class Heater:
                 return
             if not self.last_pwm_value:
                 return
-            pwm_time = max(print_time, self.last_pwm_time)
+            pwm_time = max(print_time, self.last_pwm_time + PWM_QUEUE_GAP)
+            if pwm_time > print_time:
+                logging.info("%s: hold '%s' off moved %.0f ms to go after"
+                             " a queued update", self.name, name,
+                             (pwm_time - print_time) * 1000.)
             self.last_pwm_time = pwm_time
             self.last_pwm_value = 0.
             self.next_pwm_time = 0.
             self.mcu_pwm.set_pwm(pwm_time, 0.)
     def release_pwm(self, name):
         with self.lock:
-            self.pwm_holds.pop(name, None)
+            if name in self.pwm_holds:
+                del self.pwm_holds[name]
+                self.last_hold_release = self.printer.get_reactor().monotonic()
+    def get_last_hold_release(self):
+        return self.last_hold_release
     def get_pwm_holds(self):
         return dict(self.pwm_holds)
     # External commands
@@ -491,6 +511,7 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+            gcode.check_abort()
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
@@ -515,12 +536,14 @@ class PrinterHeaters:
         else:
             sensor = self.printer.lookup_object(sensor_name)
         toolhead = self.printer.lookup_object("toolhead")
+        gcode = self.printer.lookup_object("gcode")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
             temp, target = sensor.get_temp(eventtime)
             if temp >= min_temp and temp <= max_temp:
                 return
+            gcode.check_abort()
             print_time = toolhead.get_last_move_time()
             gcmd.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)

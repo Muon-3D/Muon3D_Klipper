@@ -2,7 +2,8 @@
 #
 # Axis-agnostic parking/protected-move helper using either:
 # - TMC virtual endstops (sensorless stall), or
-# - The axis' configured endstop (for example adxl345_probe:x/y_virtual_endstop)
+# - The axis' configured endstop (for example
+#   accelerometer_probe:x/y_virtual_endstop)
 #
 # License: GPLv3 (same as Klipper)
 from . import homing as homing_mod
@@ -60,6 +61,11 @@ class AxisAdvancedHomingMovement:
         self.axis_ctx = {}      # axis -> context dict
         self.axis_errors = {}   # axis -> user-visible error string
         self.endstop_cache = {} # virtual_endstop pin -> mcu_endstop
+        # What the last AXIS_HOME_MOVE or AXIS_PROTECTED_MOVE found, for
+        # macros: printer.advanced_homing_movement.last. A macro renders
+        # before it runs, so read it in a macro called after the move.
+        self.last = self._new_result(None, None, None)
+        self.count = 0
 
         # Keep config for lazy axis initialization.
         self._config = config
@@ -75,6 +81,31 @@ class AxisAdvancedHomingMovement:
         self.gcode.register_command(
             'AXIS_PROTECTED_MOVE', self.cmd_AXIS_PROTECTED_MOVE,
             desc=self.cmd_AXIS_PROTECTED_MOVE_help)
+
+    def _new_result(self, command, axis, direction):
+        # position is in printer coordinates, and None unless the axis was
+        # homed and the endstop triggered (an unhomed axis has no frame).
+        return {'command': command, 'axis': axis, 'direction': direction,
+                'homed': False, 'triggered': False, 'position': None,
+                'count': getattr(self, 'count', 0)}
+
+    def _start_result(self, command, axis, direction):
+        self.count += 1
+        self.last = self._new_result(command, axis, direction)
+        self.last['count'] = self.count
+        return self.last
+
+    def get_status(self, eventtime=None):
+        # mcu_steps: each X/Y/Z stepper's position in microsteps as the mcu
+        # counts them. Homing resets the commanded position, not these, so
+        # the same commanded position before and after a re-home differs
+        # here by exactly the steps the motor lost (STEPLOSS_TEST).
+        steps = {}
+        toolhead = self.printer.lookup_object('toolhead', None)
+        if toolhead is not None:
+            for s in toolhead.get_kinematics().get_steppers():
+                steps[s.get_name()] = s.get_mcu_position()
+        return {'last': dict(self.last), 'mcu_steps': steps}
 
     def _parse_endstop_source(self, config, option, default):
         raw = config.get(option, default)
@@ -339,6 +370,8 @@ class AxisAdvancedHomingMovement:
         start_axis_virtual = end_axis - sign * travel
         was_homed = axis in ks.get('homed_axes', '')
         original_axis = toolhead.get_position()[axis_i]
+        result = self._start_result('AXIS_HOME_MOVE', axis, direction)
+        result['homed'] = was_homed
 
         coord_offset = None
         frame_restored = False
@@ -356,6 +389,9 @@ class AxisAdvancedHomingMovement:
             pos_after_virtual = toolhead.get_position()
             trigger_axis_real = pos_after_virtual[axis_i] + coord_offset
             final_axis_real = trigger_axis_real
+            result['triggered'] = True
+            if was_homed:
+                result['position'] = trigger_axis_real
             if was_homed:
                 # Retract in real coordinates when the axis already had a
                 # trusted frame.
@@ -469,9 +505,30 @@ class AxisAdvancedHomingMovement:
         ks = kin.get_status(self.printer.get_reactor().monotonic())
         was_homed = axis in ks.get('homed_axes', '')
         original_axis = toolhead.get_position()[axis_i]
+        result = self._start_result('AXIS_PROTECTED_MOVE', axis, direction)
+        result['homed'] = was_homed
 
         cur = toolhead.get_position()
+        if not was_homed:
+            # An unhomed axis has no real coordinate. Start the move from
+            # the far end of the axis, so any DIST up to the axis span stays
+            # inside its limits (from the leftover coordinate, a long move
+            # was refused as out of range). The coordinate is put back after.
+            # A negative DIST moves against DIR.
+            _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
+            if abs(dist) > axis_max - axis_min:
+                raise gcmd.error(
+                    "AXIS_PROTECTED_MOVE: DIST=%.3f exceeds the %s axis span"
+                    " %.3f" % (dist, axis.upper(), axis_max - axis_min))
+            cur[axis_i] = axis_max if sign * dist < 0. else axis_min
         target_axis = cur[axis_i] + sign * dist
+        if was_homed:
+            # Stop at the axis limit rather than be refused past it. The
+            # caller's DIST is in G-code terms, and a coordinate transform
+            # (skew) can put the toolhead a little off them.
+            _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
+            target_axis = self._clamp_axis_target(target_axis, axis_min,
+                                                  axis_max)
         toolhead.set_position(list(cur), homing_axes=axis)
 
         try:
@@ -484,6 +541,20 @@ class AxisAdvancedHomingMovement:
 
             pos_after = toolhead.get_position()
             stalled = abs(pos_after[axis_i] - target_axis) > 0.001
+            sim_at = gcmd.get_float('SIM_STALL_AT', None)
+            if (sim_at is not None
+                    and self.printer.get_start_args().get('debuginput')
+                    is not None):
+                # Batch tests only (test/klippy/cut_filament.cfg): a
+                # simulated MCU never triggers an endstop part way, so the
+                # test says where the stop was found. Never on a printer.
+                pos_after = list(pos_after)
+                pos_after[axis_i] = sim_at
+                toolhead.set_position(pos_after)
+                stalled = True
+            result['triggered'] = stalled
+            if stalled and was_homed:
+                result['position'] = pos_after[axis_i]
             if stalled and backoff > 0.0:
                 final_axis = pos_after[axis_i] - sign * backoff
                 backoff_pos = [None, None, None]

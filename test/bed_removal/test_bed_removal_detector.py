@@ -56,6 +56,13 @@ class FakeHeater:
     def __init__(self):
         self.temp = ATTACHED
         self.target = ATTACHED
+        # The detector samples last_temp each time last_temp_time moves on,
+        # as a real heater's temperature callback advances it.
+        self.last_temp_time = 0.
+
+    @property
+    def last_temp(self):
+        return self.temp
 
     def get_temp(self, eventtime):
         return self.temp, self.target
@@ -143,6 +150,7 @@ class FakePrinter:
         self.reactor = reactor
         self.objects = {}
         self.handlers = {}
+        self.events = []
         self.with_sdcard = with_sdcard
 
     def get_reactor(self):
@@ -160,6 +168,10 @@ class FakePrinter:
 
     def register_event_handler(self, event, callback):
         self.handlers.setdefault(event, []).append(callback)
+
+    def send_event(self, event, *params):
+        self.events.append(event)
+        return [cb(*params) for cb in self.handlers.get(event, [])]
 
 
 class FakeConfig:
@@ -226,6 +238,7 @@ class Machine:
         self.bed.heater.temp = temp
         for _ in range(count):
             self.reactor.now += 0.1
+            self.bed.heater.last_temp_time = self.reactor.now
             self.detector.check_bed_temperature(self.reactor.now)
 
     def pull_plate(self):
@@ -265,6 +278,41 @@ class PausesOnlyWhileAFileIsPrinting(unittest.TestCase):
         self.assertEqual(self.m.bed.heater.target, 0.)
         self.assertTrue(self.status()['bedRemoved'])
         self.assertEqual(self.m.gcode.scripts, ['BED_REMOVED'])
+
+    def test_a_failing_listener_cannot_skip_the_safety_steps(self):
+        # The heater goes off and the print pauses even if a listener of
+        # bed_removal_detector:removed raises
+        def boom():
+            raise RuntimeError("listener failed")
+        self.m.printer.register_event_handler(
+            "bed_removal_detector:removed", boom)
+        self.m.start_file()
+        self.m.pull_plate()
+        self.assert_paused()
+        self.assert_safety_actions()
+        self.assertIn("bed_removal_detector:removed",
+                      self.m.printer.events)
+
+    def test_event_is_sent_after_heater_off_and_before_the_pause(self):
+        # Under virtual_sdcard the pause waits in the reactor, so listeners
+        # (contact_guard) must hear about the removal before it, but the
+        # heater is zeroed first.
+        seen = []
+        def listener():
+            seen.append((self.m.bed.heater.target,
+                         self.m.pause_resume.pauses_sent))
+        self.m.printer.register_event_handler(
+            "bed_removal_detector:removed", listener)
+        self.m.start_file()
+        self.m.pull_plate()
+        self.assertEqual(seen, [(0., 0)])
+        self.assert_paused()
+
+    def test_removal_tells_contact_guard(self):
+        # contact_guard drops the known plate height on this event
+        self.m.pull_plate()
+        self.assertIn("bed_removal_detector:removed",
+                      self.m.printer.events)
 
     def test_mid_print_removal_pauses(self):
         # KAN-79: the behaviour that must not regress.

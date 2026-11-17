@@ -23,6 +23,10 @@ class NozzleWipeSmart:
         self.plunge = config.getfloat("plunge", 1.2, minval=0.0)
         self.sx = config.getfloat("sx", 9.0, above=0.0)
         self.sy = config.getfloat("sy", 2.0, above=0.0)
+        # If set, the travel to the pad goes via (x, approach_y) and then
+        # straight in Y to the pad, instead of diagonally (M1: the cutter nub
+        # sits near the pad).
+        self.approach_y = config.getfloat("approach_y", None)
         self.passes = config.getint("passes", 5, minval=1)
         self.f_travel = config.getfloat("f_travel", 7800.0, above=0.0)
         self.f_wipe = config.getfloat("f_wipe", 2000.0, above=0.0)
@@ -129,8 +133,11 @@ class NozzleWipeSmart:
         self.gcode.run_script_from_command(script)
 
     def _set_fan(self, fan_pct):
+        # M106.1, the raw duty: M106 maps through the print mode's curve
+        # ([fan_modes]), which turned 20 % into about 10 % duty on the M1's
+        # blower, too little to cool the nozzle (sloe, 2026-11-10).
         fan_s = int(max(0.0, min(1.0, fan_pct)) * 255.0)
-        self._run_script("M106 S%d" % (fan_s,))
+        self._run_script("M106.1 S%d" % (fan_s,))
 
     def _fan_off(self):
         self._run_script("M106 S0")
@@ -160,9 +167,15 @@ class NozzleWipeSmart:
             "G90",
             "G0 Z%.6f F%.6f" % (z_safe, params["f_travel"]),
         ]
-        if position.y < params["y"]:
-            lines.append("G0 Y%.6f F%.6f" % (params["y"], params["f_travel"]))
+        via_y = params["y"]
+        if self.approach_y is not None:
+            via_y = max(params["y"], self.approach_y)
+        if position.y < via_y:
+            lines.append("G0 Y%.6f F%.6f" % (via_y, params["f_travel"]))
             lines.append("M400")
+        if via_y != params["y"]:
+            lines.append("G0 X%.6f Y%.6f F%.6f" % (
+                params["x"], via_y, params["f_travel"]))
         lines.extend([
             "G0 X%.6f Y%.6f F%.6f" % (
                 params["x"], params["y"], params["f_travel"]),
@@ -284,6 +297,10 @@ class NozzleWipeSmart:
                     self.phase = "IDLE"
                     gcmd.respond_info("NOZZLE_WIPE_SMART: stop requested")
                     return
+                # A cancelled print, see gcode.run_abortable_script(). The
+                # HEAT_WAIT phase alone polls for 20-40 s with no command
+                # boundary for the abort to land on.
+                self.gcode.check_abort()
                 if self.iter >= params["max_iter"]:
                     temp, target = self._get_temp(extruder)
                     self._abort_outputs(extruder)
@@ -342,6 +359,13 @@ class NozzleWipeSmart:
                     self.active = False
                     raise gcmd.error(
                         "NOZZLE_WIPE_SMART: unknown phase %s" % (self.phase,))
+        except self.gcode.abort_error:
+            # Treated as a stop, not a failure: outputs off, phase IDLE.
+            self.active = False
+            if not self.printer.is_shutdown():
+                self._abort_outputs(extruder)
+            self.phase = "IDLE"
+            raise
         except Exception as e:
             self.last_error = str(e)
             self.active = False

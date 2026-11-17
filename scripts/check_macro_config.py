@@ -259,7 +259,10 @@ def _line_of(option_line, value_lines, name):
 
 
 def main():
-    config_dir = os.path.join(ROOT, 'core')
+    # Optional argument: another config directory (core/M1-B0), relative to
+    # the repo root or absolute. Default: all of core/.
+    config_dir = os.path.join(ROOT, sys.argv[1] if len(sys.argv) > 1
+                              else 'core')
     if not os.path.isdir(config_dir):
         sys.stderr.write("missing directory: %s\n" % config_dir)
         return 2

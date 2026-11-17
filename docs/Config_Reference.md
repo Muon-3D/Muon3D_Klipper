@@ -1516,6 +1516,23 @@ home_xy_position:
 #   positions after Z axis homing. The default is False.
 ```
 
+### [homing]
+
+Limits on homing and probing moves. This section is optional.
+
+```
+[homing]
+#max_search_distance_z: 0
+#   The furthest (in mm) that one Z probing move, including the Z
+#   homing search of a load cell probe, may travel. If the probe has
+#   not triggered by then the move stops with an error ("Z homing
+#   stopped: no contact within N mm") instead of running on to the
+#   axis limit. 0 turns the limit off. X and Y moves are never
+#   limited. The default is 0 (off): a search that starts blind from
+#   a soft-homed Z needs the full travel, so only set this if the
+#   start is known to be close.
+```
+
 ### [homing_override]
 
 Homing override. One may use this mechanism to run a series of g-code
@@ -1969,6 +1986,123 @@ Support for LIS3DH accelerometers.
 #axes_map: x, y, z
 #   See the "adxl345" section for information on this parameter.
 ```
+
+### [adxl345_probe]
+
+X/Y virtual endstops (and an optional Z probe) driven by an
+accelerometer's tap interrupt. The toolhead is driven into the frame and
+the impact, detected by the chip, is wired to an MCU pin that acts as the
+endstop. The chip is an [adxl345](#adxl345) or a [lis2dw](#lis2dw)
+(LIS2DW12 only, on SPI) section; the backend follows from the section
+`chip` names. See [Accelerometer tap homing](Accel_Tap_Homing.md) for
+how the settings map onto each chip's registers.
+
+```
+[adxl345_probe]
+#chip: adxl345
+#   Name of the accelerometer config section: an adxl345 section or a
+#   lis2dw section. The default is "adxl345".
+probe_pin:
+#   MCU pin the chip's interrupt output is wired to. This parameter must
+#   be provided.
+int_pin:
+#   Chip interrupt output that is wired to probe_pin: int1 or int2,
+#   prefixed with "!" if the interrupt should be active low. The
+#   LIS2DW12 can route tap and wake-up events to INT1 only. This
+#   parameter must be provided.
+#tap_thresh: 5000
+#   Tap threshold in mm/s^2 (9806.65 mm/s^2 = 1g). The chip quantises
+#   it: ADXL345 62.5mg steps (rounded down). LIS2DW12 single_tap uses
+#   full_scale/32 steps (125mg at +-4g), wake_up full_scale/64 steps
+#   (62.5mg at +-4g), rounded to the nearest step, from 1 step to 31
+#   (single_tap) or 63 (wake_up) steps. The value the chip uses is
+#   reported by SET_ACCEL_PROBE and in the status as
+#   tap_thresh_effective.
+#tap_dur: 0.01
+#   Longest time, in seconds, an impact may stay above tap_thresh and
+#   still count as a tap. ADXL345: 0.625ms steps, up to 0.1s. LIS2DW12
+#   single_tap: the SHOCK window, which is 4/ODR, 8/ODR, 16/ODR or
+#   24/ODR (2.5, 5, 10 or 15ms at 1600Hz); the shortest window at least
+#   tap_dur is used, and a tap_dur longer than 24/ODR is a config error.
+#   Not used by the LIS2DW12 wake_up event.
+#tap_axes: xyz
+#   Printer axes whose taps the Z profile reacts to. ADXL345: written
+#   to TAP_AXES unchanged, where "x" enables the chip's Z axis and "z"
+#   its X axis (the A1 tuning was done that way). LIS2DW12: printer
+#   axes, translated to chip axes through the lis2dw section's axes_map.
+#   Not enforceable with the LIS2DW12 wake_up event, which fires on any
+#   axis.
+#x_tap_thresh:
+#x_tap_dur:
+#x_tap_axes: x
+#y_tap_thresh:
+#y_tap_dur:
+#y_tap_axes: y
+#z_tap_thresh:
+#z_tap_dur:
+#z_tap_axes:
+#   Per-axis profile overrides. The thresh and dur defaults are
+#   tap_thresh and tap_dur; x_tap_axes defaults to "x", y_tap_axes to
+#   "y" and z_tap_axes to tap_axes.
+#homing_tap_arm_delay: 0.030
+#x_homing_tap_arm_delay:
+#y_homing_tap_arm_delay:
+#z_homing_tap_arm_delay:
+#   Seconds after the start of a homing move before the interrupt is
+#   armed, so the start of the move is not taken for the impact. Armed
+#   at the move's print_time on the chip's MCU clock.
+#tap_confirm_samples: 1
+#   Agreeing taps required before an X/Y home is accepted. Above 1, the
+#   axis backs off tap_confirm_retract_dist and re-approaches until that
+#   many consecutive taps land within tap_confirm_tolerance.
+#tap_confirm_tolerance: 0.2
+#   Largest distance (mm) between consecutive agreeing taps.
+#tap_confirm_retries: 2
+#   Disagreements allowed before the home fails.
+#tap_confirm_retract_dist: 3
+#   Back-off distance (mm) between confirmation taps. Must exceed
+#   homing_speed * homing_tap_arm_delay.
+#tap_confirm_retract_speed:
+#   Default is the rail's homing_retract_speed.
+#tap_confirm_speed:
+#   Re-approach speed. Default is the rail's homing_speed.
+#tap_confirm_seek_retries: 1
+#   Times the seek resumes after a tap is judged spurious (no contact
+#   within 2 * tap_confirm_retract_dist).
+#tap_confirm_max_seek_dist:
+#   Travel budget (mm) for resumed seeks. Default is the axis travel.
+#   Every tap_confirm_ option also accepts an x_ or y_ prefix.
+#lis2dw_tap_event: single_tap
+#   LIS2DW12 only. "single_tap" uses the tap engine (per-axis enables,
+#   tap_dur as the SHOCK window). "wake_up" uses the wake-up engine: it
+#   fires as soon as the high-pass filtered acceleration exceeds the
+#   threshold on any axis, with no duration limit and no per-axis
+#   selection.
+#lis2dw_odr: 1600
+#   LIS2DW12 only. Output data rate while tap detection is set up: 400,
+#   800 or 1600 (Hz). Sets the timing resolution of the trigger and the
+#   SHOCK window steps.
+#lis2dw_full_scale: 4
+#   LIS2DW12 only. Full scale in g: 2, 4, 8 or 16. Thresholds are
+#   relative to it. Streaming (lis2dw.py, resonance testing) runs at
+#   1600Hz +-16g and rewrites both registers; tap detection restores its
+#   own on the next homing move, and refuses to run during a stream
+#   unless lis2dw_odr is 1600 and lis2dw_full_scale is 16.
+#enable_z_probe: False
+#   Register a [probe] that uses the Z profile and z_virtual_endstop.
+#z_offset:
+#   Required when enable_z_probe is True.
+#activate_gcode:
+#deactivate_gcode:
+#   G-Code run before and after each Z probing move.
+#disable_fans:
+#   Comma separated fan objects switched off while Z probing.
+```
+
+The pins are `adxl345_probe:x_virtual_endstop`,
+`adxl345_probe:y_virtual_endstop` and (with enable_z_probe)
+`adxl345_probe:z_virtual_endstop`. The X and Y rails take their
+`position_endstop` from their stepper sections.
 
 ### [bmi160]
 
@@ -2676,6 +2810,14 @@ endstop_pin:
 #   of zero will result in no acceleration. This value will be used if
 #   EXTRUDER_HOMING_MOVE does not specify an ACCEL parameter. The
 #   default is zero.
+#blank_distance: 0
+#   Ignore the endstop for this many mm at the start of each move. A
+#   StallGuard virtual endstop can report a stall while the motor is
+#   still slow, early in the acceleration, or while the drive gears
+#   first grip the filament. Keep it shorter than the shortest distance
+#   at which a real stop can happen. This value will be used if
+#   EXTRUDER_HOMING_MOVE does not specify a BLANK parameter. The
+#   default is 0, which watches the endstop from the start.
 #min_extrude_temp_override:
 #   Override the normal extruder `min_extrude_temp` safety check for
 #   EXTRUDER_HOMING_MOVE only. If set, the command is allowed once the
@@ -4726,6 +4868,141 @@ run_current:
 #   sensorless homing.
 ```
 
+### [z_power]
+
+Muon M1 B1 Z column and bed power path. The 48 V feed to the Z column and
+the removable bed passes through an eFuse whose enable this module drives.
+It switches the feed on only when the Z column is present with its lever
+locked (`present_pin`, a resistor divider read in three bands) and
+`[bed_removal_detector]` reports a plate, and off as soon as either stops
+being true. Plate presence is the detector's judgement alone (it is
+unknown, and the feed stays off, until the detector has measured), so a
+`[bed_removal_detector]` section is required. The bed thermistor is wired
+through the Z column, so that judgement only counts once the column has
+been plugged in for `plate_settle_time`.
+The bed heater refuses a target unless the path is `ready`. The eFuse PGOOD
+must rise within `power_good_timeout` of enabling, and a later PGOOD drop,
+a current above `max_current`, or current drawn with the bed heater off
+latch a fault that holds the feed off until `Z_POWER_RESET`. The status
+object reports `state`, `reason`, `z`, `plate_present`, `enabled`,
+`power_good`, `present_ratio`, `current` (A), `power` (W), `fault`,
+`fault_detail` (the peak current and recent PGOOD polls at the fault),
+`pgood_glitches` (PGOOD lows that came back before a fault latched),
+`last_pgood_glitch` and `last_pgood_glitch_age` (s).
+
+```
+[z_power]
+enable_pin:
+#   The eFuse enable output. It is off at startup and on an mcu shutdown.
+#   This parameter must be provided.
+power_good_pin:
+#   The eFuse PGOOD input (high when the feed is up). This parameter must
+#   be provided.
+present_pin:
+#   The ADC pin reading the Z column presence and lever divider. This
+#   parameter must be provided.
+present_absent_range:
+present_unlocked_range:
+present_locked_range:
+#   "low, high" ADC ratio (0..1) for each Z_PRESENT state. A reading in no
+#   range counts as unknown and keeps the feed off. These parameters must
+#   be provided.
+#present_samples: 3
+#   Consecutive readings (0.1 s apart) before a Z_PRESENT state change is
+#   accepted.
+#current_pin:
+#   Optional ADC pin on the eFuse IMON output.
+#current_per_volt: 2.24
+#adc_voltage: 3.3
+#   Current in amps per volt at current_pin, and the ADC reference voltage.
+#max_current: 5.0
+#max_current_time: 0.5
+#   A current above max_current for max_current_time seconds is a fault.
+#idle_current: 1.0
+#idle_current_time: 2.0
+#   A current above idle_current for idle_current_time seconds while the
+#   bed heater is off is a fault.
+#supply_voltage: 45.0
+#   Used for the reported power when no [tmc_driver_monitor] supply
+#   reading is available.
+#heater: heater_bed
+#   The heater whose target is gated.
+#power_good_timeout: 2.0
+#   Seconds PGOOD has to rise after the enable pin changes. The default
+#   outlasts the TPS16630's own start-up limit (thermal regulation up to
+#   1.5 s, then a 13 ms PGOOD deglitch). The fault text gives the highest
+#   IMON current seen while waiting.
+#power_good_drop_samples: 3
+#   Consecutive polls (0.1 s apart) PGOOD must stay low while the path is
+#   ready before a "PGOOD dropped" fault latches. A shorter low is counted
+#   as a glitch and logged, and the feed stays on. 1 latches on the first
+#   low poll. A low within power_good_timeout of PGOOD first coming up is
+#   treated as part of the start-up, not as a drop.
+#plate_settle_time: 2.0
+#   Seconds the Z column must be plugged in before the plate reading
+#   counts. The bed thermistor input floats while the column is out.
+#lost_gcode:
+#   G-Code run when a READY path goes down for any reason other than the
+#   plate being removed (bed_removal_detector handles that) or a fault.
+#fault_gcode:
+#   G-Code run when a fault latches.
+#xy_requires_column: True
+#   Refuse any G-code X/Y move (and the homing macros refuse an X/Y
+#   home) unless the Z column is plugged in, locked or not: folded,
+#   the Z axis is in the gantry's path. Set False only on a
+#   development unit run without a column. The status object reports
+#   the result as `xy_allowed`.
+```
+
+### [m1_machine]
+
+Muon M1 machine state: the one owner of what the printer is doing and of
+what each action needs. It reads `[z_power]` (column, bed power path),
+`[bed_removal_detector]` (plate), the `toolhead` MCU, `muon_hotend`, the
+toolhead filament switch, `[hotend_fan_latch]`, `print_stats` and
+`pause_resume`, each optional, and moves nothing itself. While a print is
+paused it leaves a running part fan at the print's speed until the hot
+end has cooled below `pause_cool_temp`, then turns it off. The status object
+reports `activity` (`idle`, `busy`, `waiting`, `preparing`, `printing`,
+`paused`, `complete`, `cancelled`, `error`, `fault`), `conditions`,
+`missing` and `ready` per action (`print`, `resume`, `home_z`, `home_xy`;
+the missing items are reason codes), `faults`, `pause_reason`,
+`plate_cleared`, `job_targets` (the last non-zero bed and hot-end targets
+the print set), `saved_fan`, `cooling` (the pause cool-down is running),
+`toolhead_hotplug` (the last toolhead connect was a toolhead plugged in,
+not a Klipper start) and `gate`. With this section
+loaded, `[filament_switch_sensor]` treats only a running, unpaused print
+file as printing, not toolhead motion.
+
+```
+[m1_machine]
+#settle_time: 3
+#   Seconds every condition must hold before MACHINE_WAIT_READY continues.
+#gate_timeout: 1800
+#   Seconds MACHINE_WAIT_READY waits before it fails (0 waits for ever).
+#pause_bed_off_time: 1800
+#   Seconds into a pause after which the bed is turned off. RESUME reheats
+#   it to the print's target. 0 keeps it on.
+#require_plate_cleared: True
+#   After a print that printed something, refuse the next print until the
+#   plate has been taken off and refitted (or MACHINE_PLATE_CLEAR).
+#pause_cool_temp:
+#   On a pause, a part fan that was on keeps running at the print's speed
+#   until the hot end is below this temperature, where filament no longer
+#   oozes from the nozzle. The default is [nozzle_wipe_smart]'s
+#   fan_off_temp, or 160. 0 disables the cool-down: the fan is turned off
+#   at once.
+#pause_cool_max_time: 600
+#   The longest the cool-down runs, in seconds (0 for no limit).
+#toolhead_startup_grace: 15
+#   A first toolhead connect later than this many seconds after Klipper is
+#   ready counts as a toolhead plugged in, as any reconnect does.
+#poll_time: 0.5
+#toolhead_mcu: toolhead
+#filament_sensor: filament_sensor_toolhead
+#hotend: extruder
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]
@@ -5740,6 +6017,39 @@ sensor_type:
 #   Raw ADC value for the stable max-load anchor used by
 #   safety_model=preloaded_max. This can be set manually or captured with
 #   LOAD_CELL_CALIBRATE_MAX.
+#press_direction:
+#   -1 or 1: the way pressing on the nozzle moves the raw counts when
+#   safety_model=preloaded_max. The default is the sign of
+#   reference_max_load_counts (the max-load anchor is on the press side of
+#   zero). This is never inferred from the tare. It must be set if
+#   reference_max_load_counts is 0.
+#min_tare_headroom_percent: 20.0
+#   With safety_model=preloaded_max, probing is refused ("The nozzle is
+#   already under load") when the tare is closer to reference_max_load_counts
+#   than this percentage of abs(reference_max_load_counts), or past it. This
+#   catches something resting on the nozzle at tare. 0 to below 100.
+#z_move_abort_ceiling_factor: 2.5
+#   While a Z probing move runs (the Z homing search is one) the host
+#   watches the load cell and ends the move when the load is more than
+#   this many times the trigger's own count delta away from the tare, on
+#   either side, for z_move_abort_confirm_time. It backs up the MCU
+#   trigger, and stops a push even if the trigger never fires. The
+#   move fails with "Homing aborted: the load on the nozzle exceeded the
+#   safety ceiling during the Z move". 0 turns it off, otherwise at
+#   least 1.5. The default is 2.5.
+#z_move_abort_ceiling_counts: 0
+#   An explicit ceiling in raw counts from the tare, used instead of
+#   z_move_abort_ceiling_factor when above 0. The default is 0.
+#z_move_wrong_way_factor: 1.0
+#   Ends the move ("the load cell moved the wrong way during the Z
+#   move") when the load moves away from the press direction by this
+#   many times the trigger's count delta. Only for a directed trigger
+#   (trigger_counts or trigger_percent with safety_model=preloaded_max),
+#   and not on a descent that uses MCUTARE. 0 turns it off, otherwise at
+#   least 0.5. The default is 1.0.
+#z_move_abort_confirm_time: 0.020
+#   How long (in seconds) a limit must hold, in consecutive samples,
+#   before the move is ended. 0.002 to 0.2. The default is 0.020.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than
@@ -5792,7 +6102,36 @@ sensor_type:
 
 ### [contact_guard]
 
-Refuse G-code moves that would drag the nozzle across the plate. Between
+Refuse G-code moves that would drag the nozzle across the plate.
+
+With `move_guard: height` (the default) the guard decides on the known
+plate height and never on the load cell. A G-code move with an X or Y
+component is refused only if its lowest point is below `contact_z` (plus
+`unmeshed_margin` while no bed mesh is active, or where either end of the
+move is outside the region the active mesh probed), with "The plate is at
+the nozzle ...: lift Z before moving X or Y". If the height is not known
+(Z not homed, or homed and then invalidated by a position reset outside
+homing, a FORCE_MOVE of Z, the Z motor turned off, the bed removed, or a
+homing or probing move that failed) an X or Y move is refused with "Home
+first: ...", unless a homing move has lifted the plate by at least
+`lift_clear_min` (the M1's G28 lifts 10 mm before it homes X and Y), no
+G-code move has taken Z down since, every Z stepper is still
+`lift_clear_min` above where the lift began (on its own step count, so Z
+moves made outside G-code count too), and Z has not been forced or turned
+off and the bed has not been removed: the plate is then clear, and X and Y
+may move at that height or higher. A bed mesh that was loaded when the bed
+was removed is treated as no mesh until another is loaded. Moves that
+modules make directly on the toolhead (SHAPER_CALIBRATE, the AXIS_* moves
+of X and Y) do not pass through the guard. The guard is inactive during a job, during homing and probing and
+during NOZZLE_WIPE_SMART. In this mode `printer.contact_guard.contact` is
+the height decision, `home_required`, `z_known` and `lift_clear` report the
+height state, and the load cell model below still runs and reports `load`
+and `load_contact` but refuses nothing.
+
+With `move_guard: load_cell` the load cell contact model decides instead.
+It is kept for probing and contact detection work and is not meant for
+moves on a printer: the cell reads many times `threshold_counts` during
+plain X and Y motion. In that mode, between
 probes the guard watches the `[load_cell_probe]` load cell and reports
 contact when the load stays above `threshold_counts`. While it does, a
 G-code move with an X or Y component that does not also raise Z fails with
@@ -5816,6 +6155,22 @@ recognised as a job. See the
 
 ```
 [contact_guard]
+#move_guard: height
+#   What refuses an X or Y move: "height" (the known plate height, "Home
+#   first" when it is not known) or "load_cell" (the load cell contact
+#   model). The default is height.
+#contact_z: 0.1
+#   move_guard: height. The lowest G-code Z, in mm, at which X and Y may
+#   move. With a bed mesh active this is the height above the measured
+#   surface.
+#unmeshed_margin: 2.5
+#   move_guard: height. Added to contact_z while no bed mesh is active,
+#   when Z is only known at the point Z homing probed, and for a move
+#   with either end outside the region the active mesh probed.
+#lift_clear_min: 5.0
+#   move_guard: height. How far, in mm, a homing move must lift the plate
+#   (on the Z steppers' step counts) for X and Y to move with the height
+#   not known. It may not be less than contact_z plus unmeshed_margin.
 #threshold_counts: 90000
 #   Raw load cell counts, in the direction the probe presses, above which
 #   the nozzle is in contact. The default is half the force at which the

@@ -7,9 +7,16 @@ class BedRemovalDetector:
         # thresholds
         self.remove_thr = config.getfloat('remove_threshold', -15.0)
         self.attach_thr = config.getfloat('attach_threshold', -5.0)
-        # buffer settings
-        buffer_len = config.getint('buffer_length', 5)
+        # Decide on fresh raw thermistor samples, not on the smoothed
+        # temperature polled every interval. The smoothed value (smooth_time
+        # 1.0) lags a pulled plate by most of a second, and the bed sensor
+        # only reports every 0.3 s, so a window of polls mostly held repeats
+        # of one sample. Two fresh samples is ~0.6 s from pull to decision,
+        # well inside the ~2 s before [verify_heater] would trip on the open
+        # reading. z_power uses the same thresholds to gate the bed feed.
+        buffer_len = config.getint('buffer_length', 2, minval=1)
         self.window = collections.deque(maxlen=buffer_len)
+        self.last_sample_time = None
         # check interval
         self.bed_check_interval = config.getfloat('interval', 0.1)
 
@@ -25,6 +32,10 @@ class BedRemovalDetector:
         self.pause_resume = self.printer.load_object(config, 'pause_resume')
 
         self.bed_removed = False
+        # False until the readings have said one way or the other. bed_removed
+        # starts False, which would otherwise read as "plate present" before
+        # anything was measured -- z_power must not power the bed on that.
+        self.plate_known = False
         # KAN-272: whether the latest removal came while a file was printing,
         # and so paused it. Latched at removal time for BED_REMOVED, which
         # renders later (behind the gcode mutex) and must not re-derive it
@@ -60,8 +71,10 @@ class BedRemovalDetector:
                       self.bed_check_interval)
 
     def check_bed_temperature(self, eventtime):
-        raw_temp, _ = self.bed_heater.get_temp(eventtime)
-        self.window.append(raw_temp)
+        heater = self.bed_heater
+        if heater.last_temp_time != self.last_sample_time:
+            self.last_sample_time = heater.last_temp_time
+            self.window.append(heater.last_temp)
 
         if (self.restore_target is not None and not self.bed_removed
                 and not self.pause_resume.is_paused):
@@ -76,9 +89,12 @@ class BedRemovalDetector:
         if len(self.window) == self.window.maxlen:
             avg_temp = sum(self.window) / len(self.window)
             if not self.bed_removed and avg_temp < self.remove_thr:
+                self.plate_known = True
                 self.handle_bed_removal(eventtime)
             elif self.bed_removed and avg_temp > self.attach_thr:
                 self.handle_bed_reconnection()
+            elif not self.plate_known and avg_temp > self.attach_thr:
+                self.plate_known = True
 
         return eventtime + self.bed_check_interval
 
@@ -120,6 +136,29 @@ class BedRemovalDetector:
             # reheat on resume would silently do nothing.
             self.restore_target = target
         self.bed_heater.set_temp(0.0)
+        # KAN-3370: a Z homing or probe move in progress is driving the bed
+        # into whatever is in the way (Boxwood, Nov 2026: a 164 mm search
+        # lifted the bed off its mount).  Stop it now; the HOMING_GATE macro
+        # only looks at this flag before a move starts.  A move that does not
+        # involve Z is left alone.
+        try:
+            homing = self.printer.lookup_object('homing', None)
+            abort = getattr(homing, 'abort_active_move', None)
+            if abort is not None:
+                abort("the bed was removed")
+        except Exception:
+            self.log.exception('aborting the active homing move failed')
+        # Straight after the heater is zeroed and before the pause: under
+        # virtual_sdcard the pause waits in the reactor, and a move that runs
+        # during that wait must already be checked against "plate height
+        # unknown" (contact_guard drops its height on this event). The heater
+        # is still zeroed first, and the try/except means a failing listener
+        # cannot skip the pause.
+        try:
+            self.printer.send_event("bed_removal_detector:removed")
+        except Exception:
+            self.log.exception('bed_removal_detector:removed listener'
+                               ' failed')
         # Stop feeding the file immediately, the way filament_switch_sensor
         # does on runout: the pause half of pause_resume has to take effect
         # now, not whenever the macro below wins the gcode mutex, because
@@ -198,6 +237,14 @@ class BedRemovalDetector:
             lambda et: self._run_macro(et, 'BED_ATTACHED'))
         self.log.info('Bed attached, monitoring resumed')
 
+    def plate_present(self):
+        """True or False once measured, None before (or between thresholds
+        at startup). The single source of plate presence: z_power gates the
+        bed feed on it."""
+        if not self.plate_known:
+            return None
+        return not self.bed_removed
+
     def get_status(self, eventtime):
         # restore_target is read by _BED_RESUME_NOW to put the bed back where
         # it was before resuming. The macro only compares it against zero, so
@@ -206,6 +253,7 @@ class BedRemovalDetector:
         # removedWhilePrinting is what BED_REMOVED reads to decide whether to
         # PAUSE and say the print is paused. printEnding is informational.
         return {'bedRemoved': self.bed_removed,
+                'plateKnown': self.plate_known,
                 'restoreTarget': self.restore_target or 0.,
                 'removedWhilePrinting': self.removed_while_printing,
                 'printEnding': self._print_ending()}

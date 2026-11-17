@@ -3,13 +3,31 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, threading, os
+import logging, threading, os, time
 import serial
 
 import msgproto, chelper, util
 
 class error(Exception):
     pass
+
+# MUON KAN-1362: disconnect() used to join the serial threads with no
+# timeout, so one that did not stop hung FIRMWARE_RESTART for good.
+DISCONNECT_TIMEOUT = 5.
+_stuck_queues = []
+
+def _stop_serial_threads(ffi_lib, sq, bg):
+    exiter = threading.Thread(target=ffi_lib.serialqueue_exit, args=(sq,),
+                              name="serialq exit", daemon=True)
+    exiter.start()
+    deadline = time.monotonic() + DISCONNECT_TIMEOUT
+    exiter.join(DISCONNECT_TIMEOUT)
+    if exiter.is_alive():
+        return False
+    if bg is not None:
+        bg.join(max(0., deadline - time.monotonic()))
+        return not bg.is_alive()
+    return True
 
 class SerialReader:
     def __init__(self, reactor, mcu_name="", mcu=None):
@@ -100,7 +118,8 @@ class SerialReader:
             self.disconnect()
             return False
         self.serialqueue = self.ffi_main.gc(sq, self.ffi_lib.serialqueue_free)
-        self.background_thread = threading.Thread(target=self._bg_thread)
+        self.background_thread = threading.Thread(target=self._bg_thread,
+                                                  daemon=True)
         self.background_thread.start()
         # Obtain and load the data dictionary from the firmware
         completion = self.reactor.register_callback(self._get_identify_data)
@@ -250,10 +269,15 @@ class SerialReader:
             self.serialqueue, freq, conv_time, conv_clock, last_clock)
     def disconnect(self):
         if self.serialqueue is not None:
-            self.ffi_lib.serialqueue_exit(self.serialqueue)
-            if self.background_thread is not None:
-                self.background_thread.join()
+            sq, bg = self.serialqueue, self.background_thread
             self.background_thread = self.serialqueue = None
+            if not _stop_serial_threads(self.ffi_lib, sq, bg):
+                logging.error("%sserial threads did not stop within %.0fs"
+                              " at disconnect; leaving them running",
+                              self.warn_prefix, DISCONNECT_TIMEOUT)
+                # Never free (or close the fd of) a queue a thread still uses
+                _stuck_queues.append((sq, bg, self.serial_dev))
+                self.serial_dev = None
         if self.serial_dev is not None:
             self.serial_dev.close()
             self.serial_dev = None

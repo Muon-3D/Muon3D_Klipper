@@ -107,9 +107,12 @@ class LIS2DW:
                 f"LIS2DW: {self.name} could not connect because mcu: {self.mcu.get_name()} is non_critical_disconnected!"
             )
 
-    def read_reg(self, reg):
+    def read_reg(self, reg, minclock=0, reqclock=0):
+        # minclock/reqclock apply to SPI only (adxl345_probe tap arming)
         if self.bus_type == SPI_SERIAL_TYPE:
-            params = self.bus.spi_transfer([reg | REG_MOD_READ, 0x00])
+            params = self.bus.spi_transfer([reg | REG_MOD_READ, 0x00],
+                                           minclock=minclock,
+                                           reqclock=reqclock)
             response = bytearray(params['response'])
             return response[1]
         params = self.bus.i2c_read([reg], 1)
