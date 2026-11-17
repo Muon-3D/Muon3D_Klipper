@@ -4888,7 +4888,23 @@ object reports `state`, `reason`, `z`, `plate_present`, `enabled`,
 `power_good`, `present_ratio`, `current` (A), `power` (W), `fault`,
 `fault_detail` (the peak current and recent PGOOD polls at the fault),
 `pgood_glitches` (PGOOD lows that came back before a fault latched),
-`last_pgood_glitch` and `last_pgood_glitch_age` (s).
+`last_pgood_glitch` and `last_pgood_glitch_age` (s),
+`pgood_idle_recoveries` (PGOOD drops recovered without a fault, see
+`idle_recovery_max`) and `last_pgood_idle_recovery` (time of the last one).
+
+A PGOOD drop while the bed is idle is not a fault: the feed is switched
+off, re-enabled once and, if PGOOD comes back and stays up, the path
+returns to `ready` with no fault, alert or red LED, and
+`pgood_idle_recoveries` goes up by one. The bed is idle when its heater
+target is 0, it is below `idle_recovery_bed_temp`, the print is not
+printing or paused, `idle_timeout` is not `Printing` (no queued
+motion), the heater power is 0 and the IMON peak over the last
+2 s is at most `idle_recovery_current` (with no `current_pin` it is never
+idle). The state is `recovering`, not `ready`, meanwhile, so heating and
+moves that need bed power are refused. A drop that is not idle, a recovery
+that fails, or too many recoveries in a window latches the usual fault.
+A recovery clears Z's homed flag (`SET_KINEMATIC_POSITION CLEAR_HOMED=Z`),
+so Z must be homed again, and `Z_POWER_RESET` is refused while one runs.
 
 ```
 [z_power]
@@ -4938,6 +4954,24 @@ present_locked_range:
 #   as a glitch and logged, and the feed stays on. 1 latches on the first
 #   low poll. A low within power_good_timeout of PGOOD first coming up is
 #   treated as part of the start-up, not as a drop.
+#idle_recovery_max: 3
+#idle_recovery_window: 1800
+#   More than idle_recovery_max idle recoveries within idle_recovery_window
+#   seconds latch the PGOOD fault. 0 turns the idle recovery off (every
+#   drop latches).
+#idle_recovery_daily_max: 8
+#   More than this many idle recoveries in 24 hours also latch the fault.
+#   More than 5 in 24 hours set the status flag `pgood_recoveries_high` and
+#   log a warning (a flaky connector).
+#idle_recovery_bed_temp: 40
+#idle_recovery_current: 0.3
+#   The bed counts as idle only below this temperature (C) and with the
+#   IMON peak over the last 2 s no higher than this current (A).
+#idle_recovery_off_time: 2.0
+#idle_recovery_hold_time: 5.0
+#   Seconds the feed stays off before the single re-enable, and seconds
+#   PGOOD must then stay high (it must rise within power_good_timeout)
+#   before the path is ready again. Otherwise the fault latches.
 #plate_settle_time: 2.0
 #   Seconds the Z column must be plugged in before the plate reading
 #   counts. The bed thermistor input floats while the column is out.

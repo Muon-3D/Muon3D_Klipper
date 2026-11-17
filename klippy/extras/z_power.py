@@ -71,6 +71,26 @@ PEAK_WINDOW = 2.0
 PGOOD_HISTORY = 10
 # At most one glitch line in the log per this long; the rest are counted.
 GLITCH_LOG_INTERVAL = 10.0
+# KAN-3955: a PGOOD drop with the bed idle is recovered without a fault. Idle
+# means the heater target is 0, the bed is below IDLE_BED_TEMP (C), the print
+# is not printing or paused, the heater power is 0 and the IMON peak over
+# PEAK_WINDOW is at most IDLE_RECOVERY_CURRENT (A); without a current reading
+# it is never idle. The feed is held off for IDLE_RECOVERY_OFF_TIME,
+# re-enabled once, and PGOOD must then rise within power_good_timeout and stay
+# high for IDLE_RECOVERY_HOLD_TIME. More than IDLE_RECOVERY_MAX recoveries
+# within IDLE_RECOVERY_WINDOW seconds is a real fault (0 disables recovery).
+IDLE_BED_TEMP = 40.
+IDLE_RECOVERY_CURRENT = 0.3
+IDLE_RECOVERY_OFF_TIME = 2.0
+IDLE_RECOVERY_HOLD_TIME = 5.0
+IDLE_RECOVERY_MAX = 3
+IDLE_RECOVERY_WINDOW = 1800.
+# A flaky connector shows as many recoveries over a day: more than
+# IDLE_RECOVERY_DAILY_MAX in 24 h is a fault, and more than
+# IDLE_RECOVERY_HIGH sets the status flag pgood_recoveries_high (and logs once).
+IDLE_RECOVERY_DAILY_MAX = 8
+IDLE_RECOVERY_HIGH = 5
+DAY = 86400.
 
 # States, in the order the path comes up
 ABSENT = 'absent'           # no Z column on the connector
@@ -79,6 +99,7 @@ UNKNOWN = 'unknown'         # Z_PRESENT outside every configured band
 NO_PLATE = 'no_plate'       # column locked, no plate on the bed thermistor
 POWERING = 'powering'       # enable on, waiting for PGOOD
 READY = 'ready'             # 48V_Z up and confirmed
+RECOVERING = 'recovering'   # idle PGOOD drop: off, re-enabling, holding
 INHIBITED = 'inhibited'     # held off by Z_POWER_INHIBIT
 FAULT = 'fault'             # latched until Z_POWER_RESET
 
@@ -92,6 +113,7 @@ REASONS = {
              " Z_POWER_STATUS)",
     NO_PLATE: "no bed plate detected: attach the bed plate",
     POWERING: "bed power is starting up",
+    RECOVERING: "bed power is recovering from a brief dropout",
     INHIBITED: "bed power is held off (Z_POWER_INHIBIT ENABLE=0 releases"
                " it)",
     FAULT: "bed power fault: %s. Check the bed and its cable, then run"
@@ -205,6 +227,20 @@ class ZPower:
         # PGOOD drop debounce while READY (see DROP_SAMPLES)
         self._init_pgood_state(config.getint('power_good_drop_samples',
                                              DROP_SAMPLES, minval=1))
+        self.idle_bed_temp = config.getfloat('idle_recovery_bed_temp',
+                                             IDLE_BED_TEMP)
+        self.idle_recovery_current = config.getfloat(
+            'idle_recovery_current', IDLE_RECOVERY_CURRENT, minval=0.)
+        self.idle_recovery_off_time = config.getfloat(
+            'idle_recovery_off_time', IDLE_RECOVERY_OFF_TIME, above=0.)
+        self.idle_recovery_hold_time = config.getfloat(
+            'idle_recovery_hold_time', IDLE_RECOVERY_HOLD_TIME, above=0.)
+        self.idle_recovery_max = config.getint('idle_recovery_max',
+                                               IDLE_RECOVERY_MAX, minval=0)
+        self.idle_recovery_window = config.getfloat(
+            'idle_recovery_window', IDLE_RECOVERY_WINDOW, above=0.)
+        self.idle_recovery_daily_max = config.getint(
+            'idle_recovery_daily_max', IDLE_RECOVERY_DAILY_MAX, minval=0)
         # IMON current (optional). IMON reads a small non-zero value with
         # the feed off (~0.11 A equivalent on gimlet), so the zero is learnt
         # while the enable is off and subtracted while it is on.
@@ -296,6 +332,18 @@ class ZPower:
         # after an enable), and whether the enable follows a reset
         self.settle_end = None
         self.after_reset = False
+        # Idle PGOOD-drop recovery (see IDLE_RECOVERY_*)
+        self.idle_bed_temp = IDLE_BED_TEMP
+        self.idle_recovery_current = IDLE_RECOVERY_CURRENT
+        self.idle_recovery_off_time = IDLE_RECOVERY_OFF_TIME
+        self.idle_recovery_hold_time = IDLE_RECOVERY_HOLD_TIME
+        self.idle_recovery_max = IDLE_RECOVERY_MAX
+        self.idle_recovery_window = IDLE_RECOVERY_WINDOW
+        self.idle_recovery_daily_max = IDLE_RECOVERY_DAILY_MAX
+        self.recovery = None
+        self.recovery_times = collections.deque()
+        self.pgood_idle_recoveries = 0
+        self.last_idle_recovery = None
         self.pgood_history = collections.deque(maxlen=PGOOD_HISTORY)
         self.current_history = collections.deque()
         self.fault_reason = None
@@ -471,11 +519,113 @@ class ZPower:
             # tripped, so nothing is heated meanwhile; a latch zeroes the
             # heater target through _transition.
             return READY, "bed power is on", True
+        if (self._idle_state(eventtime) is None
+                and self._start_recovery(eventtime)):
+            return RECOVERING, REASONS[RECOVERING], False
         self._latch_fault("PGOOD dropped (eFuse tripped, peak %s A over"
                           " %.0f s)" % (self._amps(self._peak()),
                                         PEAK_WINDOW), eventtime,
                           DROPPED_REASON, self._diagnostics(eventtime))
         return FAULT, self.fault_reason, False
+    def _idle_state(self, eventtime):
+        """None when the bed is idle (see IDLE_*), else why it is not."""
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is not None:
+            pstate = stats.get_status(eventtime).get('state')
+            if pstate in ('printing', 'paused'):
+                return "print %s" % (pstate,)
+        # Any queued motion (a Z jog) would run through the power-off.
+        idle_timeout = self.printer.lookup_object('idle_timeout', None)
+        if idle_timeout is not None and idle_timeout.get_status(
+                eventtime).get('state') == 'Printing':
+            return "toolhead moving"
+        temp, target = self.heater.get_temp(eventtime)
+        if target:
+            return "bed target %.0f" % (target,)
+        if temp is None or temp >= self.idle_bed_temp:
+            return "bed at %s C" % (temp,)
+        if self.heater.get_status(eventtime).get('power', 0.) > 0.:
+            return "heater power on"
+        peak = self._peak()
+        if peak is None or peak > self.idle_recovery_current:
+            return "bed current peak %s A" % (self._amps(peak),)
+        return None
+    def _start_recovery(self, eventtime):
+        """Begin an idle recovery; False when the drop must fault."""
+        times = self.recovery_times
+        while times and eventtime - times[0] > DAY:
+            times.popleft()
+        recent = [t for t in times
+                  if eventtime - t <= self.idle_recovery_window]
+        if (len(recent) >= self.idle_recovery_max
+                or len(times) >= self.idle_recovery_daily_max):
+            return False
+        self.recovery = {'phase': 'off', 'start': eventtime,
+                         'until': eventtime + self.idle_recovery_off_time,
+                         'enabled_at': None, 'high_since': None,
+                         'history': self._diagnostics(eventtime)}
+        logging.warning("%s: PGOOD dropped with the bed idle; power off for"
+                        " %.1fs, then one re-enable (recovery #%d)",
+                        self.name, self.idle_recovery_off_time,
+                        self.pgood_idle_recoveries + 1)
+        return True
+    def _recovery_fail(self, why, eventtime):
+        rec, self.recovery = self.recovery, None
+        _temp, target = self.heater.get_temp(eventtime)
+        if target:
+            self._raw_set_temp(0.)
+        self._latch_fault("PGOOD dropped, idle recovery failed: %s" % (why,),
+                          eventtime, DROPPED_REASON,
+                          "first drop: %s | now: %s"
+                          % (rec['history'], self._diagnostics(eventtime)))
+        return FAULT, self.fault_reason, False
+    def _recovery_step(self, eventtime):
+        """One poll of an idle recovery: (state, reason, enable)."""
+        rec = self.recovery
+        _temp, target = self.heater.get_temp(eventtime)
+        if target:
+            return self._recovery_fail("bed target set to %.0f during the"
+                                       " recovery" % (target,), eventtime)
+        if rec['phase'] == 'off':
+            if eventtime < rec['until']:
+                return RECOVERING, REASONS[RECOVERING], False
+            rec['phase'] = 'hold'
+            rec['enabled_at'] = self._set_enable(True, eventtime)
+            self.start_peak = 0.
+            return RECOVERING, REASONS[RECOVERING], True
+        if not self.power_good:
+            if rec['high_since'] is not None:
+                return self._recovery_fail("PGOOD fell again after the"
+                                           " re-enable", eventtime)
+            if eventtime - rec['enabled_at'] > self.power_good_timeout:
+                return self._recovery_fail(
+                    "PGOOD did not rise within %.2fs of the re-enable"
+                    % (self.power_good_timeout,), eventtime)
+            return RECOVERING, REASONS[RECOVERING], True
+        if rec['high_since'] is None:
+            rec['high_since'] = eventtime
+        if eventtime - rec['high_since'] < self.idle_recovery_hold_time:
+            return RECOVERING, REASONS[RECOVERING], True
+        self.recovery = None
+        self.pgood_idle_recoveries += 1
+        self.last_idle_recovery = eventtime
+        self.recovery_times.append(eventtime)
+        if len(self.recovery_times) == IDLE_RECOVERY_HIGH + 1:
+            logging.warning("%s: %d idle PGOOD recoveries in 24 h; check the"
+                            " bed connector", self.name,
+                            len(self.recovery_times))
+        # The Z driver may have lost its supply: Z must be homed again.
+        self.reactor.register_callback(lambda et: self._run_script(
+            "SET_KINEMATIC_POSITION CLEAR_HOMED=Z"))
+        self.powering_since = None
+        self.settle_end = None
+        self.low_polls = 0
+        self._pgood_high(eventtime)
+        logging.warning("%s: idle PGOOD recovery #%d done in %.1fs, no fault"
+                        " | first drop: %s", self.name,
+                        self.pgood_idle_recoveries,
+                        eventtime - rec['start'], rec['history'])
+        return READY, "bed power is on", True
     def _pgood_high(self, eventtime):
         self.low_run = False
         if self.settle_end is None:
@@ -529,7 +679,11 @@ class ZPower:
             self._check_current(eventtime)
         state, reason, enable = decide(band, plate, self.fault,
                                        self.inhibited, self.fault_reason)
-        if enable:
+        if not enable:
+            self.recovery = None
+        if enable and self.recovery is not None:
+            state, reason, enable = self._recovery_step(eventtime)
+        elif enable:
             if not self.enabled:
                 self.powering_since = self._set_enable(True, eventtime)
                 self.start_peak = 0.
@@ -674,7 +828,13 @@ class ZPower:
                 'fault_detail': self.fault_detail,
                 'pgood_glitches': self.glitches,
                 'last_pgood_glitch': self.last_glitch,
-                'last_pgood_glitch_age': glitch_age}
+                'last_pgood_glitch_age': glitch_age,
+                'pgood_idle_recoveries': self.pgood_idle_recoveries,
+                'last_pgood_idle_recovery': self.last_idle_recovery,
+                'pgood_recoveries_high': sum(
+                    1 for t in self.recovery_times
+                    if eventtime is None or eventtime - t <= DAY
+                    ) > IDLE_RECOVERY_HIGH}
     # Commands
     cmd_Z_POWER_STATUS_help = "Report the Z column and bed power path"
     def cmd_Z_POWER_STATUS(self, gcmd):
@@ -683,12 +843,12 @@ class ZPower:
         gcmd.respond_info(
             "Z power: %s%s\n"
             "Z_PRESENT ratio %s -> %s | plate %s | enable %s | PGOOD %s\n"
-            "current %s A | power %s W | PGOOD glitches %d"
+            "current %s A | power %s W | PGOOD glitches %d, idle recoveries %d"
             % (st['state'], " (%s)" % st['reason'] if st['reason'] else "",
                "-" if ratio is None else "%.3f" % (ratio,), st['z'],
                st['plate_present'], int(st['enabled']),
                int(st['power_good']), st['current'], st['power'],
-               st['pgood_glitches']))
+               st['pgood_glitches'], st['pgood_idle_recoveries']))
     cmd_Z_POWER_RESET_help = "Clear a latched Z power fault"
     def cmd_Z_POWER_RESET(self, gcmd):
         # Not mid-print: if the cause is still there the fault re-latches
@@ -697,6 +857,9 @@ class ZPower:
         if stats is not None and stats.get_status(
                 self.reactor.monotonic()).get('state') == 'printing':
             raise gcmd.error(PRINTING_RESET_ERROR)
+        if self.recovery is not None:
+            raise gcmd.error("Bed power is recovering from a brief dropout."
+                             " Wait about 10 s for it to finish.")
         if self.fault:
             gcmd.respond_info("Cleared Z power fault: %s" % (self.fault,))
         # A reset that clears a fault re-enables the feed: if PGOOD does not
@@ -706,6 +869,7 @@ class ZPower:
         self.low_polls = 0
         self.low_run = False
         self.settle_end = None
+        self.recovery = None
         self.over_since = self.idle_over_since = None
     cmd_Z_POWER_INHIBIT_help = "Hold 48V_Z off (ENABLE=1) or release it"
     def cmd_Z_POWER_INHIBIT(self, gcmd):
