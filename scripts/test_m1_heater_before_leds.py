@@ -141,7 +141,7 @@ class M1:
         # and bed power path (z_power), locked and ready.
         printer.add_object('fan_modes', Status({'commanded_speed': 0.5}))
         self.z_power = {'z': 'locked', 'state': 'ready', 'reason': '',
-                        'xy_allowed': True}
+                        'xy_allowed': True, 'xy_home_allowed': True}
         printer.add_object('z_power', Status(self.z_power))
         # m1_machine: what RESUME reads back (the bed target the print set,
         # the part-fan speed PAUSE saved), and the bed heater it compares.

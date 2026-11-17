@@ -311,7 +311,7 @@ class M1Leds:
         # B1: RESUME reads the Z column; locked.
         printer.add_object('z_power', Status({
             'z': 'locked', 'state': 'ready', 'reason': '',
-            'xy_allowed': True}))
+            'xy_allowed': True, 'xy_home_allowed': True}))
         printer.add_object('m1_machine', Status({
             'job_targets': {'bed': 0.0, 'hotend': 0.0}, 'saved_fan': 0.0}))
         printer.add_object('heater_bed', Status({'target': 0.0}))

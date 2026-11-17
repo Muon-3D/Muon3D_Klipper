@@ -661,6 +661,9 @@ class ZLoadBackstop:
         self._over_t0 = None    # timestamp of the first sample of the run
         self._wrong_t0 = None
         self.last_fired = None
+        self._armed_rules = 'none'      # of the last descent
+        self._last_not_armed = None     # logging dedupe, see _note_arming
+        self._last_armed_key = None
 
     def is_armed(self):
         return self._armed
@@ -694,6 +697,8 @@ class ZLoadBackstop:
         self._need = need
         self._over_run = self._wrong_run = 0
         self._over_t0 = self._wrong_t0 = None
+        self._note_arming(ceiling, wrong, trigger_delta, press_direction,
+                          mcutare)
         if not ceiling and not wrong:
             return
         self._armed = True
@@ -705,6 +710,60 @@ class ZLoadBackstop:
 
     def disarm(self):
         self._armed = False
+
+    # Say in klippy.log what the descent that just started is watched for.
+    # Logging only: it never changes what arms.  "Not armed" is warned once
+    # per distinct reason until a descent arms again; the "armed" note is
+    # written only when the rule set or a limit differs from the previous
+    # descent's, so a bed mesh does not repeat either line per point.
+    def _note_arming(self, ceiling, wrong, trigger_delta, press_direction,
+                     mcutare):
+        rules = [n for n, v in (('ceiling', ceiling),
+                                ('wrong_way', wrong)) if v]
+        self._armed_rules = '+'.join(rules) or 'none'
+        no_ceiling = []
+        no_wrong = []
+        if not ceiling:
+            if self._ceiling_counts_param <= 0 and not self._ceiling_factor:
+                no_ceiling.append("z_move_abort_ceiling_factor is 0 and "
+                                  "z_move_abort_ceiling_counts is 0")
+            elif not trigger_delta:
+                no_ceiling.append("no trigger delta (%r)" % (trigger_delta,))
+        if not wrong:
+            if mcutare:
+                no_wrong.append("MCUTARE (the host tare is approximate)")
+            if not self._wrong_way_factor:
+                no_wrong.append("z_move_wrong_way_factor is 0")
+            if press_direction not in (-1, 1):
+                no_wrong.append("no press direction (%r)"
+                                % (press_direction,))
+            if not trigger_delta and not no_ceiling:
+                no_wrong.append("no trigger delta (%r)" % (trigger_delta,))
+        if not rules:
+            why = "no ceiling: %s; no wrong-way: %s" % (
+                ", ".join(no_ceiling) or "unknown",
+                ", ".join(no_wrong) or "unknown")
+            self._last_armed_key = None
+            if why != self._last_not_armed:
+                self._last_not_armed = why
+                logging.warning("load_cell_probe: the Z load backstop is NOT"
+                                " armed for this descent (%s)", why)
+            return
+        self._last_not_armed = None
+        # The rule set only: the limits follow every tare, so keying on
+        # them would log each tap of a bed mesh.  The limits of the last
+        # descent are in get_status.
+        key = self._armed_rules
+        if key == self._last_armed_key:
+            return
+        self._last_armed_key = key
+        logging.info(
+            "load_cell_probe: Z load backstop armed (%s): ceiling %s, wrong"
+            " way %s", self._armed_rules,
+            "%i counts" % ceiling if ceiling else "off (%s)" % (
+                ", ".join(no_ceiling) or "unknown"),
+            "%i counts" % wrong if wrong else "off (%s)" % (
+                ", ".join(no_wrong) or "unknown"))
 
     def _on_batch(self, msg):
         # Runs in the sensor's batch timer: it never raises.  False drops
@@ -779,6 +838,7 @@ class ZLoadBackstop:
         return {'z_backstop_ceiling_counts': self._ceiling,
                 'z_backstop_wrong_way_counts': self._wrong,
                 'z_backstop_fired': self.last_fired,
+                'z_backstop_armed_rules': self._armed_rules,
                 'z_backstop_ceiling_factor': self._ceiling_factor,
                 'z_backstop_ceiling_counts_config':
                     self._ceiling_counts_param,

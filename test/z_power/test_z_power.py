@@ -1324,11 +1324,6 @@ class TestXyGateAfterAFittedColumn(HarnessFixture, unittest.TestCase):
         self.run_readings(zp, [0.1])
         self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
 
-    def test_the_status_key_the_homing_macros_read_stays_strict(self):
-        zp = self.make()
-        self.run_readings(zp, [0.1, 0.3])
-        self.assertFalse(zp.get_status(2.0)['xy_allowed'])
-
     def test_a_z_only_move_never_asked(self):
         zp = self.make()
         zp.last_position = [5., 5., 0., 0.]
@@ -1355,6 +1350,67 @@ class TestXyGateAfterAFittedColumn(HarnessFixture, unittest.TestCase):
         self.assertEqual(self.xy(zp), [10., 10., 0., 0.])
         self.run_readings(zp, [0.99, 0.99, 0.99])
         self.assertIn("Cannot move X or Y", self.refused(zp))
+
+
+class TestStatusAgreesWithTheGate(HarnessFixture, unittest.TestCase):
+    """get_status()['xy_allowed'] is what the panel shows; it must say what
+    move() does. xy_home_allowed stays strict for X/Y homing."""
+    def make(self):
+        zp = HarnessFixture.make(self)
+        zp.next_transform = StubTransform()
+        zp.last_position = [0., 0., 0., 0.]
+        return zp
+
+    def run_readings(self, zp, ratios):
+        for i, ratio in enumerate(ratios):
+            self.tick(zp, 1.0 + 0.1 * i, ratio=ratio)
+
+    def gate_allows(self, zp):
+        zp.last_position = [0., 0., 0., 0.]
+        try:
+            zp.move([10., 10., 0., 0.], 100.)
+        except CommandError:
+            return False
+        return True
+
+    def check(self, ratios, allowed, home_allowed):
+        zp = self.make()
+        self.run_readings(zp, ratios)
+        st = zp.get_status(5.0)
+        self.assertIs(self.gate_allows(zp), allowed)
+        self.assertIs(st['xy_allowed'], allowed)
+        self.assertIs(st['xy_home_allowed'], home_allowed)
+
+    def test_locked(self):
+        self.check([0.1], True, True)
+
+    def test_unlocked(self):
+        self.check([0.5], True, True)
+
+    def test_unknown_after_fitted(self):
+        self.check([0.1, 0.3], True, False)
+
+    def test_unknown_after_unlocked(self):
+        self.check([0.5, 0.3], True, False)
+
+    def test_unknown_at_startup(self):
+        self.check([0.3, 0.3, 0.3], False, False)
+
+    def test_absent(self):
+        self.check([0.99], False, False)
+
+    def test_unknown_after_absent(self):
+        self.check([0.1, 0.99, 0.3], False, False)
+
+    def test_unread(self):
+        self.check([], False, False)
+
+    def test_not_requiring_a_column_allows_both(self):
+        zp = self.make()
+        zp.xy_requires_column = False
+        st = zp.get_status(5.0)
+        self.assertTrue(st['xy_allowed'])
+        self.assertTrue(st['xy_home_allowed'])
 
 
 if __name__ == '__main__':
