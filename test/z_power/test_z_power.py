@@ -1607,5 +1607,94 @@ class TestIdleRecovery(Ready):
         with self.assertRaises(CommandError):
             zp.cmd_Z_POWER_RESET(StubGcmd())
 
+class StubIdleTimeout:
+    def __init__(self, state='Ready'):
+        self.state = state
+    def get_status(self, eventtime):
+        return {'state': self.state}
+
+
+class TestIdleRecoverySafety(TestIdleRecovery):
+    """KAN-3955 review fixes. Subclasses the main class for its helpers."""
+    def test_queued_motion_is_not_idle(self):
+        zp = self.idle()
+        zp.printer.objects['idle_timeout'] = StubIdleTimeout('Printing')
+        self.blip(zp)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.pgood_idle_recoveries, 0)
+
+    def test_ready_toolhead_is_idle(self):
+        zp = self.idle()
+        zp.printer.objects['idle_timeout'] = StubIdleTimeout('Ready')
+        self.blip(zp)
+        self.assertEqual(zp.state, RECOVERING)
+
+    def test_recovery_clears_z_homed(self):
+        zp = self.idle()
+        ran = []
+        zp._run_script = ran.append
+        self.blip(zp)
+        self.run_to(zp, 2.3, 4.1, False)
+        self.run_to(zp, 4.2, 9.2, True)
+        self.assertEqual(ran, [])          # not before the hold is over
+        self.run_to(zp, 9.3, 9.4, True)
+        self.assertEqual(zp.state, READY)
+        self.assertEqual(ran, ['SET_KINEMATIC_POSITION CLEAR_HOMED=Z'])
+
+    def test_failed_recovery_does_not_clear_homed(self):
+        zp = self.idle()
+        ran = []
+        zp._run_script = ran.append
+        self.blip(zp)
+        self.run_to(zp, 2.3, 5.0, False)
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(ran, [])
+
+    def test_reset_refused_while_recovering(self):
+        zp = self.idle()
+        self.blip(zp)
+        self.assertEqual(zp.state, RECOVERING)
+        with self.assertRaises(CommandError) as cm:
+            zp.cmd_Z_POWER_RESET(StubGcmd())
+        self.assertIn('recovering', str(cm.exception))
+        self.assertIsNotNone(zp.recovery)
+        self.assertEqual(zp.state, RECOVERING)
+        self.run_to(zp, 2.3, 2.5, False)
+        self.assertFalse(zp.enabled)       # off phase not skipped
+
+    def test_daily_cap_faults(self):
+        zp = self.idle()
+        zp.idle_recovery_window = 100.
+        zp.idle_recovery_max = 100
+        t = 2.0
+        for _n in range(8):
+            self.recover(zp, t)
+            t += 2000.
+        self.assertEqual(zp.pgood_idle_recoveries, 8)
+        self.blip(zp, t)
+        self.assertEqual(zp.state, FAULT)
+
+    def test_daily_cap_forgets_after_24h(self):
+        zp = self.idle()
+        zp.idle_recovery_window = 100.
+        zp.idle_recovery_max = 100
+        t = 2.0
+        for _n in range(10):
+            self.recover(zp, t)
+            t += 20000.
+        self.assertEqual(zp.pgood_idle_recoveries, 10)
+
+    def test_high_flag_and_warning_above_five_in_a_day(self):
+        zp = self.idle()
+        zp.idle_recovery_window = 100.
+        t = 2.0
+        for n in range(6):
+            self.recover(zp, t)
+            t += 2000.
+            high = zp.get_status(t)['pgood_recoveries_high']
+            self.assertEqual(high, n >= 5, n)
+        self.assertEqual(zp.state, READY)
+
+
 if __name__ == '__main__':
     unittest.main()

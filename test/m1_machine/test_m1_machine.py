@@ -57,6 +57,13 @@ class TestMissing(unittest.TestCase):
                                                bed_power='fault')),
                          ['plate_absent', 'bed_power_fault'])
 
+    def test_idle_recovery_is_starting_not_a_fault(self):
+        # z_power's idle PGOOD recovery (KAN-3955) is a short wait.
+        self.assertEqual(missing('print', cond(bed_power='recovering')),
+                         ['bed_power_starting'])
+        self.assertNotIn('bed_power_fault',
+                         missing('print', cond(bed_power='recovering')))
+
     def test_unread_column_is_waited_for(self):
         self.assertEqual(missing('print', cond(column='reading')),
                          ['column_reading'])
