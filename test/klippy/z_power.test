@@ -1,0 +1,11 @@
+# Tests for the z_power bed power path
+DICTIONARY atmega2560.dict
+CONFIG z_power.cfg
+
+Z_POWER_STATUS
+Z_POWER_INHIBIT ENABLE=1
+Z_POWER_INHIBIT ENABLE=0
+Z_POWER_RESET
+
+; Turning the bed off is always allowed
+M140 S0

@@ -99,7 +99,10 @@ def check(config_dir):
 
 
 def main():
-    config_dir = os.path.join(ROOT, 'core', 'M1')
+    # Optional argument: another config directory (core/M1-B0), relative to
+    # the repo root or absolute. Default: core/M1.
+    config_dir = os.path.join(ROOT, sys.argv[1] if len(sys.argv) > 1
+                              else os.path.join('core', 'M1'))
     if not os.path.isdir(config_dir):
         sys.stderr.write("missing directory: %s\n" % config_dir)
         return 2

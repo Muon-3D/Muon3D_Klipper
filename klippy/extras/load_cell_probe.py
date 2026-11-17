@@ -5,7 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 import mcu
-from . import probe, trigger_analog, load_cell, hx71x, ads1220
+from . import probe, trigger_analog, load_cell, hx71x, ads1220, muon_ads1220
 
 np = None  # delay NumPy import until configuration time
 
@@ -221,6 +221,11 @@ class ContinuousTareFilterHelper:
         self._sos_filter.set_filter_design(design)
 
 
+# MUON: tell sensors sharing the load cell's ADC that a tap starts or ends
+def send_tap_event(printer, event, load_cell_inst):
+    printer.send_event(event, load_cell_inst)
+
+
 # check results from the collector for errors and raise an exception is found
 def check_sensor_errors(results, printer):
     samples, errors = results
@@ -264,6 +269,14 @@ class LoadCellProbeConfigHelper:
             default=0, minval=0, maxval=(1 << 30))
         self._trigger_percent_param = floatParamHelper(config,
             'trigger_percent', default=None, above=0., maxval=100.0)
+        # KAN-3370: the side of the tare the press moves toward is a fact
+        # about the unit, never inferred from the tare.
+        self._press_direction = config.getint('press_direction',
+                                              default=None)
+        if self._press_direction not in (None, -1, 1):
+            raise config.error("press_direction must be -1 or 1")
+        self._min_tare_headroom_percent = config.getfloat(
+            'min_tare_headroom_percent', 20., minval=0., below=100.)
         self._force_safety_limit_param = intParamHelper(config,
             'force_safety_limit', minval=100, maxval=5000, default=2000)
 
@@ -283,6 +296,67 @@ class LoadCellProbeConfigHelper:
         cfg = self._printer.lookup_object('configfile')
         cfg.set(self._config_name, 'reference_max_load_counts',
                 "%i" % (self._reference_max_load_counts,))
+
+    # Class defaults so a helper built without __init__ (tests) is safe
+    _press_direction = None
+    _min_tare_headroom_percent = 20.
+
+    def get_min_tare_headroom_percent(self):
+        return self._min_tare_headroom_percent
+
+    # The direction (-1. or 1.) that pressing on the nozzle moves the raw
+    # counts.  Only for safety_model=preloaded_max.  Configured, else the
+    # sign of reference_max_load_counts: the anchor is the fully loaded
+    # reading, so it lies on the press side of ADC zero.
+    def get_press_direction(self):
+        if self._press_direction is not None:
+            return float(self._press_direction)
+        ref_max = self._reference_max_load_counts
+        if ref_max is None:
+            raise self._printer.command_error(
+                "Missing reference_max_load_counts. Run "
+                "LOAD_CELL_CALIBRATE_MAX first.")
+        if ref_max == 0:
+            raise self._printer.command_error(
+                "reference_max_load_counts is 0, so the press direction "
+                "is unknown: set press_direction to -1 or 1")
+        return 1. if ref_max > 0 else -1.
+
+    # Counts between the tare and the anchor, positive while the tare is
+    # on the unloaded side of the anchor.  Returns
+    # (press_direction, headroom_counts, headroom_percent_of_anchor)
+    def get_tare_headroom(self, tare_counts):
+        direction = self.get_press_direction()
+        ref_max = self._reference_max_load_counts
+        headroom = int(direction * (ref_max - tare_counts))
+        percent = 100. * headroom / max(1, abs(ref_max))
+        return direction, headroom, percent
+
+    # KAN-3370: refuse before any motion when the nozzle is already
+    # loaded.  Independent of the trigger mode and of counts_per_gram.
+    # 20% default: the smallest normal headroom seen is one unit's worst
+    # tare of -1750000 against an anchor of -3010747, which leaves
+    # 1260747 = 42% of the anchor; another unit's normal tares leave about
+    # 113% (about 75% after its known tare shift); the incident was -7.8%.
+    # 20% is half the smallest normal headroom, so normal tares keep a 2x
+    # margin, and a nozzle preloaded to within a fifth of the calibrated
+    # maximum is refused.  The percent margin below shrinks to nothing as
+    # the tare nears the anchor, hence the floor relative to abs(anchor).
+    def check_tare_headroom(self, tare_counts, gcmd=None):
+        if self._safety_model != self.SAFETY_MODEL_PRELOADED_MAX:
+            return
+        direction, headroom, percent = self.get_tare_headroom(tare_counts)
+        ref_max = self._reference_max_load_counts
+        margin = self.get_max_load_safety_margin_counts(tare_counts, gcmd)
+        floor = int(self._min_tare_headroom_percent / 100. * abs(ref_max))
+        required = max(margin, floor)
+        if headroom <= required:
+            raise self._printer.command_error(
+                "The nozzle is already under load: check nothing is "
+                "touching it (tare %i, max-load reference %i, headroom "
+                "%.1f%%, need %.1f%%)"
+                % (tare_counts, ref_max, percent,
+                   100. * required / max(1, abs(ref_max))))
 
     def get_max_load_safety_margin_counts(self, tare_counts, gcmd=None):
         # Keep explicit raw-count override for compatibility and direct control.
@@ -359,15 +433,15 @@ class LoadCellProbeConfigHelper:
             raise cmd_err(
                 "Missing reference_max_load_counts. Run "
                 "LOAD_CELL_CALIBRATE_MAX first.")
+        self.check_tare_headroom(tare_counts, gcmd)
         margin = self.get_max_load_safety_margin_counts(tare_counts, gcmd)
         sensor_min, sensor_max = self._load_cell.get_sensor().get_range()
-        if tare_counts <= ref_max:
-            # Allow unrestricted drift on the low side and limit travel
-            # toward the calibrated max-load anchor.
+        if self.get_press_direction() > 0:
+            # Pressing raises the counts: limit travel toward the anchor
+            # and allow unrestricted drift on the other side.
             safety_min = sensor_min + 1
             safety_max = ref_max - margin
         else:
-            # Invert direction if tare is above the max-load anchor.
             safety_min = ref_max + margin
             safety_max = sensor_max - 1
         return int(safety_min), int(safety_max)
@@ -413,8 +487,7 @@ class LoadCellProbeConfigHelper:
             trigger_type = "abs_ge"
             direction = None
             if self._safety_model == self.SAFETY_MODEL_PRELOADED_MAX:
-                ref_max = self._reference_max_load_counts
-                direction = 1. if ref_max >= tare_counts else -1.
+                direction = self.get_press_direction()
                 scale = direction
                 trigger_type = "gt"
             max_delta = self._get_max_delta_before_raw_range(
@@ -430,6 +503,10 @@ class LoadCellProbeConfigHelper:
                 'trigger_type': trigger_type,
                 'trigger_value': int(trigger_counts),
                 'trigger_mode': 'counts',
+                # for the Z load backstop: the armed delta in counts, and
+                # the press direction when the trigger is directed
+                'trigger_delta_counts': int(trigger_counts),
+                'press_direction': direction,
             }
         trigger_percent = self.get_trigger_percent(gcmd)
         if trigger_percent is not None:
@@ -438,7 +515,7 @@ class LoadCellProbeConfigHelper:
                 raise cmd_err("trigger_percent is only supported with "
                               "safety_model=preloaded_max")
             ref_max = self._reference_max_load_counts
-            direction = 1. if ref_max >= tare_counts else -1.
+            direction = self.get_press_direction()
             span_counts = abs(int(ref_max - tare_counts))
             if span_counts <= 0:
                 cmd_err = self._printer.command_error
@@ -460,6 +537,8 @@ class LoadCellProbeConfigHelper:
                 'trigger_type': "gt",
                 'trigger_value': int(trigger_counts),
                 'trigger_mode': 'percent',
+                'trigger_delta_counts': int(trigger_counts),
+                'press_direction': direction,
             }
         # Fall back to grams-based trigger logic
         trigger_val = self.get_trigger_force_grams(gcmd)
@@ -480,6 +559,9 @@ class LoadCellProbeConfigHelper:
             'trigger_type': "abs_ge",
             'trigger_value': int(trigger_frac_grams),
             'trigger_mode': 'grams',
+            # abs_ge fires in either direction, so there is no press side
+            'trigger_delta_counts': abs(trigger_delta_counts),
+            'press_direction': None,
         }
 
     # calculate 1/counts_per_gram
@@ -491,6 +573,217 @@ class LoadCellProbeConfigHelper:
         if counts_per_gram >= (1<<29):
             raise OverflowError("counts_per_gram value is too large to filter")
         return 1. / counts_per_gram
+
+
+# KAN-3370 guard D: host-side load backstop for Z probing moves.
+#
+# The M1's Z homing and probe descents are blind searches: if the MCU
+# trigger never fires (a wrong tare, a wrong trigger direction) the move
+# runs on and pushes the bed up.  This watches the load cell samples on the
+# host for the length of the descent and ends the move through
+# PrinterHoming.abort_active_move() on either of two signs, whatever the
+# MCU thinks:
+#   (a) WRONG WAY: the load moved away from the tare on the side opposite
+#       the press by more than z_move_wrong_way_factor x the trigger delta
+#       (the count delta the probe's own trigger is armed with).  Only for
+#       a directed trigger ("gt"); an abs_ge trigger (grams mode, the
+#       reference_tare model) already fires on either side, so there is no
+#       wrong side to watch.
+#   (b) CEILING: |load - tare| above the ceiling on either side.  In the
+#       press direction it is a backstop behind the MCU trigger and the raw
+#       range; in the other it covers a sensor that has gone the wrong way.
+# Either needs z_move_abort_confirm_time (20 ms) of consecutive samples, so
+# one noisy sample never aborts a home.  20 ms is longer than the half
+# period of the cell's 48 Hz ring (contact_guard uses the same reasoning).
+# "20 ms" is both a count (ceil(20 ms x sps) samples in a row) and a span:
+# the watch also fires when the run of bad samples has lasted 20 ms by
+# the samples' own timestamps, so a stream with holes in it (the
+# muon_ads1220 drops the slots of a temperature read) or a rate below the
+# nominal one confirms as soon as it would on a clean stream.
+#
+# SIZING (counts; trigger_percent 10 of |anchor - tare| is the MCU trigger):
+#   Boxwood, anchor -3010747: tare -578000 -> delta 243275;
+#     tare -1750000 -> delta 126075.   Sloe, anchor -1585739: tare +200000
+#     -> delta 178574.
+#   The ceiling is 2.5 x delta: 608000 / 315000 / 446000.  The trigger
+#   stops the steppers within about a millisecond of the sample that arms
+#   it, so a normal tap overshoots by a small fraction of one delta and
+#   never reaches 2.5 x; the MCU trigger wins by a wide margin.
+#   The ceiling is relative to the armed delta, not to the anchor, on
+#   purpose.  A fixed share of abs(anchor) cannot tell the 16 Nov Boxwood
+#   incident (contact loads of 197994 to 289639 counts) from a normal tap
+#   (243275 at tare -578000).  Relative to the delta it can: the incident
+#   tare -3244819 is PAST the anchor -3010747, so its delta is 10% of the
+#   234072 counts between them = 23407, and the ceiling is 58517, under a
+#   third of the smallest contact load that was recorded.
+#   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
+#   against a delta of 178574, so noise is under 4% of the limit.
+# MCUTARE: the MCU zeroes itself on the first descent sample and the host
+#   only has _approx_tare, which note_baseline() lets move by at most
+#   MAX_BASELINE_DRIFT_COUNTS (100000) a tap.  That error is most of a
+#   126075-count delta, so rule (a) is OFF under MCUTARE; the ceiling stays
+#   on, because 2.5 x delta minus 100000 is still 1.7 x the smallest delta.
+class ZLoadBackstop:
+    REASON_WRONG_WAY = "the load cell moved the wrong way during the Z move"
+    REASON_CEILING = ("the load on the nozzle exceeded the safety ceiling "
+                      "during the Z move")
+    REASON_FAILED = "the load watch failed during the Z move"
+    MIN_CONSECUTIVE = 3
+
+    def __init__(self, config, printer, load_cell):
+        self._printer = printer
+        self._load_cell = load_cell
+        self._ceiling_factor = config.getfloat(
+            'z_move_abort_ceiling_factor', 2.5, minval=0.)
+        if 0. < self._ceiling_factor < 1.5:
+            raise config.error("z_move_abort_ceiling_factor must be 0 (off)"
+                               " or at least 1.5, so it stays above the "
+                               "trigger")
+        self._ceiling_counts_param = config.getint(
+            'z_move_abort_ceiling_counts', 0, minval=0)
+        self._wrong_way_factor = config.getfloat(
+            'z_move_wrong_way_factor', 1., minval=0.)
+        if 0. < self._wrong_way_factor < 0.5:
+            raise config.error("z_move_wrong_way_factor must be 0 (off) or "
+                               "at least 0.5")
+        self._confirm_time = config.getfloat(
+            'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
+        self._armed = False
+        self._registered = False    # our client is on the load cell
+        self._start_time = 0.
+        self._tare = 0
+        self._direction = None
+        self._ceiling = 0
+        self._wrong = 0
+        self._need = self.MIN_CONSECUTIVE
+        self._over_run = 0
+        self._wrong_run = 0
+        self._over_t0 = None    # timestamp of the first sample of the run
+        self._wrong_t0 = None
+        self.last_fired = None
+
+    def is_armed(self):
+        return self._armed
+
+    def get_limits(self):
+        return self._ceiling, self._wrong
+
+    # Start watching a descent.  Only samples stamped at or after
+    # start_time (print_time, as the sample timestamps are) are judged.
+    def arm(self, start_time, tare_counts, trigger_delta, press_direction,
+            mcutare=False):
+        self.disarm()
+        self.last_fired = None
+        sps = self._load_cell.get_sensor().get_samples_per_second()
+        need = max(self.MIN_CONSECUTIVE,
+                   int(math.ceil(self._confirm_time * sps)))
+        ceiling = 0
+        if self._ceiling_counts_param > 0:
+            ceiling = self._ceiling_counts_param
+        elif self._ceiling_factor > 0. and trigger_delta:
+            ceiling = int(self._ceiling_factor * abs(trigger_delta))
+        wrong = 0
+        if (press_direction in (-1, 1) and trigger_delta
+                and self._wrong_way_factor > 0. and not mcutare):
+            wrong = int(self._wrong_way_factor * abs(trigger_delta))
+        self._start_time = start_time
+        self._tare = tare_counts
+        self._direction = press_direction
+        self._ceiling = ceiling
+        self._wrong = wrong
+        self._need = need
+        self._over_run = self._wrong_run = 0
+        self._over_t0 = self._wrong_t0 = None
+        if not ceiling and not wrong:
+            return
+        self._armed = True
+        if not self._registered:
+            # One client for good: the load cell drops it (False) at the
+            # first batch after the watch ends, and arm() adds it again.
+            self._load_cell.add_client(self._on_batch)
+            self._registered = True
+
+    def disarm(self):
+        self._armed = False
+
+    def _on_batch(self, msg):
+        # Runs in the sensor's batch timer: it never raises.  False drops
+        # the client from the load cell.
+        if not self._armed:
+            self._registered = False
+            return False
+        try:
+            for sample in msg['data']:
+                if sample[0] < self._start_time:
+                    continue
+                reason = self._judge(sample[2], sample[0])
+                if reason is not None:
+                    self._fire(reason)
+                    self._registered = False
+                    return False
+            return True
+        except Exception:
+            logging.exception("load_cell_probe: the Z load watch failed")
+            self._fire(self.REASON_FAILED)
+            self._registered = False
+            return False
+
+    def _confirmed(self, run, t0, t):
+        if run >= self._need:
+            return True
+        return (t is not None and t0 is not None
+                and run >= self.MIN_CONSECUTIVE
+                and t - t0 >= self._confirm_time)
+
+    def _judge(self, counts, t=None):
+        dev = counts - self._tare
+        if self._ceiling and abs(dev) > self._ceiling:
+            if not self._over_run:
+                self._over_t0 = t
+            self._over_run += 1
+        else:
+            self._over_run = 0
+        if self._wrong and dev * self._direction < -self._wrong:
+            if not self._wrong_run:
+                self._wrong_t0 = t
+            self._wrong_run += 1
+        else:
+            self._wrong_run = 0
+        if self._confirmed(self._over_run, self._over_t0, t):
+            return self.REASON_CEILING
+        if self._confirmed(self._wrong_run, self._wrong_t0, t):
+            return self.REASON_WRONG_WAY
+        return None
+
+    def _fire(self, reason):
+        self._armed = False
+        try:
+            homing = self._printer.lookup_object('homing')
+            done = homing.abort_active_move(reason)
+        except Exception:
+            logging.exception("load_cell_probe: could not abort the Z move")
+            return
+        if done:
+            self.last_fired = reason
+            logging.warning("load_cell_probe: Z move aborted: %s (tare %i,"
+                            " ceiling %i, wrong way %i)", reason,
+                            self._tare, self._ceiling, self._wrong)
+        else:
+            logging.info("load_cell_probe: Z load watch tripped (%s) but no"
+                         " move could be aborted", reason)
+
+    def get_status(self):
+        # The *_counts are the limits of the descent in progress (0 until
+        # one arms); the rest is what is configured, readable at any time,
+        # so an install can be checked with no probe having run.
+        return {'z_backstop_ceiling_counts': self._ceiling,
+                'z_backstop_wrong_way_counts': self._wrong,
+                'z_backstop_fired': self.last_fired,
+                'z_backstop_ceiling_factor': self._ceiling_factor,
+                'z_backstop_ceiling_counts_config':
+                    self._ceiling_counts_param,
+                'z_backstop_wrong_way_factor': self._wrong_way_factor,
+                'z_backstop_confirm_time': self._confirm_time}
 
 
 # Execute probing moves using the MCU_trigger_analog
@@ -523,6 +816,14 @@ class LoadCellProbingMove:
         self._safety_min = 0
         self._safety_max = 0
         self._trigger_mode = 'grams'
+        # KAN-3370 guard D
+        self._z_watch = ZLoadBackstop(config, self._printer, load_cell_inst)
+
+    # Class defaults so a move built without __init__ (tests) is inert
+    _z_watch = None
+    _trigger_delta = None
+    _trigger_press_dir = None
+    _collect_start_time = None
 
     def _start_collector(self):
         toolhead = self._printer.lookup_object('toolhead')
@@ -542,7 +843,25 @@ class LoadCellProbingMove:
             print_time = toolhead.get_last_move_time()
         collector = self._load_cell.get_collector()
         collector.start_collecting(min_time=print_time)
+        # where the descent that follows starts, in sample time
+        self._collect_start_time = print_time
         return collector
+
+    def _log_tare(self, tare_counts):
+        helper = self._config_helper
+        if helper.get_safety_model() != helper.SAFETY_MODEL_PRELOADED_MAX:
+            return
+        try:
+            direction, headroom, percent = helper.get_tare_headroom(
+                tare_counts)
+        except Exception as e:
+            logging.info("load_cell_probe: tare=%i headroom unknown: %s",
+                         tare_counts, e)
+            return
+        logging.info("load_cell_probe: tare=%i anchor=%i headroom=%i "
+                     "(%.1f%%) press_direction=%i", tare_counts,
+                     helper.get_reference_max_load_counts(), headroom,
+                     percent, int(direction))
 
     # pauses for the last move to complete and then
     # sets the endstop tare value and range
@@ -554,6 +873,10 @@ class LoadCellProbingMove:
         tare_samples = check_sensor_errors(results, self._printer)
         tare_counts = int(round(
             np.average(np.array(tare_samples)[:, 2].astype(float))))
+        # KAN-3370: refuse a loaded nozzle before the bad zero is stored
+        # anywhere (load cell, approximate tare) or sent to the MCU
+        self._log_tare(tare_counts)
+        self._config_helper.check_tare_headroom(tare_counts, gcmd)
         # update sos_filter with any gcode parameter changes
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         # update the load cell so it reflects the new tare value
@@ -577,6 +900,8 @@ class LoadCellProbingMove:
         self._mcu_trigger_analog.set_trigger(
             trigger_setup['trigger_type'], trigger_setup['trigger_value'])
         self._trigger_mode = trigger_setup['trigger_mode']
+        self._trigger_delta = trigger_setup.get('trigger_delta_counts')
+        self._trigger_press_dir = trigger_setup.get('press_direction')
         logging.debug(
             "load_cell_probe: tare=%i raw_range=[%i,%i] trigger_mode=%s",
             tare_counts, safety_min, safety_max, self._trigger_mode)
@@ -597,12 +922,16 @@ class LoadCellProbingMove:
         _fresh.start_collecting(min_time=_now)
         check_sensor_errors(_fresh.collect_min(1), self._printer)
         tare_counts = self._approx_tare
+        # KAN-3370: note_baseline moves _approx_tare without a check, so
+        # refuse a loaded nozzle before the load cell takes the zero
+        self._config_helper.check_tare_headroom(tare_counts, gcmd)
         self._continuous_tare_filter_helper.update_from_command(gcmd)
         self._load_cell.tare(tare_counts)
         self._tare_counts = tare_counts
         # The raw-range guard is computed from the approximate zero but is
         # checked on the MCU against the RAW sample, before the filter, so
         # it still bounds force no matter what zero the MCU picks.
+        self._log_tare(tare_counts)
         safety_min, safety_max = self._config_helper.get_safety_range(
             tare_counts, gcmd)
         self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
@@ -620,6 +949,8 @@ class LoadCellProbingMove:
         self._mcu_trigger_analog.set_trigger(
             trigger_setup['trigger_type'], trigger_setup['trigger_value'])
         self._trigger_mode = trigger_setup['trigger_mode']
+        self._trigger_delta = trigger_setup.get('trigger_delta_counts')
+        self._trigger_press_dir = trigger_setup.get('press_direction')
 
     MAX_BASELINE_DRIFT_COUNTS = 100000
 
@@ -683,9 +1014,11 @@ class LoadCellProbingMove:
         self._config_helper.validate_probe_setup(gcmd)
         # tare the sensor just before probing
         _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
+        _used_mcutare = False
         if _mcutare and self._approx_tare is not None \
                 and self._nozzle_is_clear():
             self._mcu_tare(gcmd)
+            _used_mcutare = True
         else:
             self._pause_and_tare(gcmd)
         # get params for the homing move
@@ -703,6 +1036,12 @@ class LoadCellProbingMove:
         phoming = self._printer.lookup_object('homing')
         # start collector after tare samples are consumed
         collector = self._start_collector()
+        # KAN-3370 guard D: watch the load for the length of the descent
+        watch = self._z_watch
+        if watch is not None:
+            watch.arm(self._collect_start_time, self._tare_counts,
+                      self._trigger_delta, self._trigger_press_dir,
+                      mcutare=_used_mcutare)
         # do homing move
         try:
             epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
@@ -712,6 +1051,10 @@ class LoadCellProbingMove:
             # must stop it here or it collects for the life of klippy.
             collector.stop_collecting()
             raise
+        finally:
+            # never left armed, whatever way the move ended
+            if watch is not None:
+                watch.disarm()
         # Where this tap actually stopped.  _nozzle_is_clear() needs it to
         # decide whether the next descent may take a relative MCU zero.
         self._last_trigger_z = epos[2]
@@ -720,24 +1063,36 @@ class LoadCellProbingMove:
     # Wait for the MCU to trigger with no movement
     def probing_test(self, gcmd, timeout):
         self._config_helper.validate_probe_setup(gcmd)
-        self._pause_and_tare(gcmd)
-        toolhead = self._printer.lookup_object('toolhead')
-        print_time = toolhead.get_last_move_time()
-        self._mcu_trigger_analog.home_start(print_time, 0., 0, 0.)
-        return self._mcu_trigger_analog.home_wait(print_time + timeout)
+        send_tap_event(self._printer, "load_cell_probe:tap_begin",
+                       self._load_cell)
+        try:
+            self._pause_and_tare(gcmd)
+            toolhead = self._printer.lookup_object('toolhead')
+            print_time = toolhead.get_last_move_time()
+            self._mcu_trigger_analog.home_start(print_time, 0., 0, 0.)
+            return self._mcu_trigger_analog.home_wait(print_time + timeout)
+        finally:
+            send_tap_event(self._printer, "load_cell_probe:tap_end",
+                           self._load_cell)
 
     def get_last_trigger_time(self):
         return self._mcu_trigger_analog.get_last_trigger_time()
 
+    def get_load_cell(self):
+        return self._load_cell
+
     def get_status(self, eventtime):
         trig_time = self._mcu_trigger_analog.get_last_trigger_time()
-        return {
+        status = {
             'tare_counts': self._tare_counts,
             'raw_safety_min': self._safety_min,
             'raw_safety_max': self._safety_max,
             'trigger_mode': self._trigger_mode,
             'last_trigger_time': trig_time,
         }
+        if self._z_watch is not None:
+            status.update(self._z_watch.get_status())
+        return status
 
 
 # Perform a single complete tap
@@ -758,15 +1113,26 @@ class TappingMove:
 
     # perform a probing move and a pullback move
     def run_tap(self, gcmd):
-        # do the descending move
-        epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+        load_cell_inst = self._load_cell_probing_move.get_load_cell()
+        # MUON: the window from the tare to the end of the tap's samples.
+        # A sensor that shares its ADC (muon_ads1220) keeps the probe's
+        # samples unbroken and the heater quiet for it.
+        send_tap_event(self._printer, "load_cell_probe:tap_begin",
+                       load_cell_inst)
         try:
-            results = self._collect_tap(gcmd, collector)
-        except Exception:
-            # KAN-463: same leak as a failed descent.  collect_until stops
-            # the collector itself when it times out; nothing before it did.
-            collector.stop_collecting()
-            raise
+            # do the descending move
+            epos, collector = self._load_cell_probing_move.probing_move(gcmd)
+            try:
+                results = self._collect_tap(gcmd, collector)
+            except Exception:
+                # KAN-463: same leak as a failed descent.  collect_until
+                # stops the collector itself when it times out; nothing
+                # before it did.
+                collector.stop_collecting()
+                raise
+        finally:
+            send_tap_event(self._printer, "load_cell_probe:tap_end",
+                           load_cell_inst)
         samples = check_sensor_errors(results, self._printer)
         self._load_cell_probing_move.note_baseline(samples)
         # Analyze the tap data
@@ -907,6 +1273,7 @@ class LoadCellPrinterProbe:
         sensors = {}
         sensors.update(hx71x.HX71X_SENSOR_TYPES)
         sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+        sensors.update(muon_ads1220.MUON_ADS1220_SENSOR_TYPE)
         sensor_class = config.getchoice('sensor_type', sensors)
         sensor = sensor_class(config)
         self._load_cell = load_cell.LoadCell(config, sensor)
@@ -947,6 +1314,27 @@ class LoadCellPrinterProbe:
                               config_helper)
         probe.ProbeVirtualEndstopDeprecation(config)
         self._printer.add_object('probe', self)
+        self._printer.register_event_handler("klippy:connect",
+                                             self._log_guard_settings)
+
+    def _log_guard_settings(self):
+        # One line in klippy.log with what the KAN-3370 guards are set to,
+        # for checking an install with no motion (see also get_status).
+        try:
+            # Not get_status(): at connect the MCU may not answer yet
+            st = self._load_cell_probing_move._z_watch.get_status()
+            logging.info(
+                "load_cell_probe: press_direction %s, min_tare_headroom %g%%"
+                ", Z backstop: ceiling %g x delta (fixed %d counts, 0 = off)"
+                ", wrong way %g x delta (0 = off), confirm %g s",
+                self._get_status_press_direction(),
+                self._config_helper.get_min_tare_headroom_percent(),
+                st['z_backstop_ceiling_factor'],
+                st['z_backstop_ceiling_counts_config'],
+                st['z_backstop_wrong_way_factor'],
+                st['z_backstop_confirm_time'])
+        except Exception:
+            logging.exception("load_cell_probe: guard settings unreadable")
 
     def get_probe_params(self, gcmd=None):
         return self._param_helper.get_probe_params(gcmd)
@@ -974,9 +1362,25 @@ class LoadCellPrinterProbe:
         ref_max = helper.get_reference_max_load_counts()
         if (helper.get_safety_model() == helper.SAFETY_MODEL_PRELOADED_MAX
                 and ref_max is not None):
-            # The direction the probe's own trigger uses
-            return 1. if ref_max >= zero_counts else -1.
+            # The direction the trigger uses: fixed, not inferred from
+            # where the zero is.  This is called from contact_guard's
+            # sample path, so an unknown direction (anchor 0, no
+            # press_direction) must not raise here; probing refuses it.
+            try:
+                return helper.get_press_direction()
+            except self._printer.command_error:
+                pass
         return self._load_cell.invert
+
+    def _get_status_press_direction(self):
+        helper = self._config_helper
+        if (helper.get_safety_model() != helper.SAFETY_MODEL_PRELOADED_MAX
+                or helper.get_reference_max_load_counts() is None):
+            return None
+        try:
+            return int(helper.get_press_direction())
+        except Exception:
+            return None
 
     def get_status(self, eventtime):
         status = self._cmd_helper.get_status(eventtime)
@@ -990,6 +1394,9 @@ class LoadCellPrinterProbe:
             'safety_model': self._config_helper.get_safety_model(),
             'reference_max_load_counts':
                 self._config_helper.get_reference_max_load_counts(),
+            'press_direction': self._get_status_press_direction(),
+            'min_tare_headroom_percent':
+                self._config_helper.get_min_tare_headroom_percent(),
         })
         return status
 

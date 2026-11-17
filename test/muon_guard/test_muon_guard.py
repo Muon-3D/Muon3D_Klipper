@@ -70,6 +70,17 @@ MUST_REFUSE = [
     'HOMING_GATE CALLBACK="G1 X1"',
     'HOMING_GATE CALLBACK=_HOME_Z',
     'HOMING_GATE CALLBACK=G280',
+    'HOMING_GATE Z=1 CALLBACK=SET_KINEMATIC_POSITION',
+    'HOMING_GATE Z=0 CALLBACK=_HOME_Z',
+    # z_power.py and m1_machine.py commands that are the printer's own: they
+    # hold bed power off, gate macros or change the pause state
+    'Z_POWER_INHIBIT ENABLE=1',
+    'Z_POWER_WAIT TIMEOUT=5',
+    'Z_POWER_REQUIRE',
+    'MACHINE_RESUMED',
+    'MACHINE_PAUSED REASON=plate_removed',
+    'MACHINE_PAUSE_REASON REASON=filament_out',
+    'MACHINE_REQUIRE ACTION=resume',
     # Parameters a client may not send to an allowlisted command. Each
     # would reach a refused command or unbounded motion inside the macro.
     'FILAMENT_INSERT_SENSORLESS_LOAD CURRENT=2000',
@@ -715,6 +726,79 @@ def test_homing_gate_callback():
               "HOMING_GATE with another callback is refused: %s" % line)
 
 
+def test_homing_gate_button_passes_the_gate():
+    # The CONTINUE button of the homing-blocked prompt (homing.cfg) sends
+    # HOMING_GATE with Z and a quoted CALLBACK. Take the line from the macro
+    # itself, so a change to it is checked here.
+    with open(os.path.join(MACRO_DIR, 'homing.cfg'), encoding='utf-8') as f:
+        m = re.search(r'prompt_footer_button CONTINUE\|([^|"]+)\|', f.read())
+    check(m is not None, "homing.cfg has the CONTINUE button")
+    template = m.group(1)
+    check('{for_z}' in template and '{params.CALLBACK}' in template,
+          "the CONTINUE button sends Z and CALLBACK: %r" % (template,))
+    rig = Rig()
+    for for_z in ('0', '1'):
+        for callback in ('G28', 'G28 X Y', 'G28 O'):
+            line = (template.replace('{for_z}', for_z)
+                    .replace('{params.CALLBACK}', callback))
+            err = rig.client(line)
+            check(err is None,
+                  "the homing-blocked CONTINUE button passes: %s (%s)"
+                  % (line, err))
+            check(len(rig.calls) == 1, "and it ran: %s" % (line,))
+    for line in ("HOMING_GATE Z=2 CALLBACK='G28 X Y'",
+                 "HOMING_GATE Z=-1 CALLBACK=G28",
+                 "HOMING_GATE Z=1 CALLBACK='G28.1 X'",
+                 "HOMING_GATE Z=1 CALLBACK=_HOME_Z",
+                 "HOMING_GATE Z=1 CALLBACK='FORCE_MOVE STEPPER=stepper_z'",
+                 "HOMING_GATE Z=1 FOO=1 CALLBACK=G28"):
+        err = rig.client(line)
+        check(err is not None and refused_text_ok(err),
+              "HOMING_GATE outside the button's form is refused: %s (%r)"
+              % (line, err))
+        check(rig.calls == [], "and nothing ran: %s" % (line,))
+
+
+def test_z_power_and_machine_commands():
+    # What the panel alert, the start gate prompt and Control send after a
+    # user confirm (KAN-3334 refuses Z_POWER_RESET while printing, in
+    # z_power.py itself). Driven through the real guard with dev mode off.
+    rig = Rig()
+    check(not rig.guard.is_dev_mode(), "the rig is not in dev mode")
+    # registered whatever the allowlist says, so that removing an entry is
+    # a refusal here and not an 'unknown command' that passes
+    for name in ('Z_POWER_STATUS', 'Z_POWER_RESET', 'MACHINE_STATUS',
+                 'MACHINE_PLATE_CLEAR'):
+        rig._register(name)
+    for line in ('Z_POWER_STATUS', 'Z_POWER_RESET', 'MACHINE_STATUS',
+                 'MACHINE_PLATE_CLEAR', 'z_power_reset'):
+        for door in ('webhooks', 'pty', 'file'):
+            err = rig.client(line, door)
+            check(err is None, "%s passes from a client via %s (%s)"
+                  % (line, door, err))
+            check(len(rig.calls) == 1, "and it ran: %s via %s"
+                  % (line, door))
+    # they take no parameters, so a client cannot add any
+    for line in ('Z_POWER_RESET FORCE=1', 'MACHINE_PLATE_CLEAR X=1'):
+        err = rig.client(line)
+        check(err is not None and refused_text_ok(err),
+              "no parameters: %s (%r)" % (line, err))
+    # negative controls: their neighbours stay refused outside dev mode
+    for line in ('Z_POWER_INHIBIT ENABLE=1', 'Z_POWER_INHIBIT ENABLE=0',
+                 'Z_POWER_WAIT TIMEOUT=5', 'Z_POWER_REQUIRE',
+                 'MACHINE_RESUMED', 'MACHINE_PAUSED REASON=plate_removed',
+                 'MACHINE_REQUIRE ACTION=resume'):
+        err = rig.client(line)
+        check(err is not None and refused_text_ok(err),
+              "%s is not on the allowlist and is refused (%r)"
+              % (line, err))
+        check(rig.calls == [], "and nothing ran: %s" % (line,))
+    # and the same line runs in dev mode
+    dev = Rig(dev=True)
+    check(dev.client('Z_POWER_INHIBIT ENABLE=1') is None,
+          "Z_POWER_INHIBIT runs in dev mode")
+
+
 def line_for(entry, end=1):
     """A command line that satisfies one allowlist entry."""
     parts = shlex.split(entry)
@@ -824,7 +908,7 @@ def test_virtual_sdcard_lines():
     path = os.path.join(ROOT, 'klippy', 'extras', 'virtual_sdcard.py')
     with open(path, encoding='utf-8') as f:
         src = f.read()
-    check("self.gcode.run_client_script(line, 'file')" in src,
+    check("self.gcode.run_client_script(line, 'file', abortable=True)" in src,
           "virtual_sdcard sends each file line in as a 'file' client line")
     check("self.gcode.run_script(self.on_error_gcode.render())" in src,
           "virtual_sdcard keeps on_error_gcode internal")
@@ -946,6 +1030,7 @@ NOT_FOR_CLIENTS = {
     'FILAMENT_INSERT_GRAB_MORE': 'step of the insert flow',
     'IF_BED_TEMP_ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
     'ANTI_OOZE_NOZZLE_DOCK': 'step of PRINT_START',
+    'STEPLOSS_TEST': 'bench tool (macros/debug.cfg), not for clients',
 }
 
 
@@ -974,8 +1059,9 @@ def test_every_macro_is_classified():
           "sent by the panel: %r"
           % (sorted(underscore_allowed - prompt_targets - panel_sent),))
     check(underscore_allowed == set([
-        '_BED_RESUME_NOW', '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
-        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE'])
+        '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
+        '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE',
+        '_RUNOUT_UNLOAD'])
         | panel_sent,
         "the underscore exceptions are exactly the nine reviewed ones: %r"
         % (sorted(underscore_allowed),))

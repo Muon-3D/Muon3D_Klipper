@@ -88,6 +88,30 @@ finish_test check_m1_armed_hooks "Check M1 armed hooks"
 
 
 ######################################################################
+# B0 config (core/M1-B0) under this tree's klippy
+######################################################################
+
+# The B0 board (unit Boxwood: tmc2130, ads1220, adxl345) keeps master's
+# config, copied to core/M1-B0, and runs under the same klippy/ as the B1
+# core/M1. The checkers take the config directory as an argument. The
+# scripts/b0 and test/b0 tests are master's, which assert B0's behaviour
+# (core/M1's versions assert B1's: the start gate, m1_machine, z_power).
+start_test b0_config "Check B0 config"
+$PYTHON scripts/check_macro_config.py core/M1-B0
+$PYTHON scripts/check_macro_status_keys.py core/M1-B0
+$PYTHON scripts/check_m1_armed_hooks.py core/M1-B0
+$PYTHON scripts/b0/test_m1_led_modes.py
+$PYTHON scripts/b0/test_m1_heater_before_leds.py
+$PYTHON scripts/b0/test_m1_purge_line.py
+$PYTHON scripts/b0/test_m1_fan_stoppage.py
+$PYTHON scripts/b0/test_m1_print_start_z_offset.py
+$PYTHON scripts/b0/test_m1_unlock_guard_offset.py
+$PYTHON test/b0/test_muon_guard.py
+$PYTHON test/b0/test_cold_retract.py
+finish_test b0_config "Check B0 config"
+
+
+######################################################################
 # Check for whitespace errors
 ######################################################################
 
@@ -150,11 +174,61 @@ start_test load_cell "Test load cell collector is stopped on a failed tap"
 $PYTHON test/load_cell/test_collector_leak.py
 finish_test load_cell "Test load cell collector is stopped on a failed tap"
 
+# MUON: the tap register bytes adxl345_probe writes, ADXL345 (A1) and
+# LIS2DW12 (B1). File-output klippy tests drop every register write.
+start_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+$PYTHON test/adxl345_probe/test_accel_tap_chip.py
+finish_test adxl345_probe_chips "Test adxl345_probe tap chip registers"
+
 # MUON: contact_guard refusal text, hysteresis timing and inactive states.
 start_test contact_guard "Test contact_guard decisions"
 $PYTHON test/contact_guard/test_contact_guard.py
 $PYTHON test/contact_guard/test_height_guard.py
 finish_test contact_guard "Test contact_guard decisions"
+
+# MUON: B1 shared load cell / hotend ADS1220: the mcu's no-DRDY sampling
+# against a modelled chip, hotend detection, range limits, heater hold.
+start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+$PYTHON test/muon_ads1220/test_muon_ads1220.py
+finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+# MUON: B1 Z/bed power path decisions and fault latching.
+start_test z_power "Test z_power decisions"
+$PYTHON test/z_power/test_z_power.py
+finish_test z_power "Test z_power decisions"
+
+# MUON: bed heater live supply power, resistance learning and heater check.
+start_test heater_supply "Test heater_supply and MPC on a simulated bed"
+$PYTHON test/heater_supply/test_heater_supply.py
+finish_test heater_supply "Test heater_supply and MPC on a simulated bed"
+
+# MUON: KAN-3370 probe and homing guards: a loaded tare is refused, a Z
+# probing move is ended by the load backstop or an outside abort, and the
+# Z home retry never swallows either.
+start_test probe_guards "Test load cell probe and homing guards"
+$PYTHON test/load_cell_probe/test_tare_guard.py
+$PYTHON test/load_cell_probe/test_z_load_backstop.py
+$PYTHON test/homing_abort/test_homing_abort.py
+$PYTHON test/homing_abort/test_search_cap.py
+$PYTHON test/homing_abort/test_toolhead_disconnect.py
+$PYTHON test/landing/test_landing_resolutions.py
+$PYTHON test/landing/test_abort_mid_print_start.py
+# SIM_STALL_AT (a batch-only seam in AXIS_PROTECTED_MOVE) does nothing
+# unless klippy was started with -i, which no printer does.
+$PYTHON test/landing/test_sim_stall_seam.py
+$PYTHON test/load_cell_home_z/test_load_cell_home_z.py
+finish_test probe_guards "Test load cell probe and homing guards"
+
+# MUON: tests the M1 print-start stack added but never ran in CI.
+start_test stack_extras "Test heater hold, tap path and motor tune"
+$PYTHON test/heaters/test_hold_pwm.py
+$PYTHON test/verify_heater/test_tap_hold.py
+$PYTHON test/m1_machine/test_filament_sensor_reconnect.py
+$PYTHON test/motor_tune/test_motor_tune.py
+$PYTHON test/tap_path/test_drip_prime.py
+$PYTHON test/tap_path/test_mcu_tare.py
+$PYTHON test/tap_path/test_retract_first.py
+$PYTHON test/tap_path/test_zlead.py
+finish_test stack_extras "Test heater hold, tap path and motor tune"
 
 # MUON: fail-closed dev-mode check; clients start only allowlisted commands
 # outside dev mode, macros and internal sources are not checked (KAN-1730).
@@ -182,6 +256,10 @@ finish_test m600 "Test M600 with no print only prompts"
 start_test bed_removal "Test bed_removal_detector pauses only in the print phase"
 $PYTHON test/bed_removal/test_bed_removal_detector.py
 finish_test bed_removal "Test bed_removal_detector pauses only in the print phase"
+# MUON: M1 machine state, start/resume gates and heat waits (m1_machine).
+start_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
+$PYTHON test/m1_machine/test_m1_machine.py
+finish_test m1_machine "Test m1_machine gates, heat waits and pause bookkeeping"
 
 # MUON: the unlock retract without FORCE_MOVE, which is off (KAN-380).
 start_test cold_retract "Test cold_retract and that FORCE_MOVE is off"
@@ -208,6 +286,25 @@ finish_test bed_mesh_no_go_snap "Test bed_mesh no-go snapping keeps the grid"
 start_test klippy "Test invoke klippy (Python3)"
 $PYTHON scripts/test_klippy.py -d ${DICTDIR} test/klippy/*.test
 finish_test klippy "Test invoke klippy (Python3)"
+
+# MUON: klippy STARTS on the shipped board configs. Every test above loads
+# a small test config; this loads the real core/M1/core.cfg (B1) and
+# core/M1-B0/core.cfg (B0) in batch mode with stand-ins for the files
+# outside the repo, against the rp2040 and linuxprocess dictionaries built
+# above, and fails on an unknown option or section, a bad pin, or any
+# config error. --selftest proves it fails on those, so it cannot pass
+# vacuously.
+start_test real_config "Test klippy starts on the shipped M1 configs"
+$PYTHON scripts/test_real_config.py --selftest -d ${DICTDIR} core/M1 core/M1-B0
+$PYTHON scripts/test_real_config.py -d ${DICTDIR} core/M1 core/M1-B0
+finish_test real_config "Test klippy starts on the shipped M1 configs"
+
+# MUON: cancelling a print while PRINT_START runs. Real reactor, gcode and
+# virtual_sdcard, no MCU: the batch-mode .test files above cannot send a
+# webhook from a second greenlet, which is the whole of the case.
+start_test print_cancel "Test cancel during PRINT_START"
+$PYTHON test/print_cancel/test_cancel_during_print_start.py
+finish_test print_cancel "Test cancel during PRINT_START"
 
 # MUON: an error in CUT_FILAMENT's cutter sequence re-enables contact_guard
 # (KAN-1940); batch mode exits on any error, so this reads the log.

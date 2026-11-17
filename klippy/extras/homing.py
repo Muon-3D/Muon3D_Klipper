@@ -8,6 +8,10 @@ import logging, math
 HOMING_START_DELAY = 0.001
 ENDSTOP_SAMPLE_TIME = .000015
 ENDSTOP_SAMPLE_COUNT = 4
+# KAN-3370: off by default.  The M1 starts its Z search blind from a
+# soft-homed Z, so no distance short of the full travel is safe for every
+# start; a printer that knows its start may set a cap in [homing].
+DEFAULT_MAX_SEARCH_DISTANCE_Z = 0.
 
 # Return a completion that completes when all completions in a list complete
 def multi_complete(printer, completions):
@@ -50,6 +54,12 @@ class HomingMove:
             toolhead = printer.lookup_object('toolhead')
         self.toolhead = toolhead
         self.stepper_positions = []
+        # Abort support (KAN-3370): the reason an outside caller ended this
+        # move, the trigger completions the drip move waits on, and whether
+        # the move is still at a stage an abort can reach
+        self._abort_reason = None
+        self._trigger_completions = []
+        self._abortable = False
     def get_mcu_endstops(self):
         return [es for es, name in self.endstops]
     def _calc_endstop_rate(self, mcu_endstop, movepos, speed):
@@ -74,8 +84,55 @@ class HomingMove:
         cpos = kin.calc_position(kin_spos)
         return [cp if cp is not None else tp
                 for cp, tp in zip(cpos, thpos[:3])] + thpos[3:]
+    def involves_z(self):
+        # True if a stepper that this move watches an endstop for drives Z
+        for es, name in self.endstops:
+            for s in es.get_steppers():
+                if s.is_active_axis('z'):
+                    return True
+        return False
+    def abort(self, reason):
+        # End this move now, from any context (it only completes the
+        # completions the drip move waits on, so it never blocks).  The
+        # greenlet inside homing_move does the cleanup and raises
+        # "Homing aborted: <reason>".  False if the move is not (or no
+        # longer) at a stage that can be aborted, or was already aborted.
+        if not self._abortable or self._abort_reason is not None:
+            return False
+        for c in self._trigger_completions:
+            if c.test():
+                # An endstop already ended the move (a probe that has
+                # triggered, or failed): it is not an abort, and a normal
+                # trigger must never be reported as one
+                return False
+        self._abort_reason = reason
+        self._complete_triggers()
+        return True
+    def _complete_triggers(self):
+        # A true result is how a failed endstop ends the drip early.  These
+        # are the endstops' own trigger completions, so the wait_end() in
+        # home_wait() returns at once even if the MCU never answers.
+        for c in self._trigger_completions:
+            if not c.test():
+                c.complete(True)
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):
+        homing = self.printer.lookup_object('homing', None)
+        note_move = getattr(homing, 'note_move_active', None)
+        self._abort_reason = None
+        self._trigger_completions = []
+        self._abortable = True
+        if note_move is not None:
+            note_move(self, True)
+        try:
+            return self._homing_move(movepos, speed, probe_pos,
+                                     triggered, check_triggered)
+        finally:
+            self._abortable = False
+            if note_move is not None:
+                note_move(self, False)
+    def _homing_move(self, movepos, speed, probe_pos, triggered,
+                     check_triggered):
         # Notify start of homing/probing move
         self.printer.send_event("homing:homing_move_begin", self)
         # Note start location
@@ -100,6 +157,10 @@ class HomingMove:
                                           ENDSTOP_SAMPLE_COUNT, rest_time,
                                           triggered=triggered)
             endstop_triggers.append(wait)
+        self._trigger_completions = list(endstop_triggers)
+        if self._abort_reason is not None:
+            # Aborted while the move was being set up
+            self._complete_triggers()
         all_endstop_trigger = multi_complete(self.printer, endstop_triggers)
         # dwell() primes print_time BUFFER_TIME_START out; the drip-lead
         # dwell is enough here and is what the drip move itself uses.
@@ -110,9 +171,16 @@ class HomingMove:
         # Issue move
         error = None
         try:
-            self.toolhead.drip_move(movepos, speed, all_endstop_trigger)
+            if self._abort_reason is None:
+                self.toolhead.drip_move(movepos, speed, all_endstop_trigger)
         except self.printer.command_error as e:
             error = "Error during homing move: %s" % (str(e),)
+        # No abort can reach the move past this point (nothing pauses
+        # between drip_move returning and this line)
+        self._abortable = False
+        aborted = self._abort_reason is not None
+        if aborted:
+            error = "Homing aborted: %s" % (self._abort_reason,)
         # Wait for endstops to trigger
         trigger_times = {}
         # The end time only has to be at or after the drip's physical end
@@ -129,6 +197,15 @@ class HomingMove:
                 if error is None:
                     error = "Error during homing %s: %s" % (name, str(e))
                 continue
+            except Exception:
+                # An aborted move must still reach the end of this method
+                # (halt position, homing_move_end).  The usual cause is an
+                # endstop MCU that has gone away.
+                if not aborted:
+                    raise
+                logging.exception("homing: home_wait failed on %s while"
+                                  " aborting", name)
+                continue
             if trigger_time > 0.:
                 trigger_times[name] = trigger_time
             elif check_triggered and error is None:
@@ -138,7 +215,10 @@ class HomingMove:
         for sp in self.stepper_positions:
             tt = trigger_times.get(sp.endstop_name, move_end_print_time)
             sp.note_home_end(tt)
-        if probe_pos:
+            if aborted:
+                # No trigger: the position is where the steppers stopped
+                sp.trig_pos = sp.halt_pos
+        if probe_pos or aborted:
             halt_steps = {sp.stepper_name: sp.halt_pos - sp.start_pos
                           for sp in self.stepper_positions}
             trig_steps = {sp.stepper_name: sp.trig_pos - sp.start_pos
@@ -264,6 +344,78 @@ class PrinterHoming:
         # Register g-code commands
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('G28', self.cmd_G28)
+        # KAN-3370: the furthest a Z probing move (the M1's Z homing search
+        # is one) may travel in one go.  0 (the default) turns the cap off.
+        # Z only: X/Y homing travel is never limited here.
+        self.max_search_distance_z = config.getfloat(
+            'max_search_distance_z', DEFAULT_MAX_SEARCH_DISTANCE_Z,
+            minval=0.)
+        # Homing/probing moves in progress (KAN-3370 abort)
+        self.active_moves = []
+        # What was wired at connect, for status and the log (read with no
+        # motion, to check an install): the non-critical MCUs whose
+        # disconnect aborts a Z move, and every source that can call
+        # abort_active_move().
+        self.disconnect_mcus = []
+        self.abort_sources = []
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
+    def _handle_connect(self):
+        # A non-critical MCU (the M1's toolhead) that goes away takes the
+        # probe with it, so the Z move it was ending must stop at once
+        for name, obj in self.printer.lookup_objects():
+            if not getattr(obj, 'is_non_critical', False):
+                continue
+            get_name = getattr(obj, 'get_non_critical_disconnect_event_name',
+                               None)
+            if get_name is None:
+                continue
+            self.printer.register_event_handler(
+                get_name(), self._handle_non_critical_disconnect)
+            self.disconnect_mcus.append(name)
+        # The other sources call abort_active_move() themselves: the plate
+        # pulled, the load cell's Z backstop, the bed power lost.
+        self.abort_sources = [
+            name for name in ('bed_removal_detector', 'load_cell_probe',
+                              'z_power')
+            if self.printer.lookup_object(name, None) is not None]
+        self.abort_sources += ['non_critical_disconnect: ' + n
+                               for n in self.disconnect_mcus]
+        logging.info(
+            "homing: Z search cap %g mm (0 = off); abort_on_disconnect %s;"
+            " a Z move can be aborted by: %s", self.max_search_distance_z,
+            bool(self.disconnect_mcus),
+            ", ".join(self.abort_sources) or "(nothing)")
+    def get_status(self, eventtime):
+        return {'max_search_distance_z': self.max_search_distance_z,
+                'abort_on_disconnect': bool(self.disconnect_mcus),
+                'abort_on_disconnect_mcus': list(self.disconnect_mcus),
+                'abort_sources': list(self.abort_sources)}
+    def _handle_non_critical_disconnect(self):
+        self.abort_active_move("the toolhead disconnected")
+    def note_move_active(self, hmove, active):
+        # Called by HomingMove.homing_move on entry and exit
+        if active:
+            self.active_moves.append(hmove)
+        elif hmove in self.active_moves:
+            self.active_moves.remove(hmove)
+    def abort_active_move(self, reason, z_only=True):
+        # End any homing/probing move in progress at once.  Safe to call
+        # from a reactor timer or callback: it only completes the moves'
+        # trigger completions and does not wait.  The greenlet running each
+        # move then stops its endstops, resynchronises the toolhead to the
+        # steps actually taken and raises "Homing aborted: <reason>".
+        # Moves that do not drive Z are left alone unless z_only is False.
+        # Returns True if a move was aborted, False if there was none.
+        aborted = False
+        for hmove in list(self.active_moves):
+            if z_only and not hmove.involves_z():
+                continue
+            if hmove.abort(reason):
+                aborted = True
+        if aborted:
+            logging.warning("homing: aborting the active move: %s", reason)
+        return aborted
     def manual_home(self, toolhead, endstops, pos, speed,
                     triggered, check_triggered):
         hmove = HomingMove(self.printer, endstops, toolhead)
@@ -275,15 +427,46 @@ class PrinterHoming:
                 raise self.printer.command_error(
                     "Homing failed due to printer shutdown")
             raise
+    def _in_homing(self):
+        scope = self.printer.lookup_object('homing_scope', None)
+        if getattr(scope, 'in_scope', False):
+            return True
+        override = self.printer.lookup_object('homing_override', None)
+        return bool(getattr(override, 'in_script', False))
+    def _cap_search(self, pos):
+        # Limit a probing move to max_search_distance_z of Z travel.  Returns
+        # (pos, capped).  The target is pulled back along the same line, so
+        # the move never travels further than the cap.
+        cap = self.max_search_distance_z
+        if cap <= 0.:
+            return pos, False
+        start = self.printer.lookup_object('toolhead').get_position()
+        dz = pos[2] - start[2]
+        if abs(dz) <= cap:
+            return pos, False
+        scale = cap / abs(dz)
+        capped = list(pos)
+        for i in range(2):
+            capped[i] = start[i] + (pos[i] - start[i]) * scale
+        capped[2] = start[2] + math.copysign(cap, dz)
+        return capped, True
     def probing_move(self, mcu_probe, pos, speed):
         endstops = [(mcu_probe, "probe")]
         hmove = HomingMove(self.printer, endstops)
+        pos, capped = self._cap_search(pos)
         try:
             epos = hmove.homing_move(pos, speed, probe_pos=True)
-        except self.printer.command_error:
+        except self.printer.command_error as e:
             if self.printer.is_shutdown():
                 raise self.printer.command_error(
                     "Probing failed due to printer shutdown")
+            if capped and "No trigger on" in str(e):
+                logging.info("homing: %s", str(e))
+                raise self.printer.command_error(
+                    "%s stopped: no contact within %g mm. Check the bed is"
+                    " fitted and nothing is wrong with the nozzle"
+                    % ("Z homing" if self._in_homing() else "Z probing",
+                       self.max_search_distance_z))
             raise
         if hmove.check_no_movement() is not None:
             raise self.printer.command_error(

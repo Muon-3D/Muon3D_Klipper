@@ -102,6 +102,11 @@ class Probe:
         return Session(self.th, self.liftlast, self.plate)
 
 
+class Gcode:
+    def check_abort(self):
+        pass
+
+
 class Printer:
     config_error = Exception
 
@@ -109,7 +114,8 @@ class Printer:
         self.th, self.probe = th, probe
 
     def lookup_object(self, n, default=None):
-        return {'toolhead': self.th, 'probe': self.probe, 'gcode': None}[n]
+        return {'toolhead': self.th, 'probe': self.probe,
+                'gcode': Gcode()}[n]
 
 
 class Config:

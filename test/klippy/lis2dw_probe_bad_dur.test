@@ -1,0 +1,6 @@
+# A tap_dur the LIS2DW12 cannot represent is a config error
+CONFIG lis2dw_probe_bad_dur.cfg
+DICTIONARY linuxprocess.dict
+SHOULD_FAIL
+
+G28 X
