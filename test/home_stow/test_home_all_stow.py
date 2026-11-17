@@ -39,7 +39,8 @@ def macros_of(board):
     return out
 
 
-def render(board, rawparams, gate_open=True):
+def render(board, rawparams, gate_open=True, print_state='standby',
+           paused=False):
     macro = macros_of(board)['gcode_macro G28']['gcode']
     params = {}
     for tok in rawparams.split():
@@ -55,6 +56,8 @@ def render(board, rawparams, gate_open=True):
         'mcu toolhead': {'non_critical_disconnected': False},
         'bed_removal_detector': {'bedRemoved': not gate_open},
         'gcode_macro G28': {'z_lifted_once': 0},
+        'print_stats': {'state': print_state},
+        'pause_resume': {'is_paused': paused},
     }
     text = cmc._jinja_env().from_string(macro).render(
         rawparams=rawparams, params=params, printer=printer)
@@ -99,6 +102,19 @@ class StowRender(unittest.TestCase):
             lines = render(b, 'STOW=1', gate_open=False)
             self.assertFalse(any(ln.startswith('Z_PARK') for ln in lines))
 
+    def test_no_stow_while_printing_or_paused(self):
+        for b in BOARDS:
+            for st, paused in (('printing', False), ('paused', False),
+                               ('standby', True)):
+                lines = render(b, '', print_state=st, paused=paused)
+                self.assertFalse(any(ln.startswith('Z_PARK') for ln in lines),
+                                 (b, st, paused))
+                self.assertTrue(any(ln.startswith('_HOME_Z') for ln in lines))
+            for st in ('standby', 'complete', 'cancelled', 'error'):
+                lines = render(b, '', print_state=st)
+                self.assertTrue(any(ln.startswith('Z_PARK') for ln in lines),
+                                (b, st))
+
     def test_o_is_not_a_stow_even_when_nothing_is_homed(self):
         for b in BOARDS:
             ok, lines = self.stows(b, 'O')
@@ -123,9 +139,16 @@ class InternalCallers(unittest.TestCase):
         out = []
         for path in cmc.config_files(base):
             for n, ln in enumerate(cmc._klipper_lines(read(path)), 1):
-                if re.match(r'^\s*G28(\s|$)', ln):
+                if re.search(r'(?:^|%\})\s*G28(?=\s|$)', ln):
                     out.append((os.path.relpath(path, ROOT), n, ln.strip()))
         return out
+
+    def test_the_caller_finder_sees_inline_g28(self):
+        pat = r'(?:^|%\})\s*G28(?=\s|$)'
+        self.assertTrue(re.search(pat, '  {% if x %} G28 X {% endif %}'))
+        self.assertTrue(re.search(pat, '    G28'))
+        self.assertFalse(re.search(pat, '  G28.1 X'))
+        self.assertFalse(re.search(pat, '  HOMING_GATE CALLBACK="G28 {a}"'))
 
     def test_every_internal_g28_passes_stow_0(self):
         for b in BOARDS:

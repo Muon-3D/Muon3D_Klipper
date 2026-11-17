@@ -331,7 +331,7 @@ class Suite:
         # toolhead and the Z column as missing and put up a prompt instead
         # of homing, so G28 returns with nothing homed. Retry until Z homes.
         for attempt in range(6):
-            self.gcode("G28")
+            self.gcode("G28 STOW=0")
             if self.dry or 'z' in self.query(['toolhead'])['toolhead'][
                     'homed_axes']:
                 break
