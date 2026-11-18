@@ -628,9 +628,12 @@ class LoadCellProbeConfigHelper:
 #   comes back.  A real wrong-way event is a step of one delta (146000 and
 #   up) in milliseconds, or a ramp far faster than 50000 a second, so it is
 #   still judged at nearly full size.  The press side is never re-referenced.
-#   One descent absorbs at most min(1000000, 4 x delta) counts of drift in
-#   all (146400 -> 585600); past that the wrong side runs from tare + cap, so
-#   a drift this large is a real fault.  Each descent logs what it absorbed.
+#   One descent absorbs at most z_move_drift_cap_counts (2500000, above the
+#   2.4M worst swing of KAN-3818; Sloe's tare moved 1.1M in 23 s) in all;
+#   past that the wrong side runs from tare + cap.  The cap only bounds
+#   pathological drift: a real sign-error press is a rate, not a size, and
+#   trips at ~1.006 x delta whatever has been absorbed.  Each descent logs
+#   what it absorbed, to learn the real rates.
 #   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
 #   against a delta of 178574, so noise is under 4% of the limit.
 # MCUTARE: the MCU zeroes itself on the first descent sample and the host
@@ -665,6 +668,8 @@ class ZLoadBackstop:
             'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
         self._drift_rate = config.getfloat(
             'z_move_drift_rate_counts', 50000., minval=0.)
+        self._drift_cap_param = config.getint(
+            'z_move_drift_cap_counts', 2500000, minval=1)
         self._armed = False
         self._registered = False    # our client is on the load cell
         self._start_time = 0.
@@ -725,12 +730,10 @@ class ZLoadBackstop:
         self._drift_peak = 0.
         self._last_t = None
         self._end_logged = False
-        # The most drift one descent may absorb: 1M counts or 4 x the
-        # trigger delta, whichever is less.  Past it the wrong side is
-        # judged from tare + cap, so the allowance can never grow into a
-        # real wrong-way event.
-        self._drift_cap = float(min(1000000, 4 * abs(trigger_delta or 0))
-                                or 1000000)
+        # The most drift one descent may absorb, z_move_drift_cap_counts.
+        # Past it the wrong side is judged from tare + cap, so the
+        # allowance can never grow without bound.
+        self._drift_cap = float(self._drift_cap_param)
         self._note_arming(ceiling, wrong, trigger_delta, press_direction,
                           mcutare)
         if not ceiling and not wrong:
@@ -915,7 +918,8 @@ class ZLoadBackstop:
                     self._ceiling_counts_param,
                 'z_backstop_wrong_way_factor': self._wrong_way_factor,
                 'z_backstop_confirm_time': self._confirm_time,
-                'z_backstop_drift_rate_counts': self._drift_rate}
+                'z_backstop_drift_rate_counts': self._drift_rate,
+                'z_backstop_drift_cap_counts': self._drift_cap_param}
 
 
 # Execute probing moves using the MCU_trigger_analog

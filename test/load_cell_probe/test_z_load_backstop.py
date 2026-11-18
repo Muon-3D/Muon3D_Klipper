@@ -735,7 +735,8 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
             'z_backstop_confirm_time': 0.02,
-            'z_backstop_drift_rate_counts': 50000.}
+            'z_backstop_drift_rate_counts': 50000.,
+            'z_backstop_drift_cap_counts': 2500000}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,

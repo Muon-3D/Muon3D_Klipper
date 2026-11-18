@@ -88,28 +88,28 @@ def test_1_slow_wrong_side_drift_does_not_trip(mod):
     assert w.get_limits() == (647975, 259190), w.get_limits()
     assert homing.calls == [] and idx is None, (homing.calls, idx)
     # Logged attempt 1: tare -121734, wrong way 146400, ceiling 366000.
-    # Heat-up drift of 20000 counts/s for 25 s (500000 counts: past BOTH
-    # limits, under the cap of 4 x 146400 = 585600) never trips them.
+    # Sloe's own heat-up: the tare moved 1.1M counts in 23 s (48000
+    # counts/s, t=2176 -> 2199): past BOTH limits, never trips them.
     w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 20000., 25.))
+                               drift_counts(TARE_1, 1100000. / 23., 23.))
     assert w.get_limits() == (366000, 146400), w.get_limits()
     assert homing.calls == [] and idx is None, (homing.calls, idx)
-    # The 2M-count swing over 100 s is more than one descent may absorb:
-    # the cap (min(1M, 4 x delta) = 585600) stops the allowance, and the
-    # rule trips once the drift is cap + 1 delta = 732000 (36.6 s).
+    # 3M counts over 60 s (50000 counts/s) is more than one descent may
+    # absorb: the cap of 2.5M stops the allowance at 50 s and the rule
+    # trips once the drift is cap + 1 delta = 2646400 (52.93 s).
     w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 20000., 100.))
+                               drift_counts(TARE_1, 50000., 60.))
     assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
-    assert abs(idx - 36.6 * SPS) < 80, idx
+    assert abs(idx - 52.93 * SPS) < 100, idx
     # the old behaviour (z_move_drift_rate_counts 0) tripped on it
     w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 20000., 25.),
+                               drift_counts(TARE_1, 1100000. / 23., 23.),
                                z_move_drift_rate_counts=0)
     assert homing.calls and homing.calls[0] in (
         zb.WRONG_WAY_REASON, zb.CEILING_REASON), homing.calls
-    print('ok  1 30000 counts/s for 12 s (tare 1006163) and 500000 counts '
-          'over 25 s (tare -121734) no longer abort; 2M over 100 s aborts '
-          'at the cap; with the rate at 0 it aborts early')
+    print('ok  1 30000 counts/s for 12 s (tare 1006163) and 1.1M counts '
+          'over 23 s (tare -121734) no longer abort; 3M over 60 s aborts '
+          'at cap + delta; with the rate at 0 it aborts early')
 
 
 def test_2_a_real_wrong_way_event_still_trips(mod):
@@ -208,7 +208,7 @@ def test_4_logged_tap_pairs_pass_the_shipped_tolerance(mod_probe):
 
 def test_5_sign_error_press_after_absorbed_drift(mod):
     # 10 s of 50000 counts/s drift (500000 absorbed, under the cap of
-    # 4 x 146400), then the press itself rises the wrong way at 2M
+    # the 2.5M cap), then the press itself rises the wrong way at 2M
     # counts/s (a sign error).  Judged sample by sample.
     n0 = 10 * SPS
     counts = drift_counts(TARE_1, 50000., 10.)
@@ -233,7 +233,7 @@ def test_5_sign_error_press_after_absorbed_drift(mod):
     assert idx == cross + 39, (idx, cross)
     over = counts[cross] - TARE_1 - seen[cross]
     assert DELTA_1 < over < 1.02 * DELTA_1 + 1000, (over, DELTA_1)
-    assert max(seen) <= 4 * DELTA_1, max(seen)
+    assert max(seen) <= 2500000, max(seen)
     print('ok  5 a 2M counts/s sign-error press after 10 s of absorbed '
           'drift crosses the limit at %.3f x delta and aborts 20 ms later'
           % (over / float(DELTA_1)))
@@ -291,7 +291,7 @@ def test_8_drift_is_logged_once_per_descent(mod):
         ended = [(lv, m) for lv, m in cap.lines if 'backstop descent' in m]
         assert len(ended) == 1 and ended[0][0] == 'INFO', cap.lines
         msg = ended[0][1]
-        assert 'ended' in msg and 'cap 585600' in msg, msg
+        assert 'ended' in msg and 'cap 2500000' in msg, msg
         assert 'absorbed 59' in msg and 'over 3.000 s' in msg or \
             'over 2.999 s' in msg, msg
     with zb.LogCapture() as cap:
@@ -302,14 +302,18 @@ def test_8_drift_is_logged_once_per_descent(mod):
         w.disarm()
         ended = [m for lv, m in cap.lines if 'backstop descent' in m]
         assert len(ended) == 1 and 'aborted' in ended[0], cap.lines
-    # the cap is min(1M, 4 x delta)
+    # the cap is absolute, and configurable
     w, cell, homing = zb.make_watch(mod)
     w.arm(10., TARE_2, 400000, PRESS)
-    assert w._drift_cap == 1000000, w._drift_cap
+    assert w._drift_cap == 2500000, w._drift_cap
     w.arm(10., TARE_1, DELTA_1, PRESS)
-    assert w._drift_cap == 4 * DELTA_1, w._drift_cap
+    assert w._drift_cap == 2500000, w._drift_cap
+    w, cell, homing = zb.make_watch(mod, z_move_drift_cap_counts=900000)
+    w.arm(10., TARE_1, DELTA_1, PRESS)
+    assert w._drift_cap == 900000, w._drift_cap
+    assert w.get_status()['z_backstop_drift_cap_counts'] == 900000
     print('ok  8 one INFO line per descent with the drift, its peak, the '
-          'cap and the time; cap = min(1M, 4 x delta)')
+          'cap and the time; cap absolute 2.5M')
 
 
 def main():
