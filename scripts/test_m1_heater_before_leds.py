@@ -1813,9 +1813,10 @@ class RefusedCutStillParks(_M1TestCase):
         self.assertTrue(m.guard['enabled'])
         self.drop_errors()
 
-    def test_the_stop_find_taps_y_at_06_and_a_y_home_runs_at_08(self):
+    def test_the_stop_find_taps_y_at_06_and_a_y_home_runs_at_06(self):
         # KAN-3813: the tap's Y current is CUT_FILAMENT's tap_current_y, its
-        # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y, 0.8.
+        # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y,
+        # 0.6 too.
         m = self.make(-6.8, real_currents=True)
         m.run('PRINT_END')
         cur = m.currents()
@@ -1826,7 +1827,7 @@ class RefusedCutStillParks(_M1TestCase):
         m.run('_HOMING_CURRENT')
         cur = m.currents()
         self.assertEqual(cur['stepper_x'], [0.6])
-        self.assertEqual(cur['stepper_y'], [0.8])
+        self.assertEqual(cur['stepper_y'], [0.6])
 
     def test_a_cut_move_that_fails_puts_the_run_currents_back(self):
         # The press runs both motors at the 2.0 A burst. In the driver the

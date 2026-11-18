@@ -16,7 +16,7 @@ failing. One test class per resolution:
       run_client_script(line, 'file', abortable=True): the muon_guard check
       for each line AND the cancel abort, and the file loop treats the abort
       as "stop here", not as an error.
-  B4  homing.cfg: X homes at 0.6 A, Y at 0.8 A (KAN-1361), both put back.
+  B4  homing.cfg: both motors home at 0.6 A (KAN-3813), both put back.
   B5  toolhead.cfg / core.cfg: nothing calls FORCE_MOVE (it is off); the
       umbilical unlock retract is COLD_RETRACT DISTANCE=16, the limit of
       [cold_retract].
@@ -523,20 +523,29 @@ def tmc_settings():
 
 
 class B4HomingCurrent(unittest.TestCase):
-    def test_homing_currents_are_x_06_and_y_08(self):
+    def test_homing_currents_are_x_06_and_y_06(self):
         lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(), {})
         self.assertEqual(lines, [
             'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6',
-            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.8'])
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6'])
+
+    def test_homing_currents_are_equal_on_b1(self):
+        # KAN-3813: unequal X/Y homing currents shifted the Y frame about
+        # 2 mm on sloe (CoreXY). Keep them equal if this is retuned.
+        home = section(HOMING, 'gcode_macro _HOMING_CURRENT')
+        self.assertEqual(float(home['variable_current']),
+                         float(home['variable_current_y']))
 
     def test_the_cut_stop_find_taps_at_06_on_y(self):
         # KAN-3813: one tap towards Y min with no confirming tap. At the
-        # Y homing current (0.8 A) it tapped 0.8 mm after arming on sloe.
+        # 0.8 A it tapped 0.8 mm after arming on sloe (17 Nov).
+        # Y= is what reaches stepper_y, not current_y: 0.5 here, so the
+        # tap's value can be told from the home's (both are 0.6 now).
         lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(),
-                       {'Y': '0.6'})
+                       {'Y': '0.5'})
         self.assertEqual(lines, [
             'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6',
-            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6'])
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.5'])
         find = macro_lines(os.path.join(MACROS, 'filament.cfg'),
                            '_CUT_FILAMENT_FIND_STOP')
         calls = [l.strip() for l in find
@@ -545,12 +554,12 @@ class B4HomingCurrent(unittest.TestCase):
             '_HOMING_CURRENT Y={c.tap_current_y}',
             '_HOMING_CURRENT RESTORE=1'])
         # The tap's current is CUT_FILAMENT's own, not _HOMING_CURRENT's
-        # (retuning homing must not move it) and not the Y home's 0.8
+        # (retuning homing must not move it) and not the Y home's
         cut = section(os.path.join(MACROS, 'filament.cfg'),
                       'gcode_macro CUT_FILAMENT')
         self.assertEqual(cut['variable_tap_current_y'], '0.6')
         home = section(HOMING, 'gcode_macro _HOMING_CURRENT')
-        self.assertEqual(home['variable_current_y'], '0.8')
+        self.assertEqual(home['variable_current_y'], '0.6')
 
     def test_restore_puts_both_run_currents_back(self):
         lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(),
