@@ -172,15 +172,11 @@ def test_1_incident_watcher_alone(mod):
     # trigger never fires (nothing here ever triggers), samples ramp
     # negative as the bed is pushed.  Delta 23407 is what trigger_percent
     # 10 arms from that tare; the ceiling is int(2.5 * 23407) = 58517.
-    # KAN-4364: the ceiling is from the slowly followed baseline.  The
-    # stiff press leaves the follow band (0.25 x 23407 = 5851) at once and
-    # moves it 400 counts; the slow ramp (150000 counts/s at 15 mm/s, only
-    # 1.5 x the 100000 follow rate) moves it 11600 before it freezes, so
-    # its abort comes 154 samples (1.16 mm) later than with a fixed tare
-    # (820, 6.15 mm): rate x band / (ramp - rate) = 2 x the band.
+    # KAN-4364: no drift was measured before this descent, so nothing is
+    # followed and the ceiling is from the fixed tare.
     for name, stiff, want_idx, want_travel in (
             ('stiff 100000 counts/mm', 100000, 118, 0.885),
-            ('slow ramp 10000 counts/mm', 10000, 974, 7.305)):
+            ('slow ramp 10000 counts/mm', 10000, 820, 6.15)):
         w, homing, idx, n_rest = run_incident(mod, stiff)
         assert homing.calls == [CEILING_REASON], (
             '%s: abort not requested: %r' % (name, homing.calls))
@@ -190,7 +186,7 @@ def test_1_incident_watcher_alone(mod):
         assert after_contact == want_idx, (name, after_contact)
         travel = after_contact / float(SPS) * SPEED
         assert abs(travel - want_travel) < 0.01, (name, travel)
-        assert travel < 7.5, (name, travel)
+        assert travel < 7., (name, travel)
         assert w.last_fired == CEILING_REASON
         st = w.get_status()
         assert st['z_backstop_ceiling_counts'] == 58517, st
@@ -208,21 +204,18 @@ def test_2_wrong_way_and_idle_wander(mod):
     w, homing, idx = first_abort_sample(mod, tare, -1., DELTA_BOX_800,
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
-    # The drift is 100 counts a sample = 200000 counts/s; KAN-4364 lets the
-    # baseline follow 100000 counts/s (50 a sample) while the load is
-    # within 0.25 x delta (55268) of it.  The excess grows 50 a sample, so
-    # the baseline freezes 55200 up (i=1104), and the load is 221075 past
-    # it at i=2763: 40 in a row -> 2802.
+    # The drift is 100 counts a sample = 200000 counts/s, and none was
+    # measured before the descent (KAN-4364: nothing is followed), so it
+    # is first over 221075 at i=2211: 40 in a row -> 2250.
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
-    assert idx == 2802, idx
+    assert idx == 2250, idx
     assert w.last_fired == WRONG_WAY_REASON
     # the same drift on the press side is not the wrong way: the ceiling
-    # (552687 past the baseline, frozen 55200 down) is what ends it, at
-    # i=6079 + 39
+    # (552687) is what ends it, at i=5527 + 39
     counts = [tare - 100 * i for i in range(8000)]
     w, homing, idx = first_abort_sample(mod, tare, -1., DELTA_BOX_800,
                                         counts)
-    assert homing.calls == [CEILING_REASON] and idx == 6118, (
+    assert homing.calls == [CEILING_REASON] and idx == 5566, (
         homing.calls, idx)
     # Sloe: tare +200000, delta 178574; idle wander -4000..+7000 for 3 s
     tare = 200000
@@ -236,7 +229,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert homing.calls == [] and w.last_fired is None, homing.calls
     assert w.get_limits() == (446435, 178574), w.get_limits()
-    print('ok  2 wrong way aborts at sample 2802 (1.40 s); idle wander '
+    print('ok  2 wrong way aborts at sample 2250 (1.13 s); idle wander '
           '-4000..+7000 on Sloe never does')
 
 
@@ -722,7 +715,7 @@ def integ_move(mod, rig, cell, tare, delta):
     m._mcu_trigger_analog = rig.endstops[0]
     m._start_collector = lambda: Collector(m)
 
-    def tare_fn(gcmd):
+    def tare_fn(gcmd, measure_drift=False):
         m._tare_counts = tare
         m._trigger_delta = delta
         m._trigger_press_dir = -1.
@@ -745,8 +738,9 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_wrong_way_factor': 1.0,
             'z_backstop_confirm_time': 0.02,
             'z_backstop_drift_rate_counts': 100000.,
-            'z_backstop_drift_cap_counts': 2500000,
-            'z_backstop_drift_band_factor': 0.25}
+            'z_backstop_drift_excess_factor': 3.0,
+            'z_backstop_drift_band_factor': 0.25,
+            'z_backstop_drift_slope': 0.}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,

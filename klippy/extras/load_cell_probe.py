@@ -620,39 +620,46 @@ class LoadCellProbeConfigHelper:
 #   KAN-4364 (Sloe, B1, hot): the load cell drifts 1.7-2.4M counts over a
 #   heat-up (KAN-3818), and Z descents tripped the wrong-way rule at 146400
 #   and 259190 counts (tares -121734 and 1006163); drift the press way
-#   made coarse probes stop in mid air (z=113.6).  A fixed floor on either
-#   rule does not help, and judging only the host rules from a moved zero
-#   (as #147 did) leaves the MCU trigger on the stale tare, so contact then
-#   needs the absorbed drift on top of the trigger force.  So the whole
-#   descent works from a BASELINE that follows the load slowly:
-#     - it moves toward each sample by at most z_move_drift_rate_counts a
-#       second (100000), and only while the load is within
-#       z_move_drift_band_factor x delta (0.25) of it.  Outside the band
-#       it holds still: that is the freeze on contact.  A real press rises
-#       at millions of counts a second (about 3.5M/s at 4 mm/s, more at
-#       G28's 15 mm/s), leaves the band within milliseconds, and moves the
-#       baseline by at most rate x band / (press rate - rate) = 0.028 x
-#       delta at 1M/s.  Drift up to the rate is followed with no lag but
-#       noise and the ~20 ms batch, a few thousand counts.
-#     - the host sends each move of the baseline (in steps of
-#       RETARE_MIN_COUNTS, one per 20 ms batch at most) to the MCU as the
-#       sos_filter offset of the running trigger, so the MCU trigger, the
-#       ceiling and the wrong-way rule all measure from the CURRENT
-#       baseline.  Under MCUTARE the MCU took its own zero, which the host
-#       does not know exactly, so the MCU is left alone there; the host
-#       rules still follow.
-#     - the baseline may move at most z_move_drift_cap_counts (2500000,
-#       above the 2.4M worst swing of KAN-3818; Sloe's tare moved 1.1M in
-#       23 s) from the tare, either way; past that the move is aborted
-#       ("the load cell baseline drifted ...").  That bounds the one thing
-#       the rate cannot tell from drift, a push slower than the rate.  On
-#       the press side the MCU raw range (from the anchor, never moved by
-#       this) bounds the absolute load before the cap on most tares.
-#   The band and the rate are what keep a real event at full size: a step
-#   or a ramp much faster than 100000 a second is judged at ~1.0 x delta
-#   (wrong way) or triggers at ~1.0 x delta (press) whatever has been
-#   followed before.  Each descent logs what it followed, to learn the
-#   real rates.
+#   made coarse probes stop in mid air (z=113.6).  Following drift is only
+#   needed where drift can add up to a delta, and a follower cannot tell
+#   drift from a slow press, so it is used as little as possible:
+#     - ONLY on a long blind descent (LoadCellProbingMove._is_long_descent:
+#       at least LONG_DESCENT_MM of travel and not within that of the last
+#       trigger).  Taps, mesh points, confirm taps and MCUTARE descents
+#       keep the fixed tare: in a second Sloe's worst drift is 48000
+#       counts, a third of a delta.
+#     - the drift is MEASURED before the descent: a line fitted to
+#       DRIFT_WINDOW (0.5 s) of samples before the tare.  Under
+#       MIN_DRIFT_SLOPE (3000 counts/s) nothing is followed.  Otherwise
+#       the BASELINE moves toward the load only in that slope's sign, at
+#       no more than 1.5 x the slope (and z_move_drift_rate_counts), and
+#       only while the load is within z_move_drift_band_factor x delta
+#       (0.25) of it.  A push the other way is never followed at all.
+#     - outside the band the baseline FREEZES (one WARNING per descent)
+#       until the load is back within half the band.
+#       While frozen the drift is assumed to go on at the measured slope,
+#       but only on the side where that fires a rule EARLIER: the press
+#       side's reference (MCU zero, press ceiling) moves with a wrong-way
+#       slope, the wrong side's (wrong-way rule, wrong-side ceiling) with
+#       a press-way slope; the other holds.  That reference also never
+#       trails slope x elapsed by more than the band, so a push AGAINST
+#       the drift (which looks like the drift slowing) is still seen: a
+#       press into a soft surface on a cell drifting away triggers by
+#       ~1.25 x delta of real force.  If the drift really stops, that
+#       side fires early (a false touch, which LOAD_CELL_HOME_Z retries),
+#       never late.
+#     - the MCU trigger's zero is the press-side reference: each move of
+#       RETARE_MIN_COUNTS or more is sent as the sos_filter offset of the
+#       running trigger after its 20 ms batch.
+#     - EXCESS: the baseline may run ahead of slope x elapsed by at most
+#       z_move_drift_excess_factor x delta (3); past that the move is
+#       aborted ("the load cell baseline moved further than its measured
+#       drift").  That bounds the one thing that is followed, a push in
+#       the drift's own sign slower than 1.5 x the slope, to about 3 x
+#       delta of force.
+#   A real contact (millions of counts a second) or a real wrong-way push
+#   leaves the band within milliseconds, so it is judged at ~1.0 x delta.
+#   Each descent logs the slope and what it followed, to learn the rates.
 #   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
 #   against a delta of 178574, so noise is under 4% of the limit.
 # MCUTARE: the MCU zeroes itself on the first descent sample and the host
@@ -665,8 +672,13 @@ class ZLoadBackstop:
     REASON_CEILING = ("the load on the nozzle exceeded the safety ceiling "
                       "during the Z move")
     REASON_FAILED = "the load watch failed during the Z move"
-    REASON_DRIFT_CAP = ("the load cell baseline drifted more than "
-                        "z_move_drift_cap_counts during the Z move")
+    REASON_DRIFT_EXCESS = ("the load cell baseline moved further than its"
+                           " measured drift during the Z move")
+    # Below this measured slope (counts/s) nothing is followed: 30 s of it
+    # is 90000 counts, under the smallest delta.
+    MIN_DRIFT_SLOPE = 3000.
+    # The baseline may follow at most this many times the measured slope.
+    SLOPE_MARGIN = 1.5
     MIN_CONSECUTIVE = 3
     # The MCU zero is re-sent once the baseline has moved this far from
     # the last one sent: 1000 counts is under 1% of the smallest delta.
@@ -692,8 +704,8 @@ class ZLoadBackstop:
             'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
         self._drift_rate = config.getfloat(
             'z_move_drift_rate_counts', 100000., minval=0.)
-        self._drift_cap_param = config.getint(
-            'z_move_drift_cap_counts', 2500000, minval=1)
+        self._excess_factor = config.getfloat(
+            'z_move_drift_excess_factor', 3., minval=1.)
         self._band_factor = config.getfloat(
             'z_move_drift_band_factor', 0.25, above=0., maxval=0.5)
         self._armed = False
@@ -717,7 +729,15 @@ class ZLoadBackstop:
         self._drift_peak = 0.   # most |baseline - tare| this descent
         self._lag_peak = 0.     # most |load - baseline| this descent
         self._lag_peak_t = None     # elapsed s since arming, at that peak
-        self._drift_cap = 0.
+        self._sign = 0.         # sign of the measured drift, 0: none
+        self._slope = 0.        # |measured drift|, counts/s
+        self._rate = 0.         # the most the baseline follows, counts/s
+        self._drift_t0 = 0.     # when the measured drift was at the tare
+        self._excess = 0.       # z_move_drift_excess_factor x delta
+        self._frozen = False
+        self._extra = 0.        # drift assumed while frozen, counts
+        self._freezes = 0
+        self._ref_p = self._ref_w = 0.
         self._last_t = None     # timestamp of the last sample judged
         self._end_logged = False
         self.last_fired = None
@@ -734,10 +754,11 @@ class ZLoadBackstop:
     # Start watching a descent.  Only samples stamped at or after
     # start_time (print_time, as the sample timestamps are) are judged.
     # retare(counts), when given, moves the zero of the running MCU
-    # trigger to counts (see KAN-4364 above); it is called from the batch
-    # callback while the descent is watched, never after.
+    # trigger to counts.  drift_slope (counts/s, signed) is the drift
+    # measured before a long descent, at drift_t0; 0 (every tap, mesh
+    # point and MCUTARE descent) keeps the fixed tare.  See KAN-4364 above.
     def arm(self, start_time, tare_counts, trigger_delta, press_direction,
-            mcutare=False, retare=None):
+            mcutare=False, retare=None, drift_slope=0., drift_t0=None):
         self.disarm()
         self.last_fired = None
         sps = self._load_cell.get_sensor().get_samples_per_second()
@@ -760,25 +781,33 @@ class ZLoadBackstop:
         self._need = need
         self._over_run = self._wrong_run = 0
         self._over_t0 = self._wrong_t0 = None
-        self._base = float(tare_counts)
+        self._base = self._ref_p = self._ref_w = float(tare_counts)
         self._sent = float(tare_counts)
         self._retares = 0
-        # Only a directed trigger is followed: an abs_ge trigger (grams
-        # mode) keeps the fixed tare, as before KAN-4364.
+        # Only a directed trigger, without MCUTARE, on a measured drift.
+        slope = float(drift_slope or 0.)
         follow = (press_direction in (-1, 1) and trigger_delta
-                  and self._drift_rate > 0.)
+                  and not mcutare and self._drift_rate > 0.
+                  and abs(slope) >= self.MIN_DRIFT_SLOPE)
+        self._sign = (1. if slope > 0. else -1.) if follow else 0.
+        self._slope = abs(slope) if follow else 0.
+        self._rate = min(self._drift_rate,
+                         self.SLOPE_MARGIN * self._slope)
+        self._drift_t0 = drift_t0 if drift_t0 is not None else start_time
         self._band = (self._band_factor * abs(trigger_delta)
                       if follow else 0.)
-        self._retare = retare if (follow and not mcutare) else None
+        self._excess = (self._excess_factor * abs(trigger_delta)
+                        if follow else 0.)
+        self._retare = retare if follow else None
+        self._frozen = False
+        self._extra = 0.
+        self._freezes = 0
         self._drift_t = None
         self._drift_peak = 0.
         self._lag_peak = 0.
         self._lag_peak_t = None
         self._last_t = None
         self._end_logged = False
-        # The furthest the baseline may move from the tare in one
-        # descent, z_move_drift_cap_counts; past it the move is aborted.
-        self._drift_cap = float(self._drift_cap_param)
         self._note_arming(ceiling, wrong, trigger_delta, press_direction,
                           mcutare)
         if not ceiling and not wrong:
@@ -805,12 +834,14 @@ class ZLoadBackstop:
         t = self._last_t
         elapsed = (t - self._start_time) if t is not None else 0.
         logging.info("load_cell_probe: Z load backstop descent %s: drift"
-                     " absorbed %i counts at the end, %i at most (cap %i),"
-                     " peak lag %i counts at %.3f s, over %.3f s, MCU zero"
-                     " moved %i times", how,
-                     self._base - self._tare, self._drift_peak,
-                     self._drift_cap, self._lag_peak,
-                     self._lag_peak_t or 0., elapsed, self._retares)
+                     " slope %i counts/s (followed at up to %i), absorbed"
+                     " %i counts at the end, %i at most, peak lag %i counts"
+                     " at %.3f s, over %.3f s, MCU zero moved %i times,"
+                     " froze %i times", how, self._sign * self._slope,
+                     self._rate, self._ref_p - self._tare,
+                     self._drift_peak, self._lag_peak,
+                     self._lag_peak_t or 0., elapsed, self._retares,
+                     self._freezes)
 
     # Say in klippy.log what the descent that just started is watched for.
     # Logging only: it never changes what arms.  "Not armed" is warned once
@@ -896,38 +927,85 @@ class ZLoadBackstop:
                 and run >= self.MIN_CONSECUTIVE
                 and t - t0 >= self._confirm_time)
 
-    # KAN-4364: move the MCU trigger's zero to the baseline (sos_filter
-    # offset; the filter state and the raw range are not touched).  An
-    # exception aborts the move through _on_batch (REASON_FAILED).
+    # KAN-4364: move the MCU trigger's zero to the press-side reference
+    # (sos_filter offset; the filter state and the raw range are not
+    # touched).  An exception aborts the move through _on_batch.
     def _send_baseline(self):
         if self._retare is None:
             return
-        if abs(self._base - self._sent) < self.RETARE_MIN_COUNTS:
+        if abs(self._ref_p - self._sent) < self.RETARE_MIN_COUNTS:
             return
-        base = int(round(self._base))
-        self._retare(base)
-        self._sent = float(base)
+        zero = int(round(self._ref_p))
+        self._retare(zero)
+        self._sent = float(zero)
         self._retares += 1
 
-    # KAN-4364: follow slow drift.  The baseline steps toward the sample
-    # by at most rate x dt, and only while the sample is within the band;
-    # a load that has left the band (contact, a real wrong-way push)
-    # freezes it.  The time step is taken whether or not it moves, so a
-    # freeze never banks allowance.
+    # KAN-4364: follow the measured drift, see above.  The time step is
+    # taken on every sample, so a freeze never banks allowance.
     def _follow(self, counts, t):
-        dev = counts - self._base
-        if (t is not None and self._drift_t is not None
-                and abs(dev) <= self._band):
-            step = self._drift_rate * max(0., t - self._drift_t)
-            self._base += max(-step, min(step, dev))
+        dt = 0.
         if t is not None:
+            if self._drift_t is not None:
+                dt = max(0., t - self._drift_t)
             self._drift_t = t
+        sign = self._sign
+        if self._frozen:
+            # Hysteresis: it follows again only once the load is back
+            # within half the band, so noise at the band's edge cannot
+            # let a ramp through in small steps.
+            self._extra += self._slope * dt
+            ahead = self._base + sign * self._extra
+            half = 0.5 * self._band
+            if abs(counts - ahead) <= half:
+                self._base = ahead      # the drift went on as measured
+            elif abs(counts - self._base) > half:
+                return
+            self._frozen = False
+            self._extra = 0.
+            logging.info("load_cell_probe: Z load backstop baseline"
+                         " follows again at %i counts", self._base)
+        dev = counts - self._base
+        if abs(dev) > self._band:
+            self._frozen = True
+            self._extra = 0.
+            self._freezes += 1
+            if self._freezes == 1:
+                logging.warning(
+                    "load_cell_probe: Z load backstop baseline froze %.3f s"
+                    " into the descent: load %i counts from it (band %i)",
+                    (t - self._start_time) if t is not None else 0.,
+                    dev, self._band)
+            return
+        if dev * sign > 0.:
+            self._base += sign * min(self._rate * dt, dev * sign)
+
+    # The references the rules judge from: the baseline, except on the
+    # one side where assuming the measured drift fires a rule earlier.
+    # There the reference also goes on with the drift while frozen, and
+    # never trails the measured drift (slope x elapsed) by more than the
+    # band: a push against the drift, slower than it, looks like the
+    # drift slowing down and would otherwise go unseen.
+    def _update_refs(self, t):
+        self._ref_p = self._ref_w = self._base
+        sign = self._sign
+        moved = self._extra if self._frozen else 0.
+        if t is not None:
+            pred = self._slope * max(0., t - self._drift_t0)
+            trail = pred - (self._base - self._tare) * sign - self._band
+            moved = max(moved, trail)
+        if moved <= 0.:
+            return
+        if sign == -self._direction:
+            self._ref_p = self._base + sign * moved     # trigger sooner
+        else:
+            self._ref_w = self._base + sign * moved     # wrong way sooner
 
     def _judge(self, counts, t=None):
         if self._band:
             self._follow(counts, t)
-        shift = abs(self._base - self._tare)
-        self._drift_peak = max(self._drift_peak, shift)
+            self._update_refs(t)
+        lead = max(self._ref_p, self._ref_w, key=lambda r: abs(r - self._tare))
+        self._drift_peak = max(self._drift_peak, abs(lead - self._tare))
         dev = counts - self._base
         if abs(dev) > self._lag_peak:
             self._lag_peak = abs(dev)
@@ -935,13 +1013,23 @@ class ZLoadBackstop:
                                 if t is not None else 0.)
         if t is not None:
             self._last_t = t
-        if self._ceiling and abs(dev) > self._ceiling:
+        if self._direction in (-1, 1):
+            # press side from the press reference, wrong side from the
+            # wrong-side one; with nothing followed both are the tare
+            press_dev = (counts - self._ref_p) * self._direction
+            wrong_dev = (counts - self._ref_w) * self._direction
+            over = (press_dev > self._ceiling
+                    or -wrong_dev > self._ceiling)
+        else:
+            wrong_dev = 0.
+            over = abs(counts - self._tare) > self._ceiling
+        if self._ceiling and over:
             if not self._over_run:
                 self._over_t0 = t
             self._over_run += 1
         else:
             self._over_run = 0
-        if self._wrong and dev * self._direction < -self._wrong:
+        if self._wrong and wrong_dev < -self._wrong:
             if not self._wrong_run:
                 self._wrong_t0 = t
             self._wrong_run += 1
@@ -951,8 +1039,11 @@ class ZLoadBackstop:
             return self.REASON_CEILING
         if self._confirmed(self._wrong_run, self._wrong_t0, t):
             return self.REASON_WRONG_WAY
-        if shift > self._drift_cap:
-            return self.REASON_DRIFT_CAP
+        if self._excess and t is not None:
+            ahead = ((lead - self._tare) * self._sign
+                     - self._slope * max(0., t - self._drift_t0))
+            if ahead > self._excess:
+                return self.REASON_DRIFT_EXCESS
         return None
 
     def _fire(self, reason):
@@ -968,7 +1059,7 @@ class ZLoadBackstop:
             self.last_fired = reason
             logging.warning("load_cell_probe: Z move aborted: %s (tare %i,"
                             " baseline %i, ceiling %i, wrong way %i)",
-                            reason, self._tare, self._base, self._ceiling,
+                            reason, self._tare, self._ref_p, self._ceiling,
                             self._wrong)
         else:
             logging.info("load_cell_probe: Z load watch tripped (%s) but no"
@@ -988,8 +1079,9 @@ class ZLoadBackstop:
                 'z_backstop_wrong_way_factor': self._wrong_way_factor,
                 'z_backstop_confirm_time': self._confirm_time,
                 'z_backstop_drift_rate_counts': self._drift_rate,
-                'z_backstop_drift_cap_counts': self._drift_cap_param,
-                'z_backstop_drift_band_factor': self._band_factor}
+                'z_backstop_drift_excess_factor': self._excess_factor,
+                'z_backstop_drift_band_factor': self._band_factor,
+                'z_backstop_drift_slope': self._sign * self._slope}
 
 
 # Execute probing moves using the MCU_trigger_analog
@@ -1030,6 +1122,9 @@ class LoadCellProbingMove:
     _trigger_delta = None
     _trigger_press_dir = None
     _collect_start_time = None
+    _drift_slope = 0.
+    _drift_t0 = None
+    _last_trigger_z = None
 
     def _start_collector(self):
         toolhead = self._printer.lookup_object('toolhead')
@@ -1069,14 +1164,49 @@ class LoadCellProbingMove:
                      helper.get_reference_max_load_counts(), headroom,
                      percent, int(direction))
 
+    # KAN-4364: a descent is long (its drift may be followed) when it can
+    # travel at least this far and does not start within this of the last
+    # trigger.  Sloe's worst drift is 48000 counts a second, so anything
+    # shorter gains well under a delta (126075 and up) on a fixed tare.
+    LONG_DESCENT_MM = 20.
+    # Seconds of samples fitted for the drift slope before a long descent.
+    # The line through 0.5 s at 2000 sps has a slope error near 1000
+    # counts/s for Sloe's wander (-4000..+7000).
+    DRIFT_WINDOW = 0.5
+
+    def _is_long_descent(self, start_z):
+        if start_z - self._z_min_position < self.LONG_DESCENT_MM:
+            return False
+        last = self._last_trigger_z
+        return last is None or start_z - last >= self.LONG_DESCENT_MM
+
     # pauses for the last move to complete and then
-    # sets the endstop tare value and range
-    def _pause_and_tare(self, gcmd):
+    # sets the endstop tare value and range.  measure_drift: also fit the
+    # drift slope over DRIFT_WINDOW (a long descent, KAN-4364)
+    def _pause_and_tare(self, gcmd, measure_drift=False):
         collector = self._start_collector()
         num_samples = self._config_helper.get_tare_samples(gcmd)
-        # use collect_min collected samples are not wasted
-        results = collector.collect_min(num_samples)
-        tare_samples = check_sensor_errors(results, self._printer)
+        self._drift_slope = 0.
+        self._drift_t0 = None
+        if not measure_drift:
+            # use collect_min collected samples are not wasted
+            results = collector.collect_min(num_samples)
+            tare_samples = check_sensor_errors(results, self._printer)
+        else:
+            sps = self._load_cell.get_sensor().get_samples_per_second()
+            want = max(num_samples, int(math.ceil(self.DRIFT_WINDOW * sps)))
+            results = collector.collect_min(want)
+            window = check_sensor_errors(results, self._printer)
+            arr = np.array(window)[:, :3].astype(float)
+            if len(arr) >= 8 and arr[-1, 0] > arr[0, 0]:
+                self._drift_slope = float(
+                    np.polyfit(arr[:, 0] - arr[0, 0], arr[:, 2], 1)[0])
+                self._drift_t0 = float(arr[-1, 0])
+            # the tare is the newest tare_time of the window
+            tare_samples = window[-num_samples:]
+            logging.info("load_cell_probe: long descent: drift %i counts/s"
+                         " over %.3f s before the tare", self._drift_slope,
+                         arr[-1, 0] - arr[0, 0])
         tare_counts = int(round(
             np.average(np.array(tare_samples)[:, 2].astype(float))))
         # KAN-3370: refuse a loaded nozzle before the bad zero is stored
@@ -1221,14 +1351,19 @@ class LoadCellProbingMove:
         # tare the sensor just before probing
         _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
         _used_mcutare = False
+        toolhead = self._printer.lookup_object('toolhead')
+        self._drift_slope = 0.
+        self._drift_t0 = None
         if _mcutare and self._approx_tare is not None \
                 and self._nozzle_is_clear():
             self._mcu_tare(gcmd)
             _used_mcutare = True
         else:
-            self._pause_and_tare(gcmd)
+            # KAN-4364: only a long blind descent measures (and so may
+            # follow) its drift; every other descent keeps a fixed tare
+            self._pause_and_tare(gcmd, measure_drift=self._is_long_descent(
+                toolhead.get_position()[2]))
         # get params for the homing move
-        toolhead = self._printer.lookup_object('toolhead')
         # SETTLE=<seconds>: queued quiet time before the descent, to bound
         # how much of the travel ring the MCU can bake into its zero.  This
         # is queue time, not a host block: it does not drain the move
@@ -1247,7 +1382,9 @@ class LoadCellProbingMove:
         if watch is not None:
             watch.arm(self._collect_start_time, self._tare_counts,
                       self._trigger_delta, self._trigger_press_dir,
-                      mcutare=_used_mcutare, retare=self._retare_mcu)
+                      mcutare=_used_mcutare, retare=self._retare_mcu,
+                      drift_slope=self._drift_slope,
+                      drift_t0=self._drift_t0)
         # do homing move
         try:
             epos = phoming.probing_move(self._mcu_trigger_analog, pos, speed)
