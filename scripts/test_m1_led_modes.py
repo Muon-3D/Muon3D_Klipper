@@ -48,7 +48,7 @@ INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'filament.cfg')
 # unknown is an error.
 STUB_COMMANDS = ('SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'M400', 'G92',
                  'G1', 'G0', 'G90', 'G91', 'M107', 'M84', 'TURN_OFF_HEATERS',
-                 'CUT_FILAMENT', '_STOW_IF_IDLE', 'M104', 'M83', 'G4', 'M300',
+                 'CUT_FILAMENT', '_STOW_IF_IDLE', '_STOW_AFTER_PRINT_ERROR', 'M104', 'M83', 'G4', 'M300',
                  'M117',
                  'TEMPERATURE_WAIT', 'RESPOND', 'CLEAR_PAUSE',
                  '_SAVE_CONFIG_IF_PENDING', 'M106', 'M140', 'BED_MESH_CLEAR',

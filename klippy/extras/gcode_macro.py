@@ -132,6 +132,10 @@ class GCodeMacro:
         self.printer = printer = config.get_printer()
         gcode_macro = printer.load_object(config, 'gcode_macro')
         self.template = gcode_macro.load_template(config, 'gcode')
+        # Muon (KAN-4298): script run when the macro's gcode raises, before
+        # the error goes on. Empty by default.
+        self.on_error = gcode_macro.load_template(config, 'on_error_gcode', '')
+        self.has_on_error = bool(config.get('on_error_gcode', '').strip())
         self.gcode = printer.lookup_object('gcode')
         self.rename_existing = config.get("rename_existing", None)
         self.cmd_desc = config.get("description", "G-Code macro")
@@ -206,8 +210,20 @@ class GCodeMacro:
         try:
             self.template.run_gcode_from_command(kwparams,
                                                  abortable=self.abortable)
+        except self.gcode.abort_error:
+            raise
+        except self.gcode.error:
+            if self.has_on_error:
+                self._run_on_error(kwparams)
+            raise
         finally:
             self.script_depth -= 1
+    def _run_on_error(self, kwparams):
+        # Never replaces the error that got us here.
+        try:
+            self.on_error.run_gcode_from_command(kwparams)
+        except self.gcode.error:
+            logging.exception("gcode_macro %s on_error_gcode", self.alias)
 
 def load_config_prefix(config):
     return GCodeMacro(config)

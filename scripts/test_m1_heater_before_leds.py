@@ -54,10 +54,11 @@ STUBS = ('G0', 'G1', 'G90', 'G91', 'G92', 'M84', 'M107', 'M400', 'M117',
          'MACHINE_PAUSE_REASON', 'MACHINE_RESUMED', 'MACHINE_PLATE_CLEAR',
          'MACHINE_TOOLHEAD_CONNECTED',
          # position.cfg's and homing.cfg's, which only move (KAN-3813).
-         'Z_PARK', '_STOW_IF_IDLE', '_HOMING_CURRENT')
+         'Z_PARK', '_STOW_IF_IDLE', '_STOW_AFTER_PRINT_ERROR', '_HOMING_CURRENT')
 # Builtins the macros rename on klippy:connect.
 RENAMED = ('PAUSE', 'RESUME', 'CANCEL_PRINT', 'M106', 'M109',
-           'PID_CALIBRATE', 'PROBE_CALIBRATE')
+           'PID_CALIBRATE', 'PROBE_CALIBRATE', 'BED_MESH_CALIBRATE',
+           'SHAPER_CALIBRATE')
 LED_COMMANDS = ('SET_LED_EFFECT', 'STOP_LED_EFFECTS')
 
 # The prompt a hot-end fan fault puts on the panel and in Fluidd.

@@ -46,7 +46,8 @@ INCLUDES = ('led.cfg', 'led_modes.cfg', 'print.cfg', 'filament.cfg')
 STUB_COMMANDS = ('SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE', 'M400', 'G92',
                  'G1', 'G0', 'G90', 'G91', 'M107', 'M84', 'TURN_OFF_HEATERS',
                  'CUT_FILAMENT', 'M104', 'M83', 'G4', 'M300', 'M117',
-                 'TEMPERATURE_WAIT', 'RESPOND', 'CLEAR_PAUSE')
+                 'TEMPERATURE_WAIT', 'RESPOND', 'CLEAR_PAUSE',
+                 '_STOW_AFTER_PRINT_ERROR')
 
 # What PRINT_END must always reach: heaters, part fan, motors off.
 SHUTDOWN = ('TURN_OFF_HEATERS', 'M107', 'M84')

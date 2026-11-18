@@ -150,6 +150,19 @@ def verify_no_manual_probe(printer):
             "Already in a manual Z probe. Use ABORT to abort it.")
     gcode.register_command('ACCEPT', None)
 
+def stow_if_idle(printer):
+    # Muon (KAN-4298): a manual probe ends (ACCEPT, ABORT, or a failed
+    # move) with the bed where the user left it. The M1 config has
+    # _STOW_IF_IDLE, which raises it to the stow position under its own
+    # gates (Z homed, Z feed ready, no print); other configs do not.
+    try:
+        if printer.lookup_object('gcode_macro _STOW_IF_IDLE', None) is None:
+            return
+        gcode = printer.lookup_object('gcode')
+        gcode.run_script_from_command("_STOW_IF_IDLE")
+    except printer.command_error:
+        logging.exception("manual probe: stow")
+
 Z_BOB_MINIMUM = 0.500
 BISECT_MAX = 0.200
 
@@ -281,10 +294,13 @@ class ManualProbeHelper:
         self.gcode.register_command('ABORT', None)
         self.gcode.register_command('TESTZ', None)
         mpresult = None
-        if success:
-            kin_pos = self.get_kinematics_pos()
-            mpresult = ProbeResult(*(kin_pos[:3] + kin_pos[:3]))
-        self.finalize_callback(mpresult)
+        try:
+            if success:
+                kin_pos = self.get_kinematics_pos()
+                mpresult = ProbeResult(*(kin_pos[:3] + kin_pos[:3]))
+            self.finalize_callback(mpresult)
+        finally:
+            stow_if_idle(self.printer)
 
 def load_config(config):
     return ManualProbe(config)
