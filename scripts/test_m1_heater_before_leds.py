@@ -1815,7 +1815,8 @@ class RefusedCutStillParks(_M1TestCase):
 
     def test_the_stop_find_taps_y_at_06_and_a_y_home_runs_at_06(self):
         # KAN-3813: the tap's Y current is CUT_FILAMENT's tap_current_y, its
-        # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y, 0.6 too (KAN-3813).
+        # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y,
+        # 0.6 too.
         m = self.make(-6.8, real_currents=True)
         m.run('PRINT_END')
         cur = m.currents()
