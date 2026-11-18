@@ -22,7 +22,9 @@ touching the nozzle; a larger Z is the plate farther from it.
 | A calibration that raises | yes, idle | the new `on_error_gcode` option of `[gcode_macro]` (`gcode_macro.py`) runs `_STOW_IF_IDLE` and then re-raises the error. A print cancel (`CommandAbort`) does not run it. |
 
 `_STOW_IF_IDLE` runs `Z_PARK` only with Z homed, the Z feed ready
-(`z_power`, when the board has one), Klipper not shut down, no PRINT_START in
+(`z_power`, when the board has one), Klipper not shut down, no manual probe open
+(`manual_probe.is_active`: a multi-point `BED_MESH_CALIBRATE METHOD=manual` stows
+only after its last point), no PRINT_START in
 progress (`_PRINT_START_MARK.phase`) and no print running or paused
 (`print_stats`, `pause_resume`, `virtual_sdcard`). It never homes.
 `_STOW_AFTER_PRINT_ERROR` has the same gates minus the print state and the

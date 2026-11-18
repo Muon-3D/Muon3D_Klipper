@@ -63,7 +63,7 @@ def macros_of(board):
 
 
 def printer_for(state, paused, sd, homed, z_power=None, webhooks=None,
-                phase=None):
+                phase=None, probing=None):
     p = {
         'toolhead': {'homed_axes': homed, 'position': {'z': 20.},
                      'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.}},
@@ -82,25 +82,28 @@ def printer_for(state, paused, sd, homed, z_power=None, webhooks=None,
         p['webhooks'] = {'state': webhooks}
     if phase is not None:
         p['gcode_macro _PRINT_START_MARK'] = {'phase': phase}
+    if probing is not None:
+        p['manual_probe'] = {'is_active': probing}
     return p
 
 
 def render(board, name, st, homed='xyz', z_power=None, params=None,
-           option='gcode', webhooks=None, phase=None):
+           option='gcode', webhooks=None, phase=None, probing=None):
     macro = macros_of(board)['gcode_macro ' + name][option]
     text = cmc._jinja_env().from_string(macro).render(
         rawparams='', params=params or {},
         action_respond_info=lambda m: '',
-        printer=printer_for(*st[:3], homed, z_power, webhooks, phase))
+        printer=printer_for(*st[:3], homed, z_power, webhooks, phase,
+                            probing))
     return [ln.strip() for ln in text.split('\n')
             if ln.strip() and not ln.strip().startswith('#')]
 
 
 def zparks(board, name, st, homed='xyz', z_power=None, params=None,
-           option='gcode', webhooks=None, phase=None):
+           option='gcode', webhooks=None, phase=None, probing=None):
     """How many Z_PARK run when the macro (and the helper it calls) does."""
     n = 0
-    kw = dict(webhooks=webhooks, phase=phase)
+    kw = dict(webhooks=webhooks, phase=phase, probing=probing)
     for ln in render(board, name, st, homed, z_power, params, option, **kw):
         if ln.startswith('Z_PARK'):
             n += 1
@@ -294,6 +297,20 @@ class NewGates(unittest.TestCase):
                     self.assertEqual(
                         zparks(b, name, STATES[0], webhooks=wh), want,
                         (b, name, wh))
+
+    def test_no_stow_while_a_manual_probe_is_open(self):
+        # BED_MESH_CALIBRATE METHOD=manual returns once the probe opens;
+        # the nozzle is where the user is moving it with TESTZ.
+        for b in BOARDS:
+            self.assertEqual(zparks(b, '_STOW_IF_IDLE', STATES[0],
+                                    probing=True), 0, b)
+            self.assertEqual(zparks(b, '_STOW_IF_IDLE', STATES[0],
+                                    probing=False), 1, b)
+            for name in ('BED_MESH_CALIBRATE', 'SHAPER_CALIBRATE',
+                         'CALIBRATE_PROBE'):
+                opt = 'on_error_gcode' if name == 'CALIBRATE_PROBE' else 'gcode'
+                self.assertEqual(zparks(b, name, STATES[0], probing=True,
+                                        option=opt), 0, (b, name))
 
     def test_no_stow_during_a_console_print_start(self):
         for b in BOARDS:
@@ -504,6 +521,56 @@ class PythonHooks(unittest.TestCase):
         pr = Printer(macro=False)                       # not an M1 config
         helper(pr, lambda r: None).finalize(False)
         self.assertEqual(pr.gcode.ran, [])
+
+    def test_two_manual_points_stow_only_after_the_last(self):
+        import manual_probe as mp
+
+        status = {'is_active': False}
+        zparks_seen = []
+
+        class Gcode:
+            def register_command(self, *a, **k):
+                pass
+
+            def run_script_from_command(self, s):
+                assert s == '_STOW_IF_IDLE'
+                # the real helper macro, with the probe state at this moment
+                zparks_seen.append(zparks('M1', '_STOW_IF_IDLE', STATES[0],
+                                          probing=status['is_active']))
+
+        class Printer:
+            command_error = Exception
+            gcode = Gcode()
+
+            def lookup_object(self, name, default=None):
+                if name == 'gcode':
+                    return self.gcode
+                if name == 'gcode_macro _STOW_IF_IDLE':
+                    return object()
+                return default
+
+        class MP:
+            def reset_status(self):
+                status['is_active'] = False
+
+        def helper(cb):
+            h = mp.ManualProbeHelper.__new__(mp.ManualProbeHelper)
+            h.printer, h.gcode, h.manual_probe = Printer(), Printer.gcode, MP()
+            h.finalize_callback = cb
+            h.get_kinematics_pos = lambda: [1., 2., 3.]
+            return h
+
+        def start_next(result):
+            # BED_MESH_CALIBRATE's finalize starts the next point: a new
+            # ManualProbeHelper reports the probe active again
+            status['is_active'] = True
+
+        helper(start_next).finalize(True)     # ACCEPT of point 1 of 2
+        self.assertEqual(zparks_seen, [0])    # no stow: point 2 is open
+        helper(lambda r: None).finalize(True)  # ACCEPT of the last point
+        self.assertEqual(zparks_seen, [0, 1])
+        helper(start_next).finalize(False)    # ABORT with a point to go on:
+        self.assertEqual(zparks_seen, [0, 1, 0])
 
     def test_macro_on_error_gcode_runs_then_reraises(self):
         import gcode_macro as gm
