@@ -416,19 +416,30 @@ class Calibration(unittest.TestCase):
                 t = macros_of(b)['gcode_macro ' + n]['gcode']
                 self.assertNotIn('|_CLOSE_CALIBRATE_PROBE|', t, (b, n))
 
-    def test_print_path_calls_skip_the_stow(self):
+    def test_print_path_calls_pass_stow_0(self):
         for b in BOARDS:
             ps = macros_of(b)['gcode_macro PRINT_START']['gcode']
             self.assertRegex(ps, r'(?m)^\s*FINETUNE_RESONANCE STOW=0\s*$')
             cal = macros_of(b)['gcode_macro FINETUNE_RESONANCE']['gcode']
-            # the sweeps call the original, not the stowing wrapper
             self.assertEqual(len(re.findall(
-                r'(?m)^\s*SHAPER_CALIBRATE_BASE AXIS=\w ', cal)), 4, b)
-            self.assertNotRegex(cal, r'(?m)^\s*SHAPER_CALIBRATE ')
-        t = macros_of('M1')['gcode_macro _BED_MESH_ENSURE']['gcode']
-        self.assertEqual(len(re.findall(
-            r'(?m)^\s*BED_MESH_CALIBRATE_BASE ', t)), 2)
-        self.assertNotRegex(t, r'(?m)^\s*BED_MESH_CALIBRATE ')
+                r'(?m)^\s*SHAPER_CALIBRATE AXIS=\w .*STOW=0$', cal)), 4, b)
+            ens = macros_of(b)['gcode_macro _BED_MESH_ENSURE']['gcode']
+            calls = [ln for ln in ens.splitlines()
+                     if ln.strip().startswith('BED_MESH_CALIBRATE')]
+            self.assertEqual(len(calls), 2, b)
+            for ln in calls:
+                self.assertTrue(ln.rstrip().endswith('STOW=0'), (b, ln))
+
+    def test_wrappers_are_not_in_calibration_cfg(self):
+        # the klippy regression tests include calibration.cfg and stub the
+        # commands the wrappers rename
+        for b in BOARDS:
+            text = read(os.path.join(ROOT, 'core', b, 'macros',
+                                     'calibration.cfg'))
+            self.assertNotIn('rename_existing: BED_MESH', text)
+            self.assertNotIn('rename_existing: SHAPER', text)
+            inc = read(os.path.join(ROOT, 'core', b, 'macros', 'macros.cfg'))
+            self.assertIn('[include stow_wrappers.cfg]', inc)
 
 
 
