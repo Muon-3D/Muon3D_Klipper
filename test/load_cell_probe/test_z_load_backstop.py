@@ -812,7 +812,8 @@ class LogCapture(object):
     def of(self, level):
         return [m for lv, m in self.lines
                 if lv == level and m.startswith('load_cell_probe:')
-                and 'Z load backstop' in m]
+                and 'Z load backstop' in m
+                and 'backstop descent' not in m]  # KAN-4364
 
 
 def test_11_arming_is_logged_and_deduped(mod):

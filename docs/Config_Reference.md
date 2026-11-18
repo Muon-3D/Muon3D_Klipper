@@ -6093,7 +6093,9 @@ sensor_type:
 #   against the tare plus the drift seen so far, which is followed at no
 #   more than this many counts a second and dropped as soon as the load
 #   comes back, so a step or a fast ramp still trips at full size. The
-#   press side is never followed. 0 turns it off. The default is 50000.
+#   press side is never followed, and one descent absorbs at most the
+#   lesser of 1000000 counts and 4 times the trigger's count delta.
+#   0 turns it off. The default is 50000.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than
