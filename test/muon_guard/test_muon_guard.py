@@ -1059,7 +1059,7 @@ def test_every_macro_is_classified():
           "sent by the panel: %r"
           % (sorted(underscore_allowed - prompt_targets - panel_sent),))
     check(underscore_allowed == set([
-        '_CANCEL_M600', '_CLOSE_CALIBRATE_PROBE',
+        '_CANCEL_M600', '_CANCEL_CALIBRATE_PROBE',
         '_DO_CALIBRATE_PROBE', '_DO_UNLOAD_M600', '_HELP_CALIBRATE_PROBE',
         '_RUNOUT_UNLOAD'])
         | panel_sent,
@@ -1299,6 +1299,10 @@ OPEN_PARAMS_OK = {
     'SPEED_SLOW_PRE_PURGE_FOR_TPU': 'MATERIAL is a name',
     'SPEED_NORMAL__POST_PURGE_FOR_TPU': 'MATERIAL is a name',
     'M600': 'reads no client parameter',
+    'BED_MESH_CALIBRATE': 'forwards rawparams to the original command, '
+                          'which checks them (KAN-4298 stow wrapper)',
+    'SHAPER_CALIBRATE': 'forwards rawparams to the original command, '
+                        'which checks them (KAN-4298 stow wrapper)',
 }
 
 

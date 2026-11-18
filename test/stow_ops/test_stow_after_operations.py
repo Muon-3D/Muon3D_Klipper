@@ -374,10 +374,9 @@ class Calibration(unittest.TestCase):
                 self.assertEqual(
                     zparks(b, name, STATES[0], params=p, phase='mesh'),
                     0, (b, name))
-            for name in self.WRAPPED + ('FINETUNE_RESONANCE',):
-                self.assertEqual(
-                    zparks(b, name, STATES[0], params={'STOW': '0'}), 0,
-                    (b, name))
+            self.assertEqual(
+                zparks(b, 'FINETUNE_RESONANCE', STATES[0],
+                       params={'STOW': '0'}), 0, b)
 
     def test_failure_stows_under_the_gates(self):
         for b in BOARDS:
@@ -396,10 +395,9 @@ class Calibration(unittest.TestCase):
                                  0, (b, name))
                 self.assertEqual(zparks(b, name, STATES[0],
                                         webhooks='shutdown', **kw), 0)
-            for name in self.WRAPPED + ('FINETUNE_RESONANCE',):
-                self.assertEqual(
-                    zparks(b, name, STATES[0], params={'STOW': '0'},
-                           option='on_error_gcode'), 0, (b, name))
+            self.assertEqual(
+                zparks(b, 'FINETUNE_RESONANCE', STATES[0],
+                       params={'STOW': '0'}, option='on_error_gcode'), 0, b)
 
     def test_pid_stows_after_the_base_command(self):
         for b in BOARDS:
@@ -418,19 +416,20 @@ class Calibration(unittest.TestCase):
                 t = macros_of(b)['gcode_macro ' + n]['gcode']
                 self.assertNotIn('|_CLOSE_CALIBRATE_PROBE|', t, (b, n))
 
-    def test_print_path_calls_pass_stow_0(self):
+    def test_print_path_calls_skip_the_stow(self):
         for b in BOARDS:
             ps = macros_of(b)['gcode_macro PRINT_START']['gcode']
             self.assertRegex(ps, r'(?m)^\s*FINETUNE_RESONANCE STOW=0\s*$')
             cal = macros_of(b)['gcode_macro FINETUNE_RESONANCE']['gcode']
+            # the sweeps call the original, not the stowing wrapper
             self.assertEqual(len(re.findall(
-                r'SHAPER_CALIBRATE AXIS=\w .*STOW=0', cal)), 4, b)
+                r'(?m)^\s*SHAPER_CALIBRATE_BASE AXIS=\w ', cal)), 4, b)
+            self.assertNotRegex(cal, r'(?m)^\s*SHAPER_CALIBRATE ')
         t = macros_of('M1')['gcode_macro _BED_MESH_ENSURE']['gcode']
-        calls = [ln for ln in t.split('\n')
-                 if ln.strip().startswith('BED_MESH_CALIBRATE')]
-        self.assertEqual(len(calls), 2)
-        for ln in calls:
-            self.assertIn('STOW=0', ln)
+        self.assertEqual(len(re.findall(
+            r'(?m)^\s*BED_MESH_CALIBRATE_BASE ', t)), 2)
+        self.assertNotRegex(t, r'(?m)^\s*BED_MESH_CALIBRATE ')
+
 
 
 class PythonHooks(unittest.TestCase):

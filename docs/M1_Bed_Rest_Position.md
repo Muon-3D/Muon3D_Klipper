@@ -15,7 +15,7 @@ touching the nozzle; a larger Z is the plate farther from it.
 | Insert flow: Quick Load | yes, idle | via `_STOW_IF_IDLE`. |
 | Insert flow: Full Purge | yes, idle | `Z_PARK` as before, now skipped in a print. |
 | A print that fails | yes | `_ON_PRINT_ERROR` (`[virtual_sdcard] on_error_gcode`) ends with `_STOW_AFTER_PRINT_ERROR`, after the heaters are off and `CLEAR_PAUSE`. It runs while `print_stats` still says `printing` (Klipper notes the error after), so it skips the print-state gate but keeps the rest. |
-| `BED_MESH_CALIBRATE`, `SHAPER_CALIBRATE` | yes, idle | `rename_existing` wrappers in `calibration.cfg` call `_STOW_IF_IDLE` after the original. `STOW=0` turns it off: PRINT_START's mesh (`_BED_MESH_ENSURE`) and `FINETUNE_RESONANCE`'s sweeps pass it. |
+| `BED_MESH_CALIBRATE`, `SHAPER_CALIBRATE` | yes, idle | `rename_existing` wrappers in `calibration.cfg` call `_STOW_IF_IDLE` after the original. PRINT_START's mesh (`_BED_MESH_ENSURE`) and `FINETUNE_RESONANCE`'s sweeps call `BED_MESH_CALIBRATE_BASE` and `SHAPER_CALIBRATE_BASE` instead, so they never stow. |
 | `FINETUNE_RESONANCE` | yes, idle | one stow at the end; PRINT_START calls it with `STOW=0`. |
 | `PID_CALIBRATE` (hot end), `CALIBRATE_HEATING_BED` (MPC) | yes, idle | stow after the calibration. |
 | Probe Z offset (`CALIBRATE_PROBE`, `PROBE_CALIBRATE`) | yes, idle | `ManualProbeHelper.finalize` (`manual_probe.py`) runs `_STOW_IF_IDLE` for ACCEPT, ABORT and a failed TESTZ move, if the config defines it. The prompt's Cancel button (`_CANCEL_CALIBRATE_PROBE`) stows too. |
@@ -40,7 +40,7 @@ recovering, fault), Klipper shut down (no G-code runs then anyway).
   flows hand back to `RESUME`, which depends on where the head is.
 - `SAVE_CONFIG` after a probe calibration: it restarts Klipper and unhomes Z,
   so the bed is wherever the stow before it left it (the top).
-- The print path: PRINT_START's mesh and sweep (`STOW=0`), and
+- The print path: PRINT_START's mesh and sweep (the `_BASE` commands), and
   `ANTI_OOZE_NOZZLE_DOCK` (the nozzle rests in the pad on purpose), the debug
   and bench tests.
 
