@@ -190,6 +190,17 @@ class MCU_SosFilter:
         self._scale_frac_bits = scale_frac_bits
         self._auto_offset = auto_offset
 
+    # Move the zero (offset) of a running filter, keeping the scale and
+    # the filter state: the MCU uses it from its next sample.  For a
+    # load cell probe following slow drift during a descent (KAN-4364).
+    def update_offset(self, offset):
+        self._offset = offset
+        self._auto_offset = False
+        su = to_fixed_32(self._scale, self._scale_frac_bits)
+        args = (self._oid, offset, su, self._scale_frac_bits, False)
+        self._set_offset_scale_cmd.send(args)
+        self._last_sent_offset_scale = args
+
     # Change the filter coefficients and state at runtime
     def set_filter_design(self, design, coeff_frac_bits=29):
         self._design = design

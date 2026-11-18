@@ -6088,19 +6088,27 @@ sensor_type:
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
 #z_move_drift_rate_counts: 100000
-#   A hot load cell drifts by millions of counts. The side opposite the
-#   press (the wrong-way rule, and the ceiling on that side) is judged
-#   against the tare plus the drift seen so far, which is followed at no
-#   more than this many counts a second and dropped as soon as the load
-#   comes back, so a step or a fast ramp still trips at full size. The
-#   press side is never followed. 0 turns it off. The default is 100000:
-#   a hot cell drifted about 48000 counts a second, and a real
-#   wrong-way press rises at millions a second, so the rate is the
-#   margin to keep wide.
+#   A hot load cell drifts by millions of counts. During a probing
+#   descent with a directed trigger the probe works from a baseline that
+#   follows the load at no more than this many counts a second, either
+#   way, and only while the load is within z_move_drift_band_factor x the
+#   trigger delta of it. The MCU trigger's zero is moved with it, so the
+#   trigger, the ceiling and the wrong-way rule all measure from the
+#   current baseline: contact needs the normal force however far the
+#   cell drifted, and a step or a fast ramp is judged at full size. Not
+#   for MCUTARE descents' MCU zero, nor grams mode. 0 turns it off (a
+#   fixed tare). The default is 100000: a hot cell drifted about 48000
+#   counts a second, and a real press rises at millions a second.
+#z_move_drift_band_factor: 0.25
+#   The baseline follows only while the load is within this many trigger
+#   deltas of it, and holds still once a press leaves the band, so a
+#   real contact moves it by a small fraction of a delta. Above 0 and at
+#   most 0.5. The default is 0.25.
 #z_move_drift_cap_counts: 2500000
-#   The most drift, in counts, that one descent may absorb in all. Past
-#   it the wrong side is judged from the tare plus this many counts. At
-#   least 1. The default is 2500000.
+#   The furthest, in counts, the baseline may move from the tare in one
+#   descent. Past it the move is ended: that bounds a push slower than
+#   z_move_drift_rate_counts, which cannot be told from drift. At least
+#   1. The default is 2500000.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than
