@@ -12,20 +12,20 @@ Sloe (B1, train 17, Klipper 61caab27), three PRINT_START attempts:
     alternated by a fixed ~0.047 mm (z=0.1585/0.2027/0.1551/0.2022...),
     samples_tolerance was 0.045: "Probe samples exceed samples_tolerance".
 
-This drives the real ZLoadBackstop with those numbers (2000 sps, press
-direction -1 as in the other backstop tests), and the real
-ProbeSessionHelper.run_probe with the samples_tolerance read from
-core/M1/core.cfg.
+KAN-4364 (#148, after two reviews of a drift follower): a probing move
+longer than 20 mm runs as 20 mm segments, each with its own fixed tare,
+backstop and trigger.  Tests 1-3 and 5-7 drive the real
+LoadCellProbingMove (probing_move, _probe_segment, _pause_and_tare) and
+ZLoadBackstop through a simulated world: a nozzle descending over a bed,
+the cell drifting as Sloe's did, the MCU trigger checked on every sample
+and the host watch fed 20 ms batches.  Test 6 runs the real
+LOAD_CELL_HOME_Z on top.  Test 4 is the shipped samples_tolerance.
 
-KAN-4364 on #148 (two reviews): drift is followed only on a long blind
-descent, only in the sign of the slope measured over 0.5 s before it, at
-no more than 1.5 x that slope; the MCU trigger's zero moves with it.
-run_mcu() models the MCU trigger beside the real watch: it fires on
-(counts - zero) x press > delta, zero being the last one the host sent,
-applied 20 ms after the batch that produced it.  Tests 5-10 are the
-review's cases: slow pushes, a 110000 counts/s ramp, a soft surface, the
-sign-flipped incident at 4 mm/s, a burst, and the excess bound.
+    python3 test/load_cell_probe/test_hot_load_cell.py
+
+Needs numpy.
 """
+import math
 import os
 import re
 import sys
@@ -61,615 +61,541 @@ DELTA_1 = 146400    # tare -121734, ceiling 366000
 DELTA_2 = 259190    # tare 1006163, ceiling 647975
 TARE_1 = -121734
 TARE_2 = 1006163
-DRIFT_EXCESS_REASON = ("the load cell baseline moved further than its"
-                       " measured drift during the Z move")
 
 
-def drift_counts(tare, rate, seconds, step=None, step_at=None):
-    """Counts that drift up (the wrong way) by rate counts/s, with an
-    optional step (counts) added from step_at seconds on."""
-    n = int(seconds * SPS)
-    out = []
-    for i in range(n):
-        c = tare + rate * i / float(SPS)
-        if step is not None and i >= int(step_at * SPS):
-            c += step
-        out.append(int(c))
-    return out
-
+# --- a descent in a simulated world ---------------------------------------
 
 SLOE_RATE = 1100000. / 23.     # Sloe's heat-up drift, counts/s
+SLOE_REF = zb.SLOE_REF
 
 
-def run_watch(mod, tare, delta, counts, slope=0., **opts):
-    """The real watch on one descent, judged in 20 ms batches.  slope is
-    the drift measured before the descent (0: a tap, nothing followed)."""
-    w, cell, homing = zb.make_watch(mod, **opts)
-    t0 = 10.
-    w.arm(t0, tare, delta, PRESS, drift_slope=slope, drift_t0=t0)
-    idx, _ = zb.feed_until_abort(cell, homing, t0, counts)
-    return w, homing, idx
+def wander(i, seed=[4364]):
+    # Sloe's idle wander, -4000..+7000 counts
+    seed[0] = (seed[0] * 1103515245 + 12345) % (1 << 31)
+    return -4000 + seed[0] % 11001
 
 
-# Sloe's idle wander (test_z_load_backstop test 2), as a fixed sequence
-def wander(n, seed=4364):
-    out = []
-    for _ in range(n):
-        seed = (seed * 1103515245 + 12345) % (1 << 31)
-        out.append(-4000 + seed % 11001)
-    return out
+class World(object):
+    """The Z axis over a bed and the load cell on the nozzle.  `real` is
+    the nozzle's height over the bed (mm), the toolhead's commanded Z is
+    real + off.  The cell reads tare0 + drift(seconds) + load toward the
+    press side (the other way with flip, a sign error); load is
+    stiff counts/mm under real 0, plus `soft` counts/mm under soft_at mm
+    (a soft object on the bed).  bump=(at_s, secs, counts) adds a spike."""
+
+    def __init__(self, tare0=TARE_1, drift=None, stiff=1000000., flip=False,
+                 real=150., noise=True, bump=None, soft=0., soft_at=0.):
+        self.tare0 = tare0
+        self.drift = drift or (lambda s: 0.)
+        self.stiff = stiff
+        self.flip = flip
+        self.real = real
+        self.off = 0.
+        self.noise = noise
+        self.bump = bump
+        self.soft, self.soft_at = soft, soft_at
+        self.t = 10.
+        self.segments = []      # (start real, end real) of each move
+
+    @property
+    def z(self):
+        return self.real + self.off
+
+    def load(self, real):
+        load = max(0., -real) * self.stiff
+        if self.soft:
+            load += max(0., self.soft_at - real) * self.soft
+        return load
+
+    def counts(self):
+        c = self.tare0 + self.drift(self.t - 10.)
+        sign = -PRESS if self.flip else PRESS
+        c += sign * self.load(self.real)
+        if self.noise:
+            c += wander(0)
+        if self.bump is not None:
+            at, secs, b = self.bump
+            if at <= self.t - 10. < at + secs:
+                c += b
+        return int(c)
 
 
-def descent(drift_rate, seconds, press_rate=None, press_at=None,
-            wrong=False, tare=TARE_1, noise=True, burst=None):
-    """A descent's samples as (counts, drift, load): the cell drifts by
-    drift_rate counts/s (positive is the wrong way) from tare, and from
-    press_at seconds on the nozzle is pressed at press_rate counts/s
-    (wrong=True: a sign error, the press reads the wrong way).  load is
-    the press alone, in counts toward the press side.  burst=(at, secs,
-    counts) adds counts (signed) for secs."""
-    n = int(seconds * SPS)
-    nz = wander(n) if noise else [0] * n
-    out = []
-    for i in range(n):
-        d = drift_rate * i / float(SPS)
-        load = 0.
-        if press_rate is not None and i >= int(press_at * SPS):
-            load = press_rate * (i - int(press_at * SPS)) / float(SPS)
-        sign = -PRESS if wrong else PRESS
-        c = tare + d + sign * load + nz[i]
-        if burst is not None and burst[0] <= i / float(SPS) < (
-                burst[0] + burst[1]):
-            c += burst[2]
-        out.append((int(c), d, load))
-    return out
+class Toolhead(object):
+    def __init__(self, world):
+        self.w = world
+
+    def get_position(self):
+        return [100., 100., self.w.z, 0.]
+
+    def dwell(self, t):
+        self.w.t += t
 
 
-def run_mcu(mod, delta, samples, tare=TARE_1, mcu=True, retare=True,
-            latency=40, batch=40, mcutare=False, direction=PRESS, slope=0.,
-            **opts):
-    """The real ZLoadBackstop with a model of the MCU trigger beside it.
-    The MCU sees every sample as it is converted and triggers ("gt") on
-    the first with (counts - zero) x press > delta, zero being the last
-    one the host sent; a zero the host sends after a 20 ms batch reaches
-    the MCU `latency` samples after that batch (40 = another 20 ms).
-    slope is the drift measured before the descent.
-    Returns a dict: what ended the move and at which sample."""
-    w, cell, homing = zb.make_watch(mod, **opts)
-    sent = []
-    w.arm(10., tare, delta, direction, mcutare=mcutare,
-          retare=sent.append if retare else None, drift_slope=slope,
-          drift_t0=10.)
-    zero = tare
-    pending = []
-    rs = zb.rows(10., [s[0] for s in samples])
-    res = {'watch': w, 'sent': sent, 'trigger': None, 'abort': None,
-           'idx': None}
-    for b in range(0, len(rs), batch):
-        chunk = rs[b:b + batch]
-        for k, r in enumerate(chunk):
-            i = b + k
-            while pending and pending[0][0] <= i:
-                zero = pending.pop(0)[1]
-            if mcu and (r[2] - zero) * PRESS > delta:
-                res['trigger'], res['idx'] = i, i
-                res['zero'] = zero
-                return res
-        n = len(sent)
-        cell.feed(chunk)
-        if homing.calls:
-            res['abort'], res['idx'] = homing.calls[0], b + len(chunk) - 1
-            return res
-        for z in sent[n:]:
-            pending.append((b + len(chunk) + latency, z))
-    return res
+class Collector(object):
+    """The tare: the queue drains (0.15 s, at rest), then n samples."""
+
+    def __init__(self, world, m):
+        self.w = world
+        m._collect_start_time = world.t
+
+    def start_collecting(self, min_time=None):
+        pass
+
+    def collect_min(self, n=1):
+        self.w.t += 0.15
+        out = []
+        for _ in range(n):
+            self.w.t += 1. / SPS
+            out.append([self.w.t, 0., self.w.counts()])
+        return out, None
+
+    def stop_collecting(self):
+        pass
 
 
-def force_at(s, r):
-    return s[r['idx']][2] / float(DELTA_1)
+class Phoming(object):
+    """PrinterHoming for a probing move: moves the nozzle at `speed`, one
+    sample at a time.  The MCU trigger ("gt" on the tare the move was
+    armed with) is checked on every sample unless mcu is False (a dead
+    trigger); the host watch gets 20 ms batches and may abort."""
+
+    max_search_distance_z = 0.
+
+    def __init__(self, world, m, mcu=True):
+        self.w = world
+        self.m = m
+        self.mcu = mcu
+        self.calls = []
+        self.trigger_load = None
+        self.trigger_delta = None
+
+    def abort_active_move(self, reason, z_only=True):
+        self.calls.append(reason)
+        return True
+
+    def probing_move(self, endstop, pos, speed):
+        w, m = self.w, self.m
+        target = pos[2] - w.off
+        start = w.real
+        zero, delta = m._tare_counts, m._trigger_delta
+        press = m._trigger_press_dir
+        batch = []
+        cell = m._load_cell
+        n = self.calls[:]
+        try:
+            while True:
+                w.real = max(target, w.real - speed / float(SPS))
+                w.t += 1. / SPS
+                c = w.counts()
+                batch.append([w.t, None, c, None])
+                if self.mcu and (c - zero) * press > delta:
+                    cell.feed(batch)
+                    self.trigger_load = w.load(w.real)
+                    self.trigger_delta = delta
+                    return [100., 100., w.z, 0.]
+                if len(batch) == 40 or w.real <= target:
+                    cell.feed(batch)
+                    batch = []
+                    if len(self.calls) > len(n):
+                        raise tg.CommandError(
+                            "Homing aborted: " + self.calls[-1])
+                if w.real <= target:
+                    raise tg.CommandError(
+                        "No trigger on probe after full movement")
+        finally:
+            w.segments.append((start, w.real))
 
 
-def cross(s, level, start=0):
-    return next(i for i in range(start, len(s)) if s[i][2] > level)
+class ProbeParams(object):
+    def __init__(self, speed):
+        self.speed = speed
+
+    def get_probe_params(self, gcmd):
+        if gcmd is not None:
+            return {'probe_speed': gcmd.get_float('PROBE_SPEED',
+                                                  self.speed)}
+        return {'probe_speed': self.speed}
 
 
-def test_1_measured_drift_is_followed(mod):
-    # Logged attempt 1 (tare -121734, wrong way 146400, ceiling 366000):
-    # Sloe's heat-up, 1.1M counts in 23 s, measured before the descent:
-    # past both limits, never trips them.  Logged attempt 2 (tare
-    # 1006163): 30000 counts/s for 12 s.
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, SLOE_RATE, 23.),
-                               slope=SLOE_RATE)
-    assert w.get_limits() == (366000, 146400), w.get_limits()
-    assert homing.calls == [] and idx is None, (homing.calls, idx)
-    w, homing, idx = run_watch(mod, TARE_2, DELTA_2,
-                               drift_counts(TARE_2, 30000., 12.),
-                               slope=30000.)
-    assert homing.calls == [] and idx is None, (homing.calls, idx)
-    # the same drift with nothing measured (every tap, mesh point and
-    # confirm tap) or with the rate at 0 is judged from the fixed tare
-    for slope, opts in ((0., {}), (SLOE_RATE,
-                                   {'z_move_drift_rate_counts': 0})):
-        w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                                   drift_counts(TARE_1, SLOE_RATE, 23.),
-                                   slope=slope, **opts)
-        assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
-        assert abs(idx - DELTA_1 / SLOE_RATE * SPS) < 100, idx
-    # a slope under 3000 counts/s is not followed
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, [TARE_1] * 100,
-                               slope=2999.)
-    assert w._slope == 0. and w._band == 0., (w._slope, w._band)
-    print('ok  1 Sloe 1.1M counts in 23 s, measured, never trips; with '
-          'nothing measured or rate 0 it trips at 1 x delta (3.06 s)')
+def make(mod, world, speed=15., mcu=True, ref=SLOE_REF, fixed=None):
+    """The real LoadCellProbingMove (probing_move, _probe_segment and,
+    unless fixed=(tare, delta), the real _pause_and_tare with its
+    KAN-3370 checks) and the real ZLoadBackstop, in `world`."""
+    helper = tg.make_helper(mod, ref, trigger_percent=10)
+    cell = zb.Cell(SPS, counts_per_gram=1000., tare_counts=world.tare0)
+    helper._load_cell = cell
+    m = tg.make_move(mod, helper, world.tare0)
+    m._load_cell = cell
+    ph = Phoming(world, m, mcu=mcu)
+    printer = zb.Printer(ph)
+    printer.objects['toolhead'] = Toolhead(world)
+    m._printer = printer
+    helper._printer = printer
+    m._z_min_position = -4.
+    m._param_helper = ProbeParams(speed)
+    m._nozzle_is_clear = lambda: False
+    m._start_collector = lambda: Collector(world, m)
+    m._z_watch = mod.ZLoadBackstop(tg.FakeConfig(printer, {}), printer,
+                                   cell)
+    if fixed is not None:
+        # a tare the real helper would refuse (the incident's): the
+        # counts at rest now, with the incident's delta
+        def tare_fn(gcmd, prev_tare=None):
+            col = Collector(world, m)
+            rows, _ = col.collect_min(80)
+            tare = int(sum(r[2] for r in rows) / len(rows))
+            if prev_tare is not None:
+                lim = m.SEGMENT_TARE_STEP * fixed[1]
+                tare = int(max(prev_tare - lim, min(prev_tare + lim, tare)))
+            m._tare_counts = tare
+            m._trigger_delta = fixed[1]
+            m._trigger_press_dir = PRESS
+        m._pause_and_tare = tare_fn
+    return m, ph
 
 
-def test_2_a_real_wrong_way_event_still_trips(mod):
-    # A step of 1.2 x the delta on a cell measured and drifting 20000
-    # counts/s: judged at full size, 40 samples in.
-    counts = drift_counts(TARE_1, 20000., 10., step=int(1.2 * DELTA_1),
-                          step_at=5.)
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts, slope=20000.)
-    assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
-    assert 10000 <= idx <= 10000 + 41, idx
-    # a ramp of 300000 counts/s on that cell trips inside a second
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 300000., 3.),
-                               slope=20000.)
-    assert homing.calls and idx < 0.6 * SPS, (homing.calls, idx)
-    # a step of 1.1 x 146400 on a cold cell
-    counts = [TARE_1] * 100 + [TARE_1 + int(1.1 * DELTA_1)] * 400
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.WRONG_WAY_REASON] and idx == 120, (
-        homing.calls, idx)
-    print('ok  2 a 1.2 x delta step on a drifting cell aborts 40 samples '
-          'in; a 300000 counts/s ramp aborts; a 1.1 x delta step aborts')
+def descend(mod, world, **kw):
+    """One PROBE: returns (move, phoming, error or None)."""
+    m, ph = make(mod, world, **kw)
+    err = None
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        err = str(e)
+    return m, ph, err
 
 
-def test_3_ceiling_from_the_current_baseline(mod):
-    # a fast push to 2.6 x the delta trips at once
-    counts = [TARE_1] * 100 + [TARE_1 - int(2.6 * DELTA_1)] * 400
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.CEILING_REASON] and idx == 120, (
-        homing.calls, idx)
-    # the wrong-side ceiling covers a sensor that jumps the wrong way
-    counts = [TARE_2] * 100 + [TARE_2 + int(2.6 * DELTA_2)] * 400
-    w, homing, idx = run_watch(mod, TARE_2, DELTA_2, counts)
-    assert homing.calls and idx == 120, (homing.calls, idx)
-    # 1M counts of press-way drift (measured, followed), then the MCU
-    # trigger is dead and the bed is pushed at 3.5M counts/s: the host
-    # ceiling stops it 2.5 x delta above the CURRENT baseline
-    s = descent(-50000., 21., 3500000., 20.)
-    r = run_mcu(mod, DELTA_1, s, mcu=False, slope=-50000.)
-    assert r['abort'] == zb.CEILING_REASON, r
-    c = cross(s, 2.5 * DELTA_1)
-    assert c + 39 <= r['idx'] <= c + 80, (c, r['idx'])
-    # a press to 2.3 x delta, held 0.2 s, is not past it
-    s = [(c_, d, min(l, 2.3 * DELTA_1)) for c_, d, l in s[:int(20.3 * SPS)]]
-    s = [(int(TARE_1 + d + PRESS * l), d, l) for c_, d, l in s]
-    r = run_mcu(mod, DELTA_1, s, mcu=False, slope=-50000.)
-    assert r['abort'] is None, r
-    print('ok  3 a 2.6 x delta push or wrong-side jump aborts; with the '
-          'trigger dead the ceiling stops a press 2.5 x delta above the '
-          'baseline after 1M of drift, 2.3 x does not')
+def sloe_drifts():
+    r = SLOE_RATE
+    return [
+        ('heating (+1.1M in 23 s)', lambda s: r * s),
+        ('heating the press way', lambda s: -r * s),
+        ('stops after 4 s', lambda s: r * min(s, 4.)),
+        ('decays (tau 3 s)', lambda s: 3. * r * (1. - math.exp(-s / 3.))),
+        ('reverses at 5 s', lambda s: r * (s if s < 5. else 10. - s)),
+        ('press way, stops', lambda s: -r * min(s, 4.)),
+    ]
 
 
-def test_5_slow_push_is_never_followed_cold(mod):
-    # Review of 3c5158a: a push slower than the follow rate was followed
-    # to the 2.5M cap.  With nothing measured (a cold cell) nothing is
-    # followed: an 80000 counts/s push is stopped at 1 x delta, by the
-    # trigger on the press side and by the wrong-way rule on the other.
-    s = descent(0., 10., 80000., 1., noise=False)
-    r = run_mcu(mod, DELTA_1, s, slope=0.)
-    assert r['trigger'] is not None, r
-    assert 1. <= force_at(s, r) < 1.01, force_at(s, r)
-    s = descent(0., 10., 80000., 1., wrong=True, noise=False)
-    r = run_mcu(mod, DELTA_1, s, slope=0.)
-    assert r['abort'] == zb.WRONG_WAY_REASON, r
-    c = cross(s, DELTA_1)
-    assert c + 39 <= r['idx'] <= c + 80, (c, r['idx'])
-    # hot, measured drifting the wrong way: a 20000 counts/s press-side
-    # push only slows the drift the load shows, and the baseline follows
-    # that; the press-side reference may trail the measured drift by no
-    # more than the band, so it fires at about 1.25 x delta
-    s = descent(SLOE_RATE, 16., 20000., 2.)
-    r = run_mcu(mod, DELTA_1, s, slope=SLOE_RATE)
-    assert r['trigger'] is not None, r
-    assert 1.1 <= force_at(s, r) < 1.3, force_at(s, r)
-    against = force_at(s, r)
-    # the same on the other side: drifting the press way, a 20000
-    # counts/s sign-flipped push is caught by the wrong-way rule
-    s = descent(-SLOE_RATE, 16., 20000., 2., wrong=True)
-    r = run_mcu(mod, DELTA_1, s, slope=-SLOE_RATE)
-    assert r['abort'] == zb.WRONG_WAY_REASON, r
-    assert force_at(s, r) < 1.35, force_at(s, r)
-    # and if the measured drift stops (the hot end at temperature) the
-    # trailing limit fires EARLY: a false touch, never a late one
-    s = descent(0., 16., noise=False)
-    r = run_mcu(mod, DELTA_1, s, slope=SLOE_RATE)
-    assert r['trigger'] is not None and s[r['idx']][2] == 0., r
-    assert abs(r['idx'] - 1.25 * DELTA_1 / SLOE_RATE * SPS) < 0.1 * SPS, r
-    print('ok  5 an 80000 counts/s push on a cold cell triggers or aborts '
-          'at 1 x delta; a 20000 counts/s press against measured drift '
-          'triggers at %.3f x delta; drift that stops fires early' % against)
-
-
-def test_6_ramp_of_110000(mod):
-    # The review's ramp: 110000 counts/s, just over the old follow rate
-    # (3c5158a followed it 360000 counts before freezing).
-    out = []
-    for slope, wrong in ((0., False), (0., True), (SLOE_RATE, False),
-                         (SLOE_RATE, True)):
-        drift = slope
-        s = descent(drift, 12., 110000., 2., wrong=wrong)
-        r = run_mcu(mod, DELTA_1, s, slope=slope)
-        if wrong:
-            assert r['abort'] == zb.WRONG_WAY_REASON, (slope, r)
-            # the ramp at the confirming batch: 1 x delta, + the 20 ms
-            # confirm and the 20 ms batch (4400), + what was followed
-            f = force_at(s, r)
-            assert f < 1.15, (slope, f)
-        else:
-            # against drift the press side holds until the load leaves
-            # the band, so it fires late by up to the drift in that time
-            # (1.15 here), within the 1.3 of test 7
-            assert r['trigger'] is not None, (slope, r)
-            f = force_at(s, r)
-            assert 0.95 <= f < 1.2, (slope, f)
-        out.append(f)
-    print('ok  6 a 110000 counts/s ramp, cold or on measured drift: '
-          'triggers at %.3f / %.3f x delta, wrong way aborts at %.3f / '
-          '%.3f x delta' % (out[0], out[2], out[1], out[3]))
-
-
-def test_7_soft_surface_at_probe_speed(mod):
-    # A press at 4 mm/s into a surface of 25000 counts/mm (100000
-    # counts/s), cold and on a cell measured drifting either way at
-    # Sloe's rate: the trigger fires at 0.75-1.3 x delta of real force.
-    # Against wrong-way drift the press reference goes on with the drift
-    # (~1.0); with press-way drift it holds, so the drift helps (~0.85).
-    out = []
-    for slope in (0., SLOE_RATE, -SLOE_RATE):
-        s = descent(slope, 14., 100000., 5.)
-        r = run_mcu(mod, DELTA_1, s, slope=slope)
-        assert r['trigger'] is not None and r['abort'] is None, (slope, r)
-        f = force_at(s, r)
-        assert 0.75 <= f <= 1.3, (slope, f)
-        out.append(f)
-    print('ok  7 4 mm/s into 25000 counts/mm: triggers at %.3f x delta '
-          'cold, %.3f drifting away, %.3f drifting in' % tuple(out))
-
-
-def test_8_sign_flipped_incident_at_4mm_s(mod):
-    # The Boxwood incident (tare -3244819 past the anchor, delta 23407,
-    # the trigger never fires) with the press reading the wrong way, at
-    # 4 mm/s, on the long G28 descent: it must stop no later than the
-    # 6.15 mm the fixed-tare ceiling took at 15 mm/s on a slow ramp.
-    # Cold (nothing measured) and on a cell drifting the wrong way at
-    # Sloe's rate (measured), stiff and soft.
-    tare, delta, speed = zb.INCIDENT_TARE, zb.DELTA_INCIDENT, 4.
-    out = []
-    for slope in (0., SLOE_RATE):
-        for stiff in (100000., 10000.):
-            s = descent(slope, 6., stiff * speed, 1., wrong=True,
-                        tare=tare)
-            r = run_mcu(mod, delta, s, tare=tare, mcu=False, slope=slope)
-            assert r['abort'] == zb.WRONG_WAY_REASON, (slope, stiff, r)
-            mm = (r['idx'] - SPS) / float(SPS) * speed
-            assert mm <= 6.15, (slope, stiff, mm)
-            out.append(mm)
-    print('ok  8 sign-flipped incident at 4 mm/s aborts after %.2f / %.2f '
-          'mm (cold) and %.2f / %.2f mm (drifting)' % tuple(out))
-
-
-def test_9_burst_is_not_captured(mod):
-    # Measured drift the wrong way; at 5 s a 50 ms burst of 0.6 x delta
-    # each way (past the band, under every limit).  The baseline freezes
-    # (one WARNING), does not move toward the burst, follows again, and
-    # contact at 10 s still fires at 1 x delta.
-    for b in (0.6 * DELTA_1, -0.6 * DELTA_1):
-        s = descent(SLOE_RATE, 11., 3500000., 10., burst=(5., 0.05, b))
-        with zb.LogCapture() as cap:
-            w, cell, homing = zb.make_watch(mod)
-            w.arm(10., TARE_1, DELTA_1, PRESS, drift_slope=SLOE_RATE,
-                  drift_t0=10.)
-            rs = zb.rows(10., [x[0] for x in s])
-            before = after = None
-            for i in range(0, int(10. * SPS), 40):
-                cell.feed(rs[i:i + 40])
-                if i + 40 == int(4.98 * SPS):
-                    before = w._base
-                if i + 40 == int(5.2 * SPS):
-                    after = w._base
-            assert homing.calls == [], homing.calls
-            warns = [m for lv, m in cap.lines if lv == 'WARNING'
-                     and 'baseline froze' in m]
-            assert len(warns) == 1, cap.lines
-        # 0.22 s of drift at Sloe's rate is 10500; the burst was 87840
-        assert abs((after - before) - 0.22 * SLOE_RATE) < 6000, (
-            before, after)
-        r = run_mcu(mod, DELTA_1, s, slope=SLOE_RATE)
-        assert r['trigger'] is not None, r
-        assert 0.95 <= force_at(s, r) < 1.1, force_at(s, r)
-    print('ok  9 a 0.6 x delta burst either way freezes the baseline once '
-          '(WARNING), is not followed, and contact after it fires at '
-          '%.3f x delta' % force_at(s, r))
-
-
-def test_10_push_with_the_drift_is_bounded_by_the_excess(mod):
-    # The one push that is followed: in the measured drift's own sign and
-    # slower than 1.5 x the slope.  Sloe's drift the wrong way plus a
-    # 20000 counts/s push the same way (68000 in all, under the 71740
-    # follow rate): the baseline runs ahead of slope x elapsed by 20000 a
-    # second and the move is aborted when that passes 3 x delta (439200),
-    # at 22 s: the push is then 3 x delta.
-    for wrong, slope in ((True, SLOE_RATE), (False, -SLOE_RATE)):
-        s = descent(slope, 30., 20000., 0., wrong=wrong, noise=False)
-        r = run_mcu(mod, DELTA_1, s, slope=slope)
-        assert r['abort'] == DRIFT_EXCESS_REASON, (wrong, r)
-        f = force_at(s, r)
-        assert 3. <= f < 3.05, (wrong, f)
-    # a configured factor
-    s = descent(SLOE_RATE, 30., 20000., 0., wrong=True, noise=False)
-    r = run_mcu(mod, DELTA_1, s, slope=SLOE_RATE,
-                z_move_drift_excess_factor=1.5)
-    assert r['abort'] == DRIFT_EXCESS_REASON, r
-    assert 1.5 <= force_at(s, r) < 1.55, force_at(s, r)
-    print('ok  10 a 20000 counts/s push in the drift\'s own sign is '
-          'followed and aborted at 3 x delta (1.5 x when configured)')
-
-
-def test_11_sloe_heatup_either_way_then_contact(mod):
-    # Sloe: 1.1M counts in 23 s, measured, with its wander on top, the
-    # wrong way (as logged) and the press way (the mid-air stops at
-    # z=113.6).  No abort and no trigger for the whole descent, then the
-    # bed: 3.5M counts/s (4 mm/s) or 1M counts/s.  The MCU fires within
-    # 0.25 x delta of the trigger delta above the drift.
+def test_1_hot_g28_from_the_top(mod):
+    # The G28 fast approach: 150 mm at 15 mm/s (8 segments), the cell
+    # drifting as Sloe's did, or stopping, decaying or reversing; the bed
+    # at 1M counts/mm.  No abort, and the trigger fires at the trigger
+    # delta of real force, give or take one segment of drift.
     worst = 0.
-    for sign in (1., -1.):
-        for press in (3500000., 1000000.):
-            s = descent(sign * SLOE_RATE, 24., press, 23.)
-            r = run_mcu(mod, DELTA_1, s, slope=sign * SLOE_RATE)
-            assert r['abort'] is None and r['trigger'] is not None, (
-                sign, press, r)
-            assert r['trigger'] >= 23 * SPS, (sign, press, r['trigger'])
-            f = force_at(s, r)
-            assert abs(f - 1.) < 0.25, (sign, press, f)
-            worst = max(worst, abs(f - 1.))
-            assert len(r['sent']) > 500, len(r['sent'])
-        # with the MCU zero left at the tare the press-way drift stops
-        # the descent in mid air, 3 s in, and the wrong-way drift needs
-        # the 1.1M drift on top of the trigger force
-        s = descent(sign * SLOE_RATE, 24., 3500000., 23.)
-        r = run_mcu(mod, DELTA_1, s, retare=False, slope=sign * SLOE_RATE)
-        if sign < 0:
-            assert r['trigger'] is not None and r['trigger'] < 4 * SPS, r
-        else:
-            assert r['trigger'] is None, r
-    print('ok  11 Sloe 1.1M counts in 23 s either way: no abort, contact '
-          'at 3.5M or 1M counts/s triggers within %.3f x delta of nominal'
-          % worst)
+    for name, drift in sloe_drifts():
+        w = World(drift=drift)
+        m, ph, err = descend(mod, w)
+        assert err is None and ph.calls == [], (name, err, ph.calls)
+        assert len(w.segments) == 8, (name, w.segments)
+        assert abs(w.real) < 0.5, (name, w.real)
+        f = ph.trigger_load / ph.trigger_delta
+        assert 0.5 < f < 1.5, (name, f)
+        worst = max(worst, abs(f - 1.))
+        # every segment ended on its own end, except the last
+        assert all(abs(b - a) <= 20.0001 for a, b in w.segments), name
+    # the same heat-up as ONE move (no segments) is the KAN-4364 abort
+    w = World(drift=sloe_drifts()[0][1])
+    m, ph = make(mod, w)
+    m.SEGMENT_MM = 1000.
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        assert zb.WRONG_WAY_REASON in str(e), str(e)
+    else:
+        raise AssertionError('one 150 mm move did not abort')
+    print('ok  1 a 150 mm G28 descent in 8 segments, Sloe drift heating, '
+          'stopping, decaying or reversing either way: no abort, trigger '
+          'within %.2f x delta of nominal (one move aborts)' % worst)
 
 
-def test_12_contact_after_2M_followed(mod):
-    # 2M counts of drift at the full 100000 counts/s, measured, either
-    # way, with wander, then contact at 3.5M counts/s: the trigger fires
-    # at the nominal force though its zero has moved 2M counts.
-    for sign in (1., -1.):
-        s = descent(sign * 100000., 21., 3500000., 20.)
-        r = run_mcu(mod, DELTA_1, s, slope=sign * 100000.)
-        assert r['abort'] is None and r['trigger'] is not None, r
-        f = force_at(s, r)
-        assert abs(f - 1.) < 0.25, (sign, f)
-        assert abs(abs(r['zero'] - TARE_1) - 2000000) < 30000, r['zero']
-    print('ok  12 2M counts followed at 100000 counts/s, then contact: '
-          'the trigger fires at %.3f x delta' % f)
+def test_2_a_press_at_any_rate(mod):
+    # Cold and hot (Sloe's drift either way), contact at 1.5M counts/s
+    # (100000 counts/mm at 15 mm/s) to 15M counts/s, from far up
+    # (soft-homed at Z160): the trigger fires by 1.5 x delta.
+    out = []
+    for drift in (None, sloe_drifts()[0][1], sloe_drifts()[1][1]):
+        for stiff in (100000., 1000000.):
+            w = World(drift=drift, stiff=stiff, real=60.)
+            w.off = 100.
+            m, ph, err = descend(mod, w)
+            assert err is None, (stiff, err)
+            f = ph.trigger_load / ph.trigger_delta
+            assert 0.5 < f < 1.5, (stiff, f)
+            out.append(f)
+    # KNOWN LIMIT (reported): 150000 counts/s (10000 counts/mm, a soft
+    # object, not the bed).  Cold it fires at 1 x delta; against Sloe's
+    # wrong-way drift each segment nets under a delta, so the later
+    # tares take in 0.75 x delta each and it fires at ~4 x delta.
+    soft = []
+    for drift in (None, sloe_drifts()[0][1], sloe_drifts()[1][1]):
+        w = World(drift=drift, stiff=10000., real=60.)
+        w.off = 100.
+        m, ph, err = descend(mod, w)
+        assert err is None, err
+        f = ph.trigger_load / ph.trigger_delta
+        assert f < 4.5, (drift, f)
+        soft.append(f)
+    assert soft[0] < 1.1, soft
+    # With the trigger dead the ceiling stops a stiff press at 2.5 x
+    # delta of the segment's tare (+ the drift since it, the 20 ms
+    # confirm and one batch at that rate).
+    dead = []
+    for drift in (None, sloe_drifts()[0][1], sloe_drifts()[1][1]):
+        for stiff in (100000., 1000000.):
+            w = World(drift=drift, stiff=stiff, real=60.)
+            w.off = 100.
+            m, ph, err = descend(mod, w, mcu=False)
+            assert err == 'Homing aborted: ' + zb.CEILING_REASON, err
+            delta = m._trigger_delta
+            f = w.load(w.real) / delta
+            slack = (0.6 * delta + stiff * 15. * 0.042) / delta
+            assert 2.4 < f < 2.5 + slack, (drift, stiff, f, slack)
+            dead.append(f)
+    # KNOWN LIMIT (reported, not bounded here): trigger dead AND a soft
+    # press (10000 counts/mm).  Each segment presses 200000 counts, under
+    # the ceiling; each later tare takes in up to 0.75 x delta of it.
+    # Cold the ceiling still ends it (~4.3 x delta); against Sloe's
+    # wrong-way drift the net per segment is barely over the 0.75 and the
+    # descent runs to its end.
+    lim = []
+    for drift in (None, sloe_drifts()[0][1]):
+        w = World(drift=drift, stiff=10000., real=60.)
+        w.off = 100.
+        m, ph, err = descend(mod, w, mcu=False)
+        lim.append(((err or 'triggered').split(':')[0],
+                    w.load(w.real) / m._trigger_delta))
+    print('ok  2 contact at 1.5M-15M counts/s, cold or drifting either '
+          'way, triggers at %.2f-%.2f x delta; trigger dead: the ceiling '
+          'stops it at %.2f-%.2f x delta.  LIMIT, 150k counts/s: triggers '
+          'at %.2f / %.2f / %.2f x delta (cold / drift away / in); trigger '
+          'dead: %s at %.2f (cold), %s at %.2f x delta (drifting)'
+          % ((min(out), max(out), min(dead), max(dead)) + tuple(soft)
+             + lim[0] + lim[1]))
 
 
-def test_13_fast_wrong_way_push_after_drift(mod):
-    # 1M counts of measured drift (50000 counts/s) either way, then a
-    # sign-error press at 2M counts/s: the wrong-way rule aborts with the
-    # push about 1 x delta past where the drift really was.
-    for sign in (1., -1.):
-        s = descent(sign * 50000., 22., 2000000., 20., wrong=True)
-        r = run_mcu(mod, DELTA_1, s, slope=sign * 50000.)
-        assert r['abort'] == zb.WRONG_WAY_REASON, (sign, r)
-        c = cross(s, DELTA_1, 20 * SPS)
-        assert c + 39 <= r['idx'] <= c + 80, (sign, c, r['idx'])
-        c2 = cross(s, 1.03 * DELTA_1, 20 * SPS)
-        assert r['idx'] <= c2 + 80, (sign, c2, r['idx'])
-    print('ok  13 a 2M counts/s wrong-way push after 1M of drift aborts '
-          '20 ms after it passes 1 x delta')
+def test_3_wrong_way_push(mod):
+    # A sign error: contact reads the wrong way, at 1.5M counts/s
+    # (100000 counts/mm), cold and hot: the wrong-way rule ends it at
+    # 1 x delta, give or take one segment of drift, plus what the 20 ms
+    # confirm and the 20 ms batch add at that rate (63000).
+    out = []
+    for drift in (None, sloe_drifts()[0][1], sloe_drifts()[1][1]):
+        w = World(drift=drift, flip=True, real=60., stiff=100000.)
+        w.off = 100.
+        m, ph, err = descend(mod, w)
+        assert err == 'Homing aborted: ' + zb.WRONG_WAY_REASON, err
+        delta = m._trigger_delta
+        f = w.load(w.real) / delta
+        lo = 1. - (0.5 if drift else 0.05)
+        hi = 1. + (0.5 if drift else 0.05) + 1500000. * 0.042 / delta
+        assert lo < f < hi, (f, lo, hi)
+        out.append(f)
+    print('ok  3 a wrong-way contact at 1.5M counts/s aborts at %.2f / '
+          '%.2f / %.2f x delta (cold / drifting either way; 0.43 of it '
+          'is the 40 ms of confirm and batch)' % tuple(out))
 
 
-def test_14_who_moves_the_mcu_zero(mod):
-    s = descent(-50000., 5., noise=False)
-    # measured drift: the zero follows in steps of at least 1000
-    r = run_mcu(mod, DELTA_1, s, slope=-50000.)
-    sent = r['sent']
-    assert sent and all(abs(b - a) >= 1000 for a, b in zip(
-        [TARE_1] + sent, sent)), sent[:5]
-    assert abs(sent[-1] - (TARE_1 - 250000)) < 3000, sent[-1]
-    # nothing measured, MCUTARE, an abs_ge trigger or a rate of 0: the
-    # zero stays at the tare and so does the baseline
-    for kw in ({'slope': 0.}, {'slope': -50000., 'mcutare': True},
-               {'slope': -50000., 'direction': None},
-               {'slope': -50000., 'z_move_drift_rate_counts': 0}):
-        r = run_mcu(mod, DELTA_1, descent(-20000., 2., noise=False),
-                    mcu=False, **kw)
-        assert r['sent'] == [] and r['watch']._base == TARE_1, (kw, r)
-    # never after the descent: disarm drops the hook
-    w, cell, homing = zb.make_watch(mod)
-    sent = []
-    w.arm(10., TARE_1, DELTA_1, PRESS, retare=sent.append,
-          drift_slope=-50000., drift_t0=10.)
-    w.disarm()
-    cell.feed(zb.rows(10., [TARE_1 - 100000] * 400))
-    assert sent == [] and w._retare is None, sent
-    # a failing send aborts the move (fails safe)
-    w, cell, homing = zb.make_watch(mod)
-
-    def broken(z):
-        raise IOError('mcu gone')
-    w.arm(10., TARE_1, DELTA_1, PRESS, retare=broken, drift_slope=-50000.,
-          drift_t0=10.)
-    cell.feed(zb.rows(10., [x[0] for x in s[:400]]))
-    assert homing.calls == [zb.FAILED_REASON], homing.calls
-    print('ok  14 the MCU zero moves only on measured drift (not MCUTARE, '
-          'grams mode or rate 0), in steps of 1000+, never after disarm; '
-          'a failed send aborts')
+def test_4b_slow_press_across_segments(mod):
+    # KNOWN LIMIT (reported): a press too slow to reach one delta inside
+    # one 20 mm segment (under ~110000 counts/s at 15 mm/s: an object
+    # softer than 7300 counts/mm) is partly taken into the next segment's
+    # tare.  Here a soft object of 5000 counts/mm, 40 mm thick, on the
+    # bed: each segment tares on top of what it pressed, and the bed
+    # itself then triggers.  The headroom refusal (KAN-3370) and the raw
+    # range still bound the absolute load.
+    w = World(stiff=1000000., soft=5000., soft_at=40., real=150.,
+              noise=False)
+    m, ph, err = descend(mod, w)
+    soft_load = w.soft * w.soft_at
+    print('ok  4b (limit) a 5000 counts/mm object 40 mm deep: %s at '
+          '%.2f x delta of total load (%.2f x of it the soft object)'
+          % ('triggered' if err is None else err,
+             w.load(w.real) / m._trigger_delta, soft_load / m._trigger_delta))
 
 
-def load_trigger_analog():
-    import types
-    m = types.ModuleType('mcu')
+def test_5_sign_flipped_incident_at_4mm_s(mod):
+    # The Boxwood incident (tare -3244819 past the anchor -3010747, delta
+    # 23407, the trigger never fired) with the press reading the wrong
+    # way, at 4 mm/s from the top.  The real tare refuses it (KAN-3370);
+    # forced past that, the wrong-way rule must stop it no later than
+    # 6.15 mm past contact (the old fixed-tare ceiling on the slow ramp).
+    # Worst case for the segments: contact begins so that a segment ends
+    # with the load just under the trigger and the next one tares on it.
+    w = World(tare0=zb.INCIDENT_TARE, stiff=10000., flip=True, real=60.)
+    m, ph = make(mod, w, speed=4., ref=zb.BOX_REF)
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        assert 'already under load' in str(e), str(e)
+    else:
+        raise AssertionError('the incident tare was not refused')
+    out = []
+    for stiff in (100000., 10000.):
+        under = 0.95 * zb.DELTA_INCIDENT / stiff    # mm of contact
+        for real in (60., 60. - under):     # a segment ends at real -under
+            w = World(tare0=zb.INCIDENT_TARE, stiff=stiff, flip=True,
+                      real=real, noise=False)
+            # soft-homed at the top, Z160: the bed is far above z_min
+            w.off = 160. - real
+            m, ph, err = descend(mod, w, speed=4., ref=zb.BOX_REF,
+                                 fixed=(None, zb.DELTA_INCIDENT))
+            assert err == 'Homing aborted: ' + zb.WRONG_WAY_REASON, err
+            mm = -w.real
+            assert mm <= 6.15, (stiff, real, mm)
+            out.append(mm)
+    print('ok  5 sign-flipped incident at 4 mm/s aborts %.2f / %.2f mm '
+          'past contact (stiff), %.2f / %.2f mm (soft), the second of '
+          'each with a segment ending just under the trigger'
+          % tuple(out))
 
-    class MCU_trsync(object):
-        REASON_COMMS_TIMEOUT = 2
-    m.MCU_trsync = MCU_trsync
-    sys.modules['mcu'] = m
-    path = os.path.join(ROOT, 'klippy', 'extras', 'trigger_analog.py')
-    mod = types.ModuleType('trigger_analog_under_test')
+
+def load_home_z():
+    path = os.path.join(ROOT, 'klippy', 'extras', 'load_cell_home_z.py')
+    mod = types.ModuleType('home_z_under_test')
     exec(compile(open(path).read(), path, 'exec'), mod.__dict__)
     return mod
 
 
-def test_15_probing_move_long_and_short(mod):
-    # The real MCU_SosFilter.update_offset: the offset only, with the
-    # scale the tare set and auto_offset off, and recorded so the next
-    # tare's offset is sent again.
-    ta = load_trigger_analog()
+class Gcmd(object):
+    def __init__(self, **params):
+        self.params = params
+        self.info = []
 
-    class Cmd(object):
+    def get(self, k, d=None, *a, **kw):
+        return self.params.get(k, d)
+
+    def get_float(self, k, d=None, *a, **kw):
+        return self.params.get(k, d)
+
+    def get_int(self, k, d=None, *a, **kw):
+        return self.params.get(k, d)
+
+    def respond_info(self, msg):
+        self.info.append(msg)
+
+    def error(self, msg):
+        return tg.CommandError(msg)
+
+
+def test_6_home_z_retries_an_early_false_touch(mod):
+    # LOAD_CELL_HOME_Z on the real module, its PROBEs on the segmented
+    # probing_move in the world.  A spike toward the press side (a fan
+    # winding down: 1.5 x delta for 30 ms, 3 s into the first approach)
+    # stops the fast approach in mid air; the confirm tap finds nothing,
+    # so the home starts again from the top and finds the bed.
+    hz = load_home_z()
+    w = World(drift=sloe_drifts()[0][1], real=150.,
+              bump=(3., 0.03, -1.5 * DELTA_1))
+    m, ph = make(mod, w, speed=5.)
+    last = {}
+
+    class Gcode(object):
+        error = tg.CommandError
+
         def __init__(self):
-            self.sent = []
+            self.cmds = {}
+            self.relative = False
 
-        def send(self, args):
-            self.sent.append(tuple(args))
-    f = object.__new__(ta.MCU_SosFilter)
-    f._oid, f._max_sections, f._design = 7, 0, None
-    f._coeff_frac_bits, f._start_value = 0, 0.
-    f._last_sent_coeffs = []
-    f._last_sent_offset_scale = None
-    f._set_offset_scale_cmd = Cmd()
-    f._set_section_cmd = f._set_state_cmd = f._set_active_cmd = Cmd()
-    f.set_offset_scale(121734, -1., 0)
-    f.reset_filter()
-    f.update_offset(70000)
-    f.set_offset_scale(121734, -1., 0)     # the next tap's tare
-    f.reset_filter()
-    assert f._set_offset_scale_cmd.sent == [
-        (7, 121734, -1, 0, False), (7, 70000, -1, 0, False),
-        (7, 121734, -1, 0, False)], f._set_offset_scale_cmd.sent
-    # LoadCellProbingMove: the long G28 descent (Z160 -> z_min -4, no
-    # trigger yet) fits 0.5 s of samples before the tare, arms the watch
-    # with that slope and moves the trigger zero; the tare is the newest
-    # tare_time of the window.
-    tare = -800000
-    rate = -60000.
-    cell = zb.Cell(SPS, counts_per_gram=1000., tare_counts=tare)
-    m, cell, fake, w = zb.make_move(mod, 'trigger', tare=tare, cell=cell)
+        def register_command(self, name, fn, desc=None):
+            self.cmds[name] = fn
 
-    class Window(object):
-        def __init__(self, mv):
-            mv._collect_start_time = 10.
+        def run_script_from_command(self, script):
+            for line in script.split('\n'):
+                p = line.split()
+                if not p:
+                    continue
+                if p[0] == 'SET_KINEMATIC_POSITION':
+                    w.off = float(p[1].split('=')[1]) - w.real
+                elif p[0] == 'PROBE':
+                    kw = dict(x.split('=') for x in p[1:])
+                    g = Gcmd(**{k: float(v) for k, v in kw.items()})
+                    epos, _ = m.probing_move(g)
+                    last['z'] = epos[2]
+                elif p[0] == '_HOME_Z_FROM_LAST_PROBE':
+                    w.off -= last['z']
+                elif p[0] == 'G91':
+                    self.relative = True
+                elif p[0] == 'G1':
+                    w.real += float(p[1][1:])
+                    w.t += 0.2
 
-        def start_collecting(self, min_time=None):
-            pass
+    class HzToolhead(Toolhead):
+        def get_status(self, et):
+            return {'axis_maximum': [200., 174., 160.],
+                    'axis_minimum': [0., -10., -4.]}
 
-        def collect_min(self, n=1):
-            got['n'] = n
-            return [[9.5 + i / 2000., 0., int(tare + rate * (i - n) / 2000.)]
-                    for i in range(n)], None
+    gcode = Gcode()
 
-        def stop_collecting(self):
-            pass
-    got = {}
-    m._start_collector = lambda: Window(m)
-    fed = descent(rate, 3., tare=tare, noise=False)
+    class HzPrinter(object):
+        def lookup_object(self, name):
+            return {'gcode': gcode, 'toolhead': HzToolhead(w)}[name]
 
-    class Ph(zb.Homing):
-        def probing_move(self, endstop, pos, speed):
-            seen['slope'] = w._sign * w._slope
-            for b in range(0, len(fed), 40):
-                cell.feed(zb.rows(10. + b / float(SPS),
-                                  [x[0] for x in fed[b:b + 40]]))
-            return [0., 0., 1.2, 0.]
-    seen = {}
-    m._printer.objects['homing'] = Ph()
-    log = m._mcu_trigger_analog.log
-    m.probing_move(zb.Gcmd(0))
-    ntare = m._config_helper.get_tare_samples(None)
-    assert got['n'] == max(ntare, 1000), (got, ntare)
-    assert abs(seen['slope'] - rate) < 50, seen
-    offs = [e for e in log if e[0] == 'set_offset_scale']
-    assert offs[-1][1] == -m._tare_counts, (offs[-1], m._tare_counts)
-    assert 0 < m._tare_counts - tare <= -rate * ntare / 2000., m._tare_counts
-    moved = [e[1] for e in log if e[0] == 'update_offset']
-    assert len(moved) > 100, len(moved)
-    assert abs(moved[-1] - (-tare + 180000)) < 2000, moved[-1]
-    assert not w.is_armed() and w._retare is None
-    # a descent that starts within 20 mm of the last trigger (the confirm
-    # tap, a mesh point) or that can only travel under 20 mm: no window,
-    # no slope, nothing moved
-    for last, z in ((1.2, 15.), (None, 15.)):
-        del log[:]
-        m._last_trigger_z = last
-        m._printer.objects['toolhead'].get_position = (
-            lambda z=z: [100., 100., z, 0.])
-        m.probing_move(zb.Gcmd(0))
-        assert got['n'] == ntare, (last, z, got)
-        assert seen['slope'] == 0., seen
-        assert [e for e in log if e[0] == 'update_offset'] == [], log
-    m._last_trigger_z = 1.2
-    assert not m._is_long_descent(21.)
-    assert m._is_long_descent(21.3)
-    m._last_trigger_z = None
-    assert not m._is_long_descent(15.9) and m._is_long_descent(16.)
-    # MCUTARE: the same descent moves nothing on the MCU
-    del log[:]
-    m._printer.objects['toolhead'].get_position = (
-        lambda: [100., 100., 160., 0.])
-    m._last_trigger_z = 100.
-    m._mcu_tare = mod.LoadCellProbingMove._mcu_tare.__get__(m)
+        def get_reactor(self):
+            return zb.Reactor()
 
-    class Fresh(object):
-        def start_collecting(self, min_time=None):
-            pass
+    class Cfg(object):
+        def get_printer(self):
+            return HzPrinter()
 
-        def collect_min(self, n=1):
-            return [[10., 0., tare]], None
-    cell.get_collector = lambda: Fresh()
-    m._approx_tare = tare
-    m.probing_move(zb.Gcmd(1))
-    assert seen['slope'] == 0.
-    assert [e for e in log if e[0] == 'update_offset'] == [], log
-    print('ok  15 a long descent fits 0.5 s for its slope and moves the '
-          'trigger zero (MCU_SosFilter.update_offset); confirm taps, short '
-          'descents and MCUTARE keep a fixed tare')
+        def getint(self, k, d, **kw):
+            return d
+
+        def getfloat(self, k, d, **kw):
+            return d
+    obj = hz.load_config(Cfg())
+    g = Gcmd()
+    gcode.cmds['LOAD_CELL_HOME_Z'](g)
+    assert obj.false_touches == 1 and obj.last_attempts == 2, (
+        obj.false_touches, obj.last_attempts, g.info)
+    # homed: Z0 is the bed (to the trigger's own overtravel), lifted 10
+    assert 0. <= w.off < 0.3 and abs(w.real - 10.) < 0.3, (w.off, w.real)
+    assert ph.calls == [], ph.calls
+    print('ok  6 LOAD_CELL_HOME_Z: a mid-air false touch in a segment is '
+          'retried from the top and homes on the bed (%d segments in all)'
+          % len(w.segments))
 
 
-def test_16_descent_log(mod):
-    with zb.LogCapture() as cap:
-        w, cell, homing = zb.make_watch(mod)
-        w.arm(10., TARE_1, DELTA_1, PRESS, drift_slope=20000.,
-              drift_t0=10.)
-        zb.feed_until_abort(cell, homing, 10., drift_counts(
-            TARE_1, 20000., 3.))
-        w.disarm()      # the descent ended without an abort
-        w.disarm()
-        ended = [(lv, m) for lv, m in cap.lines if 'backstop descent' in m]
-        assert len(ended) == 1 and ended[0][0] == 'INFO', cap.lines
-        msg = ended[0][1]
-        for part in ('ended', 'slope 20000 counts/s', 'up to 30000',
-                     'froze 0 times'):
-            assert part in msg, (part, msg)
-        assert 'over 3.000 s' in msg or 'over 2.999 s' in msg, msg
-    st = w.get_status()
-    assert st['z_backstop_drift_slope'] == 20000., st
-    assert st['z_backstop_drift_excess_factor'] == 3., st
-    print('ok  16 one INFO line per descent with the measured slope, the '
-          'follow rate and the freezes')
+def test_7_segments_and_short_moves(mod):
+    m, ph = make(mod, World())
+    ends = m.segment_ends
+    assert ends(150., -4.) == [130., 110., 90., 70., 50., 30., 10., -4.]
+    assert ends(16., -4.) == [-4.] and len(ends(16.1, -4.)) == 2
+    assert ends(1.2, -4.) == [-4.]      # a confirm tap: one move
+    # a tap is one move, one tare, exactly as before
+    w = World(real=3.)
+    m, ph, err = descend(mod, w)
+    assert err is None and len(w.segments) == 1, (err, w.segments)
+    # no contact at all: only the last segment says so
+    w = World(real=150., stiff=0.)
+    m, ph, err = descend(mod, w)
+    assert err == "No trigger on probe after full movement", err
+    assert len(w.segments) == 8 and abs(w.z + 4.) < 1e-6, (w.segments, w.z)
+    # max_search_distance_z bounds the whole descent, with its message
+    w = World(real=150., stiff=0.)
+    m, ph = make(mod, w)
+    ph.max_search_distance_z = 50.
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        assert 'no contact within 50 mm' in str(e), str(e)
+    assert abs(w.real - 100.) < 1e-6 and len(w.segments) == 3, (
+        w.real, w.segments)
+    # every segment's tare goes through the KAN-3370 headroom check
+    w = World(real=150.)
+    m, ph = make(mod, w)
+    seen = []
+    orig = m._config_helper.check_tare_headroom
+
+    def check(tare, gcmd=None):
+        seen.append(tare)
+        return orig(tare, gcmd)
+    m._config_helper.check_tare_headroom = check
+    m.probing_move(None)
+    assert len(w.segments) == 8 and len(seen) == 2 * 8, (seen, w.segments)
+    print('ok  7 segment ends, a tap is one move, "No trigger" only from '
+          'the last segment, max_search_distance_z over the whole '
+          'descent, KAN-3370 on every segment tare')
 
 
 def read_probe_config():
@@ -718,22 +644,14 @@ def main():
         'klippy/extras/load_cell_probe.py'))
     probe = rf.load_module(rf._paths.patched('klippy/extras/probe.py'),
                            'hot_probe')
-    tests = [(test_1_measured_drift_is_followed, mod),
-             (test_2_a_real_wrong_way_event_still_trips, mod),
-             (test_3_ceiling_from_the_current_baseline, mod),
+    tests = [(test_1_hot_g28_from_the_top, mod),
+             (test_2_a_press_at_any_rate, mod),
+             (test_3_wrong_way_push, mod),
              (test_4_logged_tap_pairs_pass_the_shipped_tolerance, probe),
-             (test_5_slow_push_is_never_followed_cold, mod),
-             (test_6_ramp_of_110000, mod),
-             (test_7_soft_surface_at_probe_speed, mod),
-             (test_8_sign_flipped_incident_at_4mm_s, mod),
-             (test_9_burst_is_not_captured, mod),
-             (test_10_push_with_the_drift_is_bounded_by_the_excess, mod),
-             (test_11_sloe_heatup_either_way_then_contact, mod),
-             (test_12_contact_after_2M_followed, mod),
-             (test_13_fast_wrong_way_push_after_drift, mod),
-             (test_14_who_moves_the_mcu_zero, mod),
-             (test_15_probing_move_long_and_short, mod),
-             (test_16_descent_log, mod)]
+             (test_4b_slow_press_across_segments, mod),
+             (test_5_sign_flipped_incident_at_4mm_s, mod),
+             (test_6_home_z_retries_an_early_false_touch, mod),
+             (test_7_segments_and_short_moves, mod)]
     failed = []
     for t, m in tests:
         try:

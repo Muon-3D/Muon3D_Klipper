@@ -205,9 +205,6 @@ class FakeSos(object):
         self.log.append(('set_offset_scale', offset, scale, scale_frac_bits,
                          auto_offset))
 
-    def update_offset(self, offset):
-        self.log.append(('update_offset', offset))
-
 
 class FakeTrigger(object):
     # records everything sent toward the mcu

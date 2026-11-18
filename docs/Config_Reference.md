@@ -6087,26 +6087,6 @@ sensor_type:
 #z_move_abort_confirm_time: 0.020
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
-#z_move_drift_rate_counts: 100000
-#   A hot load cell drifts by millions of counts. Only on a long blind
-#   descent (20 mm or more of travel, not within 20 mm of the last
-#   trigger; never a tap, mesh point, confirm tap or MCUTARE descent)
-#   the probe fits the drift over 0.5 s before the tare and, from a
-#   slope of 3000 counts a second up, works from a baseline that follows
-#   the load only in that slope's sign, at no more than 1.5 x the slope
-#   and never more than this many counts a second. The MCU trigger's
-#   zero moves with it, so contact needs the normal force however far
-#   the cell drifted. 0 turns it off (a fixed tare). The default is
-#   100000.
-#z_move_drift_band_factor: 0.25
-#   The baseline follows only while the load is within this many trigger
-#   deltas of it, and freezes (with a WARNING) once the load leaves the
-#   band, until it is back within half of it. Above 0 and at most 0.5.
-#   The default is 0.25.
-#z_move_drift_excess_factor: 3.0
-#   The baseline may run ahead of the measured slope x elapsed time by at
-#   most this many trigger deltas; past it the move is ended. That bounds
-#   a slow push in the drift's own sign. At least 1. The default is 3.0.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

@@ -172,8 +172,6 @@ def test_1_incident_watcher_alone(mod):
     # trigger never fires (nothing here ever triggers), samples ramp
     # negative as the bed is pushed.  Delta 23407 is what trigger_percent
     # 10 arms from that tare; the ceiling is int(2.5 * 23407) = 58517.
-    # KAN-4364: no drift was measured before this descent, so nothing is
-    # followed and the ceiling is from the fixed tare.
     for name, stiff, want_idx, want_travel in (
             ('stiff 100000 counts/mm', 100000, 118, 0.885),
             ('slow ramp 10000 counts/mm', 10000, 820, 6.15)):
@@ -200,13 +198,11 @@ def test_2_wrong_way_and_idle_wander(mod):
     # Normal Boxwood tare -800000, delta 221075.  Counts drift UP (the
     # wrong way: pressing lowers them) by 100 per sample.
     tare = -800000
-    counts = [tare + 100 * i for i in range(6000)]
+    counts = [tare + 100 * i for i in range(4000)]
     w, homing, idx = first_abort_sample(mod, tare, -1., DELTA_BOX_800,
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
-    # The drift is 100 counts a sample = 200000 counts/s, and none was
-    # measured before the descent (KAN-4364: nothing is followed), so it
-    # is first over 221075 at i=2211: 40 in a row -> 2250.
+    # first sample over 221075 is i=2211 (221100); 40 in a row -> 2250
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
     assert idx == 2250, idx
     assert w.last_fired == WRONG_WAY_REASON
@@ -229,7 +225,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert homing.calls == [] and w.last_fired is None, homing.calls
     assert w.get_limits() == (446435, 178574), w.get_limits()
-    print('ok  2 wrong way aborts at sample 2250 (1.13 s); idle wander '
+    print('ok  2 wrong way aborts at sample 2250 (1.125 s); idle wander '
           '-4000..+7000 on Sloe never does')
 
 
@@ -461,6 +457,9 @@ def test_6_mcutare_and_directionless(mod):
     m._nozzle_is_clear = lambda: True
     m._start_collector = lambda: Collector(m)
     m._z_watch = mod.ZLoadBackstop(tg.FakeConfig(printer, {}), printer, cell)
+    # a single-segment descent: MCUTARE never applies to a segmented one
+    # (KAN-4364, test_hot_load_cell.py)
+    m.SEGMENT_MM = 1000.
 
     class Fresh(object):
         def start_collecting(self, min_time=None):
@@ -714,8 +713,11 @@ def integ_move(mod, rig, cell, tare, delta):
     m._param_helper = ParamHelper()
     m._mcu_trigger_analog = rig.endstops[0]
     m._start_collector = lambda: Collector(m)
+    # one move, as the incident was (KAN-4364's segments: see
+    # test_hot_load_cell.py)
+    m.SEGMENT_MM = 1000.
 
-    def tare_fn(gcmd, measure_drift=False):
+    def tare_fn(gcmd):
         m._tare_counts = tare
         m._trigger_delta = delta
         m._trigger_press_dir = -1.
@@ -736,11 +738,7 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_factor': 2.5,
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
-            'z_backstop_confirm_time': 0.02,
-            'z_backstop_drift_rate_counts': 100000.,
-            'z_backstop_drift_excess_factor': 3.0,
-            'z_backstop_drift_band_factor': 0.25,
-            'z_backstop_drift_slope': 0.}
+            'z_backstop_confirm_time': 0.02}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,
@@ -817,8 +815,7 @@ class LogCapture(object):
     def of(self, level):
         return [m for lv, m in self.lines
                 if lv == level and m.startswith('load_cell_probe:')
-                and 'Z load backstop' in m
-                and 'backstop descent' not in m]  # KAN-4364
+                and 'Z load backstop' in m]
 
 
 def test_11_arming_is_logged_and_deduped(mod):

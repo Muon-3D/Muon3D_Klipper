@@ -66,6 +66,7 @@ class FakeHoming:
 
 
 class FakePrinter:
+    command_error = ProbeFailed
     def __init__(self, toolhead):
         self.objects = {'toolhead': toolhead, 'homing': FakeHoming()}
         self.events = []
@@ -118,7 +119,7 @@ def make_probing_move(printer, cell):
     m._approx_tare = None
     m._z_min_position = -2.
     m._mcu_trigger_analog = object()
-    m._pause_and_tare = lambda gcmd, **kw: None
+    m._pause_and_tare = lambda gcmd: None
     m.collector = None
     def start_collector():
         m.collector = new_collector(printer, cell)
