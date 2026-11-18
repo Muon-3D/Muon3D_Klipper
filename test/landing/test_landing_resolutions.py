@@ -533,17 +533,19 @@ class B4HomingCurrent(unittest.TestCase):
         # KAN-3813: unequal X/Y homing currents shifted the Y frame about
         # 2 mm on sloe (CoreXY). Keep them equal if this is retuned.
         home = section(HOMING, 'gcode_macro _HOMING_CURRENT')
-        self.assertEqual(home['variable_current'],
-                         home['variable_current_y'])
+        self.assertEqual(float(home['variable_current']),
+                         float(home['variable_current_y']))
 
     def test_the_cut_stop_find_taps_at_06_on_y(self):
         # KAN-3813: one tap towards Y min with no confirming tap. At the
         # 0.8 A it tapped 0.8 mm after arming on sloe (17 Nov).
+        # Y= is what reaches stepper_y, not current_y: 0.5 here, so the
+        # tap's value can be told from the home's (both are 0.6 now).
         lines = render(HOMING, '_HOMING_CURRENT', tmc_settings(),
-                       {'Y': '0.6'})
+                       {'Y': '0.5'})
         self.assertEqual(lines, [
             'SET_TMC_CURRENT STEPPER=stepper_x CURRENT=0.6',
-            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.6'])
+            'SET_TMC_CURRENT STEPPER=stepper_y CURRENT=0.5'])
         find = macro_lines(os.path.join(MACROS, 'filament.cfg'),
                            '_CUT_FILAMENT_FIND_STOP')
         calls = [l.strip() for l in find
