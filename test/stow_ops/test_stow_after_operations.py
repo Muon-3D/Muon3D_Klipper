@@ -4,9 +4,9 @@
 Z_PARK raises the bed to the stow position (Z140). After a full user home
 (KAN-3811) and after a print it already did; this covers the user-facing
 filament operations that end idle: UNLOAD_FILAMENT, the insert flow's Quick
-Load and Full Purge. They stow only when no print is running or paused (a
-RESUME depends on where the head is left) and, but for the purge's legacy
-unhomed park, only with Z homed. A plain jog is not a macro and never
+Load and Full Purge. They stow (through _STOW_IF_IDLE) only when no print is
+running or paused (a RESUME depends on where the head is left), Z is homed
+and the Z feed is ready. A plain jog is not a macro and never
 stows, and nothing on the print path gained a stow. This renders the real
 macros of core/M1 and core/M1-B0 with jinja2: no klippy, no hardware.
 
@@ -60,8 +60,8 @@ def macros_of(board):
     return _CACHE[board]
 
 
-def printer_for(state, paused, sd, homed):
-    return {
+def printer_for(state, paused, sd, homed, z_power=None):
+    p = {
         'toolhead': {'homed_axes': homed, 'position': {'z': 20.},
                      'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.}},
         'print_stats': {'state': state},
@@ -69,25 +69,29 @@ def printer_for(state, paused, sd, homed):
         'virtual_sdcard': {'is_active': sd},
         'extruder': {'target': 0., 'can_extrude': 'true'},
     }
+    if z_power is not None:
+        p['z_power'] = z_power
+    return p
 
 
-def render(board, name, st, homed='xyz'):
+def render(board, name, st, homed='xyz', z_power=None):
     macro = macros_of(board)['gcode_macro ' + name]['gcode']
     text = cmc._jinja_env().from_string(macro).render(
-        rawparams='', params={}, printer=printer_for(*st[:3], homed))
+        rawparams='', params={},
+        printer=printer_for(*st[:3], homed, z_power))
     return [ln.strip() for ln in text.split('\n')
             if ln.strip() and not ln.strip().startswith('#')]
 
 
-def zparks(board, name, st, homed='xyz'):
+def zparks(board, name, st, homed='xyz', z_power=None):
     """How many Z_PARK run when the macro (and the helper it calls) does."""
     n = 0
-    for ln in render(board, name, st, homed):
+    for ln in render(board, name, st, homed, z_power):
         if ln.startswith('Z_PARK'):
             n += 1
         elif ln.startswith('_STOW_IF_IDLE'):
             n += sum(x.startswith('Z_PARK') for x in
-                     render(board, '_STOW_IF_IDLE', st, homed))
+                     render(board, '_STOW_IF_IDLE', st, homed, z_power))
     return n
 
 
@@ -100,6 +104,46 @@ class Helper(unittest.TestCase):
                     self.assertEqual(
                         zparks(b, '_STOW_IF_IDLE', st, homed),
                         1 if want else 0, (b, st, homed))
+
+    def test_stows_only_with_the_z_feed_ready(self):
+        # A plate off, the column lever unlocked, a recovery or a fault can
+        # leave the 48V_Z feed off while Z still reads homed.
+        idle = STATES[0]
+        for b in BOARDS:
+            for state, want in (('ready', 1), ('no_plate', 0),
+                                ('recovering', 0), ('fault', 0),
+                                ('unknown', 0), ('', 0)):
+                for col in ('locked', 'unlocked'):
+                    zp = {'state': state, 'z': col}
+                    self.assertEqual(
+                        zparks(b, '_STOW_IF_IDLE', idle, 'xyz', zp),
+                        want, (b, zp))
+            # a column left unlocked reports a non-ready state
+            self.assertEqual(zparks(b, '_STOW_IF_IDLE', idle, 'xyz',
+                                    {'state': 'no_plate', 'z': 'unlocked'}),
+                             0, b)
+            # no state key at all: not ready
+            self.assertEqual(zparks(b, '_STOW_IF_IDLE', idle, 'xyz',
+                                    {'z': 'unlocked'}), 0, b)
+            # a ready feed still never stows in a job or with Z unhomed
+            ready = {'state': 'ready', 'z': 'locked'}
+            for st in STATES:
+                self.assertEqual(zparks(b, '_STOW_IF_IDLE', st, 'xyz', ready),
+                                 0 if st[3] in JOB else 1, (b, st))
+            self.assertEqual(zparks(b, '_STOW_IF_IDLE', idle, 'xy', ready), 0)
+
+    def test_every_operation_honours_the_z_feed_gate(self):
+        idle = STATES[0]
+        for b in BOARDS:
+            for name in ('UNLOAD_FILAMENT', 'FILAMENT_INSERT_QUICK_LOAD',
+                         'FILAMENT_INSERT_FULL_PURGE'):
+                for state in ('no_plate', 'recovering', 'fault', 'unknown'):
+                    self.assertEqual(
+                        zparks(b, name, idle, 'xyz', {'state': state}), 0,
+                        (b, name, state))
+                self.assertEqual(
+                    zparks(b, name, idle, 'xyz', {'state': 'ready'}), 1,
+                    (b, name))
 
     def test_never_runs_the_unhomed_parking_routine(self):
         # No AXIS_HOME_MOVE, no Z_PARK: nothing at all with Z unhomed.
@@ -133,16 +177,18 @@ class Operations(unittest.TestCase):
         for b in BOARDS:
             for st in STATES:
                 for homed in ('xyz', 'xy'):
-                    # Z unhomed: the purge sets Z only to move X and Y and
-                    # its Z_PARK (the parking routine) is the old behaviour.
+                    # Z unhomed: the purge sets Z only to move X and Y; it
+                    # ends with no Z motion at all.
+                    want = 'z' in homed and st[3] not in JOB
                     self.assertEqual(
                         zparks(b, 'FILAMENT_INSERT_FULL_PURGE', st, homed),
-                        0 if st[3] in JOB else 1, (b, st, homed))
+                        1 if want else 0, (b, st, homed))
 
     def test_the_purge_stow_is_last_before_restoring_the_state(self):
         for b in BOARDS:
             lines = render(b, 'FILAMENT_INSERT_FULL_PURGE', STATES[0])
-            i = max(n for n, ln in enumerate(lines) if ln == 'Z_PARK')
+            i = max(n for n, ln in enumerate(lines)
+                    if ln == '_STOW_IF_IDLE')
             self.assertEqual(lines[i + 1], 'M400', b)
             self.assertTrue(lines[i + 2].startswith('RESTORE_GCODE_STATE'), b)
 
@@ -182,25 +228,30 @@ class PrintPathAndPositioning(unittest.TestCase):
                 self.assertNotIn('_STOW_IF_IDLE', t, (b, name))
 
     def test_only_the_listed_macros_stow(self):
-        pat = r'(\{%[^}]*%\}\s*)?NAME\b'
+        # Scans every gcode / *_gcode option, any case: a macro call or a
+        # raw G0/G1 to Z140.
+        pat = r'(?i)(\{%[^}]*%\}\s*)?NAME\b'
+        raw = re.compile(r'(?i)(\{%[^}]*%\}\s*)?G0?[01]\b[^;]*\bZ\s*140\b')
         for b in BOARDS:
             helper, direct = set(), set()
             for header, opts in macros_of(b).items():
-                for key in ('gcode', 'safe_gcode'):
-                    lines = [ln.strip() for ln in
-                             opts.get(key, '').split('\n')]
+                for key, val in opts.items():
+                    if key != 'gcode' and not key.endswith('_gcode'):
+                        continue
+                    lines = [ln.strip() for ln in val.split('\n')]
                     if any(re.match(pat.replace('NAME', '_STOW_IF_IDLE'), ln)
                            for ln in lines):
                         helper.add(header)
                     if any(re.match(pat.replace('NAME', 'Z_PARK'), ln)
-                           for ln in lines):
+                           or raw.match(ln) for ln in lines):
                         direct.add(header)
             self.assertEqual(
                 helper, {'gcode_macro UNLOAD_FILAMENT',
-                         'gcode_macro FILAMENT_INSERT_QUICK_LOAD'}, b)
+                         'gcode_macro FILAMENT_INSERT_QUICK_LOAD',
+                         'gcode_macro FILAMENT_INSERT_FULL_PURGE'}, b)
             expect = {'gcode_macro _STOW_IF_IDLE',
                       'gcode_macro PARK_PRINTER', 'gcode_macro G28',
-                      'gcode_macro FILAMENT_INSERT_FULL_PURGE'}
+                      'gcode_macro Z_PARK'}  # Z_PARK is the raw G0 Z140
             if b == 'M1':  # B0 has no safe park
                 expect.add('print_end_park')
             self.assertEqual(direct, expect, b)
