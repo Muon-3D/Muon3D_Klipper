@@ -74,6 +74,8 @@ chmod -R u+w ${BUILD_DIR}
 
 echo -e "\n\n=============== Install python3 virtualenv\n\n"
 cd ${MAIN_DIR}
-virtualenv -p python3 ${BUILD_DIR}/python-env
+# MUON: apt's virtualenv runs on the system python (3.14), so name the
+# 3.11 that setup-python put first on PATH explicitly.
+virtualenv -p "$(command -v python3)" ${BUILD_DIR}/python-env
 ${BUILD_DIR}/python-env/bin/pip install -r ${MAIN_DIR}/scripts/klippy-requirements.txt
 ${BUILD_DIR}/python-env/bin/pip install -r ${MAIN_DIR}/scripts/tests-requirements.txt
