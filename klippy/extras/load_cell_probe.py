@@ -623,10 +623,14 @@ class LoadCellProbeConfigHelper:
 #   there, so the drift would trip it next.  So the wrong side (the
 #   wrong-way rule and the ceiling on that side only) is judged against the
 #   tare plus the slow drift so far, followed at no more than
-#   z_move_drift_rate_counts (50000 a second: 2.5x the ~20000 a second that
-#   a 2.4M swing over two minutes makes) and dropped as soon as the load
-#   comes back.  A real wrong-way event is a step of one delta (146000 and
-#   up) in milliseconds, or a ramp far faster than 50000 a second, so it is
+#   z_move_drift_rate_counts (100000 a second) and dropped as soon as the
+#   load comes back.  The margin that matters is this RATE: Sloe drifted
+#   ~48000 a second (1.1M in 23 s) against a first default of 50000, 4%
+#   headroom, and a hotter unit at 60000 a second would have tripped after
+#   ~15 s.  A real wrong-way press rises at millions of counts a second, so
+#   100000 keeps ~35x margin over a 3.5M/s press and 2x over Sloe's drift.
+#   A real wrong-way event is a step of one delta (146000 and up) in
+#   milliseconds, or a ramp far faster than 100000 a second, so it is
 #   still judged at nearly full size.  The press side is never re-referenced.
 #   One descent absorbs at most z_move_drift_cap_counts (2500000, above the
 #   2.4M worst swing of KAN-3818; Sloe's tare moved 1.1M in 23 s) in all;
@@ -667,7 +671,7 @@ class ZLoadBackstop:
         self._confirm_time = config.getfloat(
             'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
         self._drift_rate = config.getfloat(
-            'z_move_drift_rate_counts', 50000., minval=0.)
+            'z_move_drift_rate_counts', 100000., minval=0.)
         self._drift_cap_param = config.getint(
             'z_move_drift_cap_counts', 2500000, minval=1)
         self._armed = False
@@ -685,6 +689,8 @@ class ZLoadBackstop:
         self._drift = 0.        # wrong-side drift absorbed so far, counts
         self._drift_t = None
         self._drift_peak = 0.   # most drift absorbed at once this descent
+        self._lag_peak = 0.     # most wrong_side - drift seen this descent
+        self._lag_peak_t = None     # elapsed s since arming, at that peak
         self._drift_cap = 0.
         self._last_t = None     # timestamp of the last sample judged
         self._end_logged = False
@@ -728,6 +734,8 @@ class ZLoadBackstop:
         self._drift = 0.
         self._drift_t = None
         self._drift_peak = 0.
+        self._lag_peak = 0.
+        self._lag_peak_t = None
         self._last_t = None
         self._end_logged = False
         # The most drift one descent may absorb, z_move_drift_cap_counts.
@@ -760,8 +768,9 @@ class ZLoadBackstop:
         elapsed = (t - self._start_time) if t is not None else 0.
         logging.info("load_cell_probe: Z load backstop descent %s: drift"
                      " absorbed %i counts at the end, %i at most (cap %i),"
-                     " over %.3f s", how, self._drift, self._drift_peak,
-                     self._drift_cap, elapsed)
+                     " peak lag %i counts at %.3f s, over %.3f s", how,
+                     self._drift, self._drift_peak, self._drift_cap,
+                     self._lag_peak, self._lag_peak_t or 0., elapsed)
 
     # Say in klippy.log what the descent that just started is watched for.
     # Logging only: it never changes what arms.  "Not armed" is warned once
@@ -865,6 +874,11 @@ class ZLoadBackstop:
             else:
                 self._drift = min(self._drift, wrong_side)
             self._drift_peak = max(self._drift_peak, self._drift)
+            lag = wrong_side - self._drift      # what the rules judge
+            if lag > self._lag_peak:
+                self._lag_peak = lag
+                self._lag_peak_t = ((t - self._start_time)
+                                    if t is not None else 0.)
             if t is not None:
                 self._drift_t = t
                 self._last_t = t

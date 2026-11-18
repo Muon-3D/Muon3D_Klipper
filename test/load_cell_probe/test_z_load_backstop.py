@@ -198,15 +198,15 @@ def test_2_wrong_way_and_idle_wander(mod):
     # Normal Boxwood tare -800000, delta 221075.  Counts drift UP (the
     # wrong way: pressing lowers them) by 100 per sample.
     tare = -800000
-    counts = [tare + 100 * i for i in range(4000)]
+    counts = [tare + 100 * i for i in range(6000)]
     w, homing, idx = first_abort_sample(mod, tare, -1., DELTA_BOX_800,
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
     # The drift is 100 counts a sample = 200000 counts/s; KAN-4364 lets the
-    # watch follow 50000 counts/s of it (25 a sample), so the excess grows
-    # 75 a sample: first over 221075 at i=2948, 40 in a row -> 2987.
+    # watch follow 100000 counts/s of it (50 a sample), so the excess grows
+    # 50 a sample: first over 221075 at i=4422, 40 in a row -> 4461.
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
-    assert idx == 2987, idx
+    assert idx == 4461, idx
     assert w.last_fired == WRONG_WAY_REASON
     # the same drift on the press side is not the wrong way: the ceiling
     # (552687) is what ends it, at i=5527 + 39
@@ -227,7 +227,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert homing.calls == [] and w.last_fired is None, homing.calls
     assert w.get_limits() == (446435, 178574), w.get_limits()
-    print('ok  2 wrong way aborts at sample 2987 (1.49 s); idle wander '
+    print('ok  2 wrong way aborts at sample 4461 (2.23 s); idle wander '
           '-4000..+7000 on Sloe never does')
 
 
@@ -735,7 +735,7 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
             'z_backstop_confirm_time': 0.02,
-            'z_backstop_drift_rate_counts': 50000.,
+            'z_backstop_drift_rate_counts': 100000.,
             'z_backstop_drift_cap_counts': 2500000}
     assert st == want, st
     w2, cell2, homing2 = make_watch(

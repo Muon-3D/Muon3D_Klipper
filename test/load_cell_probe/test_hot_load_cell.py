@@ -316,6 +316,58 @@ def test_8_drift_is_logged_once_per_descent(mod):
           'cap and the time; cap absolute 2.5M')
 
 
+def test_9_rate_margin_and_peak_lag(mod):
+    # A hotter unit than Sloe: 60000 counts/s for 30 s (1.8M, under the
+    # cap) used to trip the 50000 rate after ~15 s; at the 100000 default
+    # it does not.
+    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
+                               drift_counts(TARE_1, 60000., 30.))
+    assert homing.calls == [] and idx is None, (homing.calls, idx)
+    # 150000 counts/s outruns the 100000 allowance: the lag grows 50000
+    # counts/s and the rule trips when it passes one delta, 146400 / 50000
+    # = 2.93 s in (+ the 20 ms confirm)
+    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
+                               drift_counts(TARE_1, 150000., 10.))
+    assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
+    assert abs(idx - 2.93 * SPS) < 120, idx
+    # ... and the INFO line reports that peak lag and when it happened
+    with zb.LogCapture() as cap:
+        w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
+                                   drift_counts(TARE_1, 150000., 10.))
+        lines = [m for lv, m in cap.lines if 'backstop descent' in m]
+    assert len(lines) == 1 and 'aborted' in lines[0], cap.lines
+    m = re.search(r'peak lag (\d+) counts at ([0-9.]+) s, over ([0-9.]+) s',
+                  lines[0])
+    assert m, lines[0]
+    lag, at, over = int(m.group(1)), float(m.group(2)), float(m.group(3))
+    assert DELTA_1 < lag < 1.02 * DELTA_1 + 2000, lag
+    assert 2.9 < at < 3.0 and at <= over < at + 0.03, (at, over)
+    # the press that follows long drift still trips at ~1.0 x delta: the
+    # 2M counts/s sign-error press of test 5, on 60000 counts/s of drift
+    counts = drift_counts(TARE_1, 60000., 10.)
+    base = counts[-1]
+    counts += [int(base + 2000000. * i / SPS) for i in range(1, 400)]
+    w, cell, homing = zb.make_watch(mod)
+    w.arm(10., TARE_1, DELTA_1, PRESS)
+    seen = []
+    orig = w._judge
+
+    def judge(c, t=None):
+        r = orig(c, t)
+        seen.append(w._drift)
+        return r
+    w._judge = judge
+    idx, _ = zb.feed_until_abort(cell, homing, 10., counts, batch=1)
+    assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
+    cross = next(k for k in range(10 * SPS, len(counts))
+                 if counts[k] - TARE_1 - seen[k] > DELTA_1)
+    over = counts[cross] - TARE_1 - seen[cross]
+    assert idx == cross + 39 and over < 1.02 * DELTA_1 + 1000, (idx, over)
+    print('ok  9 60000 counts/s for 30 s does not trip; 150000 counts/s '
+          'trips by lag at %.2f s (peak lag %i); a 2M counts/s press after '
+          'drift trips at %.3f x delta' % (at, lag, over / float(DELTA_1)))
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -328,7 +380,8 @@ def main():
              (test_5_sign_error_press_after_absorbed_drift, mod),
              (test_6_drift_that_changes_direction, mod),
              (test_7_noise_of_50000_counts_does_not_trip, mod),
-             (test_8_drift_is_logged_once_per_descent, mod)]
+             (test_8_drift_is_logged_once_per_descent, mod),
+             (test_9_rate_margin_and_peak_lag, mod)]
     failed = []
     for t, m in tests:
         try:
