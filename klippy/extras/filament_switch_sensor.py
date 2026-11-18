@@ -37,6 +37,9 @@ class RunoutHelper:
         self.min_event_systime = self.reactor.NEVER
         self.filament_present = False
         self.sensor_enabled = True
+        # Muon: set by SwitchSensor on a non-critical MCU. True while that
+        # MCU has not (re)connected, so no pin report is an insertion.
+        self.mcu_away = None
         # Register commands and event handlers
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.gcode.register_mux_command(
@@ -48,6 +51,12 @@ class RunoutHelper:
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
     def _handle_ready(self):
+        # Muon: the toolhead MCU is deferred at startup and connects some
+        # seconds after klippy:ready. Its first pin report is the state the
+        # switch was already in, not an insertion (KAN-2413), so the sensor
+        # stays quiet until the reconnect handler opens its settle window.
+        if self.mcu_away is not None and self.mcu_away():
+            return
         self.min_event_systime = self.reactor.monotonic() + 2.
     def _runout_event_handler(self, eventtime):
         # Pausing from inside an event requires that the pause portion
@@ -72,6 +81,13 @@ class RunoutHelper:
             return
         self.filament_present = is_filament_present
 
+        # Muon: the pin report can arrive, and its debounce fire, before the
+        # reconnect handler runs (the config upload and the other connect
+        # steps take longer than the 0.2 s debounce), when min_event_systime
+        # is still the stale "ready + 2 s" from a start 8 s earlier. While
+        # the MCU is away, record the state and fire nothing (KAN-2413).
+        if self.mcu_away is not None and self.mcu_away():
+            return
         if eventtime < self.min_event_systime or not self.sensor_enabled:
             # do not process during the initialization time, duplicates,
             # during the event delay time, while an event is running, or
@@ -139,6 +155,8 @@ class SwitchSensor:
         mcu = printer.lookup_object('pins').parse_pin(
             switch_pin, can_invert=True, can_pullup=True)['chip']
         if getattr(mcu, 'is_non_critical', False):
+            self.runout_helper.mcu_away = lambda: bool(
+                getattr(mcu, 'non_critical_disconnected', False))
             printer.register_event_handler(
                 mcu.get_non_critical_disconnect_event_name(),
                 self._mcu_disconnected)

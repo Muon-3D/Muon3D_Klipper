@@ -43,6 +43,7 @@ class FakeReactor:
 
 class FakeMcu:
     is_non_critical = True
+    non_critical_disconnected = False
 
     def get_non_critical_disconnect_event_name(self):
         return 'toolhead:disconnect'
@@ -147,8 +148,11 @@ class FakeConfig:
 
 
 class Sensor:
-    def __init__(self):
+    def __init__(self, deferred=False):
         self.printer = FakePrinter()
+        # A Klipper (re)start: the toolhead MCU is deferred, not yet there.
+        self.mcu = self.printer.objects['pins'].mcu
+        self.mcu.non_critical_disconnected = deferred
         self.sensor = filament_switch_sensor.SwitchSensor(
             FakeConfig(self.printer))
         self.reactor = self.printer.reactor
@@ -213,6 +217,57 @@ class TestReconnect(unittest.TestCase):
         s.pin(1)
         self.assertTrue(s.detected())
         self.assertEqual(len(s.scripts()), 1)
+
+
+class TestRestartWithFilamentLoaded(unittest.TestCase):
+    # KAN-2413: a plain Klipper restart with filament in the toolhead ran the
+    # insert flow (extruder grab + Load Mode prompt) 8 s after the start.
+    def connect(self, s):
+        s.mcu.non_critical_disconnected = False
+        s.printer.send_event('toolhead:reconnect')
+
+    def test_restart_with_filament_present_runs_no_insert(self):
+        s = Sensor(deferred=True)
+        # The MCU connects well after ready + 2 s and reports the pin.
+        s.reactor.run_until(s.reactor.now + 6.)
+        s.pin(1)
+        self.connect(s)
+        s.reactor.run_until(s.reactor.now + 5.)
+        self.assertTrue(s.detected())
+        self.assertEqual(s.scripts(), [])
+
+    def test_report_debounced_after_the_connect_runs_no_insert(self):
+        # The report lands while the connect is still running; its debounce
+        # fires after the reconnect handlers have run.
+        s = Sensor(deferred=True)
+        s.reactor.run_until(s.reactor.now + 6.)
+        s.printer.buttons.callback(s.reactor.now, 1)
+        self.connect(s)
+        s.reactor.run_until(s.reactor.now + 5.)
+        self.assertTrue(s.detected())
+        self.assertEqual(s.scripts(), [])
+
+    def test_toolhead_reconnect_with_filament_runs_no_insert(self):
+        s = Sensor()
+        s.pin(1)
+        del s.scripts()[:]
+        s.printer.send_event('toolhead:disconnect')
+        s.mcu.non_critical_disconnected = True
+        s.reactor.run_until(s.reactor.now + 6.)
+        s.printer.buttons.callback(s.reactor.now, 1)
+        self.connect(s)
+        s.reactor.run_until(s.reactor.now + 5.)
+        self.assertTrue(s.detected())
+        self.assertEqual(s.scripts(), [])
+
+    def test_a_real_insert_after_the_restart_still_loads(self):
+        s = Sensor(deferred=True)
+        s.reactor.run_until(s.reactor.now + 6.)
+        self.connect(s)
+        s.reactor.run_until(s.reactor.now + 5.)
+        s.pin(1)
+        self.assertEqual(len(s.scripts()), 1)
+        self.assertIn('INSERT', s.scripts()[0])
 
 
 if __name__ == '__main__':
