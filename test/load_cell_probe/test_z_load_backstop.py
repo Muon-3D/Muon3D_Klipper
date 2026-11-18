@@ -203,6 +203,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
     # first sample over 221075 is i=2211 (221100); 40 in a row -> 2250
+    # (KAN-4364: nothing is followed by default; legs, test_z_legs.py)
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
     assert idx == 2250, idx
     assert w.last_fired == WRONG_WAY_REASON
@@ -457,9 +458,6 @@ def test_6_mcutare_and_directionless(mod):
     m._nozzle_is_clear = lambda: True
     m._start_collector = lambda: Collector(m)
     m._z_watch = mod.ZLoadBackstop(tg.FakeConfig(printer, {}), printer, cell)
-    # a single-segment descent: MCUTARE never applies to a segmented one
-    # (KAN-4364, test_hot_load_cell.py)
-    m.SEGMENT_MM = 1000.
 
     class Fresh(object):
         def start_collecting(self, min_time=None):
@@ -713,17 +711,16 @@ def integ_move(mod, rig, cell, tare, delta):
     m._param_helper = ParamHelper()
     m._mcu_trigger_analog = rig.endstops[0]
     m._start_collector = lambda: Collector(m)
-    # one move, as the incident was (KAN-4364's segments: see
-    # test_hot_load_cell.py)
-    m.SEGMENT_MM = 1000.
 
     def tare_fn(gcmd):
         m._tare_counts = tare
         m._trigger_delta = delta
         m._trigger_press_dir = -1.
     m._pause_and_tare = tare_fn
-    m._z_watch = mod.ZLoadBackstop(tg.FakeConfig(rig.printer, {}),
-                                   rig.printer, cell)
+    # one descent, as the incident was (legs: test_z_legs.py)
+    m._z_watch = mod.ZLoadBackstop(
+        tg.FakeConfig(rig.printer, {'z_move_leg_time': 0.}), rig.printer,
+        cell)
     return m
 
 
@@ -738,7 +735,14 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_factor': 2.5,
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
-            'z_backstop_confirm_time': 0.02}
+            'z_backstop_confirm_time': 0.02,
+            'z_backstop_drift_rate_counts': 0.,
+            'z_backstop_leg_time': 1.0,
+            'z_backstop_leg_rate_counts': 50000.,
+            'z_backstop_drift_total_factor': 4.0,
+            'z_backstop_legs': 0,
+            'z_backstop_leg_last_change': 0,
+            'z_backstop_leg_total_change': 0}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,
