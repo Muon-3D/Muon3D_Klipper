@@ -252,6 +252,11 @@ start_test home_stow "Test Home All stows the bed"
 $PYTHON test/home_stow/test_home_all_stow.py
 finish_test home_stow "Test Home All stows the bed"
 
+# MUON: the bed rests at the top after user operations, never in a print (KAN-4298).
+start_test stow_ops "Test the bed rests at the top after user operations"
+$PYTHON test/stow_ops/test_stow_after_operations.py
+finish_test stow_ops "Test the bed rests at the top after user operations"
+
 # MUON: M600 with no print only prompts; PAUSE restores absolute mode (KAN-1699).
 start_test m600 "Test M600 with no print only prompts"
 $PYTHON test/m600/test_m600_no_print.py
