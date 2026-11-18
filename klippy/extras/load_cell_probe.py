@@ -1267,6 +1267,11 @@ class LoadCellProbingMove:
             z_min = pos[2] - cap
         watch = self._z_watch
         leg_time = watch.get_leg_time() if watch is not None else 0.
+        _mcu = getattr(self, '_mcu', None)
+        if _mcu is not None and _mcu.is_fileoutput():
+            # batch mode: every move "triggers" at its end (homing.py), so
+            # legs would change where a probe lands; one descent there
+            leg_time = 0.
         if watch is not None:
             watch.start_legs(self._tare_counts, self._trigger_delta)
         cmd_err = self._printer.command_error
