@@ -202,9 +202,11 @@ def test_2_wrong_way_and_idle_wander(mod):
     w, homing, idx = first_abort_sample(mod, tare, -1., DELTA_BOX_800,
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
-    # first sample over 221075 is i=2211 (221100); 40 in a row -> 2250
+    # The drift is 100 counts a sample = 200000 counts/s; KAN-4364 lets the
+    # watch follow 50000 counts/s of it (25 a sample), so the excess grows
+    # 75 a sample: first over 221075 at i=2948, 40 in a row -> 2987.
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
-    assert idx == 2250, idx
+    assert idx == 2987, idx
     assert w.last_fired == WRONG_WAY_REASON
     # the same drift on the press side is not the wrong way: the ceiling
     # (552687) is what ends it, at i=5527 + 39
@@ -225,7 +227,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert homing.calls == [] and w.last_fired is None, homing.calls
     assert w.get_limits() == (446435, 178574), w.get_limits()
-    print('ok  2 wrong way aborts at sample 2250 (1.125 s); idle wander '
+    print('ok  2 wrong way aborts at sample 2987 (1.49 s); idle wander '
           '-4000..+7000 on Sloe never does')
 
 
@@ -732,7 +734,8 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_factor': 2.5,
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
-            'z_backstop_confirm_time': 0.02}
+            'z_backstop_confirm_time': 0.02,
+            'z_backstop_drift_rate_counts': 50000.}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,
