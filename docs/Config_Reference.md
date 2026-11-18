@@ -6087,6 +6087,13 @@ sensor_type:
 #z_move_abort_confirm_time: 0.020
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
+#z_move_drift_rate_counts: 50000
+#   A hot load cell drifts by millions of counts. The side opposite the
+#   press (the wrong-way rule, and the ceiling on that side) is judged
+#   against the tare plus the drift seen so far, which is followed at no
+#   more than this many counts a second and dropped as soon as the load
+#   comes back, so a step or a fast ramp still trips at full size. The
+#   press side is never followed. 0 turns it off. The default is 50000.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

@@ -616,6 +616,18 @@ class LoadCellProbeConfigHelper:
 #   tare -3244819 is PAST the anchor -3010747, so its delta is 10% of the
 #   234072 counts between them = 23407, and the ceiling is 58517, under a
 #   third of the smallest contact load that was recorded.
+#   KAN-4364 (Sloe, B1, hot): the load cell drifts 1.7-2.4M counts over a
+#   heat-up (KAN-3818), and Z descents tripped the wrong-way rule at 146400
+#   and 259190 counts (tares -121734 and 1006163).  A fixed floor on that
+#   rule does not help: the ceiling is symmetric and sits at 366000 / 647975
+#   there, so the drift would trip it next.  So the wrong side (the
+#   wrong-way rule and the ceiling on that side only) is judged against the
+#   tare plus the slow drift so far, followed at no more than
+#   z_move_drift_rate_counts (50000 a second: 2.5x the ~20000 a second that
+#   a 2.4M swing over two minutes makes) and dropped as soon as the load
+#   comes back.  A real wrong-way event is a step of one delta (146000 and
+#   up) in milliseconds, or a ramp far faster than 50000 a second, so it is
+#   still judged at nearly full size.  The press side is never re-referenced.
 #   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
 #   against a delta of 178574, so noise is under 4% of the limit.
 # MCUTARE: the MCU zeroes itself on the first descent sample and the host
@@ -648,6 +660,8 @@ class ZLoadBackstop:
                                "at least 0.5")
         self._confirm_time = config.getfloat(
             'z_move_abort_confirm_time', 0.020, minval=0.002, maxval=0.2)
+        self._drift_rate = config.getfloat(
+            'z_move_drift_rate_counts', 50000., minval=0.)
         self._armed = False
         self._registered = False    # our client is on the load cell
         self._start_time = 0.
@@ -660,6 +674,8 @@ class ZLoadBackstop:
         self._wrong_run = 0
         self._over_t0 = None    # timestamp of the first sample of the run
         self._wrong_t0 = None
+        self._drift = 0.        # wrong-side drift absorbed so far, counts
+        self._drift_t = None
         self.last_fired = None
         self._armed_rules = 'none'      # of the last descent
         self._last_not_armed = None     # logging dedupe, see _note_arming
@@ -697,6 +713,8 @@ class ZLoadBackstop:
         self._need = need
         self._over_run = self._wrong_run = 0
         self._over_t0 = self._wrong_t0 = None
+        self._drift = 0.
+        self._drift_t = None
         self._note_arming(ceiling, wrong, trigger_delta, press_direction,
                           mcutare)
         if not ceiling and not wrong:
@@ -796,6 +814,24 @@ class ZLoadBackstop:
 
     def _judge(self, counts, t=None):
         dev = counts - self._tare
+        # KAN-4364: the wrong side (opposite the press) is judged against
+        # the tare plus the slow drift seen so far, so a hot load cell
+        # drifting for the length of a long descent never trips it.  The
+        # drift is followed at no more than z_move_drift_rate_counts a
+        # second and dropped at once when the load comes back, so a step
+        # (a real wrong-way event) is judged at its full size.  The press
+        # side keeps the raw tare: that is the push protection.
+        if self._direction in (-1, 1):
+            wrong_side = max(-dev * self._direction, 0.)
+            if (self._drift_rate > 0. and t is not None
+                    and self._drift_t is not None):
+                grow = self._drift_rate * max(0., t - self._drift_t)
+                self._drift = min(self._drift + grow, wrong_side)
+            else:
+                self._drift = min(self._drift, wrong_side)
+            if t is not None:
+                self._drift_t = t
+            dev += self._drift * self._direction    # 0 on the press side
         if self._ceiling and abs(dev) > self._ceiling:
             if not self._over_run:
                 self._over_t0 = t
@@ -843,7 +879,8 @@ class ZLoadBackstop:
                 'z_backstop_ceiling_counts_config':
                     self._ceiling_counts_param,
                 'z_backstop_wrong_way_factor': self._wrong_way_factor,
-                'z_backstop_confirm_time': self._confirm_time}
+                'z_backstop_confirm_time': self._confirm_time,
+                'z_backstop_drift_rate_counts': self._drift_rate}
 
 
 # Execute probing moves using the MCU_trigger_analog
