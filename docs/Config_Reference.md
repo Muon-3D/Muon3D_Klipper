@@ -6115,6 +6115,30 @@ sensor_type:
 #   Within one move, judge the wrong side against the tare plus the drift
 #   seen so far, followed at up to this many counts a second and never
 #   more than 0.5 x the trigger delta. 0 (the default) follows nothing.
+#z_move_fast_leg_max: 4.0
+#   KAN-4682: a probing move that is given FAST_ABOVE=<Z> (the M1's Z home
+#   passes it when the contact guard knows the plate height; the plate is
+#   below that Z) may run the legs that start above it longer than
+#   z_move_leg_time, up to this many seconds. Never shorter, and never
+#   across FAST_ABOVE, so the last legs are z_move_leg_time as before.
+#   0 turns it off. The default is 4.0.
+#z_move_fast_leg_growth: 3.0
+#   A leg may run at most this many times the leg before it. The default
+#   is 3.0.
+#z_move_fast_drift_factor: 0.5
+#   A long leg may absorb at most this share of the trigger delta as drift
+#   at the planned rate: the next leg runs for at most
+#   z_move_fast_drift_factor x delta / (z_move_fast_rate_safety x rate)
+#   seconds, rate being (the tare change since leg 1 +
+#   z_move_fast_noise_counts) divided by the seconds since leg 1. Above 0
+#   up to 0.75. The default is 0.5.
+#z_move_fast_rate_safety: 2.0
+#   The measured rate is multiplied by this: the drift may speed up while
+#   the leg runs. At least 1. The default is 2.0.
+#z_move_fast_noise_counts: 11000
+#   The spread of one tare (Sloe's idle wander is -4000 to +7000 counts),
+#   added to the tare change before it is divided by the elapsed time. The
+#   default is 11000.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

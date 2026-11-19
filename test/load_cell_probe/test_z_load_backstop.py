@@ -741,6 +741,8 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_leg_rate_counts': 50000.,
             'z_backstop_drift_total_factor': 4.0,
             'z_backstop_press_total_factor': 1.0,
+            'z_backstop_fast_leg_max': 4.0,
+            'z_backstop_fast_drift_factor': 0.5,
             'z_backstop_legs': 0,
             'z_backstop_leg_last_change': 0,
             'z_backstop_leg_total_change': 0,
