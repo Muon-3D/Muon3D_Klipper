@@ -215,6 +215,9 @@ class MuonADS1220:
                                      minval=1, maxval=4)
         max_pause = config.getfloat('max_temperature_pause', 4.0,
                                     minval=0.5, maxval=6.0)
+        # KAN-4682: the Z legs of load_cell_probe stay under this (less a
+        # margin) so a temperature read never lands inside an armed leg
+        self.max_temperature_pause = max_pause
         stall_convs = config.getint('stall_conversions', 64, minval=8,
                                     maxval=10000)
         # SPI and pins
@@ -508,6 +511,8 @@ class MuonADS1220LoadCell:
         return self.chip.get_mcu()
     def get_samples_per_second(self):
         return self.chip.get_samples_per_second()
+    def get_max_temperature_pause(self):
+        return self.chip.max_temperature_pause
     def get_range(self):
         return ADC_MIN, ADC_MAX
     def lookup_sensor_error(self, error_code):
