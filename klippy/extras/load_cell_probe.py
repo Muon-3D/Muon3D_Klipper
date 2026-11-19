@@ -722,6 +722,8 @@ class ZLoadBackstop:
         self._leg_times = []        # seconds each leg was planned for
         self._leg_pauses = []       # seconds between one leg and the next
         self.last_fast_plan = None
+        self._leg_plans = []        # KAN-4682: each leg's fast_leg_time plan
+        self._fast_above_note = 'not asked'
         self._leg_press_total = 0
         self._leg_wrong_peak = 0
         self._leg_press_peak = 0
@@ -938,6 +940,7 @@ class ZLoadBackstop:
         self._leg_times = []
         self._leg_pauses = []
         self.last_fast_plan = None
+        self._leg_plans = []
         self._leg_first_delta = abs(trigger_delta or 0)
         self._leg_press_total = 0
         self._leg_wrong_peak = 0
@@ -1020,6 +1023,7 @@ class ZLoadBackstop:
         base = self._leg_time
         plan = {'leg': self._legs, 'time': base, 'why': 'off'}
         self.last_fast_plan = plan
+        self._leg_plans.append(plan)
         if self._fast_leg_max <= base or base <= 0.:
             return base
         delta = self._leg_first_delta or abs(trigger_delta or 0)
@@ -1067,6 +1071,11 @@ class ZLoadBackstop:
         self._leg_last_time = seconds
         self._leg_times.append(seconds)
 
+    # KAN-4682 (bench, I-514 'not consistently'): what became of FAST_ABOVE
+    # for this descent, so a stepped home can be matched to its reason
+    def note_fast_above(self, note):
+        self._fast_above_note = note
+
     def note_pause(self, seconds):
         self._leg_pauses.append(seconds)
 
@@ -1087,6 +1096,16 @@ class ZLoadBackstop:
                      ", ".join("%.2f" % (s,) for s in self._leg_times),
                      sum(self._leg_pauses),
                      ", ".join("%.2f" % (s,) for s in self._leg_pauses))
+        # KAN-4682: why each leg got the time it did, and the drift rate
+        # (counts/s) it was planned from: 'drift rising', 'press-side jump
+        # held', 'too soon after leg 1' and 'off' keep 1 s legs
+        logging.info("load_cell_probe: Z legs %s: FAST_ABOVE %s; leg plans"
+                     " [%s]", how, self._fast_above_note,
+                     ", ".join("%d:%s %.2fs%s" % (
+                         p.get('leg', 0), p.get('why', '?'),
+                         p.get('time', 0.),
+                         (" @%.0f/s" % (p['rate'],)) if 'rate' in p else "")
+                         for p in self._leg_plans))
 
     def _fire(self, reason):
         self._armed = False
@@ -1464,6 +1483,17 @@ class LoadCellProbingMove:
                 fast_above = max(self.FAST_ABOVE_MIN, fast_above)
         if watch is not None:
             watch.start_legs(self._tare_counts, self._trigger_delta, tare_t)
+            asked = (gcmd.get('FAST_ABOVE', None)
+                     if gcmd is not None else None)
+            if fast_above is not None:
+                note = "%.2f mm" % (fast_above,)
+            elif asked is None:
+                note = "not asked"
+            elif _used_mcutare or tare_t is None:
+                note = "ignored (no tare time)"
+            else:
+                note = "ignored (fast legs off)"
+            watch.note_fast_above(note)
         latch = None
         note_move = getattr(phoming, 'note_move_active', None)
         if leg_time > 0. and note_move is not None:
