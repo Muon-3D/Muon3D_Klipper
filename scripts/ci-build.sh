@@ -195,6 +195,10 @@ finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
 start_test z_power "Test z_power decisions"
 $PYTHON test/z_power/test_z_power.py
 finish_test z_power "Test z_power decisions"
+# MUON: KAN-4767 muon_lights_out: webhooks-only frame output, one try, gates.
+start_test muon_lights_out "Test muon_lights_out frame output"
+$PYTHON test/muon_lights/test_muon_lights_out.py
+finish_test muon_lights_out "Test muon_lights_out frame output"
 
 # MUON: bed heater live supply power, resistance learning and heater check.
 start_test heater_supply "Test heater_supply and MPC on a simulated bed"

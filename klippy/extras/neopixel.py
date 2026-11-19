@@ -69,10 +69,12 @@ class PrinterNeoPixel:
         color_data = self.color_data
         for cdidx, (lidx, cidx) in self.color_map:
             color_data[cdidx] = int(led_state[lidx][cidx] * 255. + .5)
-    def send_data(self, print_time=None):
+    # MUON (KAN-4767): retries=1 is try-once-and-drop, for muon_lights_out.
+    # Returns True when the MCU confirmed (or nothing needed sending).
+    def send_data(self, print_time=None, retries=8):
         old_data, new_data = self.old_color_data, self.color_data
         if new_data == old_data:
-            return
+            return True
         # Find the position of all changed bytes in this framebuffer
         diffs = [[i, 1] for i, (n, o) in enumerate(zip(new_data, old_data))
                  if n != o]
@@ -95,14 +97,14 @@ class PrinterNeoPixel:
             minclock = self.mcu.print_time_to_clock(print_time)
         scmd = self.neopixel_send_cmd.send
         if self.printer.get_start_args().get('debugoutput') is not None:
-            return
-        for i in range(8):
+            return True
+        for i in range(retries):
             params = scmd([self.oid], minclock=minclock,
                           reqclock=BACKGROUND_PRIORITY_CLOCK)
             if params['success']:
-                break
-        else:
-            logging.info("Neopixel update did not succeed")
+                return True
+        logging.info("Neopixel update did not succeed")
+        return False
     def update_leds(self, led_state, print_time):
         self.update_color_data(led_state)
         self.send_data(print_time)
