@@ -8,7 +8,7 @@ counts, the watch armed on that old zero and ended the first descent with
 "the load on the nozzle exceeded the safety ceiling".  A false abort.
 
 Now MCUTARE is used only while that zero is at most mcutare_max_zero_age
-(2.5 s) old; otherwise the tap takes the host tare, which refreshes it.
+(5 s) old; otherwise the tap takes the host tare, which refreshes it.
 The ceiling itself (2.5 x the trigger delta) is not touched.
 
 This drives the real LoadCellProbingMove (probing_move,
@@ -107,7 +107,7 @@ def test_1_stale_zero_big_shift_no_press(mod):
     assert armed and abs(armed[0][0] - (old + SHIFT)) < 20000, (armed, old)
     assert armed[0][1] is False, armed
     lines = [x for lv, x in cap.lines if 'MCUTARE asked for' in x]
-    assert len(lines) == 1 and '60.' in lines[0] and '2.5 s' in lines[0], \
+    assert len(lines) == 1 and '60.' in lines[0] and '5.0 s' in lines[0], \
         cap.lines
     print('ok  1 MCUTARE with a 60 s old zero and a %d count shift: host '
           'tare, armed on the fresh zero, no false ceiling trip' % SHIFT)
@@ -155,9 +155,9 @@ def test_3_fresh_zero_uses_mcutare(mod):
     assert tap(m, w, wait=1.) is None
     assert m.paths == ['host', 'mcu', 'mcu'], m.paths
     # a zero a hair under the limit is still fresh, a hair over is not
-    m._approx_tare_t = w.t - 2.4
+    m._approx_tare_t = w.t - 4.9
     assert m._host_zero_is_fresh()
-    m._approx_tare_t = w.t - 2.6
+    m._approx_tare_t = w.t - 5.1
     assert not m._host_zero_is_fresh()
     print('ok  3 a fresh zero keeps MCUTARE (no host tare); stale -> host '
           'tare -> the next tap is MCUTARE again')
@@ -166,7 +166,7 @@ def test_3_fresh_zero_uses_mcutare(mod):
 def test_4_age_check_off_and_unknown_age(mod):
     w = zl.World(real=10.)
     m, ph = build(mod, w)
-    assert m._mcutare_max_zero_age == 2.5
+    assert m._mcutare_max_zero_age == 5.
     first_tap(m, w)
     m._mcutare_max_zero_age = 0.
     assert tap(m, w, wait=600.) is None
