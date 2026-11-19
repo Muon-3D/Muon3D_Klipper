@@ -543,7 +543,9 @@ def test_18_no_armed_leg_outlasts_the_temperature_read(mod):
     # ADS1220: max_temperature_pause 4.0, margin 0.3 -> legs <= 3.7 s
     for pause, margin, cap in ((4.0, None, 3.7), (4.0, 1.0, 3.0),
                                (6.0, None, 4.0), (2.0, None, 1.7)):
-        opts = dict(REST) if margin is None else dict(REST, z_move_fast_temp_margin=margin)
+        opts = dict(REST)
+        if margin is not None:
+            opts['z_move_fast_temp_margin'] = margin
         w = known_world(drift=zl.ramp(0.), noise=False)
         m, ph, err = run_ads(mod, w, pause=pause, opts=opts)
         assert err is None, err
