@@ -357,6 +357,8 @@ def test_11_fast_above_is_clamped_to_5_mm(mod):
 # and no armed leg outlasts the ADS1220's temperature read -----------------
 
 NO_REST = {'z_move_fast_rest_time': 0.}
+# the rest is opt-in (default 0 until benched): the option-B tests turn it on
+REST = {'z_move_fast_rest_time': 0.5}
 # what #150 alone gave (noise off, 140 mm known): the golden legs
 GOLDEN_STILL = [(140.0, 125.0), (125.0, 80.0), (80.0, 20.0), (20.0, 12.0),
                 (12.0, -0.15)]
@@ -400,7 +402,7 @@ def test_13_the_rest_plans_leg_1(mod):
     firsts = []
     for rate in (0., 5000., 10000., 20000.):
         w = known_world(drift=zl.ramp(rate), noise=False)
-        m, ph, err = run(mod, w)
+        m, ph, err = run(mod, w, opts=REST)
         assert err is None and ph.calls == [], (rate, err)
         rest = m._z_watch._rest
         assert rest is not None and rest['span'] >= 0.4, rest
@@ -416,18 +418,24 @@ def test_13_the_rest_plans_leg_1(mod):
 
 def test_14_a_still_cell_leg_sequence(mod):
     w = known_world(drift=zl.ramp(0.), noise=False)
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     secs = leg_seconds(w)
     assert err is None and len(secs) <= 5, (err, secs)
     assert secs[0] > 2.0, secs
     w2 = known_world(drift=zl.ramp(0.), noise=False)
-    run_ads(mod, w2)
+    run_ads(mod, w2, opts=REST)
     secs2 = leg_seconds(w2)
     assert len(secs2) <= 5, secs2
     for a, b in w2.segments:
         assert not (a > ABOVE + 1e-6 and b < ABOVE - 1e-6), (a, b)
     assert secs2[-1] <= 1.0 + 1e-6, secs2
-    assert secs2[0] > 2.0 and max(secs2) <= 3.7 + 1e-6, secs2
+    # 4.0 s pause less the 0.5 s default margin
+    assert secs2[0] > 2.0 and max(secs2) <= 3.5 + 1e-6, secs2
+    # the shipped default (rest off, cap on): #150's legs with the cap
+    w3 = known_world(drift=zl.ramp(0.), noise=False)
+    run_ads(mod, w3)
+    secs3 = leg_seconds(w3)
+    assert secs3[0] <= 1.0 + 1e-6 and max(secs3) <= 3.5 + 1e-6, secs3
     print('ok  14 a still cell: legs %s s (no ADS1220), %s s (ADS1220 4 s '
           'pause); #150 alone: 1.0/3.0/4.0/0.53/1.0' % (
               '/'.join('%.2f' % s for s in secs),
@@ -436,7 +444,7 @@ def test_14_a_still_cell_leg_sequence(mod):
 
 def test_15_a_hot_cell_keeps_one_second_legs_after_a_rest(mod):
     w = known_world(drift=zl.ramp(48000.))
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     assert err is None and ph.calls == [], err
     secs = leg_seconds(w)
     assert max(secs[:-1]) <= 1.0 + 1e-6, secs
@@ -451,7 +459,7 @@ def test_15_a_hot_cell_keeps_one_second_legs_after_a_rest(mod):
 def test_16_a_drift_that_rises_in_the_rest_gets_no_growth(mod):
     # still for the first part of the rest, then 48000 counts/s
     w = known_world(drift=lambda s: 48000. * max(0., s - 0.45), noise=False)
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     assert err is None, err
     secs = leg_seconds(w)
     assert max(secs[:-1]) <= 1.25, secs
@@ -477,7 +485,7 @@ def test_16_a_drift_that_rises_in_the_rest_gets_no_growth(mod):
 def test_17_a_press_side_jump_in_the_rest_gets_no_growth(mod):
     w = known_world(drift=zl.ramp(0.), noise=False, bump=(0.4, 0.2,
                                                            -250000.))
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     assert err is None, err
     rest = m._z_watch._rest
     assert rest['jump'], rest
@@ -490,7 +498,7 @@ def test_17_a_press_side_jump_in_the_rest_gets_no_growth(mod):
     # pushed tare would have hidden the load and gone on down
     w = known_world(drift=zl.ramp(0.), noise=False, bump=(0.4, 100.,
                                                            -250000.))
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     assert w.real > 135., (err, w.real)
     print('ok  17 a press-side step in the rest: the old tare is held, '
           'every leg 1 s; one that stays triggers at once, in the air '
@@ -499,7 +507,7 @@ def test_17_a_press_side_jump_in_the_rest_gets_no_growth(mod):
 
 def test_17b_the_rest_plan_formula_and_its_noise_term(mod):
     w = known_world(drift=zl.ramp(0.), noise=False)
-    m, ph = zl.make(mod, w, gcmd=zl.Gcmd(FAST_ABOVE=ABOVE))
+    m, ph = zl.make(mod, w, opts=REST, gcmd=zl.Gcmd(FAST_ABOVE=ABOVE))
     watch = m._z_watch
     delta = 146400.
 
@@ -535,7 +543,7 @@ def test_18_no_armed_leg_outlasts_the_temperature_read(mod):
     # ADS1220: max_temperature_pause 4.0, margin 0.3 -> legs <= 3.7 s
     for pause, margin, cap in ((4.0, None, 3.7), (4.0, 1.0, 3.0),
                                (6.0, None, 4.0), (2.0, None, 1.7)):
-        opts = {} if margin is None else {'z_move_fast_temp_margin': margin}
+        opts = dict(REST) if margin is None else dict(REST, z_move_fast_temp_margin=margin)
         w = known_world(drift=zl.ramp(0.), noise=False)
         m, ph, err = run_ads(mod, w, pause=pause, opts=opts)
         assert err is None, err
@@ -549,7 +557,7 @@ def test_18_no_armed_leg_outlasts_the_temperature_read(mod):
 
 def test_19_no_muon_ads1220_no_cap(mod):
     w = known_world(drift=zl.ramp(0.), noise=False)
-    m, ph, err = run(mod, w)
+    m, ph, err = run(mod, w, opts=REST)
     assert err is None, err
     assert max(leg_seconds(w)) > 3.7 + 1e-6, leg_seconds(w)
     assert m._z_watch._temp_cap() is None
@@ -560,7 +568,7 @@ def test_19_no_muon_ads1220_no_cap(mod):
 def test_20_the_log_has_the_rest_numbers(mod):
     w = known_world(drift=zl.ramp(0.))
     with zb.LogCapture() as cap:
-        m, ph, err = run(mod, w)
+        m, ph, err = run(mod, w, opts=REST)
     lines = [x for lv, x in cap.lines if 'Z legs touched' in x]
     assert len(lines) == 1, cap.lines
     assert 'rest ' in lines[0] and 'counts/s' in lines[0], lines[0]

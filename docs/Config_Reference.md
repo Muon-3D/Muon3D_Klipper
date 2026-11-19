@@ -6139,19 +6139,22 @@ sensor_type:
 #   The spread of one tare (Sloe's idle wander is -4000 to +7000 counts),
 #   added to the tare change before it is divided by the elapsed time. The
 #   default is 11000.
-#z_move_fast_rest_time: 0.5
+#z_move_fast_rest_time: 0
 #   Seconds the nozzle holds still before a fast descent (PROBE FAST_ABOVE=)
 #   while the drift is measured, so leg 1 is planned from a measured rate.
 #   The noise term is measured over the same window: twice the scatter of
 #   its tare-sized blocks about a smooth curve, at most
 #   z_move_fast_noise_counts and at least a quarter of it. A drift that
 #   speeds up during the rest, or a press-side step, gives no growth for the
-#   whole descent. 0 turns the rest off (legs as before). The default is 0.5.
-#z_move_fast_temp_margin: 0.3
+#   whole descent. 0 turns the rest off (legs as before). The default is 0 (off) until
+#   the rest has been benched; 0.5 is the designed value.
+#z_move_fast_temp_margin: 0.5
 #   No armed leg of a fast descent runs longer than the load cell's
 #   max_temperature_pause (muon_ads1220) less this many seconds: past it the
 #   chip reads the hot end's temperature and the load cell is blind. No cap
-#   when the load cell is not a muon_ads1220. The default is 0.3.
+#   when the load cell is not a muon_ads1220. The default is 0.5 (the
+#   armed window is about 0.1 s longer than the move, plus stop and
+#   disarm latency).
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

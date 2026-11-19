@@ -718,11 +718,11 @@ class ZLoadBackstop:
         # KAN-4682 option B: before the descent the nozzle holds still this
         # long, and the drift is measured over it (0 = off, as #150)
         self._fast_rest_time = config.getfloat(
-            'z_move_fast_rest_time', 0.5, minval=0.)
+            'z_move_fast_rest_time', 0., minval=0.)
         # a long leg ends this many seconds before the ADS1220's
         # max_temperature_pause (see _temp_cap)
         self._fast_temp_margin = config.getfloat(
-            'z_move_fast_temp_margin', 0.3, minval=0.)
+            'z_move_fast_temp_margin', 0.5, minval=0.)
         self._rest = None           # the rest window's numbers (note_rest)
         self._rate_ref = None       # (tare, time) the drift is measured from
         self._noise_used = None     # the tare spread the plan allows for
