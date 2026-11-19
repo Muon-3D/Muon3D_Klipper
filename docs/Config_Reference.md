@@ -6087,13 +6087,34 @@ sensor_type:
 #z_move_abort_confirm_time: 0.020
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
-#z_move_drift_rate_counts: 50000
-#   A hot load cell drifts by millions of counts. The side opposite the
-#   press (the wrong-way rule, and the ceiling on that side) is judged
-#   against the tare plus the drift seen so far, which is followed at no
-#   more than this many counts a second and dropped as soon as the load
-#   comes back, so a step or a fast ramp still trips at full size. The
-#   press side is never followed. 0 turns it off. The default is 50000.
+#z_move_leg_time: 1.0
+#   A probing move runs in legs of at most this many seconds. Each leg
+#   stops, tares again at rest and arms the trigger and the limits above
+#   on that fixed tare, so a hot load cell's drift (millions of counts
+#   over a heat-up) never adds up within one leg. A tap that touches in
+#   its first leg is one tare, as before. 0 makes every move one descent.
+#   The default is 1.0.
+#z_move_leg_rate_counts: 50000
+#   Between legs, a tare that moved toward the press by more than this
+#   many counts a second (plus 0.1 x the trigger delta) is not taken: the
+#   previous tare is kept, so light contact at the end of a leg is not
+#   zeroed away. Two such legs in a row end the move ("load on the nozzle
+#   between Z legs"). The default is 50000.
+#z_move_drift_total_factor: 4.0
+#   The most the tare may move the wrong way (away from the press) over
+#   all the legs of one move, in trigger deltas of the first leg; past it
+#   the move ends as a wrong-way move. The default is 4.0.
+#z_move_press_total_factor: 1.0
+#   The most the tare may move toward the press over all the legs of one
+#   move, in trigger deltas of the first leg; past it the move ends ("load
+#   on the nozzle between Z legs"). This stops a soft object being taken
+#   into the tare a little at a time; a cell drifting toward the press
+#   (cooling) by more than this over one move stops it too. The default is
+#   1.0.
+#z_move_drift_rate_counts: 0
+#   Within one move, judge the wrong side against the tare plus the drift
+#   seen so far, followed at up to this many counts a second and never
+#   more than 0.5 x the trigger delta. 0 (the default) follows nothing.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

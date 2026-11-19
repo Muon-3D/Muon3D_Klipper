@@ -12,8 +12,8 @@ Sloe (B1, train 17, Klipper 61caab27), three PRINT_START attempts:
     alternated by a fixed ~0.047 mm (z=0.1585/0.2027/0.1551/0.2022...),
     samples_tolerance was 0.045: "Probe samples exceed samples_tolerance".
 
-This drives the real ZLoadBackstop with those numbers (2000 sps, press
-direction -1 as in the other backstop tests), and the real
+The Z abort (1) is now handled by descending in legs, each with its own
+tare: test_z_legs.py.  This file keeps the mesh fix (2): the real
 ProbeSessionHelper.run_probe with the samples_tolerance read from
 core/M1/core.cfg.
 
@@ -58,106 +58,6 @@ TARE_1 = -121734
 TARE_2 = 1006163
 
 
-def drift_counts(tare, rate, seconds, step=None, step_at=None):
-    """Counts that drift up (the wrong way) by rate counts/s, with an
-    optional step (counts) added from step_at seconds on."""
-    n = int(seconds * SPS)
-    out = []
-    for i in range(n):
-        c = tare + rate * i / float(SPS)
-        if step is not None and i >= int(step_at * SPS):
-            c += step
-        out.append(int(c))
-    return out
-
-
-def run_watch(mod, tare, delta, counts, **opts):
-    w, cell, homing = zb.make_watch(mod, **opts)
-    t0 = 10.
-    w.arm(t0, tare, delta, PRESS)
-    idx, _ = zb.feed_until_abort(cell, homing, t0, counts)
-    return w, homing, idx
-
-
-def test_1_slow_wrong_side_drift_does_not_trip(mod):
-    # Logged attempt 2: tare 1006163, wrong way 259190.  A descent that
-    # lasts 12 s with the cell drifting 30000 counts/s the wrong way
-    # (360000 in all: past the wrong-way limit, 55% of the ceiling).
-    w, homing, idx = run_watch(mod, TARE_2, DELTA_2,
-                               drift_counts(TARE_2, 30000., 12.))
-    assert w.get_limits() == (647975, 259190), w.get_limits()
-    assert homing.calls == [] and idx is None, (homing.calls, idx)
-    # Logged attempt 1: tare -121734, wrong way 146400, ceiling 366000.
-    # The 2M-count heat-up swing, taken over 100 s (20000 counts/s): the
-    # drift is far past BOTH limits and still never trips them.
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 20000., 100.))
-    assert w.get_limits() == (366000, 146400), w.get_limits()
-    assert homing.calls == [] and idx is None, (homing.calls, idx)
-    # the old behaviour (z_move_drift_rate_counts 0) tripped on it
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1,
-                               drift_counts(TARE_1, 20000., 100.),
-                               z_move_drift_rate_counts=0)
-    assert homing.calls and homing.calls[0] in (
-        zb.WRONG_WAY_REASON, zb.CEILING_REASON), homing.calls
-    print('ok  1 30000 counts/s for 12 s (tare 1006163) and 2M counts over '
-          '100 s (tare -121734) no longer abort; with the rate at 0 it '
-          'still does')
-
-
-def test_2_a_real_wrong_way_event_still_trips(mod):
-    # A step of 1.2 x the delta (the nozzle dragging, a sign error) on a
-    # cell that has already drifted 100000 counts: judged at full size.
-    step = int(1.2 * DELTA_1)
-    counts = drift_counts(TARE_1, 20000., 10., step=step, step_at=5.)
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
-    # idx is the 40-sample batch that confirms it: the one starting at 5 s
-    assert 10000 <= idx <= 10000 + 41, idx
-    # a ramp of 300000 counts/s (a nozzle dragging along the bed) trips
-    # inside a second, even with the drift allowance
-    counts = drift_counts(TARE_1, 300000., 3.)
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls and idx < 1.5 * SPS, (homing.calls, idx)
-    # a step of 1.1 x 146400 on a cold cell, no drift at all
-    counts = [TARE_1] * 100 + [TARE_1 + int(1.1 * DELTA_1)] * 400
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.WRONG_WAY_REASON] and idx == 120, (
-        homing.calls, idx)
-    print('ok  2 a 1.2 x delta step on a drifted cell aborts 40 samples '
-          'in; a 300000 counts/s ramp aborts; a 1.1 x delta step aborts')
-
-
-def test_3_the_ceiling_still_trips(mod):
-    # the press side is never re-referenced: a slow push at the same
-    # 20000 counts/s still reaches the ceiling (366000 after 18.3 s)
-    counts = [int(TARE_1 - 20000. * i / SPS) for i in range(int(25 * SPS))]
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.CEILING_REASON], homing.calls
-    assert abs(idx - 18.3 * SPS) < 80, idx  # idx = 40-sample batch start
-    # a fast push to 2.6 x the delta trips at once
-    counts = [TARE_1] * 100 + [TARE_1 - int(2.6 * DELTA_1)] * 400
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.CEILING_REASON] and idx == 120, (
-        homing.calls, idx)
-    # the wrong-side ceiling still covers a sensor that jumps the wrong
-    # way past it (a step, not drift)
-    counts = [TARE_2] * 100 + [TARE_2 + int(2.6 * DELTA_2)] * 400
-    w, homing, idx = run_watch(mod, TARE_2, DELTA_2, counts)
-    assert homing.calls and idx == 120, (homing.calls, idx)
-    # a drifted cell that then comes back is not left with a stale
-    # allowance: drift 200000 in 2 s, back to the tare for 1 s, then a
-    # 1.2 x delta step trips 40 samples in
-    counts = (drift_counts(TARE_1, 100000., 2.)
-              + [TARE_1] * 2000 + [TARE_1 + int(1.2 * DELTA_1)] * 400)
-    w, homing, idx = run_watch(mod, TARE_1, DELTA_1, counts)
-    assert homing.calls == [zb.WRONG_WAY_REASON], homing.calls
-    assert 6000 <= idx <= 6041, idx
-    print('ok  3 a 20000 counts/s push still hits the ceiling at 18.3 s; '
-          'a 2.6 x delta push or wrong-side jump aborts; a stale '
-          'allowance is dropped when the load comes back')
-
-
 def read_probe_config():
     cfg = open(os.path.join(ROOT, 'core', 'M1', 'core.cfg')).read()
     sec = re.search(r'^\[load_cell_probe\]\n(.*?)(?=^\[)', cfg,
@@ -200,14 +100,9 @@ def test_4_logged_tap_pairs_pass_the_shipped_tolerance(mod_probe):
 
 
 def main():
-    mod = tg.load_module(tg._paths.patched(
-        'klippy/extras/load_cell_probe.py'))
     probe = rf.load_module(rf._paths.patched('klippy/extras/probe.py'),
                            'hot_probe')
-    tests = [(test_1_slow_wrong_side_drift_does_not_trip, mod),
-             (test_2_a_real_wrong_way_event_still_trips, mod),
-             (test_3_the_ceiling_still_trips, mod),
-             (test_4_logged_tap_pairs_pass_the_shipped_tolerance, probe)]
+    tests = [(test_4_logged_tap_pairs_pass_the_shipped_tolerance, probe)]
     failed = []
     for t, m in tests:
         try:

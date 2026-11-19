@@ -66,6 +66,7 @@ class FakeHoming:
 
 
 class FakePrinter:
+    command_error = ProbeFailed
     def __init__(self, toolhead):
         self.objects = {'toolhead': toolhead, 'homing': FakeHoming()}
         self.events = []
