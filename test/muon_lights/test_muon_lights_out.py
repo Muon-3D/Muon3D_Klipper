@@ -91,10 +91,35 @@ class Webhooks:
         self.endpoints[path] = cb
 
 
+class Reactor:
+    def __init__(self, printer):
+        self.printer = printer
+
+    def monotonic(self):
+        return self.printer.t
+
+
+class Scope:
+    in_scope = False
+
+
+class PrintStats:
+    def __init__(self):
+        self.state = 'standby'
+
+    def get_status(self, eventtime):
+        return {'state': self.state}
+
+
 class Printer:
     def __init__(self):
-        self.objects = {'webhooks': Webhooks(), 'gcode': Gcode()}
+        self.t = 100.
+        self.objects = {'webhooks': Webhooks(), 'gcode': Gcode(),
+                        'homing_scope': Scope(), 'print_stats': PrintStats()}
         self.handlers = {}
+
+    def get_reactor(self):
+        return Reactor(self)
 
     def lookup_object(self, name, default=None):
         return self.objects.get(name, default)
@@ -163,7 +188,9 @@ def make(enabled=True, ok=True, **opts):
     return printer, extra
 
 
-def call(extra, **params):
+def call(extra, dt=1.0, **params):
+    """One frame call; dt seconds pass first (default: well past the floor)."""
+    extra.printer.t += dt
     req = Req(**params)
     extra._handle_frame(req)
     return req.response
@@ -246,7 +273,7 @@ class TestSend(unittest.TestCase):
     def test_failure_is_dropped_counted_and_not_retried(self):
         printer, extra = make(ok=False)
         resp = call(extra, left=rgb(40, 5), right=rgb(40, 5))
-        self.assertEqual(resp, {'ok': False, 'reason': 'failed'})
+        self.assertEqual(resp, {'ok': False, 'reason': 'failed', 'sent': []})
         self.assertEqual(printer.objects['neopixel Left'].calls, [1])
         self.assertEqual(printer.objects['neopixel Right'].calls, [])
         status = extra.get_status()
@@ -344,6 +371,116 @@ class TestGates(unittest.TestCase):
         gcode.ready_gcode_handlers['STOP_LED_EFFECTS']({})
         self.assertEqual(ran, [{}])
         self.assertEqual(extra.get_status()['stop_count'], 1)
+
+
+class TestRaceAndFloor(unittest.TestCase):
+    def test_homing_that_begins_between_the_strips_stops_the_right(self):
+        printer, extra = make()
+        left = printer.objects['neopixel Left']
+        right = printer.objects['neopixel Right']
+        real = left.send_data
+
+        def send_then_homing_starts(print_time=None, retries=8):
+            ok = real(print_time, retries)
+            printer.objects['homing_scope'].in_scope = True   # G28 starts
+            return ok
+        left.send_data = send_then_homing_starts
+        resp = call(extra, left=rgb(40, 1), right=rgb(40, 2))
+        self.assertEqual(resp, {'ok': False, 'reason': 'busy',
+                                'sent': ['left']})
+        self.assertEqual(left.calls, [1])
+        self.assertEqual(right.calls, [])           # not sent
+        self.assertEqual(set(right.color_data), {0})  # not even written
+        self.assertEqual(extra.get_status()['drops'], {'busy': 1})
+
+    def test_control_without_homing_both_go(self):
+        printer, extra = make()
+        resp = call(extra, left=rgb(40, 1), right=rgb(40, 2))
+        self.assertEqual(resp['sent'], ['left', 'right'])
+
+    def test_a_fault_effect_between_the_strips_stops_the_right(self):
+        printer, extra = make()
+        left = printer.objects['neopixel Left']
+        real = left.send_data
+
+        def send_then_fault(print_time=None, retries=8):
+            ok = real(print_time, retries)
+            printer.objects['led_effect error'].enabled = True
+            return ok
+        left.send_data = send_then_fault
+        resp = call(extra, left=rgb(40, 1), right=rgb(40, 2))
+        self.assertEqual(resp['reason'], 'fault')
+        self.assertEqual(printer.objects['neopixel Right'].calls, [])
+
+    def test_the_extra_has_its_own_fps_floor_idle(self):
+        printer, extra = make()
+        self.assertTrue(call(extra, left=rgb(40, 1))['ok'])
+        # 10 ms later: far above 30 fps, refused and counted
+        resp = call(extra, dt=0.010, left=rgb(40, 2))
+        self.assertEqual(resp, {'ok': False, 'reason': 'rate'})
+        self.assertEqual(extra.get_status()['drops'], {'rate': 1})
+        self.assertEqual(printer.objects['neopixel Left'].calls, [1])
+        # a frame at 1/30 s is fine
+        self.assertTrue(call(extra, dt=1. / 30., left=rgb(40, 3))['ok'])
+
+    def test_control_a_burst_would_all_go_without_a_floor(self):
+        printer, extra = make()
+        extra._min_interval = lambda: 0.          # the floor taken away
+        results = [call(extra, dt=0.001, left=rgb(40, i + 1))['ok']
+                   for i in range(20)]
+        self.assertTrue(all(results))
+
+    def test_floor_is_6_fps_while_printing_or_paused(self):
+        for state in ('printing', 'paused'):
+            printer, extra = make()
+            printer.objects['print_stats'].state = state
+            self.assertTrue(call(extra, left=rgb(40, 1))['ok'])
+            resp = call(extra, dt=1. / 30., left=rgb(40, 2))
+            self.assertEqual(resp['reason'], 'rate', state)
+            self.assertTrue(call(extra, dt=1. / 6., left=rgb(40, 3))['ok'])
+        # control: idle at the same 1/30 spacing is accepted
+        printer, extra = make()
+        call(extra, left=rgb(40, 1))
+        self.assertTrue(call(extra, dt=1. / 30., left=rgb(40, 2))['ok'])
+
+    def test_a_rate_drop_does_not_move_the_window(self):
+        printer, extra = make()
+        call(extra, left=rgb(40, 1))
+        for _ in range(5):
+            call(extra, dt=0.004, left=rgb(40, 2))        # all too soon
+        self.assertTrue(call(extra, dt=0.02, left=rgb(40, 3))['ok'])
+
+    def test_a_failed_home_cannot_stick_the_gate(self):
+        printer, extra = make()
+        scope = printer.objects['homing_scope']
+        scope.in_scope = True
+        self.assertEqual(call(extra, left=rgb(40, 1))['reason'], 'busy')
+        # G28 raised: no end event was sent, homing_scope drops the scope
+        scope.in_scope = False
+        self.assertTrue(call(extra, left=rgb(40, 1))['ok'])
+
+    def test_a_homing_begin_with_no_end_expires(self):
+        printer, extra = make()
+        printer.send_event('homing:home_rails_begin', None, None)
+        self.assertEqual(call(extra, left=rgb(40, 1))['reason'], 'busy')
+        self.assertTrue(call(extra, dt=31., left=rgb(40, 1))['ok'])
+
+    def test_color_data_is_written_under_the_mutex(self):
+        printer, extra = make()
+        left = printer.objects['neopixel Left']
+        seen = []
+
+        class Watch(Mutex):
+            def __enter__(self_inner):
+                seen.append(('enter', bytes(left.color_data)))
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                seen.append(('exit', bytes(left.color_data)))
+        left.led_helper.mutex = Watch()
+        call(extra, left=rgb(40, 9))
+        self.assertEqual(seen[0], ('enter', bytes(120)))   # not written yet
+        self.assertEqual(set(seen[1][1]), {9})             # written inside
 
 
 if __name__ == '__main__':

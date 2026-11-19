@@ -33,10 +33,19 @@ DEFAULT_GATE_COMMANDS = (
     'PROBE', 'PROBE_ACCURACY', 'PROBE_CALIBRATE', 'BED_MESH_CALIBRATE',
     'Z_ENDSTOP_CALIBRATE', 'Z_POWER_RESET', 'Z_POWER_WAIT', 'Z_POWER_REQUIRE',
     'LOAD_CELL_TEST_TAP', 'LOAD_CELL_CALIBRATE_MAX')
-HOMING_EVENTS = (('homing:home_rails_begin', 1), ('homing:home_rails_end', -1),
-                 ('homing_scope:begin', 1), ('homing_scope:end', -1),
-                 ('homing:homing_move_begin', 1),
-                 ('homing:homing_move_end', -1))
+# Homing is read live from homing_scope.in_scope, which a failed G28 resets
+# (the end events are skipped on an error). These events are only a second
+# signal for homing outside the G28 scope, and they expire: a begin with no
+# end stops counting after HOMING_EVENT_TTL, so nothing can stick.
+HOMING_BEGIN = ('homing:home_rails_begin', 'homing:homing_move_begin')
+HOMING_END = ('homing:home_rails_end', 'homing:homing_move_end')
+HOMING_EVENT_TTL = 30.
+# The extra's own floor on frame spacing, whatever Moonraker sends: 30 fps
+# idle, 6 fps printing or paused. RATE_SLACK absorbs jitter in how the frames
+# arrive; the component spaces them by the full interval.
+IDLE_MIN_INTERVAL = 1. / 30.
+PRINT_MIN_INTERVAL = 1. / 6.
+RATE_SLACK = 0.005
 STRIPS = ('left', 'right')
 
 
@@ -54,7 +63,8 @@ class MuonLightsOut:
             'gate_commands', DEFAULT_GATE_COMMANDS))
         self.pixels = {}          # strip -> neopixel object
         self.sizes = {}           # strip -> LED count
-        self.homing = 0
+        self.homing_since = None
+        self.last_frame = None
         self.busy_commands = 0
         self.down = False
         self.stop_count = 0
@@ -65,9 +75,10 @@ class MuonLightsOut:
         webhooks.register_endpoint('muon_lights_out/frame', self._handle_frame)
         if not self.enabled:
             return
-        for event, step in HOMING_EVENTS:
-            self.printer.register_event_handler(
-                event, lambda *args, s=step: self._homing(s))
+        for event in HOMING_BEGIN:
+            self.printer.register_event_handler(event, self._homing_begin)
+        for event in HOMING_END:
+            self.printer.register_event_handler(event, self._homing_end)
         self.printer.register_event_handler('klippy:connect',
                                             self._handle_connect)
         self.printer.register_event_handler('klippy:shutdown',
@@ -118,8 +129,31 @@ class MuonLightsOut:
             return old(params)
         return wrapped
 
-    def _homing(self, step):
-        self.homing = max(0, self.homing + step)
+    def _now(self):
+        return self.printer.get_reactor().monotonic()
+
+    def _homing_begin(self, *args):
+        self.homing_since = self._now()
+
+    def _homing_end(self, *args):
+        self.homing_since = None
+
+    def _homing_active(self):
+        scope = self.printer.lookup_object('homing_scope', None)
+        if getattr(scope, 'in_scope', False):
+            return True
+        since = self.homing_since
+        return since is not None and self._now() - since < HOMING_EVENT_TTL
+
+    def _min_interval(self):
+        stats = self.printer.lookup_object('print_stats', None)
+        try:
+            state = stats.get_status(self._now())['state']
+        except Exception:
+            state = None
+        if state in ('printing', 'paused'):
+            return PRINT_MIN_INTERVAL
+        return IDLE_MIN_INTERVAL
 
     def _handle_shutdown(self, *args):
         self.down = True
@@ -135,7 +169,7 @@ class MuonLightsOut:
         """Why a frame must not be sent right now, or None."""
         if self.down:
             return 'busy'
-        if self.homing or self.busy_commands:
+        if self.busy_commands or self._homing_active():
             return 'busy'
         reason = None
         for name, effect in self._effects():
@@ -207,14 +241,26 @@ class MuonLightsOut:
         if reason is not None:
             web_request.send(self._drop(reason))
             return
+        now = self._now()
+        if (self.last_frame is not None and
+                now - self.last_frame < self._min_interval() - RATE_SLACK):
+            web_request.send(self._drop('rate'))      # too soon: our own floor
+            return
+        self.last_frame = now
         self._take_over()
         sent = []
         for strip in STRIPS:        # one after the other, left first
             if strip not in frames:
                 continue
-            if not self._send_strip(strip, frames[strip]):
-                self.counts['failed'] += 1
-                web_request.send(self._drop('failed'))
+            # Re-checked before EACH strip: the first send yields to the
+            # reactor, and homing may begin before the second goes out.
+            result = self._send_strip(strip, frames[strip])
+            if result is not None:
+                if result == 'failed':
+                    self.counts['failed'] += 1
+                resp = self._drop(result)
+                resp['sent'] = sent
+                web_request.send(resp)
                 return
             sent.append(strip)
         self.counts['sent'] += 1
@@ -222,25 +268,36 @@ class MuonLightsOut:
         web_request.send({'ok': True, 'sent': sent})
 
     def _send_strip(self, strip, rgb):
+        """None when sent, else the reason it was dropped. The block check
+        and the color_data write both happen under the strip's mutex."""
         pixel = self.pixels[strip]
-        data = pixel.color_data
-        for cdidx, (lidx, cidx) in pixel.color_map:
-            data[cdidx] = rgb[3 * lidx + cidx] if cidx < 3 else 0
         helper = getattr(pixel, 'led_helper', None)
         mutex = getattr(helper, 'mutex', None)
         try:
             if mutex is not None:
                 with mutex:
-                    ok = pixel.send_data(None, retries=1)
-            else:
-                ok = pixel.send_data(None, retries=1)
+                    return self._send_locked(pixel, rgb)
+            return self._send_locked(pixel, rgb)
         except Exception:
             logging.exception("muon_lights_out: send failed")
-            ok = False
-        if not ok:
-            # The MCU buffer may be half updated; make the next send full.
-            pixel.old_color_data[:] = bytearray(d ^ 1 for d in data)
-        return ok
+            self._invalidate(pixel)
+            return 'failed'
+
+    def _send_locked(self, pixel, rgb):
+        reason = self._blocking()
+        if reason is not None:
+            return reason
+        data = pixel.color_data
+        for cdidx, (lidx, cidx) in pixel.color_map:
+            data[cdidx] = rgb[3 * lidx + cidx] if cidx < 3 else 0
+        if pixel.send_data(None, retries=1):
+            return None
+        # The MCU buffer may be half updated; make the next send full.
+        self._invalidate(pixel)
+        return 'failed'
+
+    def _invalidate(self, pixel):
+        pixel.old_color_data[:] = bytearray(d ^ 1 for d in pixel.color_data)
 
     def get_status(self, eventtime=None):
         return {'enabled': self.enabled,
