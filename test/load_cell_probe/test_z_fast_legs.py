@@ -246,6 +246,9 @@ def test_8_the_mcu_zero_ignores_fast_above(mod):
     g = zl.Gcmd(FAST_ABOVE=ABOVE, MCUTARE=1)
     m, ph = zl.make(mod, w, gcmd=g)
     m._approx_tare = w.tare0
+    # a FRESH host zero, so the tap really takes the MCU zero (KAN-4770,
+    # #151: a stale one is replaced by a host tare, which may go fast)
+    m._approx_tare_t = 1000.    # fresh: the fake clock reads 1000
     m._nozzle_is_clear = lambda: True
     try:
         m.probing_move(g)

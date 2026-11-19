@@ -1089,18 +1089,16 @@ class ZLoadBackstop:
         logging.info("load_cell_probe: Z legs %s: %d legs, tare change"
                      " since leg 1 %i the wrong way (peak %i) / %i toward"
                      " the press (peak %i), last leg %i; planned leg"
-                     " seconds [%s], pauses %.2f s in all [%s]", how,
+                     " seconds [%s], pauses %.2f s in all [%s]; FAST_ABOVE %s;"
+                     " leg plans (why each leg got its time, KAN-4682)"
+                     " [%s]", how,
                      self._legs, self._leg_total, self._leg_wrong_peak,
                      self._leg_press_total, self._leg_press_peak,
                      self._leg_last_change,
                      ", ".join("%.2f" % (s,) for s in self._leg_times),
                      sum(self._leg_pauses),
-                     ", ".join("%.2f" % (s,) for s in self._leg_pauses))
-        # KAN-4682: why each leg got the time it did, and the drift rate
-        # (counts/s) it was planned from: 'drift rising', 'press-side jump
-        # held', 'too soon after leg 1' and 'off' keep 1 s legs
-        logging.info("load_cell_probe: Z legs %s: FAST_ABOVE %s; leg plans"
-                     " [%s]", how, self._fast_above_note,
+                     ", ".join("%.2f" % (s,) for s in self._leg_pauses),
+                     self._fast_above_note,
                      ", ".join("%d:%s %.2fs%s" % (
                          p.get('leg', 0), p.get('why', '?'),
                          p.get('time', 0.),
@@ -1483,7 +1481,7 @@ class LoadCellProbingMove:
                 fast_above = max(self.FAST_ABOVE_MIN, fast_above)
         if watch is not None:
             watch.start_legs(self._tare_counts, self._trigger_delta, tare_t)
-            asked = (gcmd.get('FAST_ABOVE', None)
+            asked = (gcmd.get_float('FAST_ABOVE', None)
                      if gcmd is not None else None)
             if fast_above is not None:
                 note = "%.2f mm" % (fast_above,)
