@@ -740,9 +740,12 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_leg_time': 1.0,
             'z_backstop_leg_rate_counts': 50000.,
             'z_backstop_drift_total_factor': 4.0,
+            'z_backstop_press_total_factor': 1.0,
             'z_backstop_legs': 0,
             'z_backstop_leg_last_change': 0,
-            'z_backstop_leg_total_change': 0}
+            'z_backstop_leg_total_change': 0,
+            'z_backstop_leg_wrong_peak': 0,
+            'z_backstop_leg_press_peak': 0}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,

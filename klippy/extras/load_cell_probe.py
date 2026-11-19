@@ -636,7 +636,16 @@ class LoadCellProbeConfigHelper:
 #       nozzle between Z legs");
 #     - the wrong-side change since leg 1 may total at most
 #       z_move_drift_total_factor x delta (4): a slower wrong-way push is
-#       caught there, at worst about 4 + 1 delta.
+#       caught there, at worst about 4 + 1 delta;
+#     - the press-side change since leg 1 may total at most
+#       z_move_press_total_factor x delta (1): a soft object pressed a
+#       little more each leg (under the per-leg jump limit) ends the move
+#       ("load on the nozzle between Z legs") by about 2 x delta.  The
+#       price: a cell drifting TOWARD the press (cooling) by more than one
+#       delta over a single move ends it the same way.
+#   An abort (bed removal, z_power, the column) that comes while the
+#   toolhead is paused between legs is latched by a stand-in move
+#   (_LegsAbortLatch) and raised before the next leg.
 #   Wrong way: 1.0 x delta.  Sloe's idle wander is -4000..+7000 counts
 #   against a delta of 178574, so noise is under 4% of the limit.
 # MCUTARE: the MCU zeroes itself on the first descent sample and the host
@@ -685,6 +694,11 @@ class ZLoadBackstop:
             'z_move_leg_rate_counts', 50000., minval=0.)
         self._total_factor = config.getfloat(
             'z_move_drift_total_factor', 4.0, minval=1.)
+        self._press_total_factor = config.getfloat(
+            'z_move_press_total_factor', 1.0, minval=0.2)
+        self._leg_press_total = 0
+        self._leg_wrong_peak = 0
+        self._leg_press_peak = 0
         self._drift_clamp = 0.
         self._legs = 0
         self._leg_first_tare = None
@@ -892,6 +906,9 @@ class ZLoadBackstop:
         self._legs = 1
         self._leg_first_tare = tare_counts
         self._leg_first_delta = abs(trigger_delta or 0)
+        self._leg_press_total = 0
+        self._leg_wrong_peak = 0
+        self._leg_press_peak = 0
         self._leg_jumps = 0
         self._leg_last_change = 0
         self._leg_total = 0
@@ -926,9 +943,24 @@ class ZLoadBackstop:
             use = prev_tare
         else:
             self._leg_jumps = 0
+        first_delta = self._leg_first_delta or delta
         total = (use - self._leg_first_tare) * -press_direction
         self._leg_total = total
-        limit = self._total_factor * (self._leg_first_delta or delta)
+        self._leg_press_total = -total
+        self._leg_wrong_peak = max(self._leg_wrong_peak, total)
+        self._leg_press_peak = max(self._leg_press_peak, -total)
+        press_limit = self._press_total_factor * first_delta
+        if -total > press_limit:
+            self.last_fired = self.REASON_LEG_LOAD
+            logging.warning("load_cell_probe: Z move stopped: %s (%i counts"
+                            " toward the press since the first leg, limit"
+                            " %i)", self.REASON_LEG_LOAD, -total,
+                            press_limit)
+            raise self._printer.command_error(
+                "Homing aborted: %s (%i counts toward the press since the"
+                " first leg, limit %i)" % (self.REASON_LEG_LOAD, -total,
+                                           press_limit))
+        limit = self._total_factor * first_delta
         if total > limit:
             self.last_fired = self.REASON_WRONG_WAY
             logging.warning("load_cell_probe: Z move stopped: %s (%i counts"
@@ -938,6 +970,18 @@ class ZLoadBackstop:
                 "Homing aborted: %s (%i counts since the first leg, limit"
                 " %i)" % (self.REASON_WRONG_WAY, total, limit))
         return use
+
+    # One INFO line per descent of more than one leg: what the legs did
+    # (bench: the cumulative changes are what the limits judge)
+    def log_legs(self, how):
+        if self._legs < 2:
+            return
+        logging.info("load_cell_probe: Z legs %s: %d legs, tare change"
+                     " since leg 1 %i the wrong way (peak %i) / %i toward"
+                     " the press (peak %i), last leg %i", how, self._legs,
+                     self._leg_total, self._leg_wrong_peak,
+                     self._leg_press_total, self._leg_press_peak,
+                     self._leg_last_change)
 
     def _fire(self, reason):
         self._armed = False
@@ -973,9 +1017,29 @@ class ZLoadBackstop:
                 'z_backstop_leg_time': self._leg_time,
                 'z_backstop_leg_rate_counts': self._leg_rate,
                 'z_backstop_drift_total_factor': self._total_factor,
+                'z_backstop_press_total_factor': self._press_total_factor,
                 'z_backstop_legs': self._legs,
                 'z_backstop_leg_last_change': self._leg_last_change,
-                'z_backstop_leg_total_change': self._leg_total}
+                'z_backstop_leg_total_change': self._leg_total,
+                'z_backstop_leg_wrong_peak': self._leg_wrong_peak,
+                'z_backstop_leg_press_peak': self._leg_press_peak}
+
+
+# KAN-4364: PrinterHoming.abort_active_move() only ends a move that is
+# running.  A probing move in legs pauses (to tare) between them, so for
+# the whole sequence this stands in the list of active moves: an abort
+# that lands in a pause is kept, and raised before the next leg.
+class _LegsAbortLatch:
+    def __init__(self):
+        self.reason = None
+
+    def involves_z(self):
+        return True
+
+    def abort(self, reason):
+        if self.reason is None:
+            self.reason = reason
+        return True
 
 
 # Execute probing moves using the MCU_trigger_analog
@@ -1061,7 +1125,7 @@ class LoadCellProbingMove:
     # sets the endstop tare value and range
     def _pause_and_tare(self, gcmd):
         tare, self._tare_time = self._measure_tare(gcmd)
-        self._apply_tare(tare, gcmd)
+        self._apply_tare(tare, gcmd, self._tare_time)
 
     # KAN-4364: the measuring half of _pause_and_tare: (tare, the time of
     # its last sample)
@@ -1076,7 +1140,7 @@ class LoadCellProbingMove:
         return tare_counts, float(arr[-1, 0])
 
     # ... and the half that stores it and sends it to the MCU
-    def _apply_tare(self, tare_counts, gcmd):
+    def _apply_tare(self, tare_counts, gcmd, tare_time=None):
         # KAN-3370: refuse a loaded nozzle before the bad zero is stored
         # anywhere (load cell, approximate tare) or sent to the MCU
         self._log_tare(tare_counts)
@@ -1087,6 +1151,7 @@ class LoadCellProbingMove:
         self._load_cell.tare(tare_counts)
         self._tare_counts = tare_counts
         self._approx_tare = tare_counts
+        self._approx_tare_t = tare_time
         # update raw range
         safety_min, safety_max = self._config_helper.get_safety_range(
             tare_counts, gcmd)
@@ -1274,9 +1339,44 @@ class LoadCellProbingMove:
             leg_time = 0.
         if watch is not None:
             watch.start_legs(self._tare_counts, self._trigger_delta)
+        latch = None
+        note_move = getattr(phoming, 'note_move_active', None)
+        if leg_time > 0. and note_move is not None:
+            latch = _LegsAbortLatch()
+            note_move(latch, True)
+        try:
+            epos, collector = self._run_legs(
+                gcmd, toolhead, phoming, watch, pos, z_min, speed, leg_time,
+                capped, cap, tare_t, _used_mcutare, latch)
+        except Exception:
+            if watch is not None:
+                watch.log_legs("ended in an error")
+            raise
+        finally:
+            if latch is not None:
+                note_move(latch, False)
+        if watch is not None:
+            watch.log_legs("touched")
+        # Where this tap actually stopped.  _nozzle_is_clear() needs it to
+        # decide whether the next descent may take a relative MCU zero.
+        self._last_trigger_z = epos[2]
+        return epos, collector
+
+    # KAN-4364: an abort latched between legs (or after the last one) is
+    # raised as the move would have raised it
+    def _check_latch(self, latch, collector=None):
+        if latch is not None and latch.reason is not None:
+            if collector is not None:
+                collector.stop_collecting()
+            raise self._printer.command_error(
+                "Homing aborted: %s" % (latch.reason,))
+
+    def _run_legs(self, gcmd, toolhead, phoming, watch, pos, z_min, speed,
+                  leg_time, capped, cap, tare_t, _used_mcutare, latch):
         cmd_err = self._printer.command_error
         leg = 1
         while True:
+            self._check_latch(latch)
             if leg > 1:
                 # KAN-4364: a fresh tare at rest, checked against the last
                 prev = self._tare_counts
@@ -1285,7 +1385,8 @@ class LoadCellProbingMove:
                 tare_t = t
                 self._apply_tare(watch.check_leg(
                     tare, dt, prev, self._trigger_delta,
-                    self._trigger_press_dir), gcmd)
+                    self._trigger_press_dir), gcmd, t)
+                self._check_latch(latch)
             z_now = toolhead.get_position()[2]
             leg_z = z_min
             if leg_time > 0.:
@@ -1333,12 +1434,11 @@ class LoadCellProbingMove:
                 if watch is not None:
                     watch.disarm()
             break
+        # an abort that came after the touch: the result is not trusted
+        self._check_latch(latch, collector)
         if leg > 1:
             logging.info("load_cell_probe: contact in leg %d at z=%.3f"
                          " (tare %i)", leg, epos[2], self._tare_counts)
-        # Where this tap actually stopped.  _nozzle_is_clear() needs it to
-        # decide whether the next descent may take a relative MCU zero.
-        self._last_trigger_z = epos[2]
         return epos, collector
 
     # Wait for the MCU to trigger with no movement

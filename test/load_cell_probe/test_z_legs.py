@@ -132,10 +132,22 @@ class Phoming(object):
         self.trigger_load = None
         self.trigger_delta = None
         self.leg_dev = []           # per leg: most |counts - tare|, no load
+        self.active = []
         self.collectors_stopped = 0
 
+    def note_move_active(self, hmove, active):
+        if active:
+            self.active.append(hmove)
+        elif hmove in self.active:
+            self.active.remove(hmove)
+
     def abort_active_move(self, reason, z_only=True):
+        # as PrinterHoming: every registered move is told (here only
+        # load_cell_probe's stand-in registers); the simulated leg itself
+        # stops on self.calls
         self.calls.append(reason)
+        for h in list(self.active):
+            h.abort(reason)
         return True
 
     def probing_move(self, endstop, pos, speed):
@@ -335,17 +347,28 @@ def test_3_press_force_after_drift(mod):
                                                  load0 - delta0))
 
 
-def test_4_press_side_drift_no_trigger_in_air(mod):
-    # Cooling: 48000 counts/s toward the press for the whole approach.
-    # No trigger in the air; the bed is found at about one delta.
-    w = World(drift=ramp(-48000.), real=160.)
+def test_4_press_side_drift(mod):
+    # Drift TOWARD the press (cooling).  10000 counts/s over the 164 mm
+    # approach (~120000 in all, under the 1 x delta press-side total):
+    # no trigger in the air, the bed at about one delta.
+    w = World(drift=ramp(-10000.), real=160.)
     w.off = 4.
     m, ph, err = descend(mod, w)
     assert err is None and abs(w.real) < 0.5, (err, w.real)
     f = ph.trigger_load / ph.trigger_delta
-    assert 0.5 < f < 1.1, f
-    print('ok  4 48k counts/s toward the press: no trigger in the air, the '
-          'bed at %.2f x delta' % f)
+    assert 0.8 < f < 1.1, f
+    # 48000 counts/s (Sloe's rate, but cooling): no trigger in the air
+    # either, but past one delta in all the move stops on the press-side
+    # total (the price of review 3's blocker 1, reported)
+    w = World(drift=ramp(-48000.), real=160.)
+    w.off = 4.
+    m, ph, err = descend(mod, w)
+    assert err is not None and 'load on the nozzle between Z legs' in err \
+        and 'toward the press since the first leg' in err, err
+    assert ph.trigger_load is None, ph.trigger_load
+    print('ok  4 10k counts/s toward the press: the bed at %.2f x delta; '
+          '48k counts/s toward the press stops on the press-side total '
+          'after %d legs' % (f, len(w.segments)))
 
 
 def test_5_leg_boundary_in_light_contact(mod):
@@ -354,7 +377,7 @@ def test_5_leg_boundary_in_light_contact(mod):
     # delta, so the previous tare is kept, and the trigger fires at no
     # more than delta + 2 x 48000.
     found = None
-    for drift in (None, ramp(48000.)):
+    for drift in (ramp(48000.), None):
         w = World(drift=drift, stiff=100000., noise=False)
         w.real = 15. * 3 - 0.88   # leg 3 ends 0.88 mm into the bed
         w.off = 160. - w.real
@@ -501,18 +524,145 @@ def test_9_note_baseline_does_not_ratchet(mod):
           'since the last accepted baseline')
 
 
+def test_10_press_side_accumulation(mod):
+    # Review 3, blocker 1: a soft object pressed ~0.2-0.45 x delta more
+    # each leg (under the per-leg jump limit) used to be taken into the
+    # tares leg after leg (4.8 x delta after 11 legs).  The press-side
+    # total since leg 1 (1 x delta) now ends it by about 2 x delta.
+    worst = 0.
+    for frac in (0.2, 0.3, 0.45):
+        for speed, real in ((15., 160.), (4., 30.)):
+            w = World(real=real, soft=frac * 146400. / speed,
+                      soft_at=real - 10.)
+            w.off = 4.
+            m, ph, err = descend(mod, w, speed=speed)
+            load = w.load(w.real) if ph.trigger_load is None \
+                else ph.trigger_load
+            d = m._z_watch._leg_first_delta or m._trigger_delta
+            f = load / d
+            assert f <= 2.0, (frac, speed, f, err)
+            if err is not None:
+                assert 'load on the nozzle between Z legs' in err, err
+            worst = max(worst, f)
+    print('ok  10 a soft object pressed 0.2-0.45 x delta a leg ends by '
+          '%.2f x delta (15 and 4 mm/s)' % worst)
+
+
+def test_11_abort_between_legs(mod):
+    # Review 3, blocker 2: an abort (bed removal, z_power, the column)
+    # that lands while the toolhead is paused for a leg's tare is latched
+    # and raised before the next leg.
+    w = World(real=160.)
+    w.off = 4.
+    m, ph = make(mod, w)
+    orig = m._measure_tare
+    count = [0]
+
+    def measure(gcmd):
+        count[0] += 1
+        if count[0] == 3:       # the pause before leg 3 (1: leg 1)
+            assert ph.active, 'no stand-in registered'
+            ph.abort_active_move("the bed was removed")
+        return orig(gcmd)
+    m._measure_tare = measure
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        assert str(e) == "Homing aborted: the bed was removed", str(e)
+    else:
+        raise AssertionError('the abort between legs was lost')
+    assert len(w.segments) == 2, w.segments
+    assert ph.active == [], ph.active       # the stand-in is gone again
+    # after a normal descent the stand-in is gone too
+    w = World(real=40.)
+    m, ph = make(mod, w)
+    m.probing_move(None)
+    assert ph.active == [], ph.active
+    print('ok  11 an abort between legs is raised with its reason before '
+          'the next leg; the stand-in is removed afterwards')
+
+
+def test_12_mcutare_batch_and_no_progress(mod):
+    # MCUTARE on a long descent: leg 1 armed on the MCU zero (wrong-way
+    # rule off), every later leg on a host tare
+    w = World(real=40.)
+    m, ph = make(mod, w)
+    arms = []
+    orig = m._z_watch.arm
+
+    def arm(*a, **k):
+        arms.append(k.get('mcutare'))
+        return orig(*a, **k)
+    m._z_watch.arm = arm
+    m._approx_tare = w.tare0
+    m._nozzle_is_clear = lambda: True
+    m._mcu_tare = lambda gcmd: m._pause_and_tare(gcmd)
+    m.probing_move(Gcmd(MCUTARE=1))
+    assert arms[0] is True and arms[1:] and not any(arms[1:]), arms
+    # batch mode (file output): one descent
+    w = World(real=40.)
+    m, ph = make(mod, w)
+
+    class FileMcu(object):
+        def is_fileoutput(self):
+            return True
+    m._mcu = FileMcu()
+    m.probing_move(None)
+    assert len(w.segments) == 1 and ph.active == [], w.segments
+    # a leg that did not move: raised, never looped
+    w = World(real=40.)
+    m, ph = make(mod, w)
+
+    def stuck(endstop, pos, speed):
+        raise tg.CommandError("No trigger on probe after full movement")
+    ph.probing_move = stuck
+    try:
+        m.probing_move(None)
+    except tg.CommandError as e:
+        assert 'No trigger' in str(e), str(e)
+    else:
+        raise AssertionError('a stuck leg did not raise')
+    print('ok  12 MCUTARE: leg 1 on the MCU zero, later legs on host tares; '
+          'batch mode is one descent; a leg that did not move raises')
+
+
+def test_13_legs_are_logged(mod):
+    w = World(drift=ramp(20000.), real=60.)
+    w.off = 4.
+    with zb.LogCapture() as cap:
+        m, ph, err = descend(mod, w)
+    assert err is None, err
+    lines = [x for lv, x in cap.lines if 'Z legs touched' in x]
+    assert len(lines) == 1, cap.lines
+    for part in ('legs, tare change since leg 1', 'the wrong way (peak',
+                 'toward the press (peak'):
+        assert part in lines[0], (part, lines[0])
+    st = m._z_watch.get_status()
+    assert st['z_backstop_leg_wrong_peak'] > 0, st
+    m, ph = make(mod, World())
+    m._approx_tare_t = None
+    m._pause_and_tare(None)
+    assert m._approx_tare_t is not None
+    print('ok  13 one INFO line per descent with the wrong-way and '
+          'press-side totals and peaks; _apply_tare stamps the zero')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
     tests = [test_1_hot_ramps_do_not_abort,
              test_2_slow_and_fast_wrong_way_pushes,
              test_3_press_force_after_drift,
-             test_4_press_side_drift_no_trigger_in_air,
+             test_4_press_side_drift,
              test_5_leg_boundary_in_light_contact,
              test_6_collectors_and_aborts,
              test_7_short_descents_unchanged,
              test_8_legs_off_is_today_with_the_follower_capped,
-             test_9_note_baseline_does_not_ratchet]
+             test_9_note_baseline_does_not_ratchet,
+             test_10_press_side_accumulation,
+             test_11_abort_between_legs,
+             test_12_mcutare_batch_and_no_progress,
+             test_13_legs_are_logged]
     failed = []
     for t in tests:
         try:

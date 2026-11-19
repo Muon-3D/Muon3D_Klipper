@@ -6104,6 +6104,13 @@ sensor_type:
 #   The most the tare may move the wrong way (away from the press) over
 #   all the legs of one move, in trigger deltas of the first leg; past it
 #   the move ends as a wrong-way move. The default is 4.0.
+#z_move_press_total_factor: 1.0
+#   The most the tare may move toward the press over all the legs of one
+#   move, in trigger deltas of the first leg; past it the move ends ("load
+#   on the nozzle between Z legs"). This stops a soft object being taken
+#   into the tare a little at a time; a cell drifting toward the press
+#   (cooling) by more than this over one move stops it too. The default is
+#   1.0.
 #z_move_drift_rate_counts: 0
 #   Within one move, judge the wrong side against the tare plus the drift
 #   seen so far, followed at up to this many counts a second and never
