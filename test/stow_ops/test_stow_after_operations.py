@@ -285,6 +285,10 @@ class PrintPathAndPositioning(unittest.TestCase):
                       'gcode_macro Z_PARK'}  # Z_PARK is the raw G0 Z140
             if b == 'M1':  # B0 has no safe park
                 expect.add('print_end_park')
+                # KAN-4683: G28's stow is Z_PARK_XY (the head's park and the
+                # rise in one move, Z_PARK when that is not safe)
+                expect.discard('gcode_macro G28')
+                expect.add('gcode_macro Z_PARK_XY')
             self.assertEqual(direct, expect, b)
 
 

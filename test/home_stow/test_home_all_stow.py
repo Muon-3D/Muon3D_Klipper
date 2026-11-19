@@ -74,7 +74,12 @@ class StowRender(unittest.TestCase):
             for raw in ('', 'STOW=1', 'PARK=1', 'PARK=1 STOW=1'):
                 ok, lines = self.stows(b, raw)
                 self.assertTrue(ok, (b, raw, lines))
-                self.assertEqual(lines[-1], 'Z_PARK', (b, raw))
+                if b == 'M1':
+                    # KAN-4683: the stow carries the head's park
+                    self.assertRegex(lines[-1], r'^Z_PARK_XY X=[\d.]+ '
+                                     r'Y=[\d.]+ F=7800$', (b, raw))
+                else:
+                    self.assertEqual(lines[-1], 'Z_PARK', (b, raw))
                 self.assertTrue(any(ln.startswith('_HOME_Z') for ln in
                                     lines[:-1]), (b, raw))
                 self.assertEqual(sum(ln.startswith('Z_PARK') for ln in
@@ -122,6 +127,52 @@ class StowRender(unittest.TestCase):
             self.assertTrue(any(ln.startswith('_HOME_Z') for ln in lines))
 
 
+class StowAndPark(unittest.TestCase):
+    # KAN-4683: on the M1 the head's park moves from _HOME_Z to Z_PARK_XY
+    # exactly when a stow follows, so it is made once, never skipped
+    def home_z_line(self, raw, **kw):
+        lines = render('M1', raw, **kw)
+        found = [ln for ln in lines if ln.startswith('_HOME_Z')]
+        self.assertEqual(len(found), 1, lines)
+        return found[0], lines
+
+    def test_home_z_knows_whether_a_stow_follows(self):
+        for raw in ('', 'STOW=1', 'PARK=1'):
+            ln, lines = self.home_z_line(raw)
+            self.assertRegex(ln, r'\bSTOW=1$', raw)
+            self.assertTrue(lines[-1].startswith('Z_PARK_XY'), raw)
+        for raw in ('Z', 'X Y Z', 'O', 'STOW=0', 'PARK=0', 'PARK=0 STOW=1'):
+            ln, lines = self.home_z_line(raw)
+            self.assertRegex(ln, r'\bSTOW=0$', raw)
+            self.assertFalse(any(x.startswith('Z_PARK') for x in lines), raw)
+        for st, paused in (('printing', False), ('paused', False),
+                           ('standby', True)):
+            ln, lines = self.home_z_line('', print_state=st, paused=paused)
+            self.assertRegex(ln, r'\bSTOW=0$', (st, paused))
+            self.assertFalse(any(x.startswith('Z_PARK') for x in lines))
+
+    def home_z_text(self, stow):
+        macro = macros_of('M1')['gcode_macro _HOME_Z']['gcode']
+        printer = {'toolhead': {'axis_maximum': {'x': 200.1, 'y': 174.1}}}
+        text = cmc._jinja_env().from_string(macro).render(
+            params={'PARK': '1', 'STOW': str(stow), 'X_OFFSET': '0',
+                    'TOLERANCE': '0'}, printer=printer)
+        return [ln.strip() for ln in text.split(chr(10)) if ln.strip()]
+
+    def test_home_z_parks_unless_the_stow_does(self):
+        lines = self.home_z_text(0)
+        self.assertIn('G0 X195.1 Y169.1 F7800', lines)
+        self.assertEqual(lines.count('M400'), 2)
+        lines = self.home_z_text(1)
+        self.assertFalse(any(ln.startswith('G0 X195') for ln in lines), lines)
+        self.assertEqual(lines.count('M400'), 1)   # the one before the home
+        # either way the Z home itself is untouched
+        for stow in (0, 1):
+            lines = self.home_z_text(stow)
+            self.assertIn('G28.1 Z', lines)
+            self.assertIn('G0 Z10 F7800', lines)
+
+
 class StowTarget(unittest.TestCase):
     def test_stow_position_is_inside_the_z_travel(self):
         for b in BOARDS:
@@ -130,6 +181,12 @@ class StowTarget(unittest.TestCase):
                                 ['gcode']).group(1))
             self.assertEqual(z, 140.0, b)
             self.assertLessEqual(z, float(m['stepper_z']['position_max']), b)
+
+    def test_the_combined_move_goes_to_the_same_stow_position(self):
+        macro = macros_of('M1')['gcode_macro Z_PARK_XY']['gcode']
+        z = re.search(r'G0 X\{px\} Y\{py\} Z([\d.]+) F', macro)
+        self.assertIsNotNone(z)
+        self.assertEqual(float(z.group(1)), 140.0)
 
 
 class InternalCallers(unittest.TestCase):

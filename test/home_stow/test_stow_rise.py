@@ -5,11 +5,15 @@ KAN-4684: Z_PARK raises the bed at 10 mm/s. With the plate height known to
 the contact guard it runs at Z_PARK's known_speed, never above [printer]
 max_z_velocity.
 
-This renders the real macros of core/M1 with jinja2, no klippy and no
-hardware (so it runs on Windows).
+KAN-4683: G28's stow is Z_PARK_XY: the head's park and the rise as ONE move
+when the height is known, X, Y and Z are homed and the plate is at or above
+Z10 (the height the cut and the wipe already move XY at); otherwise the head
+parks first and Z_PARK rises after, as before. This renders the real macros
+of core/M1 with jinja2, no klippy and no hardware (so it runs on Windows).
 
     python3 test/home_stow/test_stow_rise.py
 """
+import math
 import os
 import re
 import sys
@@ -98,6 +102,70 @@ class ZParkSpeed(unittest.TestCase):
     def test_unhomed_z_keeps_the_parking_routine(self):
         lines = render('Z_PARK', homed='xy')
         self.assertEqual(lines, ['AXIS_HOME_MOVE AXIS=Z'])
+
+
+class ParkWithTheRise(unittest.TestCase):
+    PARAMS = {'X': '195.1', 'Y': '169.1', 'F': '7800'}
+
+    def moves(self, **kw):
+        return render('Z_PARK_XY', params=self.PARAMS, **kw)
+
+    def test_a_known_plate_at_z10_travels_with_the_head(self):
+        lines = self.moves()
+        g0 = [ln for ln in lines if ln.startswith('G0')]
+        self.assertEqual(len(g0), 1, lines)
+        self.assertTrue(g0[0].startswith('G0 X195.1 Y169.1 Z140 F'), g0)
+        self.assertNotIn('Z_PARK', lines)
+        # Z runs at the known speed: the path feed is that speed scaled by
+        # the path length over the rise (Klipper holds Z at max_z_velocity)
+        dx, dy, dz = 195.1 - 100., 169.1 - 60., 140. - 10.
+        path = math.sqrt(dx * dx + dy * dy + dz * dz)
+        z_speed = feed_of(g0[0]) / 60. * dz / path
+        self.assertAlmostEqual(z_speed, 15.0, delta=0.02)
+        self.assertLessEqual(feed_of(g0[0]), 7800.)
+
+    def test_the_combined_path_is_never_below_where_it_starts(self):
+        # The XY line is the one the park always took (at Z10); Z only
+        # rises along it, so no point of it is lower than the old park.
+        start_z = 10.
+        for i in range(0, 101):
+            t = i / 100.
+            self.assertGreaterEqual(start_z + t * (140. - start_z), 10.)
+        self.assertEqual(ths.macros_of('M1')['gcode_macro Z_PARK_XY']
+                         ['variable_min_z'], '10')
+
+    def test_what_is_not_safe_parks_first_and_rises_after(self):
+        cases = {
+            'height unknown': dict(guard='unknown'),
+            'no contact guard': dict(guard='none'),
+            'guard does not say': dict(guard='no_key'),
+            'plate below Z10': dict(z=9.5),
+            'Z not homed': dict(homed='xy'),
+            'X not homed': dict(homed='yz'),
+            'Y not homed': dict(homed='xz'),
+            'already at the top': dict(z=140.),
+        }
+        for why, kw in cases.items():
+            lines = self.moves(**kw)
+            g0 = [ln for ln in lines if ln.startswith('G0')]
+            self.assertEqual(g0, ['G0 X195.1 Y169.1 F7800.0'], (why, lines))
+            self.assertEqual(lines[-1], 'Z_PARK', (why, lines))
+            self.assertLess(lines.index(g0[0]), lines.index('Z_PARK'), why)
+
+    def test_the_gcode_state_is_saved_and_restored(self):
+        for kw in ({}, dict(guard='unknown')):
+            lines = self.moves(**kw)
+            self.assertEqual(lines[0], 'SAVE_GCODE_STATE NAME=_z_park_xy_state')
+            self.assertIn('RESTORE_GCODE_STATE NAME=_z_park_xy_state MOVE=0',
+                          lines)
+
+    def test_a_slower_ceiling_slows_the_whole_move(self):
+        lines = self.moves(max_z_velocity=12.)
+        g0 = [ln for ln in lines if ln.startswith('G0')][0]
+        dx, dy, dz = 195.1 - 100., 169.1 - 60., 140. - 10.
+        path = math.sqrt(dx * dx + dy * dy + dz * dz)
+        self.assertAlmostEqual(feed_of(g0) / 60. * dz / path, 12.0,
+                               delta=0.02)
 
 
 if __name__ == '__main__':

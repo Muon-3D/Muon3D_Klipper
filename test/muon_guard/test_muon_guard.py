@@ -1011,6 +1011,8 @@ NOT_FOR_CLIENTS = {
     'LED_TIMEOUT_STATE': 'state holder',
     'WEAR_TEST': 'debug',
     'TEST_SPEED': 'homes and throws the toolhead at max velocity and accel',
+    'Z_PARK_XY': 'step of the G28 stow (KAN-4683): takes the head to the X '
+                 'and Y it is given, unchecked',
     'PID_CALIBRATE': 'M1 has CALIBRATE_HEATING_*; PID_CALIBRATE heats to a '
                      'client target (panel lists it, bare, and it errors)',
     'BED_REMOVED': 'raised by bed_removal_detector, not by a client',
