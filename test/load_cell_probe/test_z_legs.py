@@ -595,6 +595,7 @@ def test_12_mcutare_batch_and_no_progress(mod):
         return orig(*a, **k)
     m._z_watch.arm = arm
     m._approx_tare = w.tare0
+    m._approx_tare_t = 1000.    # fresh: the fake clock reads 1000
     m._nozzle_is_clear = lambda: True
     m._mcu_tare = lambda gcmd: m._pause_and_tare(gcmd)
     m.probing_move(Gcmd(MCUTARE=1))
