@@ -34,6 +34,15 @@ refuses with a pause set.
 Never stowed: Z not homed, `z_power` not `ready` (plate off, column unlocked,
 recovering, fault), Klipper shut down (no G-code runs then anyway).
 
+## How fast (KAN-4684)
+
+- **Speed.** With the plate height known to the contact guard (homed since
+  the last bed removal, motor off, `FORCE_MOVE` or failed home) the rise runs
+  at `Z_PARK`'s `known_speed` (15 mm/s), never above `[printer]
+  max_z_velocity` (15); with the height unknown it is 10 mm/s as before.
+  `Z_SPEED=` (mm/min) overrides either. Acceleration (`max_z_accel`, 1000) is
+  not touched.
+
 ## Does not stow
 
 - A jog (`G0`/`G1` from the Move screen), `CENTER`, `FRONT`: the user put the
