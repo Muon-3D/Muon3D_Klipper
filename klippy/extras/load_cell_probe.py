@@ -1361,6 +1361,9 @@ class LoadCellProbingMove:
         self._tare_counts = 0
         # last known zero, used for the raw-range envelope under MCUTARE
         self._approx_tare = None
+        # KAN-4770: MCUTARE reuses that zero only while it is this recent
+        self._mcutare_max_zero_age = config.getfloat(
+            'mcutare_max_zero_age', 5., minval=0.)
         # Z at which the last probe actually triggered, or None when no
         # probe has triggered yet in this session.
         self._last_trigger_z = None
@@ -1379,6 +1382,7 @@ class LoadCellProbingMove:
     # Class defaults so a move built without __init__ (tests) is inert
     _z_watch = None
     _approx_tare_t = None
+    _mcutare_max_zero_age = 5.
     _tare_time = None
     _trigger_delta = None
     _trigger_press_dir = None
@@ -1606,6 +1610,28 @@ class LoadCellProbingMove:
             return False
         return True
 
+    # KAN-4770: MCUTARE has the host reuse _approx_tare, the zero the last
+    # tap left, as the zero the watch (guard D) arms on.  A hot cell drifts
+    # far past the ceiling in the time between two meshes, so an old zero
+    # must not be reused: the caller then takes a host tare, which also
+    # refreshes it.  _approx_tare_t is a sample time (print_time), the same
+    # clock as estimated_print_time(monotonic()).  0 turns the check off.
+    def _host_zero_is_fresh(self):
+        limit = self._mcutare_max_zero_age
+        if limit <= 0.:
+            return True
+        if self._approx_tare_t is None:
+            return False
+        now = self._load_cell.sensor.get_mcu().estimated_print_time(
+            self._printer.get_reactor().monotonic())
+        age = now - self._approx_tare_t
+        if age > limit:
+            logging.info("load_cell_probe: MCUTARE asked for but the host "
+                         "zero is %.1f s old (limit %.1f s); taking a host "
+                         "tare for this tap", age, limit)
+            return False
+        return True
+
     # Probe towards z_min until the trigger_analog on the MCU triggers.
     # KAN-4364: in legs of at most z_move_leg_time each (see ZLoadBackstop):
     # a leg that ends without a trigger stops there (homing.py sets the
@@ -1621,7 +1647,7 @@ class LoadCellProbingMove:
         _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
         _used_mcutare = False
         if _mcutare and self._approx_tare is not None \
-                and self._nozzle_is_clear():
+                and self._nozzle_is_clear() and self._host_zero_is_fresh():
             self._mcu_tare(gcmd)
             _used_mcutare = True
             tare_t = None

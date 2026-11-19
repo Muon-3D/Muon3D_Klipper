@@ -467,6 +467,7 @@ def test_6_mcutare_and_directionless(mod):
             return [[10., 0., tare]], None
     cell.get_collector = lambda: Fresh()
     m._approx_tare = tare
+    m._approx_tare_t = 1000.    # fresh: the fake clock reads 1000
     m.probing_move(Gcmd(1))
     assert seen['armed'] and seen['limits'] == (552687, 0), seen
     assert m._trigger_delta == DELTA_BOX_800
