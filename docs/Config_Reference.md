@@ -6084,6 +6084,11 @@ sensor_type:
 #   (trigger_counts or trigger_percent with safety_model=preloaded_max),
 #   and not on a descent that uses MCUTARE. 0 turns it off, otherwise at
 #   least 0.5. The default is 1.0.
+#mcutare_max_zero_age: 5.0
+#   A tap sent with MCUTARE=1 reuses the zero the previous tap left,
+#   unless that zero is older than this many seconds (a reheated, drifting
+#   load cell would trip the ceiling above on it); the tap then takes a
+#   normal tare, which refreshes the zero. 0 turns the check off.
 #z_move_abort_confirm_time: 0.020
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
