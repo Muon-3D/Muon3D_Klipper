@@ -54,6 +54,9 @@ class LoadCellHomeZ:
         # boundary falls on the plate
         self.fast_approach = config.getboolean('fast_approach', True)
         self.fast_margin = config.getfloat('fast_margin', 12., minval=5.)
+        # a heater this far (C) from its target is still settling
+        self.heater_settle = config.getfloat('fast_heater_settle', 3.,
+                                             minval=0.)
         self.false_touches = 0
         self.last_attempts = 0
         self.fast_homes = 0
@@ -89,6 +92,19 @@ class LoadCellHomeZ:
             known = False
         if not known:
             return None, 'height not known'
+        # A heater still settling (a hot end heating at print start) makes
+        # the cell's drift rate rise within a leg, faster than a plan from
+        # measured drift can follow: 1 s legs only until it is at target.
+        heaters = self.printer.lookup_object('heaters', None)
+        try:
+            for h in (heaters.heaters.values() if heaters else ()):
+                st = h.get_status(self.printer.get_reactor().monotonic())
+                if (st.get('target', 0.) > 0.
+                        and abs(st['temperature'] - st['target'])
+                        > self.heater_settle):
+                    return None, 'heater settling'
+        except Exception:
+            return None, 'heaters unreadable'
         z = th_status['position'][2]
         above = self.fast_margin
         if z <= above + 1.:

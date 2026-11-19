@@ -421,6 +421,38 @@ class KnownZ(unittest.TestCase):
         fasts = [p for p in self.probes(m) if 'FAST_ABOVE' in p]
         self.assertEqual(len(fasts), 1)     # only the first attempt
 
+    def heaters(self, *pairs):
+        class H:
+            def __init__(self, t, g):
+                self.t, self.g = t, g
+            def get_status(self, et):
+                return {'temperature': self.t, 'target': self.g}
+
+        class Hs:
+            heaters = {'h%d' % i: H(t, g) for i, (t, g) in enumerate(pairs)}
+        return Hs()
+
+    def run_with_heaters(self, *pairs):
+        m = Machine(real_start=140., known=True)
+        p = FakePrinter(m)
+        p.objs['heaters'] = self.heaters(*pairs)
+        obj = load_cell_home_z.load_config(FakeConfig(p))
+        p.objs['gcode'].cmds['LOAD_CELL_HOME_Z'](FakeGcmd())
+        return m, obj
+
+    def test_a_heater_still_settling_takes_the_old_path(self):
+        # print start: the hot end is heating; its drift rises inside a leg
+        for pairs in (((120., 215.),), ((215., 215.), (30., 60.))):
+            m, obj = self.run_with_heaters(*pairs)
+            self.legacy(m, obj, pairs)
+            self.assertEqual(obj.last_fast, 'heater settling')
+
+    def test_heaters_at_target_or_off_do_not_stop_it(self):
+        for pairs in (((214., 215.), (60., 60.)), ((25., 0.),), ()):
+            m, obj = self.run_with_heaters(*pairs)
+            self.assertEqual(obj.fast_homes, 1, pairs)
+            self.assertEqual(self.soft_homes(m), 0, pairs)
+
     def test_the_status_says_what_the_last_home_did(self):
         m = Machine(real_start=140., known=True)
         obj, cmd = make(m)

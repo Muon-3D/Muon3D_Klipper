@@ -290,6 +290,76 @@ def test_homed_flag_lost_and_put_back_is_not_a_height():
     assert r.refused(60., 60., 20.) is None
 
 
+def test_clear_homed_z_drops_the_height_even_if_put_back_unpolled():
+    # KAN-4682 review: z_power's idle PGOOD recovery runs
+    # SET_KINEMATIC_POSITION CLEAR_HOMED=Z; _HOME_Z then sets the flag back
+    # on the same Z before anything polls the guard. The flag is back, the
+    # height must not be.
+    r = Rig(z=20.)
+    assert r.status()['z_known'] is True
+    r.printer.send_event("force_move:homing_cleared", 'z')
+    r.printer.toolhead.homed_axes = 'xyz'       # SET_HOMED=Z, Z unchanged
+    r.set_position()
+    assert r.status()['z_known'] is False
+    assert r.refused(60., 60., 20.) == HOME_FIRST
+    r.home_z()
+    assert r.status()['z_known'] is True
+    # clearing X or Y says nothing about Z
+    r.printer.send_event("force_move:homing_cleared", 'xy')
+    assert r.status()['z_known'] is True
+
+
+def test_set_kinematic_position_clear_homed_sends_the_event():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
+                                    'klippy'))
+    from extras import force_move
+    events = []
+
+    class P(object):
+        def send_event(self, name, *a):
+            events.append((name, a))
+
+    class K(object):
+        cleared = None
+
+        def clear_homing_state(self, axes):
+            K.cleared = axes
+
+    class TH(object):
+        def get_last_move_time(self):
+            pass
+
+        def get_position(self):
+            return [1., 2., 3., 0.]
+
+        def set_position(self, pos, homing_axes=''):
+            pass
+
+        def get_kinematics(self):
+            return K()
+
+    class G(object):
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def get_float(self, k, d=None, **_):
+            return self.kw.get(k, d)
+
+        def get(self, k, d=None, **_):
+            return self.kw.get(k, d)
+
+    fm = force_move.ForceMove.__new__(force_move.ForceMove)
+    p = P()
+    p.lookup_object = lambda n: TH()
+    fm.printer = p
+    fm.cmd_SET_KINEMATIC_POSITION(G(CLEAR_HOMED='Z', SET_HOMED=''))
+    assert events == [("force_move:homing_cleared", ('z',))], events
+    assert K.cleared == 'z'
+    del events[:]
+    fm.cmd_SET_KINEMATIC_POSITION(G(Z=5.))      # a plain set clears nothing
+    assert events == [], events
+
+
 # Option A (Jack, 12 Nov): "XY homing lifts the plate first, so nothing
 # scratches unless Z is moved down later".  A homing move that lifted the
 # plate vouches for XY at that height until Z moves down or is let go.

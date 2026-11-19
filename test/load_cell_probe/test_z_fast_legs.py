@@ -162,7 +162,7 @@ def test_6_a_rate_that_jumps_inside_a_long_leg_is_stopped(mod):
     assert err is not None and (
         err == 'Homing aborted: ' + zb.WRONG_WAY_REASON
         or 'first leg' in err), err
-    assert w.real > 15., w.real
+    assert w.real >= ABOVE - 0.5, w.real
     # counted from the tare of the leg it happened in
     over = abs(w.counts() - m._tare_counts) / float(m._trigger_delta)
     assert over <= 1.0 + 100000. * 0.045 / m._trigger_delta + 0.02, over
@@ -170,10 +170,60 @@ def test_6_a_rate_that_jumps_inside_a_long_leg_is_stopped(mod):
     # air, far above the plate; the home treats it as a false touch
     w = known_world(drift=lambda s: -100000. * max(0., s - 4.), noise=False)
     m, ph, err = run(mod, w)
-    assert err is None and w.real > 15., (err, w.real)
+    assert err is None and w.real >= ABOVE - 0.5, (err, w.real)
     print('ok  6 100000 counts/s the wrong way after 4 s: aborted at %.2f x '
           'delta of drift; toward the press: a trigger at Z%.0f, above the '
           'plate (a false touch for the home)' % (over, w.real))
+
+
+def heating(rate_at, ramp_s, peak=48000., t0=0.):
+    # drift of a cell under a heating hot end: the rate grows linearly from
+    # t0 to `peak` counts/s over ramp_s seconds and holds
+    def drift(s):
+        s = max(0., s - t0)
+        if s < ramp_s:
+            return 0.5 * peak * s * s / ramp_s
+        return 0.5 * peak * ramp_s + peak * (s - ramp_s)
+    return drift
+
+
+def test_6b_a_home_at_print_start_while_the_hot_end_heats(mod):
+    # Today's field case: G28 at print start with the hot end heating, Z
+    # known, the drift rate rising from nothing to Sloe's 48000 counts/s
+    # (wrong way) over 1 to 12 s. #148's 1 s legs finish each of these
+    # homes; a long leg must not turn one into a wrong-way abort. The plan
+    # follows the larger of the rate since leg 1 and the rate over the last
+    # leg, and gives no growth to a rate that has risen 1.5x.
+    rows = []
+    for ramp in (1., 2., 4., 8., 12.):
+        for onset in (0., 2., 5.):
+            d = heating(None, ramp, t0=onset)
+            legacy = known_world(drift=d)
+            m0, ph0, err0 = zl.descend(mod, legacy)
+            assert err0 is None, ('#148 itself aborted', ramp, onset, err0)
+            w = known_world(drift=d)
+            m, ph, err = run(mod, w)
+            step = ramp < 2. and onset > 0.
+            if step:
+                # a rate that goes from nothing to 48000 counts/s in a
+                # second, in the middle of a long leg, is beyond what any
+                # plan from measured drift can see: only the wrong-way
+                # rule (1 x delta) is left, and it is. This is what the
+                # heater gate of LOAD_CELL_HOME_Z is for (a heating hot end
+                # never takes the fast path; test_load_cell_home_z).
+                assert err is None or zb.WRONG_WAY_REASON in err, err
+                step_worst = max(ph.leg_dev) / m._trigger_delta
+                assert step_worst <= 1.1, (ramp, onset, step_worst)
+                continue
+            assert err is None and ph.calls == [], (ramp, onset, err)
+            worst = max(ph.leg_dev[:-1]) / m._trigger_delta
+            assert worst <= 0.85, (ramp, onset, worst)
+            rows.append((ramp, onset, worst, len(w.segments),
+                         max(leg_seconds(w))))
+    print('ok  6b hot end heating (ramp 2..12 s, onset 0/2/5 s): every home '
+          'finishes as #148 does, worst leg deviation %.2f x delta, longest '
+          'leg %.1f s; a 1 s step in a long leg stays under 1.1 x delta '
+          '(0.9 seen)' % (max(r[2] for r in rows), max(r[4] for r in rows)))
 
 
 def test_7_a_held_press_side_jump_gets_no_growth(mod):
@@ -227,6 +277,73 @@ def test_9_the_plan_is_in_the_status_and_the_log(mod):
           'are in the status, a maximum under the leg time is refused')
 
 
+def test_10_a_bed_removal_abort_in_a_long_leg_and_at_a_boundary(mod):
+    # (a) in the middle of a long leg: the move ends with the reason, no
+    # further leg runs, the plate is nowhere near
+    w = known_world(drift=zl.ramp(0.), noise=False)
+    m, ph = zl.make(mod, w, gcmd=zl.Gcmd(FAST_ABOVE=ABOVE))
+    fired = []
+    counts = w.counts
+
+    def counts_and_abort():
+        # leg 1 is 1 s, leg 2 is 3 s: 6 s in is inside leg 3 (4 s)
+        if not fired and w.t - 10. > 6.0:
+            fired.append(w.t)
+            ph.abort_active_move("the bed was removed")
+        return counts()
+    w.counts = counts_and_abort
+    try:
+        m.probing_move(zl.Gcmd(FAST_ABOVE=ABOVE))
+    except tg.CommandError as e:
+        assert str(e) == "Homing aborted: the bed was removed", str(e)
+    else:
+        raise AssertionError('the abort in a long leg was lost')
+    secs = leg_seconds(w)
+    assert len(w.segments) == 3 and 0. < secs[2] < 4., secs
+    assert m._z_watch._leg_times[2] > 2., m._z_watch._leg_times
+    assert w.real > ABOVE, w.real
+    assert ph.active == [], ph.active
+    leg_plan = m._z_watch._leg_times[2]
+    # (b) at the boundary before the long leg 3: raised before it starts
+    w = known_world(drift=zl.ramp(0.), noise=False)
+    m, ph = zl.make(mod, w, gcmd=zl.Gcmd(FAST_ABOVE=ABOVE))
+    orig = m._measure_tare
+    count = [0]
+
+    def measure(gcmd):
+        count[0] += 1
+        if count[0] == 3:       # the pause before leg 3 (1: leg 1)
+            assert ph.active, 'no stand-in registered'
+            ph.abort_active_move("the bed was removed")
+        return orig(gcmd)
+    m._measure_tare = measure
+    try:
+        m.probing_move(zl.Gcmd(FAST_ABOVE=ABOVE))
+    except tg.CommandError as e:
+        assert str(e) == "Homing aborted: the bed was removed", str(e)
+    else:
+        raise AssertionError('the abort at a boundary was lost')
+    assert len(w.segments) == 2, w.segments
+    assert w.real > ABOVE and ph.active == [], (w.real, ph.active)
+    print('ok  10 a bed removal in a long leg ends it (leg 3 planned %.1f s, '
+          'ran %.1f s); at the boundary before it, no leg 3 runs'
+          % (leg_plan, secs[2]))
+
+
+def test_11_fast_above_is_clamped_to_5_mm(mod):
+    # FAST_ABOVE=0 (or 2): the long legs still end 5 mm over the plate
+    for above in (0., 2.):
+        w = known_world(drift=zl.ramp(0.), noise=False)
+        m, ph, err = run(mod, w, above=above)
+        assert err is None, err
+        ends = [round(b, 2) for a, b in w.segments[:-1]]
+        assert 5.0 in ends, (above, ends)
+        for a, b in w.segments:
+            assert not (a > 5. + 1e-6 and b < 5. - 1e-6), (above, a, b)
+        assert max(leg_seconds(w)[-2:]) <= 1.0 + 1e-6, leg_seconds(w)
+    print('ok  11 FAST_ABOVE below 5 mm is taken as 5: the legs end on Z5')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -236,9 +353,12 @@ def main():
              test_4_without_fast_above_nothing_changes,
              test_5_an_obstacle_in_a_long_leg_stops_at_the_trigger,
              test_6_a_rate_that_jumps_inside_a_long_leg_is_stopped,
+             test_6b_a_home_at_print_start_while_the_hot_end_heats,
              test_7_a_held_press_side_jump_gets_no_growth,
              test_8_the_mcu_zero_ignores_fast_above,
-             test_9_the_plan_is_in_the_status_and_the_log]
+             test_9_the_plan_is_in_the_status_and_the_log,
+             test_10_a_bed_removal_abort_in_a_long_leg_and_at_a_boundary,
+             test_11_fast_above_is_clamped_to_5_mm]
     failed = []
     for t in tests:
         try:

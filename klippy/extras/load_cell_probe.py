@@ -716,6 +716,8 @@ class ZLoadBackstop:
         self._fast_noise = config.getfloat(
             'z_move_fast_noise_counts', 11000., minval=0.)
         self._leg_first_t = None
+        self._fast_prev = (0, None)     # the tare before this one, and when
+        self._fast_prev_raw = None      # its change per second, no spread
         self._leg_last_time = 0.
         self._leg_times = []        # seconds each leg was planned for
         self._leg_pauses = []       # seconds between one leg and the next
@@ -930,6 +932,8 @@ class ZLoadBackstop:
         self._legs = 1
         self._leg_first_tare = tare_counts
         self._leg_first_t = tare_time
+        self._fast_prev = (tare_counts, tare_time)
+        self._fast_prev_raw = None
         self._leg_last_time = self._leg_time
         self._leg_times = []
         self._leg_pauses = []
@@ -1026,11 +1030,27 @@ class ZLoadBackstop:
             plan['why'] = 'press-side jump held'
             return base
         elapsed = t - self._leg_first_t
+        prev_tare, prev_t = self._fast_prev
+        self._fast_prev = (tare, t)
         if elapsed < base * 0.5:
             plan['why'] = 'too soon after leg 1'
             return base
         moved = abs(tare - self._leg_first_tare)
+        # the rate since leg 1 and the rate over the last leg: a cell whose
+        # drift is speeding up (a hot end heating) shows in the second, and
+        # the larger of the two is planned for.  A rate that has risen since
+        # the leg before (1.5x and more than a tare's spread) gets no growth.
         rate = (moved + self._fast_noise) / elapsed
+        dt = (t - prev_t) if prev_t is not None else 0.
+        if dt > 0.:
+            raw = abs(tare - prev_tare) / dt
+            rate = max(rate, raw + self._fast_noise / dt)
+            before, self._fast_prev_raw = self._fast_prev_raw, raw
+            if (before is not None
+                    and raw > 1.5 * before + self._fast_noise / dt):
+                plan['why'] = 'drift rising'
+                plan['rate'] = rate
+                return base
         plan['rate'] = rate
         allowed = self._fast_budget * delta / (self._fast_safety * rate)
         grown = self._leg_last_time * self._fast_growth
@@ -1310,6 +1330,9 @@ class LoadCellProbingMove:
 
     MAX_BASELINE_DRIFT_COUNTS = 100000
 
+    # KAN-4682: the lowest FAST_ABOVE honoured (mm)
+    FAST_ABOVE_MIN = 5.
+
     # The MCU's auto_offset zero is RELATIVE: it becomes whatever the load
     # is when the descent arms.  Taking it while the nozzle is touching
     # absorbs the contact force into "zero".  Require this much clearance
@@ -1435,6 +1458,10 @@ class LoadCellProbingMove:
                 and watch.fast_enabled()
                 and not _used_mcutare and tare_t is not None):
             fast_above = gcmd.get_float('FAST_ABOVE', None)
+            if fast_above is not None:
+                # never closer to the plate than 5 mm: the legs that find
+                # it are the 1 s ones whatever a caller passes
+                fast_above = max(self.FAST_ABOVE_MIN, fast_above)
         if watch is not None:
             watch.start_legs(self._tare_counts, self._trigger_delta, tare_t)
         latch = None
