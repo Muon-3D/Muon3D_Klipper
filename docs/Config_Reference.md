@@ -6084,7 +6084,7 @@ sensor_type:
 #   (trigger_counts or trigger_percent with safety_model=preloaded_max),
 #   and not on a descent that uses MCUTARE. 0 turns it off, otherwise at
 #   least 0.5. The default is 1.0.
-#mcutare_max_zero_age: 5.0
+#mcutare_max_zero_age: 2.5
 #   A tap sent with MCUTARE=1 reuses the zero the previous tap left,
 #   unless that zero is older than this many seconds (a reheated, drifting
 #   load cell would trip the ceiling above on it); the tap then takes a

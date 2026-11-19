@@ -1062,7 +1062,7 @@ class LoadCellProbingMove:
         self._approx_tare = None
         # KAN-4770: MCUTARE reuses that zero only while it is this recent
         self._mcutare_max_zero_age = config.getfloat(
-            'mcutare_max_zero_age', 5., minval=0.)
+            'mcutare_max_zero_age', 2.5, minval=0.)
         # Z at which the last probe actually triggered, or None when no
         # probe has triggered yet in this session.
         self._last_trigger_z = None
@@ -1081,7 +1081,12 @@ class LoadCellProbingMove:
     # Class defaults so a move built without __init__ (tests) is inert
     _z_watch = None
     _approx_tare_t = None
-    _mcutare_max_zero_age = 5.
+    # 2.5 s: a stale zero is only safe while the drift it misses stays under
+    # the ceiling's margin over delta, (z_move_abort_ceiling_factor - 1) x
+    # delta = 1.5 x 126075 = 189000 counts for the smallest delta seen;
+    # at the 48000 counts/s worst hot drift that is 3.9 s, and 2.5 s keeps
+    # about a third of it (review F1, #151).  Older zeros take a host tare.
+    _mcutare_max_zero_age = 2.5
     _tare_time = None
     _trigger_delta = None
     _trigger_press_dir = None
