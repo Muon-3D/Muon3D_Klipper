@@ -109,7 +109,13 @@ class PrintStartUnchanged(_Base):
         self.assertTrue(before, self.m1.timeline)
         for line in before:
             self.assertEqual(float(line.split('S')[1]), OOZE_TEMP, line)
-        self.assertEqual(hotend_heating(self.m1.timeline[:mesh]), before)
+        # D-178: the only waits are the heat soak's, for OOZE_TEMP itself
+        # (not the print temperature), so none of them heats above it.
+        soak = ['MACHINE_HEAT_WAIT HEATER=extruder MINIMUM=%s' % (OOZE_TEMP - 0.5),
+                'TEMPERATURE_WAIT SENSOR=extruder MAXIMUM=%s' % (OOZE_TEMP + 5)]
+        heating = [line for line in hotend_heating(self.m1.timeline[:mesh])
+                   if line not in soak]
+        self.assertEqual(heating, before)
         # The print temperature is only asked for after the mesh.
         after = [line for line in self.m1.timeline[mesh:]
                  if line.split()[0].upper() == 'M104']
