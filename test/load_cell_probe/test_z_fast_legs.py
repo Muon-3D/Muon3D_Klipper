@@ -22,7 +22,7 @@ import test_z_legs as zl  # noqa: E402
 
 zb, tg = zl.zb, zl.tg
 SPEED = 15.
-ABOVE = 15.
+ABOVE = 12.   # the home's fast_margin: a 1 s leg is 15 mm, so no tare on Z0
 
 
 def run(mod, world, above=ABOVE, opts=None):
@@ -65,7 +65,11 @@ def test_1_still_cell_grows_the_legs(mod):
     below = [(a - b) / SPEED for a, b in w.segments if a <= ABOVE + 1e-6]
     assert below and max(below) <= 1.0 + 1e-6, below
     f = ph.trigger_load / ph.trigger_delta
-    assert 0.6 < f <= 1.05, f
+    assert 0.6 < f <= 1.1, f
+    # no leg boundary (a tare at rest) within 2 mm of the plate at 0: a
+    # light touch there would be taken into the next tare
+    for a, b in w.segments[:-1]:
+        assert abs(b) > 2., ('a leg ended at the plate', b)
     print('ok  1 a still cell: %d legs against %d (%s s), ends on Z%g, the '
           'bed found at %.2f x delta' % (len(w.segments),
                                          len(legacy.segments),

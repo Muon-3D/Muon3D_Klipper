@@ -341,16 +341,16 @@ class KnownZ(unittest.TestCase):
         self.assertEqual(self.soft_homes(m), 0)
         fast = self.probes(m)[0]
         self.assertIn('PROBE_SPEED=15.000', fast)
-        self.assertIn('FAST_ABOVE=15.000', fast)
+        self.assertIn('FAST_ABOVE=12.000', fast)
         self.assertNotIn('FAST_ABOVE', self.probes(m)[1])   # the confirm
         self.assertEqual(obj.fast_homes, 1)
         self.assertEqual(obj.last_fast, 'known')
 
     def test_the_margin_is_a_config_value(self):
         m = Machine(real_start=140., known=True)
-        obj, cmd = make(m, fast_margin=12.)
+        obj, cmd = make(m, fast_margin=10.)
         cmd(FakeGcmd())
-        self.assertIn('FAST_ABOVE=12.000', self.probes(m)[0])
+        self.assertIn('FAST_ABOVE=10.000', self.probes(m)[0])
 
     def legacy(self, m, obj, why):
         self.assertEqual(self.soft_homes(m), 1, why)
@@ -374,7 +374,7 @@ class KnownZ(unittest.TestCase):
         self.assertEqual(obj.last_fast, 'Z not homed')
 
     def test_a_head_already_in_the_margin_is_homed_as_before(self):
-        m = Machine(real_start=16., known=True)
+        m = Machine(real_start=13., known=True)
         obj, cmd = make(m)
         cmd(FakeGcmd())
         self.legacy(m, obj, 'inside the margin')

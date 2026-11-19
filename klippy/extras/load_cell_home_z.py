@@ -24,7 +24,9 @@
 # home keeps its frame and descends from where it is: the legs above
 # fast_margin mm (the plate is expected at Z0) may run longer, as far as the
 # measured drift allows (ZLoadBackstop.fast_leg_time), and the last
-# fast_margin mm are the 1 s legs of #148, unchanged.  Nothing of the
+# fast_margin mm are the 1 s legs of #148, unchanged (12: a 1 s leg is
+# 15 mm, so the boundaries fall at +12 and -3, never on the plate at 0,
+# where a light touch would be taken into the next tare).  Nothing of the
 # trigger, the backstop or the tares is switched off: every leg is armed.
 # Z unknown, a repeat after a false touch, or the guard not saying "known":
 # the home is what it was.
@@ -47,9 +49,11 @@ class LoadCellHomeZ:
         self.confirm_lift = config.getfloat('confirm_lift', 1., above=0.)
         self.final_lift = config.getfloat('final_lift', 10., minval=0.)
         # KAN-4682: see the top.  fast_margin is where the plate is
-        # expected, Z0, plus this much: the legs below it are the short ones
+        # expected, Z0, plus this much: the legs below it are the short ones.
+        # Keep it clear of a multiple of the 1 s leg (15 mm) so no leg
+        # boundary falls on the plate
         self.fast_approach = config.getboolean('fast_approach', True)
-        self.fast_margin = config.getfloat('fast_margin', 15., minval=5.)
+        self.fast_margin = config.getfloat('fast_margin', 12., minval=5.)
         self.false_touches = 0
         self.last_attempts = 0
         self.fast_homes = 0
