@@ -70,6 +70,14 @@ PROGRESS = {'progress_left', 'progress_left_mirror', 'progress_right',
 SETUP = {'setup_left', 'setup_left_mirror', 'setup_right',
          'setup_right_mirror'}
 
+BOTH_MODE = frozenset({'muon_mode_left', 'muon_mode_right'})
+
+
+def idle_set(idle):
+    """A test's idle look: 'ready', or BOTH_MODE for a user mode."""
+    return set(idle) if isinstance(idle, (set, frozenset)) else {idle}
+
+
 _MISSING = object()
 
 
@@ -424,8 +432,18 @@ class M1Leds:
         return status['variables']
 
     def mode_params(self):
-        """SET_LED_EFFECT's params on the last muon_mode render."""
-        return self.printer.lookup_object('led_effect muon_mode').params
+        """SET_LED_EFFECT's params on the last muon_mode_left render."""
+        return self.printer.lookup_object('led_effect muon_mode_left').params
+
+    def strip_params(self, strip):
+        return self.printer.lookup_object(
+            'led_effect muon_mode_' + strip).params
+
+    def forget_per_strip_saves(self):
+        """Back to a variables file from before KAN-4899: only muon_led."""
+        saved = self.printer.lookup_object('save_variables').allVariables
+        saved.pop('muon_led_left', None)
+        saved.pop('muon_led_right', None)
 
     def errors(self):
         # Klippy answers an unknown command with a plain '//' line, not
@@ -496,7 +514,7 @@ class HarnessCanFail(LedTestCase):
         # DelayedGcode logs and swallows what its script raises, so
         # tearDown checks the responses and the log.
         self.leds.run('LED_MODE MODE=solid H=30')
-        self.leds.effect('muon_mode').fail = True
+        self.leds.effect('muon_mode_left').fail = True
         self.leds.run('SET_GCODE_VARIABLE MACRO=LED_TIMEOUT_STATE '
                       'VARIABLE=laststate VALUE="\'LED_COMPLETE\'"')
         self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_COMPLETE_DONE '
@@ -563,7 +581,8 @@ class ModeChangeWhileBusy(LedTestCase):
                 self.assertEqual(self.leds.laststate(), 'LED_PRINTING')
                 self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'],
                                  mode)
-                self.assertEqual(self.leds.saved()['muon_led']['mode'], mode)
+                saved = self.leds.saved()['muon_led_left']
+                self.assertEqual(saved['mode'], mode)
 
     def test_every_active_state_is_kept(self):
         states = {'LED_SETUP_PROGRESS': SETUP, 'LED_PRINTING': PROGRESS,
@@ -581,12 +600,12 @@ class ModeChangeWhileBusy(LedTestCase):
         self.leds.run('LED_MODE MODE=solid H=30')
         self.assertEqual(self.leds.lit(), PROGRESS)
         self.leds.run('LED_READY')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'], 'solid')
 
     def test_idle_mode_change_shows_now(self):
         self.leds.run('LED_MODE MODE=solid H=30')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.run('LED_MODE MODE=off')
         self.assertEqual(self.leds.lit(), set())
         self.leds.run('LED_MODE MODE=status')
@@ -606,7 +625,7 @@ class ModeAfterPrintEnd(LedTestCase):
     def setUp(self):
         super().setUp()
         self.leds.run('LED_MODE MODE=gradient H=30 H2=210')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.job('printing')
         self.leds.run('LED_SETUP_PROGRESS')
         self.leds.run('LED_PRINTING')
@@ -617,7 +636,7 @@ class ModeAfterPrintEnd(LedTestCase):
         self.leds.wait(30)
         self.assertEqual(self.leds.lit(), {'complete'})
         self.leds.wait(600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.laststate(), 'LED_READY')
         self.assertEqual(self.leds.mode_params()['MODE'], 'gradient')
 
@@ -633,7 +652,7 @@ class ModeAfterPrintEnd(LedTestCase):
         self.leds.run('LED_TIMEOUT_SET M=30')
         self.print_end()
         self.leds.wait(600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.wait(30 * 60 + 1)
         self.assertEqual(self.leds.lit(), set())
 
@@ -666,7 +685,7 @@ class CustomReadyRecordsState(LedTestCase):
         self.leds.run('LED_MODE MODE=solid H=30')
         self.leds.run('LED_INFO')
         self.leds.run('LED_READY')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.laststate(), 'LED_READY')
         self.leds.run('LED_MODE MODE=status')
         self.assertEqual(self.leds.lit(), {'ready'})
@@ -677,7 +696,7 @@ class CustomReadyRecordsState(LedTestCase):
         self.leds.run('LED_COMPLETE')
         self.leds.run('LED_READY')
         self.leds.run('LED_TIMEOUT_SET M=-1')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
 
 class CustomModeTimeout(LedTestCase):
@@ -686,7 +705,7 @@ class CustomModeTimeout(LedTestCase):
     def setUp(self):
         super().setUp()
         self.leds.run('LED_MODE MODE=solid H=30')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
     def test_timeout_zero_turns_it_off(self):
         self.leds.run('LED_TIMEOUT_SET M=0')
@@ -694,9 +713,9 @@ class CustomModeTimeout(LedTestCase):
 
     def test_positive_timeout_turns_it_off_later(self):
         self.leds.run('LED_TIMEOUT_SET M=2')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.wait(119)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.wait(2)
         self.assertEqual(self.leds.lit(), set())
 
@@ -706,7 +725,7 @@ class CustomModeTimeout(LedTestCase):
         self.leds.wait(100)
         self.leds.run('LED_MODE MODE=solid H=30')
         self.leds.wait(30)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.leds.wait(91)
         self.assertEqual(self.leds.lit(), set())
 
@@ -714,7 +733,7 @@ class CustomModeTimeout(LedTestCase):
         self.leds.run('LED_TIMEOUT_SET M=2')
         self.leds.run('LED_TIMEOUT_SET M=-1')
         self.leds.wait(3600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
 
 class LedsNeverBlockShutdown(LedTestCase):
@@ -831,7 +850,7 @@ class ConnectPulseRestoresState(LedTestCase):
         self.leds.run('LED_MODE MODE=solid H=30')
         self.leds.run('LED_CONNECTED')
         self.leds.wait(1)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
     def test_connect_during_the_glow_after_a_print(self):
         self.leds.run('LED_MODE MODE=solid H=30')
@@ -842,7 +861,7 @@ class ConnectPulseRestoresState(LedTestCase):
         self.leds.wait(1)
         self.assertEqual(self.leds.lit(), {'complete'})
         self.leds.wait(600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
 
 class ModeShowsWhenNoPrint(LedTestCase):
@@ -853,7 +872,7 @@ class ModeShowsWhenNoPrint(LedTestCase):
         self.leds.run('UNLOAD_FILAMENT TEMP=250')
         self.assertEqual(self.leds.laststate(), 'LED_INFO')
         self.leds.run('LED_MODE MODE=solid H=30')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.laststate(), 'LED_READY')
 
     def test_after_a_dismissed_filament_prompt(self):
@@ -864,7 +883,7 @@ class ModeShowsWhenNoPrint(LedTestCase):
                 self.leds.run(prompt)
                 self.assertEqual(self.leds.lit(), {'info'})
                 self.leds.run('LED_MODE MODE=chase H=0 H2=180')
-                self.assertEqual(self.leds.lit(), {'muon_mode'})
+                self.assertEqual(self.leds.lit(), BOTH_MODE)
 
     def test_after_a_failed_print(self):
         self.leds.job('printing')
@@ -875,7 +894,7 @@ class ModeShowsWhenNoPrint(LedTestCase):
         self.assertEqual(self.leds.lit(), SETUP)
         self.leds.job('error')
         self.leds.run('LED_MODE MODE=solid H=30')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
     def test_a_mode_chosen_during_a_print_that_fails(self):
         self.leds.job('printing')
@@ -887,7 +906,7 @@ class ModeShowsWhenNoPrint(LedTestCase):
         self.leds.job('error')
         self.assertEqual(self.leds.lit(), {'warning'})
         self.leds.wait(600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.laststate(), 'LED_READY')
 
     def test_a_paused_print_still_defers(self):
@@ -904,6 +923,7 @@ class SavedModeAndStandalone(LedTestCase):
     """KAN-568 nits: a bad saved mode, and led.cfg on its own."""
 
     def restore(self, value):
+        self.leds.forget_per_strip_saves()
         self.leds.run('SAVE_VARIABLE VARIABLE=muon_led VALUE="%s"' % (value,))
         self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE DURATION=1')
         self.leds.wait(2)
@@ -918,7 +938,7 @@ class SavedModeAndStandalone(LedTestCase):
         self.restore("{'mode': 'solid'}")
         self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'], 'solid')
         self.assertEqual(self.leds.macro_vars('LED_MODE')['h'], 0.)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
 
     def test_a_good_saved_mode_is_restored(self):
         self.restore("{'mode': 'breathe', 'h': 90, 'h2': 180, "
@@ -976,7 +996,7 @@ class FailedPrintWarns(LedTestCase):
         self.leds.wait(30)
         self.assertEqual(self.leds.lit(), {'warning'})
         self.leds.wait(600)
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.laststate(), 'LED_READY')
 
     def test_status_keeps_what_was_lit(self):
@@ -1008,7 +1028,7 @@ class FailedPrintWarns(LedTestCase):
     def test_choosing_a_mode_ends_the_warning(self):
         self.fail_print()
         self.leds.run('LED_MODE MODE=rainbow')
-        self.assertEqual(self.leds.lit(), {'muon_mode'})
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
         self.assertEqual(self.leds.mode_params()['MODE'], 'rainbow')
 
 
@@ -1022,17 +1042,17 @@ class PromptAfterConnect(LedTestCase):
         self.leds.run('FILAMENT_INSERT_MODE_PROMPT')
 
     def test_connect_then_prompt(self):
-        for mode, idle in (('status', 'ready'), ('solid', 'muon_mode')):
+        for mode, idle in (('status', 'ready'), ('solid', BOTH_MODE)):
             with self.subTest(mode=mode):
                 self.leds.run('LED_MODE MODE=%s H=30' % (mode,))
-                self.assertEqual(self.leds.lit(), {idle})
+                self.assertEqual(self.leds.lit(), idle_set(idle))
                 self.connect_with_prompt()
                 self.leds.wait(1)
                 self.assertEqual(self.leds.lit(), {'info'})
                 self.assertEqual(self.leds.laststate(), 'LED_INFO')
                 # A button on the prompt ends it, and the idle look returns.
                 self.leds.run('FILAMENT_INSERT_QUICK_LOAD')
-                self.assertEqual(self.leds.lit(), {idle})
+                self.assertEqual(self.leds.lit(), idle_set(idle))
 
 
 class BootOrder(unittest.TestCase):
@@ -1061,21 +1081,21 @@ class BootOrder(unittest.TestCase):
         leds.run('FILAMENT_INSERT_MODE_PROMPT')
 
     def test_restore_first(self):
-        for mode, idle in (('status', 'ready'), ('solid', 'muon_mode')):
+        for mode, idle in (('status', 'ready'), ('solid', BOTH_MODE)):
             with self.subTest(mode=mode):
                 leds = self.boot(mode)
                 leds.wait(2.05)
-                self.assertEqual(leds.lit(), {idle})
+                self.assertEqual(leds.lit(), idle_set(idle))
                 leds.wait(0.07)
                 self.connect_with_prompt(leds)
                 leds.wait(3)
                 self.assertEqual(leds.lit(), {'info'})
                 self.assertEqual(leds.macro_vars('LED_MODE')['mode'], mode)
                 leds.run('FILAMENT_INSERT_QUICK_LOAD')
-                self.assertEqual(leds.lit(), {idle})
+                self.assertEqual(leds.lit(), idle_set(idle))
 
     def test_reconnect_first(self):
-        for mode, idle in (('status', 'ready'), ('solid', 'muon_mode')):
+        for mode, idle in (('status', 'ready'), ('solid', BOTH_MODE)):
             with self.subTest(mode=mode):
                 leds = self.boot(mode)
                 leds.wait(1.9)
@@ -1085,7 +1105,7 @@ class BootOrder(unittest.TestCase):
                 self.assertEqual(leds.laststate(), 'LED_INFO')
                 self.assertEqual(leds.macro_vars('LED_MODE')['mode'], mode)
                 leds.run('FILAMENT_INSERT_QUICK_LOAD')
-                self.assertEqual(leds.lit(), {idle})
+                self.assertEqual(leds.lit(), idle_set(idle))
 
 
 class ValidModesAreFixed(LedTestCase):
@@ -1106,9 +1126,15 @@ class ValidModesAreFixed(LedTestCase):
         for name in names:
             with self.subTest(name=name):
                 self.leds.run('LED_MODE MODE=status')
-                self.leds.run('LED_MODE MODE=%s' % (name,))
+                if name.lower() in ('solid', 'gradient', 'rainbow',
+                                    'breathe', 'chase', 'status', 'off'):
+                    self.leds.run('LED_MODE MODE=%s' % (name,))
+                else:
+                    # A bad MODE is an info line and changes nothing.
+                    self.leds.run('LED_MODE MODE=%s' % (name,))
                 by_command = self.leds.macro_vars('LED_MODE')['mode']
                 self.leds.run('LED_MODE MODE=status')
+                self.leds.forget_per_strip_saves()
                 self.leds.run('SAVE_VARIABLE VARIABLE=muon_led '
                               'VALUE="{\'mode\': \'%s\'}"' % (name,))
                 self.leds.run('UPDATE_DELAYED_GCODE ID=_LED_MODE_RESTORE '
@@ -1121,6 +1147,476 @@ class ValidModesAreFixed(LedTestCase):
                                                   'rainbow', 'breathe',
                                                   'chase', 'off'))
         self.leds.responses.clear()
+
+
+# ---- KAN-4899: LED_MODE STRIP= and SAT= ------------------------------------
+
+def old_rgb(hue, bright):
+    """The colour LED_MODE rendered before KAN-4899 (HSL 85%/55%)."""
+    hf = (hue % 360) / 60.0
+    c = (1 - abs(2 * 0.55 - 1)) * 0.85
+    x = c * (1 - abs((hf % 2) - 1))
+    lp = 0.55 - c / 2
+    rgb = [(c, x, 0), (x, c, 0), (0, c, x), (0, x, c), (x, 0, c),
+           (c, 0, x)][min(int(hf), 5)]
+    return [(v + lp) * bright / 100 for v in rgb]
+
+
+def rgb_of(params, suffix=''):
+    return [float(params[k + suffix]) for k in 'RGB']
+
+
+class StripAndSatContract(LedTestCase):
+    """What Control reads, from boot, before any LED_MODE call."""
+
+    def test_variables_exist_at_boot(self):
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertIn('sat', v)
+        self.assertEqual(v['sat'], 100)
+        for strip in ('left', 'right'):
+            self.assertEqual(sorted(v[strip]),
+                             ['bright', 'h', 'h2', 'mode', 'sat', 'speed'])
+            self.assertEqual(v[strip]['mode'], 'status')
+            self.assertEqual(v[strip]['sat'], 100)
+
+    def test_the_per_strip_effects_differ_only_in_leds(self):
+        left = self.leds.effect('muon_mode_left')
+        right = self.leds.effect('muon_mode_right')
+        self.assertEqual(left.leds, {('neopixel:Left', i)
+                                     for i in range(1, CHAIN_LENGTH + 1)})
+        self.assertEqual(right.leds, {('neopixel:Right', i)
+                                      for i in range(1, CHAIN_LENGTH + 1)})
+        self.assertEqual(left.layers, right.layers)
+        # Control: the effect list really is the split one.
+        names = {e.name for e in self.leds.effects}
+        self.assertNotIn('muon_mode', names)
+
+    def test_live_state_follows_every_call(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30 SAT=40')
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual(v['left'], {'mode': 'solid', 'h': 30.0, 'h2': 180.0,
+                                     'bright': 60.0, 'speed': 50.0,
+                                     'sat': 40.0})
+        self.assertEqual(v['right']['mode'], 'status')
+        self.assertEqual(v['sat'], 40.0)
+        # variable_sat is the left strip's when the two differ.
+        self.leds.run('LED_MODE STRIP=right SAT=10')
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual(v['right']['sat'], 10.0)
+        self.assertEqual(v['sat'], 40.0)
+        # ... and the shared value after a STRIP=both call.
+        self.leds.run('LED_MODE SAT=70')
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual((v['left']['sat'], v['right']['sat'], v['sat']),
+                         (70.0, 70.0, 70.0))
+
+
+class StripSelectsTheEffects(LedTestCase):
+    def sets(self):
+        return [c for c in self.leds.stubbed if c.startswith('SET_LED_EFFECT')]
+
+    def test_left_only(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        self.assertEqual(self.leds.lit(), {'muon_mode_left',
+                                           'muon_status_right'})
+        self.assertNotIn('SET_LED_EFFECT muon_mode_right', self.leds.stubbed)
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['right']['mode'],
+                         'status')
+        self.assertEqual(self.leds.saved()['muon_led_left']['mode'], 'solid')
+        self.assertNotIn('muon_led_right', self.leds.saved())
+
+    def test_right_only(self):
+        self.leds.run('LED_MODE STRIP=right MODE=solid H=200')
+        self.assertEqual(self.leds.lit(), {'muon_mode_right',
+                                           'muon_status_left'})
+        self.assertNotIn('SET_LED_EFFECT muon_mode_left', self.leds.stubbed)
+        self.assertEqual(self.leds.saved()['muon_led_right']['mode'], 'solid')
+        self.assertNotIn('muon_led_left', self.leds.saved())
+
+    def test_both_is_the_default_and_equal_to_explicit_both(self):
+        self.leds.run('LED_MODE MODE=solid H=120')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        by_default = {s: self.leds.strip_params(s) for s in ('left', 'right')}
+        self.leds.run('LED_MODE STRIP=BOTH MODE=solid H=120')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        self.assertEqual(by_default['left'], self.leds.strip_params('left'))
+        self.assertEqual(by_default['right'], self.leds.strip_params('right'))
+
+    def test_the_other_strip_is_left_alone(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        self.leds.stubbed.clear()
+        self.leds.run('LED_MODE STRIP=right MODE=breathe H=200')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        self.assertEqual(self.sets(), ['SET_LED_EFFECT muon_mode_right'])
+        self.assertEqual(self.leds.strip_params('left')['MODE'], 'solid')
+        self.assertEqual(self.leds.strip_params('right')['MODE'], 'breathe')
+        # Control: a both call does redraw both.
+        self.leds.stubbed.clear()
+        self.leds.run('LED_MODE MODE=solid')
+        self.assertEqual(sorted(self.sets()),
+                         ['SET_LED_EFFECT muon_mode_left',
+                          'SET_LED_EFFECT muon_mode_right'])
+
+    def test_off_stops_only_that_strip(self):
+        self.leds.run('LED_MODE MODE=solid')
+        self.leds.run('LED_MODE STRIP=left MODE=off')
+        self.assertEqual(self.leds.lit(), {'muon_mode_right'})
+        self.leds.run('LED_MODE STRIP=right MODE=off')
+        self.assertEqual(self.leds.lit(), set())
+        # Control: one strip off never used the stop-everything command;
+        # the old both-strips off still does.
+        self.assertNotIn('STOP_LED_EFFECTS', self.leds.commands())
+        self.leds.run('LED_MODE MODE=solid')
+        self.leds.run('LED_MODE MODE=off')
+        self.assertIn('STOP_LED_EFFECTS', self.leds.commands())
+        self.assertEqual(self.leds.lit(), set())
+
+    def test_status_on_one_strip_keeps_the_other_mode(self):
+        self.leds.run('LED_MODE MODE=solid')
+        self.leds.run('LED_MODE STRIP=right MODE=status')
+        self.assertEqual(self.leds.lit(), {'muon_mode_left',
+                                           'muon_status_right'})
+        # Both back to status: the plain 'ready' look.
+        self.leds.run('LED_MODE STRIP=left MODE=status')
+        self.assertEqual(self.leds.lit(), {'ready'})
+
+    def test_a_strip_change_after_a_print_redraws_both(self):
+        # The glow covers both strips, so one strip's redraw would leave
+        # the other on it.
+        self.leds.run('LED_MODE MODE=solid')
+        self.leds.run('LED_COMPLETE')
+        self.assertEqual(self.leds.lit(), {'complete'})
+        self.leds.run('LED_MODE STRIP=left MODE=breathe')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+
+
+class SaturationAndWhite(LedTestCase):
+    def test_sat_zero_is_white_at_bright(self):
+        self.leds.run('LED_MODE MODE=solid H=30 BRIGHT=60 SAT=0')
+        for strip in ('left', 'right'):
+            r, g, b = rgb_of(self.leds.strip_params(strip))
+            self.assertAlmostEqual(r, 0.6)
+            self.assertAlmostEqual(g, 0.6)
+            self.assertAlmostEqual(b, 0.6)
+        # Control: with colour the channels differ.
+        self.leds.run('LED_MODE MODE=solid H=30 BRIGHT=60 SAT=100')
+        r, g, b = rgb_of(self.leds.strip_params('left'))
+        self.assertNotAlmostEqual(r, b)
+
+    def test_sat_zero_gradient_both_stops_white(self):
+        self.leds.run('LED_MODE MODE=gradient H=0 H2=200 BRIGHT=50 SAT=0')
+        p = self.leds.strip_params('left')
+        self.assertEqual(rgb_of(p), rgb_of(p, '2'))
+        self.assertAlmostEqual(rgb_of(p)[0], 0.5)
+
+    def test_sat_zero_rainbow_is_white(self):
+        self.leds.run('LED_MODE STRIP=left MODE=rainbow BRIGHT=50 SAT=0')
+        layers = self.leds.effect('muon_mode_left').layers
+        stops = [tuple(float(v) for v in t.strip('()').split(','))
+                 for t in layers.split('add ')[1].split('\n')[0].split('),(')]
+        self.assertEqual(len(stops), 6)
+        for stop in stops:
+            self.assertAlmostEqual(stop[0], 0.5)
+            self.assertAlmostEqual(stop[1], 0.5)
+            self.assertAlmostEqual(stop[2], 0.5)
+        # Control: SAT=100 keeps the six colours apart.
+        self.leds.run('LED_MODE STRIP=left MODE=rainbow BRIGHT=50 SAT=100')
+        layers = self.leds.effect('muon_mode_left').layers
+        self.assertIn('(0.5,0.035', layers)
+
+    def test_half_saturation_is_between(self):
+        self.leds.run('LED_MODE MODE=solid H=0 BRIGHT=100 SAT=100')
+        full = rgb_of(self.leds.strip_params('left'))
+        self.leds.run('LED_MODE MODE=solid H=0 BRIGHT=100 SAT=50')
+        half = rgb_of(self.leds.strip_params('left'))
+        for f, h in zip(full, half):
+            self.assertAlmostEqual(h, (f + 1) / 2)
+
+    def test_sat_is_clamped_not_rejected(self):
+        self.leds.run('LED_MODE MODE=solid SAT=150')
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['sat'], 100.0)
+        self.leds.run('LED_MODE MODE=solid SAT=-5')
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['sat'], 0.0)
+
+
+class OldCallersUnchanged(LedTestCase):
+    def test_the_panel_call(self):
+        self.leds.run('LED_MODE MODE=solid H=30 H2=200 BRIGHT=70 SPEED=40')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        want = old_rgb(30, 70)
+        want2 = old_rgb(200, 70)
+        for strip in ('left', 'right'):
+            p = self.leds.strip_params(strip)
+            for got, w in zip(rgb_of(p), want):
+                self.assertEqual(got, w)
+            for got, w in zip(rgb_of(p, '2'), want2):
+                self.assertEqual(got, w)
+            self.assertEqual(p['MODE'], 'solid')
+            self.assertEqual(float(p['SPEED']), 40.0)
+            self.assertEqual(float(p['BRIGHT']), 70.0)
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual((v['mode'], v['h'], v['h2'], v['bright'], v['speed']),
+                         ('solid', 30.0, 200.0, 70.0, 40.0))
+        self.assertEqual(v['left'], v['right'])
+        self.assertEqual(self.leds.saved()['muon_led_left'],
+                         self.leds.saved()['muon_led_right'])
+        # Control: a different hue gives a different colour.
+        self.assertNotEqual(want, old_rgb(90, 70))
+
+    def test_old_ranges_still_clamp(self):
+        self.leds.run('LED_MODE MODE=solid H=400 BRIGHT=250 SPEED=1')
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual((v['h'], v['bright'], v['speed']), (40.0, 100.0, 5.0))
+
+    def test_rainbow_at_full_sat_is_the_old_palette(self):
+        self.leds.run('LED_MODE MODE=rainbow BRIGHT=60 SPEED=50')
+        layers = self.leds.effect('muon_mode_left').layers
+        k = 60.0 / 100.0
+        pal = ([1.0, .07, .07], [1.0, .65, .07], [.07, 1.0, .07],
+               [.07, .65, 1.0], [.07, .07, 1.0], [.65, .07, 1.0])
+        old = 'gradient 0.275 1.0 add ' + ','.join(
+            '(%s,%s,%s)' % tuple(v * k for v in rgb) for rgb in pal)
+        self.assertIn(old, layers)
+
+
+class MigrationFromMuonLed(unittest.TestCase):
+    def boot(self, text):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, 'variables.cfg')
+        with open(path, 'w') as handle:
+            handle.write('[Variables]\n' + text)
+        leds = M1Leds(path)
+        self.addCleanup(lambda: self.assertEqual(leds.errors(), []))
+        return leds
+
+    def test_old_muon_led_becomes_both_strips(self):
+        leds = self.boot("muon_led = {'mode': 'chase', 'h': 30.0, "
+                         "'h2': 90.0, 'bright': 55.0, 'speed': 20.0}\n")
+        leds.wait(3)
+        v = leds.macro_vars('LED_MODE')
+        want = {'mode': 'chase', 'h': 30.0, 'h2': 90.0, 'bright': 55.0,
+                'speed': 20.0, 'sat': 100.0}
+        self.assertEqual(v['left'], want)
+        self.assertEqual(v['right'], want)
+        self.assertEqual(leds.lit(), BOTH_MODE)
+        saved = leds.saved()
+        self.assertEqual(saved['muon_led_left'], want)
+        self.assertEqual(saved['muon_led_right'], want)
+        # The old key stays as the fallback.
+        self.assertEqual(saved['muon_led']['mode'], 'chase')
+
+    def test_a_second_boot_reads_the_new_keys(self):
+        leds = self.boot("muon_led = {'mode': 'solid', 'h': 30.0}\n"
+                         "muon_led_left = {'mode': 'breathe', 'h': 10.0, "
+                         "'h2': 20.0, 'bright': 30.0, 'speed': 40.0, "
+                         "'sat': 25.0}\n"
+                         "muon_led_right = {'mode': 'off'}\n")
+        leds.wait(3)
+        v = leds.macro_vars('LED_MODE')
+        self.assertEqual(v['left']['mode'], 'breathe')
+        self.assertEqual(v['left']['sat'], 25.0)
+        self.assertEqual(v['right']['mode'], 'off')
+        # Control: muon_led was not used for either strip.
+        self.assertNotEqual(v['left']['h'], 30.0)
+        self.assertEqual(leds.saved()['muon_led_right'], {'mode': 'off'})
+
+    def test_a_strip_missing_its_key_falls_back_to_muon_led(self):
+        leds = self.boot("muon_led = {'mode': 'solid', 'h': 30.0}\n"
+                         "muon_led_left = {'mode': 'breathe'}\n")
+        leds.wait(3)
+        v = leds.macro_vars('LED_MODE')
+        self.assertEqual(v['left']['mode'], 'breathe')
+        self.assertEqual(v['right']['mode'], 'solid')
+        self.assertEqual(v['right']['h'], 30.0)
+        self.assertEqual(leds.saved()['muon_led_left'], {'mode': 'breathe'})
+
+    def test_nothing_saved_stays_on_status(self):
+        leds = self.boot('')
+        leds.wait(3)
+        self.assertEqual(leds.lit(), {'ready'})
+        self.assertNotIn('muon_led_left', leds.saved())
+
+    def test_a_restart_keeps_each_strip(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, 'variables.cfg')
+        first = M1Leds(path)
+        first.wait(3)
+        first.run('LED_MODE STRIP=left MODE=solid H=30 SAT=0')
+        first.run('LED_MODE STRIP=right MODE=breathe H=200 SPEED=80')
+        want = (first.macro_vars('LED_MODE')['left'],
+                first.macro_vars('LED_MODE')['right'])
+        second = M1Leds(path)
+        self.addCleanup(lambda: self.assertEqual(second.errors(), []))
+        second.wait(3)
+        self.assertEqual((second.macro_vars('LED_MODE')['left'],
+                          second.macro_vars('LED_MODE')['right']), want)
+        self.assertEqual(second.lit(), BOTH_MODE)
+        self.assertEqual(second.strip_params('left')['MODE'], 'solid')
+        self.assertEqual(second.strip_params('right')['MODE'], 'breathe')
+        # Control: the two strips really differ.
+        self.assertNotEqual(want[0], want[1])
+
+
+class FaultsAndPrintsOverrideBothStrips(LedTestCase):
+    def setUp(self):
+        super().setUp()
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        self.leds.run('LED_MODE STRIP=right MODE=breathe H=200 SAT=30')
+        self.before = dict(self.leds.macro_vars('LED_MODE'))
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+
+    def assert_choice_kept(self):
+        v = self.leds.macro_vars('LED_MODE')
+        self.assertEqual(v['left'], self.before['left'])
+        self.assertEqual(v['right'], self.before['right'])
+        self.assertEqual(v['sat'], self.before['sat'])
+        self.assertEqual(self.leds.saved()['muon_led_left']['mode'], 'solid')
+        self.assertEqual(self.leds.saved()['muon_led_right']['mode'],
+                         'breathe')
+
+    def test_each_fault_effect_replaces_both(self):
+        for macro, effect in (('LED_ERROR', 'error'),
+                              ('LED_WARNING', 'warning'),
+                              ('LED_INFO', 'info'),
+                              ('LED_COMPLETE', 'complete')):
+            with self.subTest(macro=macro):
+                self.leds.run(macro)
+                self.assertEqual(self.leds.lit(), {effect})
+                self.leds.run('LED_READY')
+                self.assertEqual(self.leds.lit(), BOTH_MODE)
+
+    def test_a_fault_then_clear_restores_both_strips(self):
+        self.leds.run('LED_ERROR')
+        self.assertEqual(self.leds.lit(), {'error'})
+        self.assert_choice_kept()
+        self.leds.run('LED_READY')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        self.assertEqual(self.leds.strip_params('left')['MODE'], 'solid')
+        self.assertEqual(self.leds.strip_params('right')['MODE'], 'breathe')
+        self.assert_choice_kept()
+
+    def test_print_progress_overrides_both_then_restores(self):
+        self.leds.run('LED_SETUP_PROGRESS')
+        self.assertEqual(self.leds.lit(), SETUP)
+        self.leds.run('LED_PRINTING')
+        self.assertEqual(self.leds.lit(), PROGRESS)
+        self.assert_choice_kept()
+        self.leds.run('LED_READY')
+        self.assertEqual(self.leds.lit(), BOTH_MODE)
+        self.assert_choice_kept()
+
+    def test_a_mixed_state_is_overridden_and_restored_too(self):
+        self.leds.run('LED_MODE STRIP=right MODE=status')
+        self.assertEqual(self.leds.lit(), {'muon_mode_left',
+                                           'muon_status_right'})
+        self.leds.run('LED_PRINTING')
+        self.assertEqual(self.leds.lit(), PROGRESS)
+        self.leds.run('LED_READY')
+        self.assertEqual(self.leds.lit(), {'muon_mode_left',
+                                           'muon_status_right'})
+
+    def test_the_override_depends_on_the_leds_overlapping(self):
+        # Negative control: were the right effect not on the right LEDs,
+        # a fault would leave it lit. That is what the split must not do.
+        self.leds.effect('muon_mode_right').leds = set()
+        self.leds.run('LED_ERROR')
+        self.assertEqual(self.leds.lit(), {'error', 'muon_mode_right'})
+
+
+BAD_CALLS = ('LED_MODE STRIP=top MODE=solid',
+             'LED_MODE STRIP= MODE=solid',
+             'LED_MODE STRIP=left SAT=abc',
+             'LED_MODE SAT=nan',
+             'LED_MODE SAT=inf',
+             'LED_MODE MODE=neon',
+             'LED_MODE H=red',
+             'LED_MODE BRIGHT=x',
+             'LED_MODE SPEED=fast',
+             # A good STRIP and MODE with one bad number: the good parts
+             # must not apply either.
+             'LED_MODE STRIP=right MODE=breathe H=x')
+
+
+class BadParametersAreNonFatalAndChangeNothing(LedTestCase):
+    """LED_MODE runs inside print start, print end and fault macros, so by
+    default a bad value is an info line, never an error (lead-prn review).
+    STRICT=1 is the clients' opt-in to a raised error."""
+
+    def snapshot(self):
+        return (dict(self.leds.macro_vars('LED_MODE')),
+                dict(self.leds.saved()), self.leds.lit(),
+                list(self.leds.stubbed))
+
+    def test_each_bad_call_is_an_info_line_and_changes_nothing(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        for call in BAD_CALLS:
+            with self.subTest(call=call):
+                before = self.snapshot()
+                self.leds.responses.clear()
+                self.leds.run(call)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(self.leds.errors(), [])
+                self.assertTrue(any('LED_MODE' in r
+                                    for r in self.leds.responses),
+                                self.leds.responses)
+
+    def test_the_same_calls_with_strict_raise_and_change_nothing(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        for call in BAD_CALLS:
+            with self.subTest(call=call):
+                before = self.snapshot()
+                self.expect_error(call + ' STRICT=1')
+                self.assertEqual(self.snapshot(), before)
+
+    def test_the_message_names_the_problem(self):
+        self.leds.run('LED_MODE STRIP=top')
+        self.assertTrue(any('STRIP' in r and 'top' in r
+                            for r in self.leds.responses))
+        with self.assertRaises(gcode.CommandError) as ctx:
+            self.leds.run('LED_MODE STRIP=top STRICT=1')
+        self.assertIn('STRIP', str(ctx.exception))
+        self.leds.responses.clear()
+        self.log.records.clear()
+
+    def test_good_calls_are_silent_and_strict_does_not_raise(self):
+        # Negative control for the lists above: a good call applies, with
+        # or without STRICT, and says nothing.
+        self.leds.responses.clear()
+        for call in ('LED_MODE STRIP=left MODE=solid SAT=50',
+                     'LED_MODE STRIP=right MODE=Rainbow STRICT=1',
+                     'LED_MODE STRIP=BOTH SAT=0 STRICT=1',
+                     'LED_MODE SAT=100.0'):
+            with self.subTest(call=call):
+                self.leds.run(call)
+        self.assertEqual(self.leds.responses, [])
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['sat'], 100.0)
+
+    def test_a_bad_mode_in_a_calling_macro_does_not_abort_it(self):
+        import configparser
+        fileconfig = configparser.RawConfigParser()
+        section = 'gcode_macro TEST_PRINT_START'
+        fileconfig.add_section(section)
+        fileconfig.set(section, 'gcode',
+                       'LED_MODE MODE=neon\nTEST_MARKER\n'
+                       'LED_MODE STRIP=top\nTEST_MARKER')
+        strict = 'gcode_macro TEST_PRINT_START_STRICT'
+        fileconfig.add_section(strict)
+        fileconfig.set(strict, 'gcode',
+                       'LED_MODE MODE=neon STRICT=1\nTEST_MARKER')
+        for sec in (section, strict):
+            self.leds.printer.add_object(sec, gcode_macro.GCodeMacro(
+                FakeConfig(self.leds.printer, fileconfig, sec)))
+        self.leds.gcode.register_command('TEST_MARKER', self.leds._stub)
+        self.leds.stubbed.clear()
+        self.leds.run('TEST_PRINT_START')
+        self.assertEqual(self.leds.commands().count('TEST_MARKER'), 2)
+        self.assertEqual(self.leds.errors(), [])
+        # Control: with STRICT=1 the caller is aborted before its marker.
+        self.leds.stubbed.clear()
+        self.expect_error('TEST_PRINT_START_STRICT')
+        self.assertEqual(self.leds.commands().count('TEST_MARKER'), 0)
 
 
 if __name__ == '__main__':
