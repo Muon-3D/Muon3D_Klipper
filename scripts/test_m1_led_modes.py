@@ -1115,7 +1115,7 @@ class ValidModesAreFixed(LedTestCase):
     def test_no_runtime_variable(self):
         self.expect_error('SET_GCODE_VARIABLE MACRO=LED_MODE VARIABLE=modes '
                           'VALUE="[\'neon\']"')
-        self.expect_error('LED_MODE MODE=neon')
+        self.leds.run('LED_MODE MODE=neon')
         self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'], 'status')
         self.assertEqual(self.leds.lit(), {'ready'})
         self.leds.responses.clear()
@@ -1130,8 +1130,8 @@ class ValidModesAreFixed(LedTestCase):
                                     'breathe', 'chase', 'status', 'off'):
                     self.leds.run('LED_MODE MODE=%s' % (name,))
                 else:
-                    # A bad MODE raises and changes nothing.
-                    self.expect_error('LED_MODE MODE=%s' % (name,))
+                    # A bad MODE is an info line and changes nothing.
+                    self.leds.run('LED_MODE MODE=%s' % (name,))
                 by_command = self.leds.macro_vars('LED_MODE')['mode']
                 self.leds.run('LED_MODE MODE=status')
                 self.leds.forget_per_strip_saves()
@@ -1525,48 +1525,98 @@ class FaultsAndPrintsOverrideBothStrips(LedTestCase):
         self.assertEqual(self.leds.lit(), {'error', 'muon_mode_right'})
 
 
-class BadParametersRaiseWithoutPartialApply(LedTestCase):
+BAD_CALLS = ('LED_MODE STRIP=top MODE=solid',
+             'LED_MODE STRIP= MODE=solid',
+             'LED_MODE STRIP=left SAT=abc',
+             'LED_MODE SAT=nan',
+             'LED_MODE SAT=inf',
+             'LED_MODE MODE=neon',
+             'LED_MODE H=red',
+             'LED_MODE BRIGHT=x',
+             'LED_MODE SPEED=fast',
+             # A good STRIP and MODE with one bad number: the good parts
+             # must not apply either.
+             'LED_MODE STRIP=right MODE=breathe H=x')
+
+
+class BadParametersAreNonFatalAndChangeNothing(LedTestCase):
+    """LED_MODE runs inside print start, print end and fault macros, so by
+    default a bad value is an info line, never an error (lead-prn review).
+    STRICT=1 is the clients' opt-in to a raised error."""
+
     def snapshot(self):
         return (dict(self.leds.macro_vars('LED_MODE')),
                 dict(self.leds.saved()), self.leds.lit(),
                 list(self.leds.stubbed))
 
-    def test_each_bad_call_raises_and_changes_nothing(self):
+    def test_each_bad_call_is_an_info_line_and_changes_nothing(self):
         self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
-        for call in ('LED_MODE STRIP=top MODE=solid',
-                     'LED_MODE STRIP= MODE=solid',
-                     'LED_MODE STRIP=left SAT=abc',
-                     'LED_MODE SAT=nan',
-                     'LED_MODE SAT=inf',
-                     'LED_MODE MODE=neon',
-                     'LED_MODE H=red',
-                     'LED_MODE BRIGHT=x',
-                     'LED_MODE SPEED=fast',
-                     # A good STRIP and MODE with one bad number: the
-                     # good parts must not apply either.
-                     'LED_MODE STRIP=right MODE=breathe H=x'):
+        for call in BAD_CALLS:
             with self.subTest(call=call):
                 before = self.snapshot()
-                self.expect_error(call)
+                self.leds.responses.clear()
+                self.leds.run(call)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(self.leds.errors(), [])
+                self.assertTrue(any('LED_MODE' in r
+                                    for r in self.leds.responses),
+                                self.leds.responses)
+
+    def test_the_same_calls_with_strict_raise_and_change_nothing(self):
+        self.leds.run('LED_MODE STRIP=left MODE=solid H=30')
+        for call in BAD_CALLS:
+            with self.subTest(call=call):
+                before = self.snapshot()
+                self.expect_error(call + ' STRICT=1')
                 self.assertEqual(self.snapshot(), before)
 
-    def test_the_error_names_the_problem(self):
+    def test_the_message_names_the_problem(self):
+        self.leds.run('LED_MODE STRIP=top')
+        self.assertTrue(any('STRIP' in r and 'top' in r
+                            for r in self.leds.responses))
         with self.assertRaises(gcode.CommandError) as ctx:
-            self.leds.run('LED_MODE STRIP=top')
+            self.leds.run('LED_MODE STRIP=top STRICT=1')
         self.assertIn('STRIP', str(ctx.exception))
-        self.assertIn('top', str(ctx.exception))
         self.leds.responses.clear()
         self.log.records.clear()
 
-    def test_good_calls_do_not_raise(self):
-        # Negative control for the list above.
+    def test_good_calls_are_silent_and_strict_does_not_raise(self):
+        # Negative control for the lists above: a good call applies, with
+        # or without STRICT, and says nothing.
+        self.leds.responses.clear()
         for call in ('LED_MODE STRIP=left MODE=solid SAT=50',
-                     'LED_MODE STRIP=right MODE=Rainbow',
-                     'LED_MODE STRIP=BOTH SAT=0',
+                     'LED_MODE STRIP=right MODE=Rainbow STRICT=1',
+                     'LED_MODE STRIP=BOTH SAT=0 STRICT=1',
                      'LED_MODE SAT=100.0'):
             with self.subTest(call=call):
                 self.leds.run(call)
+        self.assertEqual(self.leds.responses, [])
+        self.assertEqual(self.leds.macro_vars('LED_MODE')['sat'], 100.0)
+
+    def test_a_bad_mode_in_a_calling_macro_does_not_abort_it(self):
+        import configparser
+        fileconfig = configparser.RawConfigParser()
+        section = 'gcode_macro TEST_PRINT_START'
+        fileconfig.add_section(section)
+        fileconfig.set(section, 'gcode',
+                       'LED_MODE MODE=neon\nTEST_MARKER\n'
+                       'LED_MODE STRIP=top\nTEST_MARKER')
+        strict = 'gcode_macro TEST_PRINT_START_STRICT'
+        fileconfig.add_section(strict)
+        fileconfig.set(strict, 'gcode',
+                       'LED_MODE MODE=neon STRICT=1\nTEST_MARKER')
+        for sec in (section, strict):
+            self.leds.printer.add_object(sec, gcode_macro.GCodeMacro(
+                FakeConfig(self.leds.printer, fileconfig, sec)))
+        self.leds.gcode.register_command('TEST_MARKER', self.leds._stub)
+        self.leds.stubbed.clear()
+        self.leds.run('TEST_PRINT_START')
+        self.assertEqual(self.leds.commands().count('TEST_MARKER'), 2)
         self.assertEqual(self.leds.errors(), [])
+        # Control: with STRICT=1 the caller is aborted before its marker.
+        self.leds.stubbed.clear()
+        self.expect_error('TEST_PRINT_START_STRICT')
+        self.assertEqual(self.leds.commands().count('TEST_MARKER'), 0)
 
 
 if __name__ == '__main__':
