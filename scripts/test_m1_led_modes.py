@@ -581,7 +581,8 @@ class ModeChangeWhileBusy(LedTestCase):
                 self.assertEqual(self.leds.laststate(), 'LED_PRINTING')
                 self.assertEqual(self.leds.macro_vars('LED_MODE')['mode'],
                                  mode)
-                self.assertEqual(self.leds.saved()['muon_led_left']['mode'], mode)
+                saved = self.leds.saved()['muon_led_left']
+                self.assertEqual(saved['mode'], mode)
 
     def test_every_active_state_is_kept(self):
         states = {'LED_SETUP_PROGRESS': SETUP, 'LED_PRINTING': PROGRESS,
@@ -1252,8 +1253,9 @@ class StripSelectsTheEffects(LedTestCase):
         # Control: a both call does redraw both.
         self.leds.stubbed.clear()
         self.leds.run('LED_MODE MODE=solid')
-        self.assertEqual(sorted(self.sets()), ['SET_LED_EFFECT muon_mode_left',
-                                               'SET_LED_EFFECT muon_mode_right'])
+        self.assertEqual(sorted(self.sets()),
+                         ['SET_LED_EFFECT muon_mode_left',
+                          'SET_LED_EFFECT muon_mode_right'])
 
     def test_off_stops_only_that_strip(self):
         self.leds.run('LED_MODE MODE=solid')
