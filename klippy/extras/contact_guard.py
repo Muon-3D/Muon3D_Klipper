@@ -271,6 +271,8 @@ class ContactGuard:
                                             self._handle_set_position)
         self.printer.register_event_handler("force_move:manual_move",
                                             self._handle_manual_move)
+        self.printer.register_event_handler("force_move:homing_cleared",
+                                            self._handle_homing_cleared)
         self.printer.register_event_handler("bed_removal_detector:removed",
                                             self._handle_bed_removed)
         self.gcode.register_command('SET_CONTACT_GUARD',
@@ -834,6 +836,18 @@ class ContactGuard:
         # nozzle is
         self.own_error = None
         if stepper.is_active_axis('z'):
+            self._drop_height()
+
+    def _handle_homing_cleared(self, axes):
+        # SET_KINEMATIC_POSITION CLEAR_HOMED=Z (z_power's idle PGOOD
+        # recovery: the Z driver may have lost its supply).  A later
+        # SET_HOMED=Z on the same number (the G28 macro does it before the
+        # Z home) is no height: set_position ignores an unchanged Z, and
+        # nothing polls in between.  A clear inside a G28 that never had a
+        # trusted height (X/Y home from an unhomed Z) drops nothing new.
+        if 'z' in str(axes).lower():
+            logging.info("contact_guard: Z homed flag cleared; plate height"
+                         " not known until the next home")
             self._drop_height()
 
     def _handle_bed_removed(self):

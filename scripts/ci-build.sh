@@ -209,6 +209,8 @@ $PYTHON test/load_cell_probe/test_tare_guard.py
 $PYTHON test/load_cell_probe/test_z_load_backstop.py
 $PYTHON test/load_cell_probe/test_hot_load_cell.py
 $PYTHON test/load_cell_probe/test_z_legs.py
+# KAN-4682: longer legs above a known plate height, never across the margin.
+$PYTHON test/load_cell_probe/test_z_fast_legs.py
 $PYTHON test/load_cell_probe/test_mcutare_stale_zero.py
 $PYTHON test/homing_abort/test_homing_abort.py
 $PYTHON test/homing_abort/test_search_cap.py
@@ -253,6 +255,8 @@ finish_test homing_scope "Test homing_scope"
 # MUON: Home All stows the bed; every internal G28 passes STOW=0 (KAN-3811).
 start_test home_stow "Test Home All stows the bed"
 $PYTHON test/home_stow/test_home_all_stow.py
+# KAN-4683, KAN-4684: the stow's speed, and the head's park in its move.
+$PYTHON test/home_stow/test_stow_rise.py
 finish_test home_stow "Test Home All stows the bed"
 
 # MUON: the bed rests at the top after user operations, never in a print (KAN-4298).

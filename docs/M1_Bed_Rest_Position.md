@@ -34,6 +34,28 @@ refuses with a pause set.
 Never stowed: Z not homed, `z_power` not `ready` (plate off, column unlocked,
 recovering, fault), Klipper shut down (no G-code runs then anyway).
 
+## How fast, and with what (KAN-4684, KAN-4683)
+
+- **Speed.** With the plate height known to the contact guard (homed since
+  the last bed removal, motor off, `FORCE_MOVE` or failed home) the rise runs
+  at `Z_PARK`'s `known_speed` (15 mm/s), never above `[printer]
+  max_z_velocity` (15); with the height unknown it is 10 mm/s as before.
+  `Z_SPEED=` (mm/min) overrides either. Acceleration (`max_z_accel`, 1000) is
+  not touched.
+- **The head's park.** Klipper's planner runs one move at a time, so an X/Y
+  move queued behind the rise waits for it, and a later `G1 X..` from a
+  client cannot start alongside it. The one thing that can travel with the
+  plate is a single `G0` with X, Y and Z, and Klipper holds its Z at
+  `max_z_velocity`. A Home All does that: `Z_PARK_XY` parks the head at the
+  back right corner in the same move as the rise when the height is known,
+  X, Y and Z are homed and the plate is at or above Z10 (the height the
+  filament cut and the wipe move X/Y at, above the 5 mm wipe pad and the 8 mm
+  notch). Every point of that path is on the line the park always took at
+  Z10, at or above Z10. Otherwise the head parks first and the plate rises
+  after, as before. The park after a print (`PARK_PRINTER`) stays in that
+  order on purpose: the head may be at the cutter nub and a printed part
+  hangs from the plate, so the plate must be clear before X/Y moves.
+
 ## Does not stow
 
 - A jog (`G0`/`G1` from the Move screen), `CENTER`, `FRONT`: the user put the

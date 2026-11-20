@@ -3,7 +3,7 @@
 # Copyright (C) 2025  Gareth Farrington <gareth@waves.ky>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, math
+import logging, math, time
 import mcu
 from . import probe, trigger_analog, load_cell, hx71x, ads1220, muon_ads1220
 
@@ -696,6 +696,45 @@ class ZLoadBackstop:
             'z_move_drift_total_factor', 4.0, minval=1.)
         self._press_total_factor = config.getfloat(
             'z_move_press_total_factor', 1.0, minval=0.2)
+        # KAN-4682: legs of a home that starts from a KNOWN Z, above the
+        # last few mm, may run longer than z_move_leg_time (see
+        # fast_leg_time).  0 turns it off: every leg is z_move_leg_time.
+        self._fast_leg_max = config.getfloat(
+            'z_move_fast_leg_max', 4.0, minval=0.)
+        if 0. < self._fast_leg_max < self._leg_time:
+            raise config.error("z_move_fast_leg_max must be 0 (off) or at "
+                               "least z_move_leg_time")
+        self._fast_growth = config.getfloat(
+            'z_move_fast_leg_growth', 3.0, minval=1.)
+        # the share of a trigger delta a long leg may absorb as drift
+        self._fast_budget = config.getfloat(
+            'z_move_fast_drift_factor', 0.5, above=0., maxval=0.75)
+        # the measured rate is multiplied by this (it may rise mid-leg)
+        self._fast_safety = config.getfloat(
+            'z_move_fast_rate_safety', 2.0, minval=1.)
+        # the spread of one tare (Sloe's idle wander is -4000..+7000)
+        self._fast_noise = config.getfloat(
+            'z_move_fast_noise_counts', 11000., minval=0.)
+        # KAN-4682 option B: before the descent the nozzle holds still this
+        # long, and the drift is measured over it (0 = off, as #150)
+        self._fast_rest_time = config.getfloat(
+            'z_move_fast_rest_time', 0., minval=0.)
+        # a long leg ends this many seconds before the ADS1220's
+        # max_temperature_pause (see _temp_cap)
+        self._fast_temp_margin = config.getfloat(
+            'z_move_fast_temp_margin', 0.5, minval=0.)
+        self._rest = None           # the rest window's numbers (note_rest)
+        self._rate_ref = None       # (tare, time) the drift is measured from
+        self._noise_used = None     # the tare spread the plan allows for
+        self._leg_first_t = None
+        self._fast_prev = (0, None)     # the tare before this one, and when
+        self._fast_prev_raw = None      # its change per second, no spread
+        self._leg_last_time = 0.
+        self._leg_times = []        # seconds each leg was planned for
+        self._leg_pauses = []       # seconds between one leg and the next
+        self.last_fast_plan = None
+        self._leg_plans = []        # KAN-4682: each leg's fast_leg_time plan
+        self._fast_above_note = 'not asked'
         self._leg_press_total = 0
         self._leg_wrong_peak = 0
         self._leg_press_peak = 0
@@ -902,9 +941,20 @@ class ZLoadBackstop:
     # KAN-4364: a descent of legs starts at leg 1's tare and delta; the
     # cumulative limit stays in leg 1's delta (a later tare drifting the
     # wrong way widens the span to the anchor, and so the delta)
-    def start_legs(self, tare_counts, trigger_delta=None):
+    def start_legs(self, tare_counts, trigger_delta=None, tare_time=None):
         self._legs = 1
         self._leg_first_tare = tare_counts
+        self._leg_first_t = tare_time
+        self._fast_prev = (tare_counts, tare_time)
+        self._fast_prev_raw = None
+        self._rest = None
+        self._rate_ref = None
+        self._noise_used = None
+        self._leg_last_time = self._leg_time
+        self._leg_times = []
+        self._leg_pauses = []
+        self.last_fast_plan = None
+        self._leg_plans = []
         self._leg_first_delta = abs(trigger_delta or 0)
         self._leg_press_total = 0
         self._leg_wrong_peak = 0
@@ -971,17 +1021,264 @@ class ZLoadBackstop:
                 " %i)" % (self.REASON_WRONG_WAY, total, limit))
         return use
 
+    # KAN-4682: how long the next leg may run.  Only for a descent that
+    # starts from a known Z, and only above the last few mm (the caller
+    # decides both).  Never less than z_move_leg_time, so a hot cell keeps
+    # #148's 1 s legs exactly.  The drift rate is what the tares measured
+    # since leg 1: (change + one tare's spread) / elapsed, times a safety
+    # factor because it may rise within the leg; the leg then absorbs at
+    # most z_move_fast_drift_factor x delta of it.  A tare that was held
+    # (a press-side jump) or a cell with no usable timestamps gets no
+    # growth.  tare is the MEASURED tare of the leg about to start, t its
+    # time.  Beyond this, the rules above stay armed: a rate that rises
+    # past the plan trips the wrong-way rule (1 x delta) or fires the
+    # trigger early, both of which stop the move.
+    def fast_leg_time(self, tare, t, trigger_delta=None):
+        base = self._leg_time
+        plan = {'leg': self._legs, 'time': base, 'why': 'off'}
+        self.last_fast_plan = plan
+        self._leg_plans.append(plan)
+        if self._fast_leg_max <= base or base <= 0.:
+            return base
+        delta = self._leg_first_delta or abs(trigger_delta or 0)
+        if self._leg_first_t is None or t is None or not delta:
+            plan['why'] = 'no first tare time'
+            return base
+        if self._leg_jumps:
+            plan['why'] = 'press-side jump held'
+            return base
+        if self._rest is not None and self._rest['blocked']:
+            plan['why'] = self._rest['why']
+            return base
+        ref_tare, ref_t = self._leg_first_tare, self._leg_first_t
+        noise = self._fast_noise
+        if self._rest is not None:
+            # measured from the start of the rest: a longer baseline
+            ref_tare, ref_t = self._rate_ref
+            noise = self._noise_used
+        elapsed = t - ref_t
+        prev_tare, prev_t = self._fast_prev
+        self._fast_prev = (tare, t)
+        if elapsed < base * 0.5:
+            plan['why'] = 'too soon after leg 1'
+            return base
+        moved = abs(tare - ref_tare)
+        # the rate since leg 1 and the rate over the last leg: a cell whose
+        # drift is speeding up (a hot end heating) shows in the second, and
+        # the larger of the two is planned for.  A rate that has risen since
+        # the leg before (1.5x and more than a tare's spread) gets no growth.
+        rate = (moved + noise) / elapsed
+        dt = (t - prev_t) if prev_t is not None else 0.
+        if dt > 0.:
+            raw = abs(tare - prev_tare) / dt
+            rate = max(rate, raw + noise / dt)
+            before, self._fast_prev_raw = self._fast_prev_raw, raw
+            if (before is not None
+                    and raw > 1.5 * before + noise / dt):
+                plan['why'] = 'drift rising'
+                plan['rate'] = rate
+                return base
+        plan['rate'] = rate
+        allowed = self._fast_budget * delta / (self._fast_safety * rate)
+        grown = self._leg_last_time * self._fast_growth
+        use = max(base, min(self._fast_leg_max, allowed, grown))
+        plan['why'] = 'drift' if use == allowed else 'cap'
+        use = self._temp_limit(use, plan)
+        plan['time'] = use
+        return use
+
+    def fast_enabled(self):
+        return self._fast_leg_max > self._leg_time > 0.
+
+    # KAN-4682 option B: the longest an armed leg may run so the ADS1220's
+    # temperature read (muon_ads1220 max_temperature_pause, 4 s) never falls
+    # inside it: that read takes the load cell, and a probe armed past it
+    # can fire in mid-air.  max_temperature_pause less z_move_fast_temp_margin.
+    # None when the load cell is not a muon_ads1220 (no cap).
+    def _temp_cap(self):
+        cell = self._load_cell
+        sensor = getattr(cell, 'sensor', None)
+        fn = getattr(sensor, 'get_max_temperature_pause', None)
+        if fn is None:
+            return None
+        try:
+            pause = float(fn())
+        except Exception:
+            return None
+        return max(0., pause - self._fast_temp_margin)
+
+    # never shorter than z_move_leg_time (#148's legs stand)
+    def _temp_limit(self, use, plan):
+        cap = self._temp_cap()
+        if cap is not None and use > cap:
+            use = max(self._leg_time, cap)
+            plan['why'] = 'temp cap'
+            plan['cap'] = cap
+        return use
+
+    def get_rest_time(self):
+        return self._fast_rest_time if self.fast_enabled() else 0.
+
+    # Least-squares slope (counts/s) of the points, or None
+    @staticmethod
+    def _slope(ts, ms):
+        if len(ts) < 2 or ts[-1] <= ts[0]:
+            return None
+        if len(ts) == 2:
+            return (ms[-1] - ms[0]) / (ts[-1] - ts[0])
+        return float(np.polyfit(np.asarray(ts) - ts[0], ms, 1)[0])
+
+    # The nozzle held still for the rest: tare1 (taken at t1) began it and
+    # times/counts are the samples after it.  The samples are cut into
+    # tare-sized blocks (n each, counted from the end so the last block is
+    # the tare leg 1 arms on) and their means, with tare1, are the points.
+    # What it measures: the drift as a fitted slope, the slope over the
+    # last half (a rise shows there), and the noise: how far a tare sits
+    # from the fitted line.  The noise the plan allows for is twice that,
+    # never above z_move_fast_noise_counts and never below a quarter of it
+    # (a quiet half second does not prove the cell is quiet).
+    NOISE_FLOOR = 0.25
+    REST_RISE = 1.25
+    def analyse_rest(self, t1, tare1, times, counts, n, trigger_delta=None,
+                     press_direction=None):
+        times = np.asarray(times, dtype=float)
+        counts = np.asarray(counts, dtype=float)
+        nb = len(counts) // max(1, n)
+        if nb < 2:
+            return None
+        means, bt = [], []
+        for k in range(nb):
+            hi = len(counts) - k * n
+            means.append(float(np.mean(counts[hi - n:hi])))
+            bt.append(float(times[hi - 1]))
+        means.reverse()
+        bt.reverse()
+        pts_t = [float(t1)] + bt
+        pts_m = [float(tare1)] + means
+        span = pts_t[-1] - pts_t[0]
+        if span <= 0.:
+            return None
+        slope = self._slope(pts_t, pts_m)
+        # the noise is what is left of the points after a smooth curve (a
+        # quadratic: a drift that speeds up is not noise, it is flagged
+        # below) is taken out
+        x = np.asarray(pts_t) - pts_t[0]
+        coef = np.polyfit(x, pts_m, 2 if len(x) >= 5 else 1)
+        obs = float(np.ptp(np.asarray(pts_m) - np.polyval(coef, x)))
+        mid = len(pts_t) // 2
+        slope2 = self._slope(pts_t[mid:], pts_m[mid:])
+        dt2 = pts_t[-1] - pts_t[mid]
+        noise = min(self._fast_noise,
+                    max(self.NOISE_FLOOR * self._fast_noise, 2. * obs))
+        rate_fit, rate2 = abs(slope), abs(slope2)
+        rising = rate2 > (self.REST_RISE * rate_fit
+                          + 2. * max(obs, 500.) / dt2)
+        jump = False
+        if press_direction in (-1, 1) and trigger_delta:
+            for i in range(1, len(pts_t)):
+                allow = (self._leg_rate * (pts_t[i] - pts_t[i - 1])
+                         + self.LEG_JUMP_SLACK * abs(trigger_delta))
+                if (pts_m[i] - pts_m[i - 1]) * press_direction > allow:
+                    jump = True
+        return {'tare1': int(round(tare1)), 't1': float(t1),
+                'tare2': int(round(means[-1])), 't2': pts_t[-1],
+                'span': span, 'change': means[-1] - pts_m[0],
+                'rate_fit': rate_fit, 'rate2': rate2, 'dt2': dt2,
+                'noise_obs': obs, 'noise': noise, 'rising': bool(rising),
+                'jump': jump, 'blocks': nb}
+
+    # Called once leg 1's tare is applied (start_legs came first).  tare is
+    # the one leg 1 arms on, t its time.
+    def note_rest(self, info, tare, t):
+        r = dict(info)
+        r['blocked'] = bool(r['rising'] or r['jump'])
+        r['why'] = ('press-side jump in the rest' if r['jump']
+                    else 'drift rising in the rest' if r['rising'] else 'ok')
+        self._rest = r
+        self._rate_ref = (r['tare1'], r['t1'])
+        self._noise_used = r['noise']
+        self._fast_prev = (tare, t)
+        self._fast_prev_raw = r['rate2']
+
+    # Leg 1 of a descent that rested first: the same plan as the later
+    # legs (0.5 x delta absorbed at 2 x the rate), from the rate the rest
+    # measured (the fit over the whole window, or the last half's if that
+    # is larger) plus the noise over the window it was measured in.
+    def first_leg_time(self, trigger_delta=None):
+        base = self._leg_time
+        plan = {'leg': 1, 'time': base, 'why': 'rest off'}
+        self.last_fast_plan = plan
+        self._leg_plans.append(plan)
+        r = self._rest
+        if r is None:
+            return base
+        if r['blocked']:
+            plan['why'] = r['why']
+            return base
+        delta = self._leg_first_delta or abs(trigger_delta or 0)
+        if not delta:
+            plan['why'] = 'no trigger delta'
+            return base
+        noise = r['noise']
+        rate = max(r['rate_fit'] + noise / r['span'],
+                   r['rate2'] + noise / r['dt2'])
+        plan['rate'] = rate
+        allowed = self._fast_budget * delta / (self._fast_safety * rate)
+        grown = base * self._fast_growth
+        use = max(base, min(self._fast_leg_max, allowed, grown))
+        plan['why'] = 'rest drift' if use == allowed else 'rest cap'
+        use = self._temp_limit(use, plan)
+        plan['time'] = use
+        return use
+
+    def rest_note(self):
+        r = self._rest
+        if r is None:
+            return "rest off"
+        return ("rest %.2f s: tare change %i, drift %.0f counts/s (last half"
+                " %.0f counts/s), noise seen %.0f used %.0f, %s"
+                % (r['span'], r['change'], r['rate_fit'], r['rate2'],
+                   r['noise_obs'], r['noise'], r['why']))
+
+    # The time the leg that is about to run was given (for the next plan)
+    def note_leg_time(self, seconds):
+        self._leg_last_time = seconds
+        self._leg_times.append(seconds)
+
+    # KAN-4682 (bench, I-514 'not consistently'): what became of FAST_ABOVE
+    # for this descent, so a stepped home can be matched to its reason
+    def note_fast_above(self, note):
+        self._fast_above_note = note
+
+    def note_pause(self, seconds):
+        self._leg_pauses.append(seconds)
+
     # One INFO line per descent of more than one leg: what the legs did
     # (bench: the cumulative changes are what the limits judge)
     def log_legs(self, how):
         if self._legs < 2:
             return
+        # KAN-4682: the planned leg seconds and the pauses between legs
+        # are the bench numbers for the timing before and after
         logging.info("load_cell_probe: Z legs %s: %d legs, tare change"
                      " since leg 1 %i the wrong way (peak %i) / %i toward"
-                     " the press (peak %i), last leg %i", how, self._legs,
-                     self._leg_total, self._leg_wrong_peak,
+                     " the press (peak %i), last leg %i; planned leg"
+                     " seconds [%s], pauses %.2f s in all [%s]; FAST_ABOVE %s;"
+                     " leg plans (why each leg got its time, KAN-4682)"
+                     " [%s]; %s", how,
+                     self._legs, self._leg_total, self._leg_wrong_peak,
                      self._leg_press_total, self._leg_press_peak,
-                     self._leg_last_change)
+                     self._leg_last_change,
+                     ", ".join("%.2f" % (s,) for s in self._leg_times),
+                     sum(self._leg_pauses),
+                     ", ".join("%.2f" % (s,) for s in self._leg_pauses),
+                     self._fast_above_note,
+                     ", ".join("%d:%s %.2fs%s" % (
+                         p.get('leg', 0), p.get('why', '?'),
+                         p.get('time', 0.),
+                         (" @%.0f/s" % (p['rate'],)) if 'rate' in p else "")
+                         for p in self._leg_plans),
+                     self.rest_note())
 
     def _fire(self, reason):
         self._armed = False
@@ -1018,6 +1315,10 @@ class ZLoadBackstop:
                 'z_backstop_leg_rate_counts': self._leg_rate,
                 'z_backstop_drift_total_factor': self._total_factor,
                 'z_backstop_press_total_factor': self._press_total_factor,
+                'z_backstop_fast_leg_max': self._fast_leg_max,
+                'z_backstop_fast_drift_factor': self._fast_budget,
+                'z_backstop_fast_rest_time': self._fast_rest_time,
+                'z_backstop_fast_temp_margin': self._fast_temp_margin,
                 'z_backstop_legs': self._legs,
                 'z_backstop_leg_last_change': self._leg_last_change,
                 'z_backstop_leg_total_change': self._leg_total,
@@ -1143,6 +1444,20 @@ class LoadCellProbingMove:
         tare_counts = int(round(np.average(arr[:, 2].astype(float))))
         return tare_counts, float(arr[-1, 0])
 
+    # KAN-4682 option B: the nozzle holds still and the cell is read for
+    # `seconds` (as many samples as that takes, never fewer than two
+    # tares' worth); returns the sample times and counts and the number a
+    # tare averages.  The wait is the sample count: no move is queued.
+    def _measure_rest(self, gcmd, seconds):
+        collector = self._start_collector()
+        n = self._config_helper.get_tare_samples(gcmd)
+        sps = self._load_cell.sensor.get_samples_per_second()
+        want = max(2 * n, int(math.ceil(seconds * sps)))
+        results = collector.collect_min(want)
+        samples = check_sensor_errors(results, self._printer)
+        arr = np.array(samples)
+        return arr[:, 0].astype(float), arr[:, 2].astype(float), n
+
     # ... and the half that stores it and sends it to the MCU
     def _apply_tare(self, tare_counts, gcmd, tare_time=None):
         # KAN-3370: refuse a loaded nozzle before the bad zero is stored
@@ -1226,6 +1541,9 @@ class LoadCellProbingMove:
         self._trigger_press_dir = trigger_setup.get('press_direction')
 
     MAX_BASELINE_DRIFT_COUNTS = 100000
+
+    # KAN-4682: the lowest FAST_ABOVE honoured (mm)
+    FAST_ABOVE_MIN = 5.
 
     # The MCU's auto_offset zero is RELATIVE: it becomes whatever the load
     # is when the descent arms.  Taking it while the nozzle is touching
@@ -1363,8 +1681,55 @@ class LoadCellProbingMove:
             # batch mode: every move "triggers" at its end (homing.py), so
             # legs would change where a probe lands; one descent there
             leg_time = 0.
+        # KAN-4682: FAST_ABOVE=<Z> says the plate is known to be below it
+        # (LOAD_CELL_HOME_Z passes it when contact_guard knows the height):
+        # the legs that start above it may run longer than z_move_leg_time,
+        # as fast_leg_time plans.  No leg crosses it, so the last few mm
+        # (and any contact the known height predicts) are on 1 s legs.
+        # Not with the MCU zero (no tare time to measure drift from).
+        fast_above = None
+        if (gcmd is not None and watch is not None and leg_time > 0.
+                and watch.fast_enabled()
+                and not _used_mcutare and tare_t is not None):
+            fast_above = gcmd.get_float('FAST_ABOVE', None)
+            if fast_above is not None:
+                # never closer to the plate than 5 mm: the legs that find
+                # it are the 1 s ones whatever a caller passes
+                fast_above = max(self.FAST_ABOVE_MIN, fast_above)
+        # KAN-4682 option B: a fast descent first holds still and measures
+        # the drift (z_move_fast_rest_time), so leg 1 is planned from it
+        # and not a fixed 1 s.  The tare the rest ends on is leg 1's.
+        rest = None
+        rest_secs = (watch.get_rest_time()
+                     if (fast_above is not None and watch is not None)
+                     else 0.)
+        if rest_secs > 0.:
+            tare1, t1 = self._tare_counts, tare_t
+            times, counts, n = self._measure_rest(gcmd, rest_secs)
+            rest = watch.analyse_rest(t1, tare1, times, counts, n,
+                                      self._trigger_delta,
+                                      self._trigger_press_dir)
+            if rest is not None:
+                # a press-side jump in the rest keeps the tare it began
+                # on (as check_leg does between legs)
+                use = tare1 if rest['jump'] else rest['tare2']
+                self._apply_tare(use, gcmd, rest['t2'])
+                tare_t = rest['t2']
         if watch is not None:
-            watch.start_legs(self._tare_counts, self._trigger_delta)
+            watch.start_legs(self._tare_counts, self._trigger_delta, tare_t)
+            asked = (gcmd.get_float('FAST_ABOVE', None)
+                     if gcmd is not None else None)
+            if fast_above is not None:
+                note = "%.2f mm" % (fast_above,)
+            elif asked is None:
+                note = "not asked"
+            elif _used_mcutare or tare_t is None:
+                note = "ignored (no tare time)"
+            else:
+                note = "ignored (fast legs off)"
+            watch.note_fast_above(note)
+            if rest is not None:
+                watch.note_rest(rest, self._tare_counts, tare_t)
         latch = None
         note_move = getattr(phoming, 'note_move_active', None)
         if leg_time > 0. and note_move is not None:
@@ -1373,7 +1738,7 @@ class LoadCellProbingMove:
         try:
             epos, collector = self._run_legs(
                 gcmd, toolhead, phoming, watch, pos, z_min, speed, leg_time,
-                capped, cap, tare_t, _used_mcutare, latch)
+                capped, cap, tare_t, _used_mcutare, latch, fast_above)
         except Exception:
             if watch is not None:
                 watch.log_legs("ended in an error")
@@ -1398,9 +1763,15 @@ class LoadCellProbingMove:
                 "Homing aborted: %s" % (latch.reason,))
 
     def _run_legs(self, gcmd, toolhead, phoming, watch, pos, z_min, speed,
-                  leg_time, capped, cap, tare_t, _used_mcutare, latch):
+                  leg_time, capped, cap, tare_t, _used_mcutare, latch,
+                  fast_above=None):
         cmd_err = self._printer.command_error
         leg = 1
+        leg_dur = leg_time
+        if (leg_time > 0. and watch is not None and fast_above is not None
+                and watch._rest is not None):
+            leg_dur = watch.first_leg_time(self._trigger_delta)
+        ended = None
         while True:
             self._check_latch(latch)
             if leg > 1:
@@ -1413,10 +1784,22 @@ class LoadCellProbingMove:
                     tare, dt, prev, self._trigger_delta,
                     self._trigger_press_dir), gcmd, t)
                 self._check_latch(latch)
+                leg_dur = leg_time
+                if fast_above is not None and (
+                        toolhead.get_position()[2] > fast_above + 1e-6):
+                    leg_dur = watch.fast_leg_time(tare, t,
+                                                  self._trigger_delta)
             z_now = toolhead.get_position()[2]
             leg_z = z_min
             if leg_time > 0.:
-                leg_z = max(z_min, z_now - speed * leg_time)
+                leg_z = max(z_min, z_now - speed * leg_dur)
+            if (fast_above is not None and z_now > fast_above + 1e-6
+                    and leg_z < fast_above):
+                # a long leg stops where the last few mm begin
+                leg_z = max(z_min, fast_above)
+            if watch is not None:
+                watch.note_leg_time(abs(z_now - leg_z) / speed
+                                    if speed > 0. else leg_dur)
             last = leg_z <= z_min
             pos[2] = leg_z
             # start collector after tare samples are consumed
@@ -1427,6 +1810,10 @@ class LoadCellProbingMove:
                           self._trigger_delta, self._trigger_press_dir,
                           mcutare=(_used_mcutare and leg == 1))
             # do homing move
+            if ended is not None and watch is not None:
+                # the pause between legs: the move stopped, the tare, the
+                # arming (bench: what the leg boundaries cost)
+                watch.note_pause(time.monotonic() - ended)
             try:
                 epos = phoming.probing_move(self._mcu_trigger_analog, pos,
                                             speed)
@@ -1454,6 +1841,7 @@ class LoadCellProbingMove:
                              " no contact (tare %i)", leg, leg_z,
                              self._tare_counts)
                 leg += 1
+                ended = time.monotonic()
                 continue
             finally:
                 # never left armed, whatever way the move ended

@@ -150,6 +150,13 @@ class ForceMove:
                      x, y, z, set_homed_axes, clear_homed_axes)
         toolhead.set_position([x, y, z], homing_axes=set_homed_axes)
         toolhead.get_kinematics().clear_homing_state(clear_homed_axes)
+        if clear_homed_axes:
+            # KAN-4682: whoever keeps a height on the strength of Z's homed
+            # flag (contact_guard) must learn that it was cleared; setting
+            # the flag back on the same number is not a height.  z_power's
+            # idle PGOOD recovery clears it this way.
+            self.printer.send_event("force_move:homing_cleared",
+                                    clear_homed_axes)
 
 def load_config(config):
     return ForceMove(config)
