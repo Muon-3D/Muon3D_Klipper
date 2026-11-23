@@ -56,7 +56,16 @@ MODE_NAMES = {MODE_PT1000: 'pt1000', MODE_NTC: 'ntc'}
 
 UPDATE_INTERVAL = 0.02
 BYTES_PER_SAMPLE = 4
-SENSOR_ERRORS = {0: "ADS1220 stopped converting (frozen reading)"}
+SENSOR_ERRORS = {
+    0: "ADS1220 stopped converting (frozen reading)",
+    1: "ADS1220 temperature read kept the load cell blanked past its"
+       " hard limit",
+}
+# KAN-4835: the mcu firmware advertises the glitch-free handover with this
+HANDOVER_CONSTANT = "MUON_ADS1220_HANDOVER"
+# The longest the load cell trigger may be blanked, hard (the firmware
+# refuses more, and stops the probe if a window runs past it)
+BLANK_HARD_MAX = 0.050
 
 def hexify(byte_array):
     return "[%s]" % (", ".join([hex(b) for b in byte_array]))
@@ -218,6 +227,20 @@ class MuonADS1220:
         # KAN-4682: the Z legs of load_cell_probe stay under this (less a
         # margin) so a temperature read never lands inside an armed leg
         self.max_temperature_pause = max_pause
+        # KAN-4835: while a probe is armed and a temperature read has to be
+        # taken, the trigger is blanked for the read plus this settling
+        # time (from the mux going back to the load cell), and the whole
+        # blind window may not exceed temperature_blank_max.  Only used if
+        # the probe asks for it (z_move_fast_temp_handover) and the mcu
+        # firmware supports it.
+        self.blank_time = config.getfloat(
+            'temperature_blank_time', 0.010, minval=0.002, maxval=0.040)
+        self.blank_max = config.getfloat(
+            'temperature_blank_max', BLANK_HARD_MAX, minval=0.010,
+            maxval=BLANK_HARD_MAX)
+        if self.blank_time >= self.blank_max:
+            raise config.error("muon_ads1220: temperature_blank_time must"
+                               " be below temperature_blank_max")
         stall_convs = config.getint('stall_conversions', 64, minval=8,
                                     maxval=10000)
         # SPI and pins
@@ -275,6 +298,11 @@ class MuonADS1220:
         self.load_cells = []
         self.hotends = []
         self.blind_count = 0
+        self.handover_requested = False
+        self.handover_active = False
+        self.blank_windows = []     # (start, end, dropped) print_time
+        self.blank_count = 0
+        self.blank_stats = {}
         self.last_error = None
         self.start_cmd = self.range_cmd = self.lc_cmd = None
         self.stats_cmd = None
@@ -308,6 +336,10 @@ class MuonADS1220:
         mcu.register_response(self._handle_blind, "muon_ads1220_blind",
                               self.oid)
         mcu.register_response(self._handle_stats, "muon_ads1220_stats",
+                              self.oid)
+        mcu.register_response(self._handle_blanked, "muon_ads1220_blanked",
+                              self.oid)
+        mcu.register_response(self._handle_stats3, "muon_ads1220_stats3",
                               self.oid)
         # Events
         printer.register_event_handler("klippy:connect", self._handle_connect)
@@ -344,6 +376,7 @@ class MuonADS1220:
                 self.oid, tick(t['settle']), tick(t['lc_first']),
                 tick(t['lc_settle']), tick(t['temp']), tick(t['max_pause']),
                 stall_convs))
+        self._build_handover(tick)
         cmdqueue = self.spi.get_command_queue()
         self.start_cmd = self.mcu.lookup_command(
             "muon_ads1220_start oid=%c mode=%c", cq=cmdqueue)
@@ -358,6 +391,34 @@ class MuonADS1220:
             " stall=%u mode=%c", oid=self.oid, cq=cmdqueue)
         self.ffreader.setup_query_command("muon_ads1220_query_status oid=%c",
                                           oid=self.oid, cq=cmdqueue)
+
+    # KAN-4835: turn the handover on only when asked for AND the firmware
+    # has it (an older firmware keeps the old behaviour, and the probe
+    # keeps its legs under max_temperature_pause)
+    def _build_handover(self, tick):
+        self.handover_active = False
+        if not self.handover_requested:
+            return
+        try:
+            constants = self.mcu.get_constants()
+        except Exception:
+            constants = {}
+        if not constants.get(HANDOVER_CONSTANT):
+            logging.warning("ADS1220 '%s': the mcu firmware cannot blank the"
+                            " load cell across a temperature read; the"
+                            " handover stays off", self.name)
+            return
+        self.mcu.add_config_cmd(
+            "muon_ads1220_set_handover oid=%d settle_ticks=%d max_ticks=%d"
+            % (self.oid, tick(self.blank_time), tick(self.blank_max)))
+        self.handover_active = True
+
+    def request_temp_handover(self):
+        self.handover_requested = True
+    def get_temp_handover(self):
+        return self.handover_active
+    def get_blank_windows(self):
+        return list(self.blank_windows)
 
     # Interfaces for the load cell adapter and the hotend sensor
     def get_mcu(self):
@@ -422,8 +483,29 @@ class MuonADS1220:
         for hotend in self.hotends:
             self.reactor.register_async_callback(
                 (lambda e, h=hotend: h.note_chip_error(self.last_error)))
+    def _handle_blanked(self, params):
+        # A temperature read was taken with a probe armed; these are the
+        # clocks the trigger was blanked between (no sample was fed in it)
+        t0 = self.mcu.clock_to_print_time(
+            self.mcu.clock32_to_clock64(params['start']))
+        t1 = self.mcu.clock_to_print_time(
+            self.mcu.clock32_to_clock64(params['end']))
+        self.blank_count += 1
+        self.blank_windows.append((t0, t1, params['dropped']))
+        del self.blank_windows[:-32]
+        logging.info("ADS1220 '%s': load cell blanked %.2f ms for a"
+                     " temperature read with the probe armed (%d samples)",
+                     self.name, (t1 - t0) * 1000., params['dropped'])
+    def _handle_stats3(self, params):
+        self.blank_stats = dict(params)
     def _handle_blind(self, params):
         self.blind_count += 1
+        if self.handover_active:
+            logging.info("ADS1220 '%s': probe armed past"
+                         " max_temperature_pause; the temperature read was"
+                         " handed over with the load cell blanked (%d so"
+                         " far)", self.name, self.blind_count)
+            return
         logging.warning("ADS1220 '%s': probe armed past max_temperature_pause;"
                         " a temperature read briefly took the load cell"
                         " (%d so far)", self.name, self.blind_count)
@@ -486,6 +568,14 @@ class MuonADS1220:
                    s.get('filler'), s.get('late'), params['temp'],
                    params['blind'], params['overrun'], params['stall'],
                    MODE_NAMES.get(params['mode'], 'off')))
+        b = self.blank_stats
+        if self.handover_active and b:
+            msg += ("\nhandover: %d windows, longest %.2f ms (limit %.0f"
+                    " ms), %d samples blanked, %d over the limit" % (
+                        b.get('blanks', 0),
+                        b.get('longest', 0) / self.mcu.seconds_to_clock(1.)
+                        * 1000., self.blank_max * 1000.,
+                        b.get('dropped', 0), b.get('over', 0)))
         rate = self.get_measured_rate()
         if rate is not None:
             real = sum(s.get(k, 0) for k in ('new', 'dup', 'hold'))
@@ -513,6 +603,13 @@ class MuonADS1220LoadCell:
         return self.chip.get_samples_per_second()
     def get_max_temperature_pause(self):
         return self.chip.max_temperature_pause
+    # KAN-4835
+    def request_temp_handover(self):
+        self.chip.request_temp_handover()
+    def get_temp_handover(self):
+        return self.chip.get_temp_handover()
+    def get_blank_windows(self):
+        return self.chip.get_blank_windows()
     def get_range(self):
         return ADC_MIN, ADC_MAX
     def lookup_sensor_error(self, error_code):

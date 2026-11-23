@@ -17,6 +17,12 @@
 // window. The temperature is range checked here, so an open or shorted
 // sensor shuts the mcu down without waiting for the host.
 //
+// A read that has to be taken while a probe is armed (the pause ran out) is
+// handed over without a glitch, if the host asked for it (KAN-4835): the
+// trigger is blanked from the moment the mux leaves the load cell until a
+// settling time after it returns (see struct mads_blank), and the window
+// has a hard limit past which the probe is stopped rather than left blind.
+//
 // All SPI traffic is issued from task context, like every other device on
 // the bus, so it can never interleave with another device's transfer.
 
@@ -53,11 +59,14 @@ enum {
 };
 
 // Sensor specific errors reported through trigger_analog
-enum { ME_STALL };
+enum { ME_STALL, ME_BLANK };
 
 #define BYTES_PER_SAMPLE 4
 #define ADS1220_SAT_MAX 0x7fffff
 #define ADS1220_SAT_MIN (-0x800000)
+// No blanking window may be configured longer than this, whatever the host
+// asks for: at 15 mm/s this is 0.75 mm of travel with the trigger blind
+#define BLANK_HARD_MAX_US 50000
 
 struct muon_ads1220 {
     struct timer timer;
@@ -84,6 +93,8 @@ struct muon_ads1220 {
     // Load cell stream
     struct sensor_bulk sb;
     struct mads_sampler ms;
+    // KAN-4835 blanking across a temperature read while armed
+    struct mads_blank blank;
     // Statistics
     uint32_t n_temp, n_blind, n_overrun, n_stall;
 };
@@ -206,10 +217,42 @@ fill_gap(struct muon_ads1220 *a, uint8_t oid, uint32_t now)
         trigger_analog_note_alive(a->ta);
 }
 
+// Samples inside a blanking window: slots with no measurement. The trigger
+// is not fed (its filter keeps the state it had before the read), and the
+// host discards them.
+static void
+emit_blanked(struct muon_ads1220 *a, uint8_t oid, struct mads_result *r)
+{
+    emit_fillers(a, oid, r->fillers + r->holds + r->emit);
+    // The sensor is alive, and the host is told this window happens
+    trigger_analog_note_alive(a->ta);
+}
+
+// The window ran past its hard limit with a probe armed: stop the probe
+// (never extend the window, never leave the probe blind)
+static void
+blank_over(struct muon_ads1220 *a)
+{
+    trigger_analog_note_error(a->ta, ME_BLANK);
+}
+
+// Tell the host about a window that has just ended
+static void
+blank_report(struct muon_ads1220 *a, uint8_t oid)
+{
+    struct mads_blank *b = &a->blank;
+    if (!b->ended)
+        return;
+    b->ended = 0;
+    sendf("muon_ads1220_blanked oid=%c start=%u end=%u dropped=%u"
+          , oid, b->t0, b->t_end, b->dropped);
+}
+
 static void
 resume_load_cell(struct muon_ads1220 *a)
 {
     uint32_t w = ads_write_reg0(a, a->lc_reg0);
+    mads_blank_resumed(&a->blank, w);
     mads_sampler_restart(&a->ms, w + a->lc_first_ticks);
     a->state = ST_LC_SETTLE;
     a->state_time = w + a->lc_settle_ticks;
@@ -257,6 +300,8 @@ start_temp(struct muon_ads1220 *a, uint32_t now)
     a->next_temp_time += a->temp_ticks;
     if (mads_before(a->next_temp_time, now))
         a->next_temp_time = now + a->temp_ticks;
+    if (a->flags & MF_LC)
+        mads_blank_begin(&a->blank, now);
     uint32_t w = ads_write_reg0(a, a->sense_reg0[a->mode]);
     a->state = ST_TEMP_SENSE;
     a->state_time = w + a->settle_ticks;
@@ -340,6 +385,8 @@ step(struct muon_ads1220 *a, uint8_t oid)
             break;
         }
         int temp_due = 0;
+        if (mads_blank_step(&a->blank, now, is_armed(a), 0) == MB_OVER)
+            blank_over(a);
         if (a->state == ST_LC_SETTLE) {
             fill_gap(a, oid, now);
             if (mads_before(now, a->state_time))
@@ -352,7 +399,16 @@ step(struct muon_ads1220 *a, uint8_t oid)
         int32_t raw = ads_read_data(a);
         struct mads_result r;
         mads_sampler_read(&a->ms, now, raw, &r);
-        emit_result(a, oid, &r);
+        int blank = mads_blank_step(&a->blank, now, is_armed(a), 1);
+        if (blank == MB_OVER) {
+            blank_over(a);
+            emit_blanked(a, oid, &r);
+        } else if (blank == MB_DROP) {
+            emit_blanked(a, oid, &r);
+        } else {
+            emit_result(a, oid, &r);
+        }
+        blank_report(a, oid);
         a->state = ST_LC;
         if (a->ms.dup_run >= a->stall_count && raw < ADS1220_SAT_MAX
             && raw > ADS1220_SAT_MIN) {
@@ -368,6 +424,8 @@ step(struct muon_ads1220 *a, uint8_t oid)
     }
     case ST_TEMP_SENSE:
     case ST_TEMP_REF: {
+        if (mads_blank_step(&a->blank, now, is_armed(a), 0) == MB_OVER)
+            blank_over(a);
         fill_gap(a, oid, now);
         if (is_armed(a) && !(a->flags & MF_BLIND)) {
             // A probe was armed during the slice: give it the load cell
@@ -485,6 +543,22 @@ DECL_COMMAND(command_muon_ads1220_set_schedule
              " lc_first_ticks=%u lc_settle_ticks=%u temp_ticks=%u"
              " max_pause_ticks=%u stall_count=%hu");
 
+// KAN-4835: turn on the glitch-free handover of a temperature read taken
+// while a probe is armed. max_ticks=0 turns it off (the default).
+void
+command_muon_ads1220_set_handover(uint32_t *args)
+{
+    struct muon_ads1220 *a = lookup(args[0]);
+    uint32_t settle = args[1], max = args[2];
+    if (max > timer_from_us(BLANK_HARD_MAX_US) || settle > max)
+        shutdown("muon_ads1220 blanking window out of range");
+    mads_blank_config(&a->blank, settle, max);
+}
+DECL_COMMAND(command_muon_ads1220_set_handover, "muon_ads1220_set_handover"
+             " oid=%c settle_ticks=%u max_ticks=%u");
+// The host looks for this to know the firmware can blank
+DECL_CONSTANT("MUON_ADS1220_HANDOVER", 1);
+
 void
 command_muon_ads1220_attach_trigger_analog(uint32_t *args)
 {
@@ -507,6 +581,7 @@ command_muon_ads1220_start(uint32_t *args)
     a->fault_max = a->fault_count = 0;
     a->state = ST_IDLE;
     mads_sampler_reset(&a->ms);
+    mads_blank_cancel(&a->blank);
     high_side_set(a, 0);
     if (mode != MODE_PT1000 && mode != MODE_NTC) {
         // Also turns off the IDAC
@@ -574,6 +649,7 @@ command_muon_ads1220_lc_enable(uint32_t *args)
             a->state = ST_IDLE;
     } else {
         a->flags &= ~(MF_LC | MF_PAUSED | MF_BLIND | MF_TOLD);
+        mads_blank_cancel(&a->blank);
     }
 }
 DECL_COMMAND(command_muon_ads1220_lc_enable
@@ -603,6 +679,9 @@ command_muon_ads1220_query_stats(uint32_t *args)
     sendf("muon_ads1220_stats2 oid=%c temp=%u blind=%u overrun=%u stall=%u"
           " mode=%c", oid, a->n_temp, a->n_blind, a->n_overrun, a->n_stall
           , a->mode);
+    sendf("muon_ads1220_stats3 oid=%c blanks=%u dropped=%u over=%u"
+          " longest=%u", oid, a->blank.n_windows, a->blank.n_dropped
+          , a->blank.n_over, a->blank.max_window);
 }
 DECL_COMMAND(command_muon_ads1220_query_stats
              , "muon_ads1220_query_stats oid=%c");

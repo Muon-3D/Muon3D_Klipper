@@ -723,6 +723,19 @@ class ZLoadBackstop:
         # max_temperature_pause (see _temp_cap)
         self._fast_temp_margin = config.getfloat(
             'z_move_fast_temp_margin', 0.5, minval=0.)
+        # KAN-4835: let the long legs above FAST_ABOVE run past the ADS1220's
+        # temperature read, which the mcu then hands over with the trigger
+        # blanked (a hard-capped few ms).  Off = the cap above stands.  It
+        # takes effect only if the mcu firmware supports it.
+        self._fast_temp_handover = config.getboolean(
+            'z_move_fast_temp_handover', False)
+        if self._fast_temp_handover:
+            ask = getattr(self._sensor(), 'request_temp_handover', None)
+            if ask is not None:
+                ask()
+        self._blank_seen_t = None   # the last sample time judged
+        self._blank_skipped = 0     # samples ignored inside a blank window
+        self._blank_resets = 0      # runs cut by a blank window
         self._rest = None           # the rest window's numbers (note_rest)
         self._rate_ref = None       # (tare, time) the drift is measured from
         self._noise_used = None     # the tare spread the plan allows for
@@ -798,6 +811,7 @@ class ZLoadBackstop:
         self._over_t0 = self._wrong_t0 = None
         self._drift = 0.
         self._drift_t = None
+        self._blank_seen_t = None
         self._drift_clamp = self.DRIFT_CLAMP * abs(trigger_delta or 0)
         self._note_arming(ceiling, wrong, trigger_delta, press_direction,
                           mcutare)
@@ -874,8 +888,11 @@ class ZLoadBackstop:
             self._registered = False
             return False
         try:
+            windows = self._blank_windows()
             for sample in msg['data']:
                 if sample[0] < self._start_time:
+                    continue
+                if windows and self._in_blank(windows, sample[0]):
                     continue
                 reason = self._judge(sample[2], sample[0])
                 if reason is not None:
@@ -888,6 +905,35 @@ class ZLoadBackstop:
             self._fire(self.REASON_FAILED)
             self._registered = False
             return False
+
+    # KAN-4835: the windows the mcu blanked the trigger for (a temperature
+    # read taken while armed).  No sample in one counts as wrong-way or
+    # press load, and a run of samples is not carried across one: the
+    # judging restarts from the first sample after it.  A real contact in
+    # the window is caught by the samples that follow it.
+    def _blank_windows(self):
+        if not self._fast_temp_handover:
+            return None
+        fn = getattr(self._sensor(), 'get_blank_windows', None)
+        try:
+            return fn() if fn is not None else None
+        except Exception:
+            return None
+
+    def _in_blank(self, windows, t):
+        for w0, w1, _n in windows:
+            if w0 <= t <= w1:
+                self._blank_skipped += 1
+                return True
+        last, self._blank_seen_t = self._blank_seen_t, t
+        for w0, w1, _n in windows:
+            if last is not None and last < w0 and w1 < t:
+                # a window lies between the last judged sample and this
+                self._over_run = self._wrong_run = 0
+                self._over_t0 = self._wrong_t0 = None
+                self._blank_resets += 1
+                break
+        return False
 
     def _confirmed(self, run, t0, t):
         if run >= self._need:
@@ -1095,11 +1141,26 @@ class ZLoadBackstop:
     # inside it: that read takes the load cell, and a probe armed past it
     # can fire in mid-air.  max_temperature_pause less z_move_fast_temp_margin.
     # None when the load cell is not a muon_ads1220 (no cap).
+    def _sensor(self):
+        return getattr(self._load_cell, 'sensor', None)
+
+    # KAN-4835: True when legs may run past the temperature read: asked
+    # for in the config AND the mcu firmware reported it can blank
+    def temp_handover(self):
+        if not self._fast_temp_handover:
+            return False
+        fn = getattr(self._sensor(), 'get_temp_handover', None)
+        try:
+            return bool(fn()) if fn is not None else False
+        except Exception:
+            return False
+
     def _temp_cap(self):
-        cell = self._load_cell
-        sensor = getattr(cell, 'sensor', None)
+        sensor = self._sensor()
         fn = getattr(sensor, 'get_max_temperature_pause', None)
         if fn is None:
+            return None
+        if self.temp_handover():
             return None
         try:
             pause = float(fn())
@@ -1109,6 +1170,8 @@ class ZLoadBackstop:
 
     # never shorter than z_move_leg_time (#148's legs stand)
     def _temp_limit(self, use, plan):
+        if self.temp_handover():
+            plan['handover'] = True
         cap = self._temp_cap()
         if cap is not None and use > cap:
             use = max(self._leg_time, cap)
@@ -1319,6 +1382,11 @@ class ZLoadBackstop:
                 'z_backstop_fast_drift_factor': self._fast_budget,
                 'z_backstop_fast_rest_time': self._fast_rest_time,
                 'z_backstop_fast_temp_margin': self._fast_temp_margin,
+                'z_backstop_fast_temp_handover_config':
+                    self._fast_temp_handover,
+                'z_backstop_fast_temp_handover': self.temp_handover(),
+                'z_backstop_blank_skipped': self._blank_skipped,
+                'z_backstop_blank_resets': self._blank_resets,
                 'z_backstop_legs': self._legs,
                 'z_backstop_leg_last_change': self._leg_last_change,
                 'z_backstop_leg_total_change': self._leg_total,

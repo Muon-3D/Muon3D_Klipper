@@ -14,6 +14,7 @@ No hardware and no klippy reactor. Covers:
 """
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -500,6 +501,108 @@ def test_command_names_survive_the_gcode_parser():
         parts = args_r.split((name + " CHIP=x").upper())
         cmd = ''.join(parts[:3]).strip()
         assert cmd == name, "%s is parsed as %r" % (name, cmd)
+
+
+######################################################################
+# Temperature read handed over while armed (KAN-4835)
+######################################################################
+
+def test_firmware_handover():
+    """The real src/sensor_muon_ads1220.c on the host, against a model of
+    the chip (fw_harness.c): blanking, the hard cap, the negative control."""
+    cc = shutil.which('cc') or shutil.which('gcc')
+    if cc is None:
+        print("skip test_firmware_handover: no C compiler")
+        return
+    out_dir = tempfile.mkdtemp()
+    exe = os.path.join(out_dir, 'fw_harness')
+    src = os.path.join(HERE, '..', '..', 'src')
+    subprocess.check_call([cc, '-std=gnu11', '-O2', '-Wall', '-o', exe,
+                           os.path.join(HERE, 'fw_harness.c'),
+                           '-I' + os.path.join(HERE, 'stubs'), '-I' + src,
+                           '-lm'])
+    res = subprocess.run([exe], stdout=subprocess.PIPE,
+                         universal_newlines=True)
+    sys.stdout.write(res.stdout)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    assert res.returncode == 0, "firmware handover harness failed"
+    # the negative control ran: the same chip model false triggers
+    # without the handover
+    assert "negative control" in res.stdout
+    # the force bound: no window may cost 1 mm at 15 mm/s (= 66 ms)
+    seen = 0
+    for line in res.stdout.splitlines():
+        mm = re.search(r'([0-9.]+) mm at', line)
+        if mm:
+            seen += 1
+            assert float(mm.group(1)) < 1.0, line
+    assert seen >= 3, res.stdout
+
+
+def test_hard_cap_matches_firmware():
+    src = open(os.path.join(HERE, '..', '..', 'src',
+                            'sensor_muon_ads1220.c')).read()
+    us = int(re.search(r'#define BLANK_HARD_MAX_US (\d+)', src).group(1))
+    assert abs(m.BLANK_HARD_MAX * 1e6 - us) < 1e-6, (m.BLANK_HARD_MAX, us)
+    # 15 mm/s over the hard cap: under a millimetre
+    assert m.BLANK_HARD_MAX * 15. < 1.0
+    assert 1 in m.SENSOR_ERRORS
+
+
+class FakeChipMcu:
+    def __init__(self, constants):
+        self.constants = constants
+        self.cmds = []
+    def get_constants(self):
+        return self.constants
+    def add_config_cmd(self, cmd, **kw):
+        self.cmds.append(cmd)
+    def clock32_to_clock64(self, c):
+        return c
+    def clock_to_print_time(self, c):
+        return c / 1000.
+
+
+def make_chip(constants, requested):
+    chip = m.MuonADS1220.__new__(m.MuonADS1220)
+    chip.mcu = FakeChipMcu(constants)
+    chip.name = 'x'
+    chip.oid = 3
+    chip.blank_time = 0.010
+    chip.blank_max = 0.050
+    chip.handover_requested = requested
+    chip.handover_active = False
+    chip.blank_windows = []
+    chip.blank_count = 0
+    chip.blind_count = 0
+    return chip
+
+
+def test_handover_only_when_asked_and_supported():
+    tick = lambda s: int(round(s * 12e6))
+    for constants, requested, expect in (
+            ({}, False, False),
+            ({'MUON_ADS1220_HANDOVER': 1}, False, False),
+            ({}, True, False),
+            ({'MUON_ADS1220_HANDOVER': 1}, True, True)):
+        chip = make_chip(constants, requested)
+        chip._build_handover(tick)
+        assert chip.get_temp_handover() == expect, (constants, requested)
+        assert (len(chip.mcu.cmds) == 1) == expect, chip.mcu.cmds
+        if expect:
+            assert chip.mcu.cmds[0] == (
+                "muon_ads1220_set_handover oid=3 settle_ticks=120000"
+                " max_ticks=600000"), chip.mcu.cmds
+
+
+def test_blank_windows_reach_the_host():
+    chip = make_chip({}, True)
+    for i in range(40):
+        chip._handle_blanked({'start': 1000 * i, 'end': 1000 * i + 12,
+                              'dropped': 24})
+    wins = chip.get_blank_windows()
+    assert len(wins) == 32 and chip.blank_count == 40, len(wins)
+    assert abs(wins[-1][1] - wins[-1][0] - 0.012) < 1e-9, wins[-1]
 
 
 def HOLD_REFUSES(heater):

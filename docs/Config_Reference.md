@@ -6001,6 +6001,18 @@ high_side_pin:
 #   the mcu takes a temperature read anyway (logged as a warning). The
 #   heater is held off for the whole tap, so this only bounds how stale
 #   the reported temperature can get.
+#temperature_blank_time: 0.010
+#   KAN-4835. Only with z_move_fast_temp_handover and an mcu firmware that
+#   supports it. A temperature read taken while a probe is armed blanks the
+#   probe's trigger from the moment the multiplexer leaves the load cell
+#   until this many seconds after it returns (the load cell channel
+#   settles). Nothing from the load cell reaches the trigger in between.
+#   0.002 to 0.040 seconds.
+#temperature_blank_max: 0.050
+#   The hard limit of the whole blind window (the read plus the settling).
+#   A window that runs past it stops the probe (an error), it is never
+#   extended. At the 15 mm/s Z speed 0.050 s is 0.75 mm. 0.010 to 0.050
+#   seconds; the mcu refuses more than 0.050.
 #stall_conversions: 64
 #   An unsaturated load cell reading that repeats for this many
 #   conversions means the chip stopped converting; an armed probe then
@@ -6153,6 +6165,17 @@ sensor_type:
 #   speeds up during the rest, or a press-side step, gives no growth for the
 #   whole descent. 0 turns the rest off (legs as before). The default is 0 (off) until
 #   the rest has been benched; 0.5 is the designed value.
+#z_move_fast_temp_handover: False
+#   KAN-4835. True lets the long legs of a fast descent (the ones above
+#   FAST_ABOVE) run past muon_ads1220's max_temperature_pause instead of
+#   being capped at it (see z_move_fast_temp_margin): the mcu takes the
+#   temperature read mid-leg with the trigger blanked for the read plus a
+#   settling time (muon_ads1220 temperature_blank_time, at most
+#   temperature_blank_max), and tells the host, whose load backstop ignores
+#   the window. Takes effect only if the mcu firmware supports it (otherwise
+#   the cap stays). The 1 s legs near the plate are not changed. Legs are
+#   still bounded by z_move_fast_leg_max and the drift budget. The default
+#   is False (the cap).
 #z_move_fast_temp_margin: 0.5
 #   No armed leg of a fast descent runs longer than the load cell's
 #   max_temperature_pause (muon_ads1220) less this many seconds: past it the
