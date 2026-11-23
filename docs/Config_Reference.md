@@ -67,8 +67,8 @@ serial:
 #reconnect_fast_window: 0
 #   if is_non_critical == true and this is above 0, poll every
 #   reconnect_interval for this many seconds after the disconnect (a
-#   re-plugged toolhead is picked up at once), then every
-#   reconnect_max_interval, instead of doubling the wait.
+#   re-plugged toolhead is picked up at once), then double the wait up to
+#   reconnect_max_interval as usual.
 #reconnect_max_interval: 30.0
 #   if is_non_critical == true, the ceiling for the reconnect poll
 #   back-off. Each connect attempt that opens the serial port but gets
@@ -4978,24 +4978,17 @@ present_locked_range:
 #   PGOOD must then stay high (it must rise within power_good_timeout)
 #   before the path is ready again. Otherwise the fault latches.
 #toolhead_removal_before: 3.0
-#toolhead_removal_after: 3.0
-#   A PGOOD drop with no overload (the IMON peak never above
-#   max_current) is the toolhead coming off, not a bed power fault, when an
-#   unlock press (Z_POWER_NOTE_TOOLHEAD_UNLOCK) or the toolhead MCU going
-#   away falls within this many seconds before or after the drop. Bed power
-#   is off meanwhile. With no such event by the end of the "after" wait the
-#   drop is judged as before (idle recovery or the latched fault). 0 for
-#   "after" never waits. The state is `toolhead_removed` and it clears by
-#   itself when the toolhead is back.
-#toolhead_rail_retry: 2.0
-#   While the toolhead is off, 48V_Z stays off for toolhead_removal_after,
-#   then comes back (the bed is still not heated) so a toolhead that is
-#   powered through it can start and reconnect. If PGOOD does not hold,
-#   the rail goes off for this long and is tried again, for as long as the
-#   toolhead is away. 0 keeps it off until the toolhead is back.
+#   A PGOOD drop is the toolhead coming off, not a bed power fault, only
+#   when the unlock button was pressed (armed, not printing) up to this many
+#   seconds before it, nothing is printing or paused, and IMON was read and
+#   never passed max_current. Anything else latches the bed fault at once.
+#   The state is `toolhead_removed`: 48V_Z stays off, and when the toolhead
+#   is back it is powered up once; if that does not hold, the normal bed
+#   fault latches.
 #toolhead_mcu: toolhead
 #toolhead_hotend: extruder
-#   The non-critical MCU and the muon_hotend heater whose disconnect counts.
+#   The non-critical MCU and the muon_hotend heater whose disconnect ends
+#   toolhead_removed.
 #plate_settle_time: 2.0
 #   Seconds the Z column must be plugged in before the plate reading
 #   counts. The bed thermistor input floats while the column is out.

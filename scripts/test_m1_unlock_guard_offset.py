@@ -22,6 +22,7 @@ from test_m1_heater_before_leds import M1, _M1TestCase  # noqa: E402
 from test_m1_led_modes import Status  # noqa: E402
 
 MOTION = ('G0', 'G1', 'G4', 'G91', 'SAVE_GCODE_STATE', 'RESTORE_GCODE_STATE')
+NOTE = 'Z_POWER_NOTE_TOOLHEAD_UNLOCK'
 MESSAGE = 'lift Z 1 mm (or home) before moving X or Y'
 
 
@@ -123,6 +124,21 @@ class UnlockReportsGuardOffset(_M1TestCase):
     def test_not_when_unarmed(self):
         self.m1.run('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         self.assertNotIn('SET_CONTACT_GUARD', self.m1.names())
+        self.assertNotIn(NOTE, self.m1.names())
+
+    def test_kan5663_press_is_noted_for_z_power_first(self):
+        # Only an armed press with nothing printing is the toolhead coming
+        # off; z_power reads the note.
+        self.m1.print_stats['state'] = 'standby'
+        self.press()
+        names = self.m1.names()
+        self.assertEqual(names.count(NOTE), 1, self.m1.timeline)
+        self.assertLess(names.index(NOTE), names.index('COLD_RETRACT'))
+
+    def test_kan5663_printing_press_is_not_noted(self):
+        self.m1.print_stats['state'] = 'printing'
+        self.press()
+        self.assertNotIn(NOTE, self.m1.names())
 
 
 class UnlockWithoutGuard(_M1TestCase):

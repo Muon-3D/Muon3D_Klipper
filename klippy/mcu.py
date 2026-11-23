@@ -847,8 +847,8 @@ class MCUConnectHelper:
         )
         # KAN-5663: a hot-plug MCU (the toolhead) is polled every
         # reconnect_interval for this many seconds after it went away, so a
-        # re-plug is picked up within a couple of seconds, then every
-        # reconnect_max_interval. 0 keeps the doubling back-off above.
+        # re-plug is picked up within a couple of seconds, then the doubling
+        # back-off above. 0 is the doubling back-off from the start.
         self.reconnect_fast_window = config.getfloat(
             "reconnect_fast_window", 0., minval=0.
         )
@@ -1002,10 +1002,11 @@ class MCUConnectHelper:
         ceiling = max(self.reconnect_max_interval, self.reconnect_interval)
         window = getattr(self, "reconnect_fast_window", 0.)
         since = getattr(self, "_reconnect_since", None)
-        if window and since is not None:
-            if self._reactor.monotonic() - since < window:
-                return self.reconnect_interval
-            return ceiling
+        if (window and since is not None
+                and self._reactor.monotonic() - since < window):
+            # The fast window: a re-plug is picked up within one interval.
+            # After it the doubling below limits the openocd resets.
+            return self.reconnect_interval
         self._reconnect_delay = min(delay * 2., ceiling)
         return delay
     def non_critical_recon_event(self, eventtime):
