@@ -191,6 +191,10 @@ finish_test contact_guard "Test contact_guard decisions"
 start_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
 $PYTHON test/muon_ads1220/test_muon_ads1220.py
 finish_test muon_ads1220 "Test Muon ADS1220 sampling and hotend detection"
+# MUON: a bulk sensor on a disconnected toolhead logs one line (KAN-5663).
+start_test bulk_sensor "Test bulk sensor MCU disconnect"
+$PYTHON test/bulk_sensor/test_bulk_sensor_disconnect.py
+finish_test bulk_sensor "Test bulk sensor MCU disconnect"
 # MUON: B1 Z/bed power path decisions and fault latching.
 start_test z_power "Test z_power decisions"
 $PYTHON test/z_power/test_z_power.py

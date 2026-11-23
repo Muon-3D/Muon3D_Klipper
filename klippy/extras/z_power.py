@@ -91,6 +91,20 @@ IDLE_RECOVERY_WINDOW = 1800.
 IDLE_RECOVERY_DAILY_MAX = 8
 IDLE_RECOVERY_HIGH = 5
 DAY = 86400.
+# KAN-5663: taking the toolhead off drops PGOOD with no load on the eFuse. A
+# PGOOD drop is read as the toolhead coming off, not a bed fault, when an
+# unlock press or the toolhead MCU going away falls within this many seconds
+# before or after the drop (TOOLHEAD_REMOVAL_BEFORE / _AFTER). The path is
+# held off while it waits for the later of the two, then decides. A drop
+# whose IMON peak is above max_current (an overload) is never waited on.
+TOOLHEAD_REMOVAL_BEFORE = 3.0
+TOOLHEAD_REMOVAL_AFTER = 3.0
+# While the toolhead is off, 48V_Z is held off for the "after" wait, then
+# brought back (the bed stays unheated: only READY lets it heat) so that a
+# toolhead that takes power from the rail can start and reconnect. If PGOOD
+# does not hold it is turned off again for this long, then retried, for as
+# long as the toolhead is away. 0 keeps the rail off until it is back.
+TOOLHEAD_RAIL_RETRY = 2.0
 
 # States, in the order the path comes up
 ABSENT = 'absent'           # no Z column on the connector
@@ -102,6 +116,8 @@ READY = 'ready'             # 48V_Z up and confirmed
 RECOVERING = 'recovering'   # idle PGOOD drop: off, re-enabling, holding
 INHIBITED = 'inhibited'     # held off by Z_POWER_INHIBIT
 FAULT = 'fault'             # latched until Z_POWER_RESET
+CHECKING = 'checking'       # PGOOD dropped: off, waiting to see why
+TOOLHEAD_REMOVED = 'toolhead_removed'   # toolhead taken off; not a fault
 
 
 # What is wrong and what to do about it, as shown to the user
@@ -126,18 +142,21 @@ DROPPED_REASON = ("Bed power cut out. Check the plate is seated and its"
                   " connector is clean, then reset bed power.")
 NO_RETURN_REASON = ("Bed power did not come back after the reset. Check the"
                     " plate and its connector.")
+REMOVED_REASON = "Toolhead disconnected: reattach the toolhead."
+CHECKING_REASON = "bed power dropped: checking why"
 PRINTING_RESET_ERROR = "Pause or stop the print before resetting bed power."
 
 
 def decide(z_band, plate_present, fault, inhibited,
-           fault_reason=None):
+           fault_reason=None, removal=None):
     """Pure decision: (state before PGOOD confirmation, reason, enable).
 
     z_band is 'absent', 'unlocked', 'locked' or None (no matching band).
     plate_present is True, False or None (no reading yet). fault_reason
     is the plain sentence for the fault, if it has one. Returns the
     state the path should be in if PGOOD behaves; the caller turns
-    'powering' into 'ready' once PGOOD confirms.
+    'powering' into 'ready' once PGOOD confirms. removal is None, 'check'
+    (PGOOD dropped, waiting to see if the toolhead came off) or 'removed'.
     """
     if fault:
         return FAULT, fault_reason or REASONS[FAULT] % (fault,), False
@@ -151,6 +170,10 @@ def decide(z_band, plate_present, fault, inhibited,
         return UNKNOWN, REASONS[UNKNOWN], False
     if not plate_present:
         return NO_PLATE, REASONS[NO_PLATE], False
+    if removal == 'removed':
+        return TOOLHEAD_REMOVED, REMOVED_REASON, False
+    if removal == 'check':
+        return CHECKING, CHECKING_REASON, False
     return POWERING, REASONS[POWERING], True
 
 
@@ -257,6 +280,15 @@ class ZPower:
             mcu_current.setup_adc_callback(ADC_REPORT_TIME,
                                            self._current_callback)
         self.max_current = config.getfloat('max_current', 5.0, above=0.)
+        self.removal_before = config.getfloat(
+            'toolhead_removal_before', TOOLHEAD_REMOVAL_BEFORE, minval=0.)
+        self.removal_after = config.getfloat(
+            'toolhead_removal_after', TOOLHEAD_REMOVAL_AFTER, minval=0.)
+        self.rail_retry = config.getfloat(
+            'toolhead_rail_retry', TOOLHEAD_RAIL_RETRY, minval=0.)
+        self.toolhead_mcu_name = config.get('toolhead_mcu', 'toolhead')
+        self.toolhead_hotend_name = config.get('toolhead_hotend',
+                                               'extruder')
         self.max_current_time = config.getfloat('max_current_time', 0.5,
                                                 minval=0.)
         self.idle_current = config.getfloat('idle_current', 1.0, above=0.)
@@ -312,6 +344,10 @@ class ZPower:
         gcode = printer.lookup_object('gcode')
         gcode.register_command('Z_POWER_STATUS', self.cmd_Z_POWER_STATUS,
                                desc=self.cmd_Z_POWER_STATUS_help)
+        gcode.register_command(
+            'Z_POWER_NOTE_TOOLHEAD_UNLOCK',
+            self.cmd_Z_POWER_NOTE_TOOLHEAD_UNLOCK,
+            desc=self.cmd_Z_POWER_NOTE_TOOLHEAD_UNLOCK_help)
         gcode.register_command('Z_POWER_RESET', self.cmd_Z_POWER_RESET,
                                desc=self.cmd_Z_POWER_RESET_help)
         gcode.register_command('Z_POWER_INHIBIT', self.cmd_Z_POWER_INHIBIT,
@@ -348,6 +384,17 @@ class ZPower:
         self.current_history = collections.deque()
         self.fault_reason = None
         self.fault_detail = None
+        # KAN-5663: toolhead removal (see TOOLHEAD_REMOVAL_*)
+        self.removal_before = TOOLHEAD_REMOVAL_BEFORE
+        self.removal_after = TOOLHEAD_REMOVAL_AFTER
+        self.rail_retry = TOOLHEAD_RAIL_RETRY
+        self.toolhead_mcu_name = 'toolhead'
+        self.toolhead_hotend_name = 'extruder'
+        self.removal = None
+        self.low_started = None
+        self.unlock_at = None
+        self.gone_at = None
+        self.gone_prev = None
     def _get_range(self, config, option):
         vals = config.getfloatlist(option, count=2)
         lo, hi = vals
@@ -501,6 +548,7 @@ class ZPower:
             # abort_active_move is idempotent (False once aborted), so
             # the _transition call at the latch is a no-op.
             self.low_run = True
+            self.low_started = eventtime
             self._abort_z_move("the Z and bed power was lost")
         if self.settle_end is not None and eventtime < self.settle_end:
             # The eFuse's start-up may still be settling (see
@@ -519,16 +567,137 @@ class ZPower:
             # tripped, so nothing is heated meanwhile; a latch zeroes the
             # heater target through _transition.
             return READY, "bed power is on", True
-        if (self._idle_state(eventtime) is None
+        drop = self.low_started if self.low_started is not None else eventtime
+        peak = self._peak()
+        why = self._removal_evidence(drop)
+        if self._removal_possible(peak) and (why or self.removal_after > 0):
+            # KAN-5663: no overload on the eFuse, so this may be the
+            # toolhead coming off. Power stays off while the evidence is
+            # looked for (toolhead_removal_after 0 never waits).
+            self.removal = {'phase': 'removed' if why else 'check',
+                            'drop': drop, 'peak': peak,
+                            'diag': self._diagnostics(eventtime),
+                            'entered': eventtime,
+                            'saw_gone': self._toolhead_gone()}
+            if why:
+                logging.warning("%s: PGOOD dropped with the toolhead coming"
+                                " off (%s); not a bed fault | %s",
+                                self.name, why, self.removal['diag'])
+            else:
+                logging.info("%s: PGOOD dropped, no overload; waiting %.1fs"
+                             " to see if the toolhead comes off",
+                             self.name, self.removal_after)
+            return (TOOLHEAD_REMOVED if why else CHECKING,
+                    REMOVED_REASON if why else CHECKING_REASON, False)
+        return self._trip(eventtime, peak, self._diagnostics(eventtime))
+    def _trip(self, eventtime, peak, diag):
+        """A PGOOD drop that is not the toolhead: recover it if the bed is
+        idle, else latch the bed power fault. (state, reason, enable)."""
+        if (self._idle_state(eventtime, peak) is None
                 and self._start_recovery(eventtime)):
             return RECOVERING, REASONS[RECOVERING], False
         self._latch_fault("PGOOD dropped (eFuse tripped, peak %s A over"
-                          " %.0f s)" % (self._amps(self._peak()),
-                                        PEAK_WINDOW), eventtime,
-                          DROPPED_REASON, self._diagnostics(eventtime))
+                          " %.0f s)" % (self._amps(peak), PEAK_WINDOW),
+                          eventtime, DROPPED_REASON, diag)
         return FAULT, self.fault_reason, False
-    def _idle_state(self, eventtime):
-        """None when the bed is idle (see IDLE_*), else why it is not."""
+    def _removal_possible(self, peak):
+        """The drop carried no overload: the IMON peak never passed
+        max_current (an unread IMON counts as no overload)."""
+        return peak is None or peak <= self.max_current
+    # KAN-5663: the toolhead coming off
+    def note_toolhead_unlock(self, eventtime=None):
+        """The umbilical unlock button was pressed (the macro calls
+        Z_POWER_NOTE_TOOLHEAD_UNLOCK first thing)."""
+        self.unlock_at = (self.reactor.monotonic() if eventtime is None
+                          else eventtime)
+    def _toolhead_gone(self):
+        """The toolhead MCU is disconnected, or muon_hotend reads "toolhead
+        not connected"."""
+        mcu = self.printer.lookup_object('mcu ' + self.toolhead_mcu_name,
+                                         None)
+        if getattr(mcu, 'non_critical_disconnected', False):
+            return True
+        hotend = self.printer.lookup_object(
+            'muon_hotend ' + self.toolhead_hotend_name, None)
+        return getattr(hotend, 'state', None) == 'disconnected'
+    def _track_toolhead(self, eventtime):
+        """Time stamp the toolhead going away. Gone at the first look
+        (a start-up without it) is not a removal and is never evidence."""
+        gone = self._toolhead_gone()
+        if gone and self.gone_prev is False:
+            self.gone_at = eventtime
+            logging.info("%s: toolhead disconnected", self.name)
+        self.gone_prev = gone
+        return gone
+    def _removal_evidence(self, drop):
+        """What ties the drop at `drop` to the toolhead, or None."""
+        for what, at in (("unlock press", self.unlock_at),
+                         ("toolhead disconnected", self.gone_at)):
+            if (at is not None
+                    and drop - self.removal_before <= at
+                    <= drop + self.removal_after):
+                return what
+        return None
+    def _removal_step(self, eventtime, gone):
+        """One poll of the toolhead-removal check, before decide()."""
+        rem = self.removal
+        if rem is None:
+            return
+        if gone:
+            rem['saw_gone'] = True
+        if rem['phase'] == 'check':
+            why = self._removal_evidence(rem['drop'])
+            if why:
+                rem['phase'] = 'removed'
+                logging.warning("%s: bed power off, the toolhead came off"
+                                " (%s); not a bed fault | %s", self.name,
+                                why, rem['diag'])
+            elif eventtime >= rem['drop'] + self.removal_after:
+                # Nothing took the toolhead off: the bed power fault as it
+                # always was, with the numbers from the moment of the drop.
+                self.removal = None
+                self._trip(eventtime, rem['peak'], rem['diag'])
+            return
+        # removed: back once the toolhead is. A drop with the toolhead
+        # never leaving (an unlock press, then a change of mind) ends when
+        # the window has passed. The path then comes up as for a start.
+        if gone or not (rem['saw_gone']
+                        or eventtime >= rem['entered'] + self.removal_after):
+            return
+        self.removal = None
+        logging.info("%s: toolhead back; bed power returns", self.name)
+        if self.enabled:
+            # The rail was brought back while it was away: wait for PGOOD
+            # as for a start-up, not as a drop from READY.
+            self.powering_since = eventtime
+            self.start_peak = 0.
+            self.settle_end = None
+        self.low_polls = 0
+        self.low_run = False
+        self.reactor.register_callback(lambda et: self._run_script(
+            "SET_KINEMATIC_POSITION CLEAR_HOMED=Z"))
+    def _removal_rail(self, eventtime):
+        """The enable while the toolhead is off: off for the "after" wait,
+        then on if PGOOD holds it, else off for rail_retry and again."""
+        rem = self.removal
+        if (self.rail_retry <= 0.
+                or eventtime < rem['entered'] + self.removal_after):
+            return False
+        if self.enabled:
+            if self.power_good:
+                rem['probe_at'] = None
+                return True
+            if rem.get('probe_at') is None:
+                rem['probe_at'] = eventtime
+            if eventtime - rem['probe_at'] <= self.power_good_timeout:
+                return True
+            rem['probe_at'] = None
+            rem['off_until'] = eventtime + self.rail_retry
+            return False
+        return eventtime >= rem.get('off_until', 0.)
+    def _idle_state(self, eventtime, peak=False):
+        """None when the bed is idle (see IDLE_*), else why it is not.
+        peak is the IMON peak at the drop, if not the last window's."""
         stats = self.printer.lookup_object('print_stats', None)
         if stats is not None:
             pstate = stats.get_status(eventtime).get('state')
@@ -546,7 +715,8 @@ class ZPower:
             return "bed at %s C" % (temp,)
         if self.heater.get_status(eventtime).get('power', 0.) > 0.:
             return "heater power on"
-        peak = self._peak()
+        if peak is False:
+            peak = self._peak()
         if peak is None or peak > self.idle_recovery_current:
             return "bed current peak %s A" % (self._amps(peak),)
         return None
@@ -582,6 +752,15 @@ class ZPower:
     def _recovery_step(self, eventtime):
         """One poll of an idle recovery: (state, reason, enable)."""
         rec = self.recovery
+        if self._removal_evidence(rec['start']):
+            self.recovery = None
+            self.removal = {'phase': 'removed', 'drop': rec['start'],
+                            'peak': None, 'diag': rec['history'],
+                            'entered': eventtime,
+                            'saw_gone': self._toolhead_gone()}
+            logging.warning("%s: the toolhead came off during the idle"
+                            " recovery; not a bed fault", self.name)
+            return TOOLHEAD_REMOVED, REMOVED_REASON, False
         _temp, target = self.heater.get_temp(eventtime)
         if target:
             return self._recovery_fail("bed target set to %.0f during the"
@@ -675,10 +854,14 @@ class ZPower:
         self.plate = plate = self._plate_present(band, eventtime)
         self._update_current()
         self._record(eventtime)
+        gone = self._track_toolhead(eventtime)
+        self._removal_step(eventtime, gone)
         if self.enabled:
             self._check_current(eventtime)
+        removal = self.removal['phase'] if self.removal else None
         state, reason, enable = decide(band, plate, self.fault,
-                                       self.inhibited, self.fault_reason)
+                                       self.inhibited, self.fault_reason,
+                                       removal)
         if not enable:
             self.recovery = None
         if enable and self.recovery is not None:
@@ -722,6 +905,8 @@ class ZPower:
             self.low_polls = 0
             self.low_run = False
             self.after_reset = False
+        if state == TOOLHEAD_REMOVED:
+            enable = self._removal_rail(eventtime)
         self._set_enable(enable, eventtime)
         self._transition(state, reason, eventtime)
         return eventtime + POLL_INTERVAL
@@ -826,6 +1011,8 @@ class ZPower:
                 'power': power,
                 'fault': self.fault,
                 'fault_detail': self.fault_detail,
+                'toolhead_removed': bool(
+                    self.removal and self.removal['phase'] == 'removed'),
                 'pgood_glitches': self.glitches,
                 'last_pgood_glitch': self.last_glitch,
                 'last_pgood_glitch_age': glitch_age,
@@ -849,6 +1036,11 @@ class ZPower:
                st['plate_present'], int(st['enabled']),
                int(st['power_good']), st['current'], st['power'],
                st['pgood_glitches'], st['pgood_idle_recoveries']))
+    cmd_Z_POWER_NOTE_TOOLHEAD_UNLOCK_help = (
+        "Note that the toolhead unlock button was pressed (a PGOOD drop"
+        " around it is the toolhead coming off, not a bed fault)")
+    def cmd_Z_POWER_NOTE_TOOLHEAD_UNLOCK(self, gcmd):
+        self.note_toolhead_unlock()
     cmd_Z_POWER_RESET_help = "Clear a latched Z power fault"
     def cmd_Z_POWER_RESET(self, gcmd):
         # Not mid-print: if the cause is still there the fault re-latches

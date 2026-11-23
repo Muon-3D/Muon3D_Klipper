@@ -1109,6 +1109,47 @@ class TestBedFaultPrompt(unittest.TestCase):
         self.assertEqual(out[-1], '// action:prompt_show')
 
 
+class TestToolheadRemovedIsNotABedFault(unittest.TestCase):
+    """KAN-5663: z_power's state 'toolhead_removed' reads as one thing, the
+    toolhead, never as bed_power_fault."""
+    def removed(self):
+        m = Machine()
+        m.zp.status.update(state='toolhead_removed',
+                           reason=z_power.REMOVED_REASON)
+        m.mcu.non_critical_disconnected = True
+        return m
+
+    def test_the_fault_list_has_the_toolhead_only(self):
+        m = self.removed()
+        c = m.m1.conditions(0)
+        self.assertEqual(c['toolhead'], 'disconnected')
+        self.assertEqual(c['bed_power'], 'toolhead_removed')
+        self.assertEqual(c['bed_power_reason'], z_power.REMOVED_REASON)
+        self.assertEqual(m.m1.faults(c), ['toolhead_disconnected'])
+        self.assertNotIn('bed_power_fault', m.m1.faults(c))
+
+    def test_nothing_asks_for_a_bed_reset(self):
+        m = self.removed()
+        st = m.m1.get_status(0)
+        for action, miss in st['missing'].items():
+            self.assertNotIn('bed_power_fault', miss, action)
+            self.assertNotIn('bed_power_starting', miss, action)
+        self.assertEqual(st['missing']['print'], ['toolhead_disconnected'])
+        self.assertEqual(m.prompts(), [])
+
+    def test_a_real_bed_fault_is_unchanged(self):
+        m = Machine()
+        m.zp.status.update(state='fault', reason=z_power.DROPPED_REASON)
+        c = m.m1.conditions(0)
+        self.assertEqual(m.m1.faults(c), ['bed_power_fault'])
+
+    def test_the_toolhead_back_clears_it(self):
+        m = self.removed()
+        m.mcu.non_critical_disconnected = False
+        m.zp.status.update(state='ready', reason='')
+        self.assertEqual(m.m1.faults(m.m1.conditions(0)), [])
+
+
 class TestFilePrinting(unittest.TestCase):
     """What filament_switch_sensor asks: is a print file printing?"""
     def test_cases(self):

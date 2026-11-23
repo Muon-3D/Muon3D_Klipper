@@ -67,11 +67,22 @@ class BatchBulkHelper:
         if self.client_cbs:
             # New client started while in process of stopping
             self._start()
+    def _mcu_disconnected(self):
+        for _name, obj in self.printer.lookup_objects('mcu'):
+            if getattr(obj, 'non_critical_disconnected', False):
+                return True
+        return False
     def _proc_batch(self, eventtime):
         try:
             msg = self.batch_cb(eventtime)
         except self.printer.command_error as e:
-            logging.exception("BatchBulkHelper batch callback error")
+            if self._mcu_disconnected():
+                # KAN-5663: a sensor on a hot-plug MCU (the toolhead) lost
+                # its link. Expected: one line, no traceback.
+                logging.info("BatchBulkHelper: sensor stopped, its MCU"
+                             " disconnected (%s)", e)
+            else:
+                logging.exception("BatchBulkHelper batch callback error")
             self._stop()
             return self.printer.get_reactor().NEVER
         if not msg:

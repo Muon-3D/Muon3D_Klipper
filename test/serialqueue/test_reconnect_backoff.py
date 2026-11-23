@@ -46,6 +46,23 @@ def test_backoff_doubles_to_ceiling():
     assert delays == [2.12, 4.24, 8.48, 16.96, 30., 30., 30.], delays
 
 
+def test_fast_window_then_ceiling():
+    # KAN-5663: every 2 s for 30 s after the toolhead went away, then 10 s.
+    reactor = FakeReactor()
+    h = make_helper(interval=2.12, ceiling=10.)
+    h._reactor = reactor
+    h.reconnect_fast_window = 30.
+    h._reconnect_since = reactor.now
+    delays = []
+    for _ in range(20):
+        delays.append(h._next_reconnect_delay())
+        reactor.now += delays[-1]
+    assert delays[:14] == [2.12] * 14, delays
+    assert delays[-3:] == [10., 10., 10.], delays
+    h._reconnect_since = None      # a success clears it: the doubling again
+    assert h._next_reconnect_delay() > 0
+
+
 def test_backoff_disabled_when_ceiling_is_zero():
     h = make_helper(ceiling=0.)
     delays = [h._next_reconnect_delay() for _ in range(4)]
@@ -124,6 +141,7 @@ def main():
     serialhdl.stk500v2_leave = lambda ser, reactor: None
     try:
         test_backoff_doubles_to_ceiling()
+        test_fast_window_then_ceiling()
         test_backoff_disabled_when_ceiling_is_zero()
         test_backoff_resets_on_disconnect_and_success()
         test_connect_uart_single_attempt()
