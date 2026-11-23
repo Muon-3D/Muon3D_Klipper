@@ -179,7 +179,7 @@ def missing(action, c):
                 out.append('bed_power_fault')
             elif bp == 'inhibited':
                 out.append('bed_power_inhibited')
-            elif bp not in ('ready', 'none') and not any(
+            elif bp not in ('ready', 'none', 'toolhead_removed') and not any(
                     m.startswith(('column_', 'plate_')) for m in out):
                 out.append('bed_power_starting')
         elif check == 'fan':
@@ -426,6 +426,12 @@ class M1Machine:
             out.append('fan_fault')
         if c.get('bed_power') == 'fault':
             out.append('bed_power_fault')
+        if (c.get('bed_power') == 'toolhead_removed'
+                and c.get('toolhead') == 'disconnected'):
+            # KAN-5663: the toolhead was taken off and bed power dropped
+            # with it. That is one thing, the toolhead; z_power's state
+            # 'toolhead_removed' is not a bed fault and clears by itself.
+            out.append('toolhead_disconnected')
         if c.get('hotend') == 'failed':
             out.append('hotend_failed')
         return out

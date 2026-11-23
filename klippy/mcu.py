@@ -845,6 +845,14 @@ class MCUConnectHelper:
         self.reconnect_max_interval = config.getfloat(
             "reconnect_max_interval", 30.0, minval=0.0
         )
+        # KAN-5663: a hot-plug MCU (the toolhead) is polled every
+        # reconnect_interval for this many seconds after it went away, so a
+        # re-plug is picked up within a couple of seconds, then the doubling
+        # back-off above. 0 is the doubling back-off from the start.
+        self.reconnect_fast_window = config.getfloat(
+            "reconnect_fast_window", 0., minval=0.
+        )
+        self._reconnect_since = None
         self._reconnect_delay = self.reconnect_interval
         self.non_critical_recon_timer = None
         self._non_critical_reconnect_event_name = (
@@ -975,6 +983,7 @@ class MCUConnectHelper:
         self._mcu.non_critical_disconnected = True
         self._mcu._connecting = False
         self._reconnect_delay = self.reconnect_interval
+        self._reconnect_since = self._reactor.monotonic()
         # Stop any clock sync activity if the object supports it.
         if hasattr(self._clocksync, "disconnect"):
             try:
@@ -991,6 +1000,13 @@ class MCUConnectHelper:
     def _next_reconnect_delay(self):
         delay = self._reconnect_delay
         ceiling = max(self.reconnect_max_interval, self.reconnect_interval)
+        window = getattr(self, "reconnect_fast_window", 0.)
+        since = getattr(self, "_reconnect_since", None)
+        if (window and since is not None
+                and self._reactor.monotonic() - since < window):
+            # The fast window: a re-plug is picked up within one interval.
+            # After it the doubling below limits the openocd resets.
+            return self.reconnect_interval
         self._reconnect_delay = min(delay * 2., ceiling)
         return delay
     def non_critical_recon_event(self, eventtime):
@@ -1028,6 +1044,7 @@ class MCUConnectHelper:
             self._mcu._config_helper._connect(allow_noncritical=True)
             self._mcu.non_critical_disconnected = False
             self._reconnect_delay = self.reconnect_interval
+            self._reconnect_since = None
         except Exception as e:
             logging.info("Non-critical MCU '%s' reconnect failed: %s",
                          self._name, str(e))

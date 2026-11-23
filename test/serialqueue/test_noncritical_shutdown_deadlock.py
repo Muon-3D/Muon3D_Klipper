@@ -38,6 +38,8 @@ class FakeReactor:
         self.async_callbacks.append(callback)
     def update_timer(self, timer, waketime):
         pass
+    def monotonic(self):
+        return 1000.
     def run_async(self):
         callbacks, self.async_callbacks = self.async_callbacks, []
         for cb in callbacks:

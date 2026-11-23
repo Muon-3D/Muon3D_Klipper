@@ -1880,6 +1880,13 @@ running (pause or stop it first; a paused print can be reset, then
 resumed). If PGOOD does not rise after the reset the fault latches again
 once, saying the feed did not come back after the reset.
 
+#### Z_POWER_NOTE_TOOLHEAD_UNLOCK
+`Z_POWER_NOTE_TOOLHEAD_UNLOCK`: Note that the toolhead unlock button was
+pressed (armed, nothing printing). A PGOOD drop with no overload within 3 s
+after it is the toolhead coming off (state `toolhead_removed`), not a bed
+power fault. The unlock-press macro calls it; there is no need to run it by
+hand.
+
 #### Z_POWER_WAIT
 `Z_POWER_WAIT [TIMEOUT=<seconds>]`: Wait up to TIMEOUT (default 2) seconds
 for bed power to come up. Never an error.

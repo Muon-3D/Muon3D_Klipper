@@ -64,6 +64,11 @@ serial:
 #   and USB-probes
 #reconnect_interval: 2.0
 #   if is_non_critical == true, how often to poll for a reconnect
+#reconnect_fast_window: 0
+#   if is_non_critical == true and this is above 0, poll every
+#   reconnect_interval for this many seconds after the disconnect (a
+#   re-plugged toolhead is picked up at once), then double the wait up to
+#   reconnect_max_interval as usual.
 #reconnect_max_interval: 30.0
 #   if is_non_critical == true, the ceiling for the reconnect poll
 #   back-off. Each connect attempt that opens the serial port but gets
@@ -4972,6 +4977,18 @@ present_locked_range:
 #   Seconds the feed stays off before the single re-enable, and seconds
 #   PGOOD must then stay high (it must rise within power_good_timeout)
 #   before the path is ready again. Otherwise the fault latches.
+#toolhead_removal_before: 3.0
+#   A PGOOD drop is the toolhead coming off, not a bed power fault, only
+#   when the unlock button was pressed (armed, not printing) up to this many
+#   seconds before it, nothing is printing or paused, and IMON was read and
+#   never passed max_current. Anything else latches the bed fault at once.
+#   The state is `toolhead_removed`: 48V_Z stays off, and when the toolhead
+#   is back it is powered up once; if that does not hold, the normal bed
+#   fault latches.
+#toolhead_mcu: toolhead
+#toolhead_hotend: extruder
+#   The non-critical MCU and the muon_hotend heater whose disconnect ends
+#   toolhead_removed.
 #plate_settle_time: 2.0
 #   Seconds the Z column must be plugged in before the plate reading
 #   counts. The bed thermistor input floats while the column is out.

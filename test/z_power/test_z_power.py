@@ -1696,5 +1696,241 @@ class TestIdleRecoverySafety(TestIdleRecovery):
         self.assertEqual(zp.state, READY)
 
 
+class StubToolheadMcu:
+    def __init__(self):
+        self.non_critical_disconnected = False
+
+
+class TestToolheadRemoval(HarnessFixture, unittest.TestCase):
+    """KAN-5663: an unlock press just before a no-load PGOOD drop, with
+    nothing printing, is the toolhead coming off. Everything else is the bed
+    power fault exactly as before. Production defaults throughout."""
+    up = Ready.up
+    poll_pgood = Ready.poll_pgood
+
+    def make(self):
+        zp = HarnessFixture.make(self)
+        zp.mcu = zp.printer.objects['mcu toolhead'] = StubToolheadMcu()
+        zp.stats = zp.printer.objects['print_stats'] = StubPrintStats()
+        zp.homed_cleared = []
+        zp._run_script = zp.homed_cleared.append
+        zp.heater.last_temp = 53.2     # not idle: a drop is not recovered
+        zp.raw_current, zp.current_offset = 0., 0.    # IMON is read
+        return zp
+
+    def drop(self, zp, t0=2.0):
+        """The three low polls that latch; returns the next time."""
+        return self.poll_pgood(zp, [False] * 3, t0=t0)
+
+    def plug(self, zp, t, gone):
+        zp.mcu.non_critical_disconnected = gone
+        self.tick(zp, t)
+
+    def enable_writes(self, zp):
+        return [v for _t, v in zp.mcu_enable.writes]
+
+    def removed(self, zp):
+        self.assertEqual(zp.state, z_power.TOOLHEAD_REMOVED)
+        self.assertIsNone(zp.fault)
+        self.assertNotIn('FAULT', zp.scripts)
+        self.assertFalse(zp.enabled)
+        self.assertEqual(zp.heater.target, 0.)
+
+    def bed_fault(self, zp):
+        self.assertEqual(zp.state, FAULT)
+        self.assertEqual(zp.reason, z_power.DROPPED_REASON)
+        self.assertIn('FAULT', zp.scripts)
+        self.assertFalse(zp.enabled)
+
+    def test_press_then_drop_at_no_load_is_the_toolhead(self):
+        zp = self.make()
+        self.up(zp)
+        zp.heater.set_temp(60.)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.removed(zp)
+        self.assertEqual(zp.reason, z_power.REMOVED_REASON)
+        self.assertNotIn('Bed power cut out', zp.reason)
+        st = zp.get_status(2.6)
+        self.assertEqual(st['state'], 'toolhead_removed')
+        self.assertTrue(st['toolhead_removed'])
+        self.assertIsNone(st['fault'])
+
+    def test_no_press_is_the_bed_fault_at_once(self):
+        zp = self.make()
+        self.up(zp)
+        zp.heater.set_temp(60.)
+        self.drop(zp)
+        self.bed_fault(zp)                 # at the third low poll, no wait
+        self.assertEqual(zp.heater.target, 0.)
+
+    def test_disconnect_after_the_drop_is_not_evidence(self):
+        zp = self.make()
+        self.up(zp)
+        t = self.drop(zp)
+        self.bed_fault(zp)
+        self.plug(zp, t + 0.5, True)       # a brown-out from the drop?
+        self.bed_fault(zp)
+        self.assertIsNone(zp.removal)
+
+    def test_disconnect_before_the_drop_without_a_press_is_a_fault(self):
+        zp = self.make()
+        self.up(zp)
+        self.plug(zp, 1.5, True)
+        self.drop(zp)
+        self.bed_fault(zp)
+
+    def test_press_after_the_drop_does_not_count(self):
+        zp = self.make()
+        self.up(zp)
+        self.drop(zp)
+        zp.note_toolhead_unlock(2.5)
+        self.tick(zp, 2.6)
+        self.bed_fault(zp)
+
+    def test_old_press_does_not_count(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(2.0)
+        t = self.poll_pgood(zp, [True] * 50, t0=2.0)        # 7.0
+        self.drop(zp, t)
+        self.bed_fault(zp)
+
+    def test_press_while_printing_or_paused_does_not_count(self):
+        for state in ('printing', 'paused'):
+            zp = self.make()
+            zp.stats.state = state
+            self.up(zp)
+            zp.note_toolhead_unlock(1.9)
+            self.drop(zp)
+            self.bed_fault(zp)             # latched as before, no delay
+
+    def test_unread_imon_is_a_fault(self):
+        zp = self.make()
+        zp.raw_current = None
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.bed_fault(zp)
+
+    def test_overload_is_a_fault_even_with_a_press(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        zp.raw_current = 6.0
+        self.poll_pgood(zp, [True], t0=2.0)
+        zp.raw_current = 0.
+        self.poll_pgood(zp, [False] * 3, t0=2.1)
+        self.bed_fault(zp)
+        self.assertIn('peak 6.00 A', zp.fault)
+
+    def test_heating_load_below_the_overload_still_counts(self):
+        zp = self.make()
+        self.up(zp)
+        zp.heater.set_temp(60.)
+        zp.note_toolhead_unlock(1.9)
+        zp.raw_current = 3.0
+        self.poll_pgood(zp, [True], t0=2.0)
+        zp.raw_current = 0.
+        self.poll_pgood(zp, [False] * 3, t0=2.1)
+        self.removed(zp)
+
+    def test_rail_stays_off_for_as_long_as_the_toolhead_is_away(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.plug(zp, 2.5, True)
+        zp.power_good = True
+        for t in range(3, 120):
+            self.plug(zp, float(t), True)
+            self.assertFalse(zp.enabled, t)
+        self.removed(zp)
+        self.assertEqual(self.enable_writes(zp), [1, 0])   # no retries
+
+    def test_reconnect_powers_up_once_and_goes_ready(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.plug(zp, 2.5, True)
+        self.plug(zp, 9.0, False)           # re-plugged
+        self.assertEqual(zp.state, POWERING)
+        self.assertTrue(zp.enabled)
+        zp.power_good = True
+        self.tick(zp, 9.2)
+        self.assertEqual(zp.state, READY)
+        self.assertIsNone(zp.fault)
+        self.assertEqual(self.enable_writes(zp), [1, 0, 1])
+        self.assertEqual(zp.homed_cleared,
+                         ['SET_KINEMATIC_POSITION CLEAR_HOMED=Z'])
+        self.assertFalse(zp.get_status(9.3)['toolhead_removed'])
+
+    def test_repower_that_does_not_hold_latches_the_bed_fault(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.plug(zp, 2.5, True)
+        self.plug(zp, 9.0, False)
+        zp.power_good = False
+        self.tick(zp, 9.2)
+        self.assertEqual(zp.state, POWERING)
+        self.tick(zp, 9.7)                  # past power_good_timeout 0.5
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('PGOOD did not rise', zp.fault)
+        self.assertIn('FAULT', zp.scripts)
+        self.assertFalse(zp.enabled)
+        for t in (12., 20., 40.):
+            self.tick(zp, t)
+        self.assertEqual(self.enable_writes(zp), [1, 0, 1, 0])  # one try
+
+    def test_a_drop_after_the_repower_is_a_fault_not_a_recovery(self):
+        zp = self.make()
+        zp.heater.last_temp = 25.           # idle: it would recover
+        self.up(zp)
+        zp.repower_once = True
+        self.drop(zp)
+        self.assertEqual(zp.state, FAULT)
+        zp2 = self.make()
+        zp2.heater.last_temp = 25.
+        self.up(zp2)
+        self.drop(zp2)
+        self.assertEqual(zp2.state, RECOVERING)   # unchanged otherwise
+
+    def test_press_with_the_toolhead_staying_on_powers_up_once(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.tick(zp, 3.5)
+        self.assertEqual(zp.state, z_power.TOOLHEAD_REMOVED)
+        self.tick(zp, 5.3)                  # the 3 s are over
+        self.assertEqual(zp.state, POWERING)
+        self.assertTrue(zp.enabled)
+
+    def test_idle_draw_check_runs_in_any_state_with_the_rail_on(self):
+        zp = self.make()
+        self.up(zp)
+        zp.note_toolhead_unlock(1.9)
+        self.drop(zp)
+        self.removed(zp)
+        zp.raw_current = 2.0                # 2 A with the heater off
+        for t in (3.0, 3.5, 4.0, 4.5, 5.0):
+            zp.enabled = True               # the rail on in this state
+            self.tick(zp, t)
+        self.assertEqual(zp.state, FAULT)
+        self.assertIn('drawn with the bed heater off', zp.fault)
+
+    def test_removed_state_is_not_a_fault_to_the_decision(self):
+        state, reason, enable = z_power.decide('locked', True, None, False,
+                                               None, 'removed')
+        self.assertEqual((state, enable), (z_power.TOOLHEAD_REMOVED, False))
+        self.assertEqual(z_power.decide('locked', True, 'x', False, None,
+                                        'removed')[0], FAULT)
+        self.assertEqual(z_power.decide('locked', True, None, True, None,
+                                        'removed')[0], INHIBITED)
+
+
 if __name__ == '__main__':
     unittest.main()
