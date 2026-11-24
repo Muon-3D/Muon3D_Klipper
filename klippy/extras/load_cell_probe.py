@@ -887,6 +887,20 @@ class LoadCellProbingMove:
         # KAN-4770: MCUTARE reuses that zero only while it is this recent
         self._mcutare_max_zero_age = config.getfloat(
             'mcutare_max_zero_age', 5., minval=0.)
+        # A probe that trips before the Z move starts ("Probe triggered
+        # prior to movement") is retried this many times, each after a lift
+        # of early_trigger_lift and a fresh host tare, instead of failing
+        # the home or the mesh.  0 keeps the stock behaviour.  The trip says
+        # the zero was taken under a load that then changed: on the M1 a
+        # mesh tap that takes its MCU zero while the toolhead still rings
+        # from a 400 mm/s move (otter, 2026-11-24), or a part pressing on
+        # the toolhead (bradawl, 2026-11-16).  Every retry is counted in
+        # early_triggers.
+        self._early_trigger_retries = config.getint(
+            'early_trigger_retries', 0, minval=0, maxval=10)
+        self._early_trigger_lift = config.getfloat(
+            'early_trigger_lift', 0.5, minval=0., maxval=5.)
+        self._early_triggers = 0
         # Z at which the last probe actually triggered, or None when no
         # probe has triggered yet in this session.
         self._last_trigger_z = None
@@ -904,6 +918,9 @@ class LoadCellProbingMove:
 
     # Class defaults so a move built without __init__ (tests) is inert
     _z_watch = None
+    _early_trigger_retries = 0
+    _early_trigger_lift = 0.5
+    _early_triggers = 0
     _approx_tare_t = None
     _mcutare_max_zero_age = 5.
     _tare_time = None
@@ -1139,15 +1156,57 @@ class LoadCellProbingMove:
             return False
         return True
 
+    EARLY_TRIGGER_MSG = "Probe triggered prior to movement"
+
     # Probe towards z_min until the trigger_analog on the MCU triggers.
     # One move, armed on the tare taken at rest just before it (see
-    # ZLoadBackstop for why there are no legs).
+    # ZLoadBackstop for why there are no legs).  A trip before the move
+    # starts is retried (early_trigger_retries), each retry with a host
+    # tare.
     def probing_move(self, gcmd):
+        attempt = 0
+        while True:
+            try:
+                return self._probing_move_once(gcmd, host_tare=attempt > 0)
+            except Exception as e:
+                # homing.probing_move raises it as a command_error; the
+                # message is what identifies it.
+                if (self.EARLY_TRIGGER_MSG not in str(e)
+                        or attempt >= self._early_trigger_retries
+                        or self._printer.is_shutdown()):
+                    raise
+                attempt += 1
+                self._early_triggers += 1
+                msg = ("load_cell_probe: probe triggered before moving;"
+                       " lifting %.2f mm, re-taring and trying again"
+                       " (retry %d of %d)"
+                       % (self._early_trigger_lift, attempt,
+                          self._early_trigger_retries))
+                logging.warning(msg)
+                self._printer.lookup_object('gcode').respond_info(msg)
+                self._lift_for_retry()
+
+    # Up and clear before the retry's tare, so the new zero is not taken
+    # with the nozzle on the plate.  Never above the axis maximum: the Z
+    # home starts soft-homed at the top.
+    def _lift_for_retry(self):
+        toolhead = self._printer.lookup_object('toolhead')
+        if self._early_trigger_lift > 0.:
+            pos = toolhead.get_position()
+            eventtime = self._printer.get_reactor().monotonic()
+            z_max = toolhead.get_status(eventtime)['axis_maximum'][2]
+            z = min(pos[2] + self._early_trigger_lift, z_max)
+            if z > pos[2]:
+                speed = self._param_helper.get_probe_params()['lift_speed']
+                toolhead.manual_move([None, None, z], speed)
+        toolhead.wait_moves()
+
+    def _probing_move_once(self, gcmd, host_tare=False):
         self._config_helper.validate_probe_setup(gcmd)
         # tare the sensor just before probing
         _mcutare = 0 if gcmd is None else gcmd.get_int('MCUTARE', 0)
         _used_mcutare = False
-        if _mcutare and self._approx_tare is not None \
+        if _mcutare and not host_tare and self._approx_tare is not None \
                 and self._nozzle_is_clear() and self._host_zero_is_fresh():
             self._mcu_tare(gcmd)
             _used_mcutare = True
@@ -1236,6 +1295,7 @@ class LoadCellProbingMove:
             'raw_safety_max': self._safety_max,
             'trigger_mode': self._trigger_mode,
             'last_trigger_time': trig_time,
+            'early_triggers': self._early_triggers,
         }
         if self._z_watch is not None:
             status.update(self._z_watch.get_status())

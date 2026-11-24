@@ -382,6 +382,54 @@ def test_7_no_bed_is_no_trigger(mod):
     print('ok  7 no bed in reach: "No trigger" after one full move')
 
 
+def test_8_early_trigger_is_retried_with_a_host_tare(mod):
+    # PRINT_START's fast mesh: the MCU zero was taken while the toolhead
+    # rang after a 400 mm/s move, so the probe tripped before Z moved.
+    # early_trigger_retries lifts, takes a host tare and tries again.
+    w = World(tare0=180000, real=10.)
+    m, ph = make(mod, w, trigger=M1, ref=OTTER_REF, speed=4.)
+    m._early_trigger_retries = 3
+    lifts = []
+    th = m._printer.objects['toolhead']
+    th.manual_move = lambda pos, speed: lifts.append(pos[2])
+    th.wait_moves = lambda: None
+    th.get_status = lambda et: {'axis_maximum': [200., 174., 160.]}
+    m._param_helper.get_probe_params = lambda gcmd=None: {
+        'probe_speed': 4., 'lift_speed': 10.}
+    m._printer.objects['gcode'] = type('G', (), {
+        'respond_info': lambda self, msg: None})()
+    m._printer.get_reactor = lambda: type('R', (), {
+        'monotonic': lambda self: 0.})()
+    m._printer.is_shutdown = lambda: False
+    real, calls = ph.probing_move, []
+
+    def flaky(endstop, pos, speed):
+        calls.append(1)
+        if len(calls) < 3:
+            raise tg.CommandError("Probe triggered prior to movement")
+        return real(endstop, pos, speed)
+    ph.probing_move = flaky
+    m.probing_move(Gcmd(MCUTARE=0))
+    assert len(calls) == 3 and m._early_triggers == 2, (calls, m._early_triggers)
+    assert len(lifts) == 2, lifts
+    assert -0.15 < w.real < 0., w.real
+    # past the limit the error stands
+    w = World(tare0=180000, real=10.)
+    m, ph = make(mod, w, trigger=M1, ref=OTTER_REF, speed=4.)
+    m._early_trigger_retries = 0
+
+    def always(endstop, pos, speed):
+        raise tg.CommandError("Probe triggered prior to movement")
+    ph.probing_move = always
+    try:
+        m.probing_move(Gcmd())
+        assert False, 'no error'
+    except tg.CommandError as e:
+        assert 'prior to movement' in str(e), e
+    print('ok  8 a trip before the move is retried with a lift and a host '
+          'tare; with retries 0 the error stands')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -391,7 +439,8 @@ def main():
              test_4_cooling_drift_toward_the_press_is_no_touch,
              test_5_removed_options_load_and_change_nothing,
              test_6_dead_mcu_trigger_is_stopped_by_the_ceiling,
-             test_7_no_bed_is_no_trigger]
+             test_7_no_bed_is_no_trigger,
+             test_8_early_trigger_is_retried_with_a_host_tare]
     failed = []
     for t in tests:
         try:
