@@ -425,34 +425,39 @@ class Calibration(unittest.TestCase):
 
     def test_m1_mesh_travel_accel_is_capped_and_restored(self):
         # otter, 2026-11-24: mesh travel at max_accel 20000 lost X/Y steps.
-        macro = macros_of('M1')['gcode_macro BED_MESH_CALIBRATE']
+        macros = macros_of('M1')
         env = cmc._jinja_env()
 
-        def run(option, max_accel=20000., saved=0, cap=5000):
+        def run(name, option='gcode', max_accel=20000., saved=0, cap=5000):
             pr = printer_for(*STATES[0][:3], 'xyz')
             pr['toolhead']['max_accel'] = max_accel
             pr['gcode_macro BED_MESH_CALIBRATE'] = {
                 'travel_accel': cap, 'saved_accel': saved}
-            text = env.from_string(macro[option]).render(
-                rawparams='STOW=0', params={'STOW': '0'},
-                action_respond_info=lambda m: '', printer=pr)
+            text = env.from_string(macros['gcode_macro ' + name][option]) \
+                .render(rawparams='STOW=0', params={'STOW': '0'},
+                        action_respond_info=lambda m: '', printer=pr)
             return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-        g = run('gcode')
+        g = run('BED_MESH_CALIBRATE')
         base = g.index('BED_MESH_CALIBRATE_BASE STOW=0')
         self.assertIn('SET_VELOCITY_LIMIT ACCEL=5000.0', g[:base])
-        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', g[base:])
         self.assertIn('SET_GCODE_VARIABLE MACRO=BED_MESH_CALIBRATE'
                       ' VARIABLE=saved_accel VALUE=20000.0', g[:base])
+        self.assertEqual(g[base + 1], '_BED_MESH_RESTORE_ACCEL')
         # already at or under the cap, or the cap off: nothing changes
         for kw in ({'max_accel': 4000.}, {'cap': 0}):
-            self.assertFalse([l for l in run('gcode', **kw)
+            self.assertFalse([l for l in run('BED_MESH_CALIBRATE', **kw)
                               if 'SET_VELOCITY_LIMIT' in l], kw)
-        # a mesh that fails puts the saved limit back
-        e = run('on_error_gcode', saved=20000.)
-        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', e)
-        self.assertFalse([l for l in run('on_error_gcode')
-                          if 'SET_VELOCITY_LIMIT' in l])
+        # a mesh that fails restores too. The restore is its own macro: the
+        # handler renders with the status read at the start, where
+        # saved_accel was still 0, so inline it never ran (otter).
+        e = run('BED_MESH_CALIBRATE', 'on_error_gcode')
+        self.assertEqual(e[0], '_BED_MESH_RESTORE_ACCEL')
+        r = run('_BED_MESH_RESTORE_ACCEL', saved=20000.)
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', r)
+        self.assertIn('SET_GCODE_VARIABLE MACRO=BED_MESH_CALIBRATE'
+                      ' VARIABLE=saved_accel VALUE=0', r)
+        self.assertEqual(run('_BED_MESH_RESTORE_ACCEL'), [])
 
     def test_pid_stows_after_the_base_command(self):
         for b in BOARDS:
