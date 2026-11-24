@@ -28,8 +28,7 @@ sys.path.insert(0, KLIPPY)
 
 from extras import bed_mesh  # noqa: E402
 
-# A notch shaped like the M1's (core/M1/core.cfg [bed_mesh] used this one
-# until 2026-11-11; the geometry below is worked out for it).
+# The M1's notch (core/M1/core.cfg [bed_mesh]).
 NOTCH = ([75., 0.], [125., 34.])
 TOLERANCE = 10.
 OVERSHOOT = 4.
