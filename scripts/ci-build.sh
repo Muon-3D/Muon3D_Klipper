@@ -215,6 +215,8 @@ $PYTHON test/load_cell_probe/test_hot_load_cell.py
 $PYTHON test/load_cell_probe/test_z_legs.py
 # KAN-4682: longer legs above a known plate height, never across the margin.
 $PYTHON test/load_cell_probe/test_z_fast_legs.py
+# KAN-4835: the ADS1220 temperature read handed over inside a long leg.
+$PYTHON test/load_cell_probe/test_temp_handover.py
 $PYTHON test/load_cell_probe/test_mcutare_stale_zero.py
 $PYTHON test/homing_abort/test_homing_abort.py
 $PYTHON test/homing_abort/test_search_cap.py

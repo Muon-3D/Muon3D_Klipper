@@ -117,6 +117,9 @@ class FakeConfig(object):
         return self._bounded(name, None if v is None else float(v),
                              minval, maxval, above, below)
 
+    def getboolean(self, name, default=None):
+        return bool(self._get(name, default))
+
     def getchoice(self, name, choices, default=None):
         return choices[self._get(name, default)]
 

@@ -238,4 +238,123 @@ mads_sampler_read(struct mads_sampler *s, uint32_t now, int32_t raw
     s->last_read_time = now;
 }
 
+/****************************************************************
+ * Blanking across a temperature read while a probe is armed (KAN-4835)
+ *
+ * Switching the mux to the hotend sensor and back disturbs the load cell
+ * channel for a short while after the switch back. While a probe is armed
+ * that disturbance must never reach the trigger, so from the moment the
+ * mux leaves the load cell until 'settle_ticks' after it returns, samples
+ * are replaced by MADS_FILLER slots (the trigger is not fed and the host
+ * discards them). The trigger's filter state is not touched, so its
+ * reference is exactly what it was before the read.
+ *
+ * The blind time is hard limited: once it passes 'max_ticks' the caller
+ * must stop the probe (MB_OVER). The window is never extended.
+ ****************************************************************/
+
+enum { MB_OFF, MB_DROP, MB_OVER };
+
+struct mads_blank {
+    // Set by the host. max_ticks == 0 leaves the feature off.
+    uint32_t settle_ticks, max_ticks;
+    // The window: start, and the earliest time a sample may be fed again
+    // (0 while the mux is still away from the load cell)
+    uint32_t t0, until;
+    uint8_t active, armed_seen;
+    // Set when a window that was armed at some point has just ended;
+    // the caller reports it and clears it
+    uint8_t ended;
+    uint32_t t_end;
+    // Samples replaced in the window so far
+    uint32_t dropped;
+    // Statistics
+    uint32_t n_windows, n_dropped, n_over, max_window;
+};
+
+static inline int
+mads_blank_enabled(const struct mads_blank *b)
+{
+    return b->max_ticks != 0;
+}
+
+static inline void
+mads_blank_config(struct mads_blank *b, uint32_t settle_ticks
+                  , uint32_t max_ticks)
+{
+    b->settle_ticks = settle_ticks;
+    b->max_ticks = max_ticks;
+    b->active = b->armed_seen = b->ended = 0;
+}
+
+// The mux is leaving the load cell (a temperature slice starts)
+static inline void
+mads_blank_begin(struct mads_blank *b, uint32_t now)
+{
+    if (!mads_blank_enabled(b) || b->active)
+        return;
+    b->active = 1;
+    b->armed_seen = 0;
+    b->t0 = now;
+    b->until = 0;
+    b->dropped = 0;
+}
+
+// The mux was written back to the load cell at time 'w'
+static inline void
+mads_blank_resumed(struct mads_blank *b, uint32_t w)
+{
+    if (b->active)
+        b->until = w + b->settle_ticks;
+}
+
+// A probe may only be armed while a window is open (or just after one):
+// forget the window without a report, e.g. the stream stopped
+static inline void
+mads_blank_cancel(struct mads_blank *b)
+{
+    b->active = b->armed_seen = b->ended = 0;
+}
+
+// Called once per step in every state but idle. 'on_lc' is set when the
+// chip is on the load cell and a sample was just read at 'now'.
+// MB_DROP: do not feed this sample. MB_OVER: the window ran past its hard
+// limit with a probe armed; stop the probe. MB_OFF: feed it normally.
+static inline int
+mads_blank_step(struct mads_blank *b, uint32_t now, int armed, int on_lc)
+{
+    if (!b->active)
+        return MB_OFF;
+    if (armed) {
+        b->armed_seen = 1;
+        if (!mads_before(now, b->t0 + b->max_ticks + 1)) {
+            b->active = 0;
+            b->armed_seen = 0;
+            b->n_over++;
+            return MB_OVER;
+        }
+    }
+    if (on_lc && b->until && !mads_before(now, b->until)) {
+        // Settled: this sample is the first to be fed again
+        b->active = 0;
+        if (b->armed_seen) {
+            uint32_t len = now - b->t0;
+            b->ended = 1;
+            b->t_end = now;
+            b->n_windows++;
+            if (len > b->max_window)
+                b->max_window = len;
+        }
+        return MB_OFF;
+    }
+    if (armed) {
+        if (on_lc) {
+            b->dropped++;
+            b->n_dropped++;
+        }
+        return MB_DROP;
+    }
+    return MB_OFF;
+}
+
 #endif // sensor_muon_ads1220.h
