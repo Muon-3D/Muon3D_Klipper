@@ -6061,9 +6061,23 @@ sensor_type:
 #   trigger_force. The M1 uses 120000: with a preloaded hot end a touch
 #   unloads the cell to lift-off within about 1 ms, so a fixed trigger
 #   above the motion noise holds whatever the preload does with heat. A
-#   PROBE command's TRIGGER_COUNTS= overrides it for that probe; the M1's
-#   G28 and PRINT_START mesh pass theirs from _LOAD_CELL_TRIGGERS in
-#   macros/calibration.cfg. See docs/Load_Cell.md.
+#   PROBE command's TRIGGER_COUNTS= overrides it for that probe. The M1
+#   sets it per printer in the SAVE_CONFIG block of calibration.cfg. See
+#   docs/Load_Cell.md.
+#default_trigger_counts: 0
+#   The trigger_counts to use when trigger_counts is not set. It exists so
+#   that core can give a default while the per-printer calibration overlay
+#   holds trigger_counts itself (an overlay may not set a key that core
+#   sets). 0: no default.
+#mesh_trigger_counts: 0
+#mesh_settle: 0
+#   The trigger and the wait before each tap (seconds) for the M1's
+#   PRINT_START mesh. load_cell_probe only reports them (status
+#   mesh_trigger_counts and mesh_settle); _BED_MESH_ENSURE passes them to
+#   BED_MESH_CALIBRATE as TRIGGER_COUNTS and SETTLE. 0: not passed.
+#default_mesh_trigger_counts: 0
+#default_mesh_settle: 0
+#   As default_trigger_counts, for the two options above.
 #trigger_percent:
 #   Optional trigger threshold as a percentage of the span from the per-probe
 #   tare value to reference_max_load_counts. If set, this overrides

@@ -26,9 +26,8 @@
 # fast_heater_settle are still accepted, with a deprecation warning, and
 # ignored.
 #
-# TRIGGER_COUNTS=, when given, is passed to both taps. The M1 sends it from
-# _LOAD_CELL_TRIGGERS in macros/calibration.cfg, so the home trigger can be
-# tuned there; without it the taps use [load_cell_probe] trigger_counts.
+# TRIGGER_COUNTS=, when given, is passed to both taps; without it they use
+# [load_cell_probe] trigger_counts, which is what the M1's G28 does.
 #
 # On sloe (2026-11-11) false touches also came on plain G28s, after 1.4-2.5 mm
 # of the fast approach, three in a row after a restart and then about one in

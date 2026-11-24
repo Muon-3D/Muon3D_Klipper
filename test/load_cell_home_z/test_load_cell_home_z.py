@@ -332,8 +332,8 @@ class Test(unittest.TestCase):
         self.assertIn('PROBE SAMPLES_TOLERANCE=1.000', m.log)
 
     def test_trigger_counts_reaches_both_taps(self):
-        # _LOAD_CELL_TRIGGERS (macros/calibration.cfg) sends the home
-        # trigger; the fast approach and the confirming tap both use it.
+        # A TRIGGER_COUNTS= on the home reaches the fast approach and the
+        # confirming tap both.
         m = Machine()
         obj, cmd = make(m)
         cmd(FakeGcmd(TRIGGER_COUNTS=150000, SAMPLES_TOLERANCE=1.))

@@ -265,8 +265,27 @@ class LoadCellProbeConfigHelper:
         # triggering options
         self._trigger_force_param = intParamHelper(config, 'trigger_force',
             default=75, minval=10, maxval=250)
+        # The fixed triggers are per printer: trigger_counts,
+        # mesh_trigger_counts and mesh_settle live in the SAVE_CONFIG block
+        # of the printer's calibration.cfg, where they can be tuned without
+        # a change to core. Core cannot also declare them (configfile.py
+        # refuses an overlay key that core sets), so core gives the
+        # default_* values, which a printer whose block lacks them uses. An
+        # update never rewrites calibration.cfg, so every printer built
+        # before these options existed runs on the defaults.
+        default_trigger_counts = config.getint('default_trigger_counts', 0,
+                                               minval=0, maxval=(1 << 30))
         self._trigger_counts_param = intParamHelper(config, 'trigger_counts',
-            default=0, minval=0, maxval=(1 << 30))
+            default=default_trigger_counts, minval=0, maxval=(1 << 30))
+        # Read by the M1's PRINT_START mesh (_BED_MESH_ENSURE) from the
+        # status and passed as TRIGGER_COUNTS and SETTLE. 0: not set.
+        self._mesh_trigger_counts = config.getint('mesh_trigger_counts',
+            config.getint('default_mesh_trigger_counts', 0, minval=0,
+                          maxval=(1 << 30)),
+            minval=0, maxval=(1 << 30))
+        self._mesh_settle = config.getfloat('mesh_settle',
+            config.getfloat('default_mesh_settle', 0., minval=0., maxval=1.),
+            minval=0., maxval=1.)
         self._trigger_percent_param = floatParamHelper(config,
             'trigger_percent', default=None, above=0., maxval=100.0)
         # KAN-3370: the side of the tare the press moves toward is a fact
@@ -379,6 +398,9 @@ class LoadCellProbeConfigHelper:
     def get_trigger_counts(self, gcmd=None):
         trigger_counts = self._trigger_counts_param.get(gcmd)
         return trigger_counts if trigger_counts > 0 else None
+
+    def get_mesh_trigger(self):
+        return self._mesh_trigger_counts, self._mesh_settle
 
     def get_trigger_percent(self, gcmd=None):
         trigger_percent = self._trigger_percent_param.get(gcmd)
@@ -1604,6 +1626,11 @@ class LoadCellPrinterProbe:
             'press_direction': self._get_status_press_direction(),
             'min_tare_headroom_percent':
                 self._config_helper.get_min_tare_headroom_percent(),
+            # the fixed triggers in force (0: none), see trigger_counts
+            'trigger_counts': self._config_helper.get_trigger_counts() or 0,
+            'mesh_trigger_counts':
+                self._config_helper.get_mesh_trigger()[0],
+            'mesh_settle': self._config_helper.get_mesh_trigger()[1],
         })
         return status
 

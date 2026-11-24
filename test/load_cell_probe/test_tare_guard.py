@@ -480,6 +480,26 @@ def test_status(mod):
     print('ok  status values')
 
 
+def test_per_printer_triggers_and_core_defaults(mod):
+    # calibration.cfg's SAVE_CONFIG block sets the per-printer values; core
+    # sets default_* for a printer whose block has none (every B1 built
+    # before these options existed: updates never rewrite calibration.cfg).
+    core = dict(default_trigger_counts=120000,
+                default_mesh_trigger_counts=200000, default_mesh_settle=0.05)
+    h = make_helper(mod, BOX_REF, **core)
+    assert h.get_trigger_counts() == 120000
+    assert h.get_mesh_trigger() == (200000, 0.05)
+    h = make_helper(mod, BOX_REF, trigger_counts=150000,
+                    mesh_trigger_counts=180000, mesh_settle=0.1, **core)
+    assert h.get_trigger_counts() == 150000
+    assert h.get_mesh_trigger() == (180000, 0.1)
+    # nothing set anywhere: no fixed trigger, mesh values not passed
+    h = make_helper(mod, BOX_REF)
+    assert h.get_trigger_counts() is None
+    assert h.get_mesh_trigger() == (0, 0.)
+    print('ok  per-printer triggers over the core defaults')
+
+
 def test_no_inference_left(mod):
     src = open(_paths.patched('klippy/extras/load_cell_probe.py')).read()
     for bad in ('ref_max >= tare_counts', 'ref_max >= zero_counts',
@@ -494,7 +514,8 @@ def main():
              test_good_tare_arms_through_pause_and_tare,
              test_headroom_boundaries, test_boxwood_normal, test_sloe,
              test_mirror_and_explicit, test_contact_guard_direction,
-             test_status, test_no_inference_left]
+             test_status, test_per_printer_triggers_and_core_defaults,
+             test_no_inference_left]
     for t in tests:
         t(mod)
     print('All %d tare guard tests passed' % len(tests))
