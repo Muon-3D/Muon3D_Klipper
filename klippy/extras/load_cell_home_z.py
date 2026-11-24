@@ -26,6 +26,10 @@
 # fast_heater_settle are still accepted, with a deprecation warning, and
 # ignored.
 #
+# TRIGGER_COUNTS=, when given, is passed to both taps. The M1 sends it from
+# _LOAD_CELL_TRIGGERS in macros/calibration.cfg, so the home trigger can be
+# tuned there; without it the taps use [load_cell_probe] trigger_counts.
+#
 # On sloe (2026-11-11) false touches also came on plain G28s, after 1.4-2.5 mm
 # of the fast approach, three in a row after a restart and then about one in
 # ten; 15 fast probes from Z40 had none. The cause is not known yet. Each
@@ -64,7 +68,9 @@ class LoadCellHomeZ:
 
     def cmd_LOAD_CELL_HOME_Z(self, gcmd):
         tol = gcmd.get_float('SAMPLES_TOLERANCE', 0., minval=0.)
-        confirm = "PROBE"
+        trig = gcmd.get_int('TRIGGER_COUNTS', 0, minval=0)
+        trig_arg = " TRIGGER_COUNTS=%d" % (trig,) if trig else ""
+        confirm = "PROBE" + trig_arg
         if tol > 0.:
             confirm += " SAMPLES_TOLERANCE=%.3f" % (tol,)
         toolhead = self.printer.lookup_object('toolhead')
@@ -84,8 +90,8 @@ class LoadCellHomeZ:
                 # and the full travel from here covers it.
                 self._run("SET_KINEMATIC_POSITION Z=%.3f" % (z_top,))
                 self._run("LOAD_CELL_TARE")
-                self._run("PROBE PROBE_SPEED=%.3f LIFT_SPEED=%.3f SAMPLES=1"
-                          % (self.fast_speed, self.fast_lift_speed))
+                self._run("PROBE PROBE_SPEED=%.3f LIFT_SPEED=%.3f SAMPLES=1%s"
+                          % (self.fast_speed, self.fast_lift_speed, trig_arg))
                 self._home_from_last_probe()
                 self._run("G91\nG1 Z%.3f F600" % (self.confirm_lift,))
                 try:

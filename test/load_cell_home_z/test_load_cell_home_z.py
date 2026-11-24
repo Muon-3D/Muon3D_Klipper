@@ -155,6 +155,8 @@ class FakeGcmd:
         self.info = []
     def get_float(self, k, d, **kw):
         return self.params.get(k, d)
+    def get_int(self, k, d, **kw):
+        return self.params.get(k, d)
     def respond_info(self, msg):
         self.info.append(msg)
 
@@ -328,6 +330,25 @@ class Test(unittest.TestCase):
         obj, cmd = make(m)
         cmd(FakeGcmd(SAMPLES_TOLERANCE=1.))
         self.assertIn('PROBE SAMPLES_TOLERANCE=1.000', m.log)
+
+    def test_trigger_counts_reaches_both_taps(self):
+        # _LOAD_CELL_TRIGGERS (macros/calibration.cfg) sends the home
+        # trigger; the fast approach and the confirming tap both use it.
+        m = Machine()
+        obj, cmd = make(m)
+        cmd(FakeGcmd(TRIGGER_COUNTS=150000, SAMPLES_TOLERANCE=1.))
+        self.check_homed(m)
+        probes = [l for l in m.log if l.startswith('PROBE')]
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(probes[0].endswith('SAMPLES=1 TRIGGER_COUNTS=150000'))
+        self.assertEqual(probes[1],
+                         'PROBE TRIGGER_COUNTS=150000 SAMPLES_TOLERANCE=1.000')
+
+    def test_no_trigger_counts_leaves_the_probe_default(self):
+        m = Machine()
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertFalse(any('TRIGGER_COUNTS' in l for l in m.log))
 
 
 class OneDescent(unittest.TestCase):

@@ -4,7 +4,7 @@ CONFIG print_start_phase.cfg
 
 # The stub load cell's safety range is 199000 counts, under the 200000 the
 # shipped mesh macro passes as TRIGGER_COUNTS (an M1 has about 1.4M).
-SET_GCODE_VARIABLE MACRO=_BED_MESH_ENSURE VARIABLE=trigger_counts VALUE=100000
+SET_GCODE_VARIABLE MACRO=_LOAD_CELL_TRIGGERS VARIABLE=mesh VALUE=100000
 
 # A fresh klippy process starts unswept; its first print must sweep.
 ASSERT_PHASE NAME=

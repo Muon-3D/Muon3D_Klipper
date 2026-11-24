@@ -6060,8 +6060,10 @@ sensor_type:
 #   per-probe tare value. If set, this overrides both trigger_percent and
 #   trigger_force. The M1 uses 120000: with a preloaded hot end a touch
 #   unloads the cell to lift-off within about 1 ms, so a fixed trigger
-#   between the motion noise and the lift-off reading holds whatever the
-#   preload does with heat. See docs/Load_Cell.md.
+#   above the motion noise holds whatever the preload does with heat. A
+#   PROBE command's TRIGGER_COUNTS= overrides it for that probe; the M1's
+#   G28 and PRINT_START mesh pass theirs from _LOAD_CELL_TRIGGERS in
+#   macros/calibration.cfg. See docs/Load_Cell.md.
 #trigger_percent:
 #   Optional trigger threshold as a percentage of the span from the per-probe
 #   tare value to reference_max_load_counts. If set, this overrides

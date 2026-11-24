@@ -66,7 +66,10 @@ def printer_for(state, paused, sd, homed, z_power=None, webhooks=None,
                 phase=None, probing=None):
     p = {
         'toolhead': {'homed_axes': homed, 'position': {'z': 20.},
-                     'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.}},
+                     'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.},
+                     'max_accel': 20000.},
+        'gcode_macro BED_MESH_CALIBRATE': {'travel_accel': 5000,
+                                           'saved_accel': 0},
         'print_stats': {'state': state},
         'pause_resume': {'is_paused': paused},
         'virtual_sdcard': {'is_active': sd},
@@ -419,6 +422,37 @@ class Calibration(unittest.TestCase):
             self.assertEqual(
                 zparks(b, 'FINETUNE_RESONANCE', STATES[0],
                        params={'STOW': '0'}, option='on_error_gcode'), 0, b)
+
+    def test_m1_mesh_travel_accel_is_capped_and_restored(self):
+        # otter, 2026-11-24: mesh travel at max_accel 20000 lost X/Y steps.
+        macro = macros_of('M1')['gcode_macro BED_MESH_CALIBRATE']
+        env = cmc._jinja_env()
+
+        def run(option, max_accel=20000., saved=0, cap=5000):
+            pr = printer_for(*STATES[0][:3], 'xyz')
+            pr['toolhead']['max_accel'] = max_accel
+            pr['gcode_macro BED_MESH_CALIBRATE'] = {
+                'travel_accel': cap, 'saved_accel': saved}
+            text = env.from_string(macro[option]).render(
+                rawparams='STOW=0', params={'STOW': '0'},
+                action_respond_info=lambda m: '', printer=pr)
+            return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        g = run('gcode')
+        base = g.index('BED_MESH_CALIBRATE_BASE STOW=0')
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=5000.0', g[:base])
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', g[base:])
+        self.assertIn('SET_GCODE_VARIABLE MACRO=BED_MESH_CALIBRATE'
+                      ' VARIABLE=saved_accel VALUE=20000.0', g[:base])
+        # already at or under the cap, or the cap off: nothing changes
+        for kw in ({'max_accel': 4000.}, {'cap': 0}):
+            self.assertFalse([l for l in run('gcode', **kw)
+                              if 'SET_VELOCITY_LIMIT' in l], kw)
+        # a mesh that fails puts the saved limit back
+        e = run('on_error_gcode', saved=20000.)
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', e)
+        self.assertFalse([l for l in run('on_error_gcode')
+                          if 'SET_VELOCITY_LIMIT' in l])
 
     def test_pid_stows_after_the_base_command(self):
         for b in BOARDS:

@@ -410,7 +410,8 @@ def test_8_early_trigger_is_retried_with_a_host_tare(mod):
         return real(endstop, pos, speed)
     ph.probing_move = flaky
     m.probing_move(Gcmd(MCUTARE=0))
-    assert len(calls) == 3 and m._early_triggers == 2, (calls, m._early_triggers)
+    assert len(calls) == 3, calls
+    assert m._early_triggers == 2, m._early_triggers
     assert len(lifts) == 2, lifts
     assert -0.15 < w.real < 0., w.real
     # past the limit the error stands
