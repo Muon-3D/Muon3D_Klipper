@@ -611,10 +611,10 @@ class LoadCellProbeConfigHelper:
 # heat-up (sloe, KAN-3818).  Otter showed the same size of shift and it was
 # mechanical, not the cell: foam under the hot end (Airtable #297) and
 # then a silicone sock rubbing the toolhead block (#296) pressed on the hot
-# end as they heated (zero +2.7M at 135 C).
-# With nothing pressing on the hot end the zero moves +0.1 to 0.2M between
-# cold and 135 C and drifts under 1000 counts/s during a 14 s descent, so
-# one tare holds the whole way down.  The legs had costs of their own:
+# end as they heated (the zero moved +2.4 to +2.9M from cold to 135 C).
+# With nothing pressing on the hot end it moves -0.1 to +0.4M and drifts
+# under 1000 counts/s during a 14 s descent, so one tare holds the whole
+# way down.  The legs had costs of their own:
 # every leg was a tare taken in the wake of the last move, and check_leg's
 # "load on the nozzle between Z legs" stopped homes that were fine.
 #

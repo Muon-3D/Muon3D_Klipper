@@ -256,11 +256,12 @@ legs, because a hot load cell's zero was seen to move by 1.7-2.7M counts over
 a heat-up. On otter that movement was mechanical: something pressing on the
 hot end as it heated, which changes the preload.
 
-| Hot end condition (otter) | Zero, cold to 135 C | Drift during a descent just after heating | Home straight after heating |
+| Hot end condition (otter) | Zero shift, cold to 135 C | Drift during a descent just after heating | Home straight after heating |
 |---|---|---|---|
-| Foam under the hot end (Airtable #297) | about +2.7M | up to 35000 counts/s | false touches, aborts |
-| Silicone sock rubbing the toolhead block cutout (#296) | +2.7M to +3.0M | 16000 counts/s | stopped: "the load cell moved the wrong way" |
-| Nothing touching (foam out, sock trimmed) | +0.1M to +0.27M | under 1000 counts/s | clean |
+| Foam under the hot end (Airtable #297) | zero 2.67M at 135 C (cold not recorded) | up to 35000 counts/s | false touches, aborts |
+| Silicone sock rubbing the toolhead block cutout (#296) | +2.4M to +2.9M | 16000 counts/s | stopped: "the load cell moved the wrong way" |
+| Sock trimmed clear of the block | -0.1M to +0.38M | under 3000 counts/s | clean |
+| No sock, no foam | +0.03M to +0.11M | under 1000 counts/s | clean |
 
 Anchor-board screw heads touching the heatsink (#293) restrain the hot end
 the same way, and can overload and crack the cell. With nothing touching the
@@ -269,8 +270,8 @@ The sock also damps the hot end ring: with a sock that does not rub, the
 motion noise peak fell from about 50000 to about 30000 counts.
 
 **Pass test for a built toolhead.** Heat to 135 C and run `G28` at once. In
-the console, "Load cell tare value" should be within about 300000 counts of
-its cold value, and the home should complete with no "first touch was not
+the console, "Load cell tare value" should be within 500000 counts of its
+cold value (a clean otter moved -0.1M to +0.38M, a rubbing sock +2.4M), and the home should complete with no "first touch was not
 the bed" retry. A unit that fails this has something touching the hot end:
 check the sock against the block cutout, the anchor screw heads against the
 heatsink, and that nothing sits under the hot end. Do not change the
