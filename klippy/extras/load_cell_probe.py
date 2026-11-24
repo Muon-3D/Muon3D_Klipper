@@ -239,6 +239,14 @@ def check_sensor_errors(results, printer):
 class LoadCellProbeConfigHelper:
     SAFETY_MODEL_REFERENCE_TARE = "reference_tare"
     SAFETY_MODEL_PRELOADED_MAX = "preloaded_max"
+    # Trigger bounds in counts (Opus review of #157). The M1's defaults are
+    # 120000 (home) and 200000 (mesh); the noise peak of a 10 mm/s descent
+    # is under 61000 and the host ceiling is 2.5x the trigger.
+    HOME_TRIGGER_MIN = 60000
+    HOME_TRIGGER_MAX = 300000
+    MESH_TRIGGER_MIN = 100000
+    MESH_TRIGGER_MAX = 400000
+    MESH_SETTLE_MAX = 0.2
 
     def __init__(self, config, load_cell_inst):
         self._printer = config.get_printer()
@@ -273,19 +281,28 @@ class LoadCellProbeConfigHelper:
         # default_* values, which a printer whose block lacks them uses. An
         # update never rewrites calibration.cfg, so every printer built
         # before these options existed runs on the defaults.
-        default_trigger_counts = config.getint('default_trigger_counts', 0,
-                                               minval=0, maxval=(1 << 30))
-        self._trigger_counts_param = intParamHelper(config, 'trigger_counts',
-            default=default_trigger_counts, minval=0, maxval=(1 << 30))
+        # Bounds (counts): a typo in calibration.cfg, a Fluidd edit or a
+        # typed TRIGGER_COUNTS must not move the trigger, and with it the
+        # 2.5x ceiling, toward the cell's raw maximum. 0 or empty is "not
+        # set": the core default_* value, never trigger_percent.
+        self._trigger_counts = self._counts_option(
+            config, 'trigger_counts', 'default_trigger_counts',
+            self.HOME_TRIGGER_MIN, self.HOME_TRIGGER_MAX)
         # Read by the M1's PRINT_START mesh (_BED_MESH_ENSURE) from the
         # status and passed as TRIGGER_COUNTS and SETTLE. 0: not set.
-        self._mesh_trigger_counts = config.getint('mesh_trigger_counts',
-            config.getint('default_mesh_trigger_counts', 0, minval=0,
-                          maxval=(1 << 30)),
-            minval=0, maxval=(1 << 30))
+        self._mesh_trigger_counts = self._counts_option(
+            config, 'mesh_trigger_counts', 'default_mesh_trigger_counts',
+            self.MESH_TRIGGER_MIN, self.MESH_TRIGGER_MAX)
         self._mesh_settle = config.getfloat('mesh_settle',
-            config.getfloat('default_mesh_settle', 0., minval=0., maxval=1.),
-            minval=0., maxval=1.)
+            config.getfloat('default_mesh_settle', 0., minval=0.),
+            minval=0.)
+        if self._mesh_settle > self.MESH_SETTLE_MAX:
+            raise config.error(
+                "Option 'mesh_settle' in section '%s' is %.3f s, above the "
+                "%.1f s limit. Fix it in calibration.cfg's SAVE_CONFIG "
+                "block, or delete the line to use core's default_mesh_settle"
+                % (config.get_name(), self._mesh_settle,
+                   self.MESH_SETTLE_MAX))
         self._trigger_percent_param = floatParamHelper(config,
             'trigger_percent', default=None, above=0., maxval=100.0)
         # KAN-3370: the side of the tare the press moves toward is a fact
@@ -395,9 +412,49 @@ class LoadCellProbeConfigHelper:
     def get_trigger_force_grams(self, gcmd=None):
         return self._trigger_force_param.get(gcmd)
 
+    @staticmethod
+    def _counts_option(config, name, default_name, lo, hi):
+        # The configured value, else core's default_*; 0 is "not set".
+        # Out of range is a config error that names the file to fix.
+        big = 1 << 30
+        default = config.getint(default_name, 0, minval=0, maxval=big)
+        if default and not lo <= default <= hi:
+            raise config.error(
+                "Option '%s' in section '%s' is %d counts, outside %d-%d "
+                "counts. Fix it in core.cfg"
+                % (default_name, config.get_name(), default, lo, hi))
+        value = config.getint(name, 0, minval=0, maxval=big) or default
+        if value and not lo <= value <= hi:
+            raise config.error(
+                "Option '%s' in section '%s' is %d counts, outside %d-%d "
+                "counts. Fix it in calibration.cfg's SAVE_CONFIG block "
+                "(#*# %s), or delete the line to use core's %s"
+                % (name, config.get_name(), value, lo, hi, name,
+                   default_name))
+        return value
+
     def get_trigger_counts(self, gcmd=None):
-        trigger_counts = self._trigger_counts_param.get(gcmd)
-        return trigger_counts if trigger_counts > 0 else None
+        if gcmd is not None:
+            raw = gcmd.get('TRIGGER_COUNTS', None)
+            if raw is not None and raw.strip() not in ('', '0'):
+                try:
+                    value = int(raw)
+                except ValueError:
+                    raise gcmd.error(
+                        "Error on '%s': unable to parse TRIGGER_COUNTS=%s"
+                        % (gcmd.get_commandline(), raw))
+                # one typed parameter serves the home and the mesh taps
+                lo = min(self.HOME_TRIGGER_MIN, self.MESH_TRIGGER_MIN)
+                hi = max(self.HOME_TRIGGER_MAX, self.MESH_TRIGGER_MAX)
+                if not lo <= value <= hi:
+                    raise gcmd.error(
+                        "TRIGGER_COUNTS=%d is refused: it must be %d-%d "
+                        "counts (0 or empty: the configured value)"
+                        % (value, lo, hi))
+                return value
+        # 0 (empty, 0 or absent): the configured value, which is core's
+        # default_trigger_counts unless calibration.cfg overrides it
+        return self._trigger_counts if self._trigger_counts > 0 else None
 
     def get_mesh_trigger(self):
         return self._mesh_trigger_counts, self._mesh_settle

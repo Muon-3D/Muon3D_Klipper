@@ -709,6 +709,43 @@ class PrintEndStillStows(unittest.TestCase):
         cancel = macros_of('M1')['gcode_macro CANCEL_PRINT']['gcode']
         self.assertRegex(cancel, r'(?m)^\s*PRINT_END\s*$')
 
+    def test_a_cancel_restores_the_mesh_accel_cap(self):
+        # A cancel skips BED_MESH_CALIBRATE's on_error_gcode, so CANCEL_PRINT
+        # and PRINT_END put the saved accel back themselves. The restore is
+        # idempotent: it does nothing when no cap is active.
+        macros = macros_of('M1')
+        env = cmc._jinja_env()
+
+        def run(name, saved, with_restore=True):
+            pr = printer_for(*STATES[4][:3], 'xyz')
+            pr['gcode_macro BED_MESH_CALIBRATE'] = {
+                'travel_accel': 5000, 'saved_accel': saved}
+            if with_restore:
+                pr['gcode_macro _BED_MESH_RESTORE_ACCEL'] = {}
+            tmpl = env.from_string(macros['gcode_macro ' + name]['gcode'])
+            text = tmpl.render(rawparams='', params={},
+                               action_respond_info=lambda m: '',
+                               printer=pr)
+            return [ln.strip() for ln in text.splitlines()
+                    if ln.strip() and not ln.strip().startswith('#')]
+
+        for name in ('CANCEL_PRINT', 'PRINT_END'):
+            g = run(name, 20000)
+            self.assertEqual(g.count('_BED_MESH_RESTORE_ACCEL'), 1, name)
+            # a config without the wrappers renders without it
+            self.assertNotIn('_BED_MESH_RESTORE_ACCEL',
+                             run(name, 20000, False), name)
+        g = run('CANCEL_PRINT', 20000)
+        self.assertLess(g.index('CANCEL_PRINT_BASE'),
+                        g.index('_BED_MESH_RESTORE_ACCEL'))
+        self.assertLess(g.index('_BED_MESH_RESTORE_ACCEL'),
+                        g.index('PRINT_END'))
+        # the restore itself: puts the saved accel back, then 0; and with
+        # no cap active (saved 0) it is a no-op, so a second one is harmless
+        r = run('_BED_MESH_RESTORE_ACCEL', 20000)
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', r)
+        self.assertEqual(run('_BED_MESH_RESTORE_ACCEL', 0), [])
+
     def test_the_stow_position_is_140(self):
         for b in BOARDS:
             z = re.search(r'G0 Z([\d.]+)',

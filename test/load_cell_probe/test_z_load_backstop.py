@@ -426,6 +426,9 @@ class Gcmd(object):
     def __init__(self, mcutare):
         self.mcutare = mcutare
 
+    def get(self, name, default=None, *args, **kw):
+        return default
+
     def get_int(self, name, default=None, *args, **kw):
         return self.mcutare if name == 'MCUTARE' else default
 
@@ -767,7 +770,7 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
     try:
         p = object.__new__(mod.LoadCellPrinterProbe)
         p._config_helper = tg.make_helper(mod, BOX_REF,
-                                          trigger_counts=20000)
+                                          trigger_counts=120000)
         p._load_cell_probing_move = types.SimpleNamespace(_z_watch=w2)
         p._log_guard_settings()
     finally:

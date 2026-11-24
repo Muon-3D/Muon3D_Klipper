@@ -282,7 +282,7 @@ def arm(helper, tare):
 
 
 MODES = (
-    ('counts', {'trigger_counts': 20000}),
+    ('counts', {'trigger_counts': 120000}),
     ('percent', {'trigger_percent': 10}),
     ('grams', {'trigger_force': 75}),
 )
@@ -334,13 +334,13 @@ def test_incident_nothing_sent(mod):
 
 def test_good_tare_arms_through_pause_and_tare(mod):
     h = make_helper(mod, BOX_REF, counts_per_gram=1000., tare=-800000,
-                    trigger_counts=20000)
+                    trigger_counts=120000)
     m = make_move(mod, h, -800000)
     m._pause_and_tare(None)
     log = m._mcu_trigger_analog.log
     assert log[0] == ('set_raw_range', -2900210, SENSOR_MAX_USABLE), log
     assert ('set_offset_scale', 800000, -1., 0, False) in log, log
-    assert log[-1] == ('set_trigger', 'gt', 20000), log
+    assert log[-1] == ('set_trigger', 'gt', 120000), log
     print('ok  a normal Boxwood tare arms: range, scale -1, trigger gt')
 
 
@@ -365,12 +365,12 @@ def test_headroom_boundaries(mod):
         assert refused(h.get_safety_range, -2408597) is None, (
             'floor + 1 refused (%s)' % (name,))
     # a margin bigger than the 20% floor wins
-    h = make_helper(mod, BOX_REF, trigger_counts=20000,
+    h = make_helper(mod, BOX_REF, trigger_counts=120000,
                     max_load_safety_margin_counts=900000)
     msg = refused(h.get_safety_range, -2300000)    # headroom 710747
     assert msg is not None and 'need 29.9%' in msg, msg
     # the floor is configurable
-    h = make_helper(mod, BOX_REF, trigger_counts=20000,
+    h = make_helper(mod, BOX_REF, trigger_counts=120000,
                     min_tare_headroom_percent=50)
     assert refused(h.get_safety_range, -1750000) is not None   # 42%
     assert refused(h.get_safety_range, -1400000) is None       # 53%
@@ -428,19 +428,19 @@ def test_mirror_and_explicit(mod):
                        "touching it (tare 3244819, max-load reference "
                        "3010747, headroom -7.8%, need 20.0%)"), msg
     # explicit press_direction overrides the sign of the anchor
-    h = make_helper(mod, BOX_REF, trigger_counts=20000, press_direction=1)
+    h = make_helper(mod, BOX_REF, trigger_counts=120000, press_direction=1)
     assert h.get_press_direction() == 1.
     # the anchor is then on the unloaded side of -578000: refused
     assert refused(h.get_safety_range, -578000) is not None
-    h = make_helper(mod, ref, trigger_counts=20000, press_direction=-1)
+    h = make_helper(mod, ref, trigger_counts=120000, press_direction=-1)
     lo, hi, ts = arm(h, 5000000)
     assert ts['scale'] == -1. and ts['trigger_type'] == 'gt', ts
     assert (lo, hi) == (3110209, SENSOR_MAX_USABLE), (lo, hi)
     # zero anchor with no option: refuse and say what to set
-    h = make_helper(mod, 0, trigger_counts=20000)
+    h = make_helper(mod, 0, trigger_counts=120000)
     msg = refused(h.get_safety_range, 1000)
     assert msg is not None and 'set press_direction' in msg, msg
-    h = make_helper(mod, 0, trigger_counts=20000, press_direction=-1)
+    h = make_helper(mod, 0, trigger_counts=120000, press_direction=-1)
     assert h.get_press_direction() == -1.
     # bad option value is a config error
     try:
@@ -454,7 +454,7 @@ def test_mirror_and_explicit(mod):
 
 
 def test_contact_guard_direction(mod):
-    h = make_helper(mod, BOX_REF, trigger_counts=20000)
+    h = make_helper(mod, BOX_REF, trigger_counts=120000)
     p = object.__new__(mod.LoadCellPrinterProbe)
     p._config_helper = h
     for zero in (-1000000, -3500000, -3010747, 0, 500000):
@@ -472,7 +472,7 @@ def test_contact_guard_direction(mod):
 
 
 def test_status(mod):
-    h = make_helper(mod, BOX_REF, trigger_counts=20000)
+    h = make_helper(mod, BOX_REF, trigger_counts=120000)
     p = object.__new__(mod.LoadCellPrinterProbe)
     p._config_helper = h
     assert p._get_status_press_direction() == -1
@@ -500,6 +500,90 @@ def test_per_printer_triggers_and_core_defaults(mod):
     print('ok  per-printer triggers over the core defaults')
 
 
+class FakeGcmd(object):
+    def __init__(self, line, **params):
+        self.line = line
+        self.params = params
+
+    def get(self, name, default=None):
+        return self.params.get(name, default)
+
+    def get_commandline(self):
+        return self.line
+
+    error = CommandError
+
+
+def config_error(mod, **opts):
+    try:
+        make_helper(mod, BOX_REF, **opts)
+    except ConfigError as e:
+        return str(e)
+    return None
+
+
+def test_trigger_bounds(mod):
+    core = dict(default_trigger_counts=120000,
+                default_mesh_trigger_counts=200000, default_mesh_settle=0.05)
+    # in range (the ends included) is accepted
+    for opts, want in (
+            (dict(trigger_counts=60000), 60000),
+            (dict(trigger_counts=300000), 300000),
+            (dict(trigger_counts=150000), 150000)):
+        assert make_helper(mod, BOX_REF, **opts).get_trigger_counts() == want
+    for opts, want in (
+            (dict(mesh_trigger_counts=100000), 100000),
+            (dict(mesh_trigger_counts=400000), 400000)):
+        h = make_helper(mod, BOX_REF, **opts)
+        assert h.get_mesh_trigger()[0] == want
+    h = make_helper(mod, BOX_REF, mesh_settle=0.2)
+    assert h.get_mesh_trigger()[1] == 0.2
+    # out of range is a config error that names calibration.cfg
+    for opts in (dict(trigger_counts=59999), dict(trigger_counts=300001),
+                 dict(trigger_counts=1 << 30),
+                 dict(mesh_trigger_counts=99999),
+                 dict(mesh_trigger_counts=400001)):
+        msg = config_error(mod, **opts)
+        assert msg and 'calibration.cfg' in msg, (opts, msg)
+    msg = config_error(mod, mesh_settle=0.21)
+    assert msg and 'calibration.cfg' in msg and 'mesh_settle' in msg, msg
+    # a bad default in core.cfg is refused too, naming core.cfg
+    msg = config_error(mod, default_trigger_counts=900000)
+    assert msg and 'core.cfg' in msg, msg
+    # 0 maps to the core default, never to trigger_percent
+    h = make_helper(mod, BOX_REF, trigger_counts=0, mesh_trigger_counts=0,
+                    trigger_percent=10, **core)
+    assert h.get_trigger_counts() == 120000
+    assert h.get_mesh_trigger() == (200000, 0.05)
+    print('ok  trigger bounds: in range accepted, out of range refused, '
+          '0 is the core default')
+
+
+def test_typed_trigger_counts(mod):
+    h = make_helper(mod, BOX_REF, default_trigger_counts=120000,
+                    trigger_percent=10)
+
+    def get(**params):
+        g = FakeGcmd('PROBE', **params)
+        try:
+            return h.get_trigger_counts(g)
+        except CommandError as e:
+            return 'refused: %s' % (e,)
+
+    assert get() == 120000
+    assert get(TRIGGER_COUNTS='200000') == 200000
+    assert get(TRIGGER_COUNTS='60000') == 60000
+    assert get(TRIGGER_COUNTS='400000') == 400000
+    for bad in ('59999', '400001', '1073741824', '-120000', 'abc'):
+        r = get(TRIGGER_COUNTS=bad)
+        assert str(r).startswith('refused'), (bad, r)
+    # 0 or empty: the configured value, and not trigger_percent
+    assert get(TRIGGER_COUNTS='0') == 120000
+    assert get(TRIGGER_COUNTS='') == 120000
+    print('ok  a typed TRIGGER_COUNTS out of range is refused; 0 and empty '
+          'use the configured value')
+
+
 def test_no_inference_left(mod):
     src = open(_paths.patched('klippy/extras/load_cell_probe.py')).read()
     for bad in ('ref_max >= tare_counts', 'ref_max >= zero_counts',
@@ -515,6 +599,7 @@ def main():
              test_headroom_boundaries, test_boxwood_normal, test_sloe,
              test_mirror_and_explicit, test_contact_guard_direction,
              test_status, test_per_printer_triggers_and_core_defaults,
+             test_trigger_bounds, test_typed_trigger_counts,
              test_no_inference_left]
     for t in tests:
         t(mod)
