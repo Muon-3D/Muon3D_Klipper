@@ -199,6 +199,10 @@ finish_test bulk_sensor "Test bulk sensor MCU disconnect"
 start_test z_power "Test z_power decisions"
 $PYTHON test/z_power/test_z_power.py
 finish_test z_power "Test z_power decisions"
+# MUON: B1 toolhead umbilical eFuse telemetry from sk_daemon (#257).
+start_test umbilical_power "Test umbilical_power telemetry"
+$PYTHON test/umbilical_power/test_umbilical_power.py
+finish_test umbilical_power "Test umbilical_power telemetry"
 
 # MUON: bed heater live supply power, resistance learning and heater check.
 start_test heater_supply "Test heater_supply and MPC on a simulated bed"
