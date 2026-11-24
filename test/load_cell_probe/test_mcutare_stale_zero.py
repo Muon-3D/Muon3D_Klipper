@@ -13,7 +13,7 @@ The ceiling itself (2.5 x the trigger delta) is not touched.
 
 This drives the real LoadCellProbingMove (probing_move,
 _host_zero_is_fresh, _mcu_tare, _measure_tare, _apply_tare) and the real
-ZLoadBackstop in the simulated world of test_z_legs.py.
+ZLoadBackstop in the simulated world of test_z_descent.py.
 
     python3 test/load_cell_probe/test_mcutare_stale_zero.py
 
@@ -25,7 +25,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import test_z_legs as zl  # noqa: E402
+import test_z_descent as zl  # noqa: E402
 
 zb = zl.zb
 tg = zl.tg

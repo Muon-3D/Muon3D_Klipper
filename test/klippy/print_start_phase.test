@@ -2,6 +2,9 @@
 DICTIONARY atmega2560.dict
 CONFIG print_start_phase.cfg
 
+# The stub [load_cell_probe] sets no mesh_trigger_counts, so the mesh macro
+# passes no TRIGGER_COUNTS (the stub's safety range is only 199000 counts).
+
 # A fresh klippy process starts unswept; its first print must sweep.
 ASSERT_PHASE NAME=
 ASSERT_SWEEPS COUNT=0

@@ -203,7 +203,7 @@ def test_2_wrong_way_and_idle_wander(mod):
                                         counts)
     assert w.get_limits() == (552687, 221075), w.get_limits()
     # first sample over 221075 is i=2211 (221100); 40 in a row -> 2250
-    # (KAN-4364: nothing is followed by default; legs, test_z_legs.py)
+    # (nothing is followed: one descent, one tare, see test_z_descent.py)
     assert homing.calls == [WRONG_WAY_REASON], homing.calls
     assert idx == 2250, idx
     assert w.last_fired == WRONG_WAY_REASON
@@ -425,6 +425,9 @@ class Collector(object):
 class Gcmd(object):
     def __init__(self, mcutare):
         self.mcutare = mcutare
+
+    def get(self, name, default=None, *args, **kw):
+        return default
 
     def get_int(self, name, default=None, *args, **kw):
         return self.mcutare if name == 'MCUTARE' else default
@@ -718,10 +721,8 @@ def integ_move(mod, rig, cell, tare, delta):
         m._trigger_delta = delta
         m._trigger_press_dir = -1.
     m._pause_and_tare = tare_fn
-    # one descent, as the incident was (legs: test_z_legs.py)
-    m._z_watch = mod.ZLoadBackstop(
-        tg.FakeConfig(rig.printer, {'z_move_leg_time': 0.}), rig.printer,
-        cell)
+    m._z_watch = mod.ZLoadBackstop(tg.FakeConfig(rig.printer, {}),
+                                   rig.printer, cell)
     return m
 
 
@@ -736,21 +737,7 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
             'z_backstop_ceiling_factor': 2.5,
             'z_backstop_ceiling_counts_config': 0,
             'z_backstop_wrong_way_factor': 1.0,
-            'z_backstop_confirm_time': 0.02,
-            'z_backstop_drift_rate_counts': 0.,
-            'z_backstop_leg_time': 1.0,
-            'z_backstop_leg_rate_counts': 50000.,
-            'z_backstop_drift_total_factor': 4.0,
-            'z_backstop_press_total_factor': 1.0,
-            'z_backstop_fast_leg_max': 4.0,
-            'z_backstop_fast_drift_factor': 0.5,
-            'z_backstop_fast_rest_time': 0.,
-            'z_backstop_fast_temp_margin': 0.5,
-            'z_backstop_legs': 0,
-            'z_backstop_leg_last_change': 0,
-            'z_backstop_leg_total_change': 0,
-            'z_backstop_leg_wrong_peak': 0,
-            'z_backstop_leg_press_peak': 0}
+            'z_backstop_confirm_time': 0.02}
     assert st == want, st
     w2, cell2, homing2 = make_watch(
         mod, z_move_abort_ceiling_factor=3.0, z_move_wrong_way_factor=0.75,
@@ -783,7 +770,7 @@ def test_10_configured_limits_are_in_status_and_the_log(mod):
     try:
         p = object.__new__(mod.LoadCellPrinterProbe)
         p._config_helper = tg.make_helper(mod, BOX_REF,
-                                          trigger_counts=20000)
+                                          trigger_counts=120000)
         p._load_cell_probing_move = types.SimpleNamespace(_z_watch=w2)
         p._log_guard_settings()
     finally:

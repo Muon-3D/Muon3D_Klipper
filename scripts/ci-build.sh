@@ -212,9 +212,8 @@ start_test probe_guards "Test load cell probe and homing guards"
 $PYTHON test/load_cell_probe/test_tare_guard.py
 $PYTHON test/load_cell_probe/test_z_load_backstop.py
 $PYTHON test/load_cell_probe/test_hot_load_cell.py
-$PYTHON test/load_cell_probe/test_z_legs.py
-# KAN-4682: longer legs above a known plate height, never across the margin.
-$PYTHON test/load_cell_probe/test_z_fast_legs.py
+# One descent, one tare, a fixed trigger (2026-11-24, otter).
+$PYTHON test/load_cell_probe/test_z_descent.py
 $PYTHON test/load_cell_probe/test_mcutare_stale_zero.py
 $PYTHON test/homing_abort/test_homing_abort.py
 $PYTHON test/homing_abort/test_search_cap.py

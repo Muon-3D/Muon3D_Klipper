@@ -66,7 +66,10 @@ def printer_for(state, paused, sd, homed, z_power=None, webhooks=None,
                 phase=None, probing=None):
     p = {
         'toolhead': {'homed_axes': homed, 'position': {'z': 20.},
-                     'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.}},
+                     'axis_maximum': {'x': 200.1, 'y': 174.1, 'z': 160.},
+                     'max_accel': 20000.},
+        'gcode_macro BED_MESH_CALIBRATE': {'travel_accel': 5000,
+                                           'saved_accel': 0},
         'print_stats': {'state': state},
         'pause_resume': {'is_paused': paused},
         'virtual_sdcard': {'is_active': sd},
@@ -420,6 +423,42 @@ class Calibration(unittest.TestCase):
                 zparks(b, 'FINETUNE_RESONANCE', STATES[0],
                        params={'STOW': '0'}, option='on_error_gcode'), 0, b)
 
+    def test_m1_mesh_travel_accel_is_capped_and_restored(self):
+        # otter, 2026-11-24: mesh travel at max_accel 20000 lost X/Y steps.
+        macros = macros_of('M1')
+        env = cmc._jinja_env()
+
+        def run(name, option='gcode', max_accel=20000., saved=0, cap=5000):
+            pr = printer_for(*STATES[0][:3], 'xyz')
+            pr['toolhead']['max_accel'] = max_accel
+            pr['gcode_macro BED_MESH_CALIBRATE'] = {
+                'travel_accel': cap, 'saved_accel': saved}
+            text = env.from_string(macros['gcode_macro ' + name][option]) \
+                .render(rawparams='STOW=0', params={'STOW': '0'},
+                        action_respond_info=lambda m: '', printer=pr)
+            return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        g = run('BED_MESH_CALIBRATE')
+        base = g.index('BED_MESH_CALIBRATE_BASE STOW=0')
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=5000.0', g[:base])
+        self.assertIn('SET_GCODE_VARIABLE MACRO=BED_MESH_CALIBRATE'
+                      ' VARIABLE=saved_accel VALUE=20000.0', g[:base])
+        self.assertEqual(g[base + 1], '_BED_MESH_RESTORE_ACCEL')
+        # already at or under the cap, or the cap off: nothing changes
+        for kw in ({'max_accel': 4000.}, {'cap': 0}):
+            self.assertFalse([l for l in run('BED_MESH_CALIBRATE', **kw)
+                              if 'SET_VELOCITY_LIMIT' in l], kw)
+        # a mesh that fails restores too. The restore is its own macro: the
+        # handler renders with the status read at the start, where
+        # saved_accel was still 0, so inline it never ran (otter).
+        e = run('BED_MESH_CALIBRATE', 'on_error_gcode')
+        self.assertEqual(e[0], '_BED_MESH_RESTORE_ACCEL')
+        r = run('_BED_MESH_RESTORE_ACCEL', saved=20000.)
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', r)
+        self.assertIn('SET_GCODE_VARIABLE MACRO=BED_MESH_CALIBRATE'
+                      ' VARIABLE=saved_accel VALUE=0', r)
+        self.assertEqual(run('_BED_MESH_RESTORE_ACCEL'), [])
+
     def test_pid_stows_after_the_base_command(self):
         for b in BOARDS:
             g = render(b, 'PID_CALIBRATE', STATES[0],
@@ -669,6 +708,43 @@ class PrintEndStillStows(unittest.TestCase):
     def test_cancel_print_ends_through_print_end(self):
         cancel = macros_of('M1')['gcode_macro CANCEL_PRINT']['gcode']
         self.assertRegex(cancel, r'(?m)^\s*PRINT_END\s*$')
+
+    def test_a_cancel_restores_the_mesh_accel_cap(self):
+        # A cancel skips BED_MESH_CALIBRATE's on_error_gcode, so CANCEL_PRINT
+        # and PRINT_END put the saved accel back themselves. The restore is
+        # idempotent: it does nothing when no cap is active.
+        macros = macros_of('M1')
+        env = cmc._jinja_env()
+
+        def run(name, saved, with_restore=True):
+            pr = printer_for(*STATES[4][:3], 'xyz')
+            pr['gcode_macro BED_MESH_CALIBRATE'] = {
+                'travel_accel': 5000, 'saved_accel': saved}
+            if with_restore:
+                pr['gcode_macro _BED_MESH_RESTORE_ACCEL'] = {}
+            tmpl = env.from_string(macros['gcode_macro ' + name]['gcode'])
+            text = tmpl.render(rawparams='', params={},
+                               action_respond_info=lambda m: '',
+                               printer=pr)
+            return [ln.strip() for ln in text.splitlines()
+                    if ln.strip() and not ln.strip().startswith('#')]
+
+        for name in ('CANCEL_PRINT', 'PRINT_END'):
+            g = run(name, 20000)
+            self.assertEqual(g.count('_BED_MESH_RESTORE_ACCEL'), 1, name)
+            # a config without the wrappers renders without it
+            self.assertNotIn('_BED_MESH_RESTORE_ACCEL',
+                             run(name, 20000, False), name)
+        g = run('CANCEL_PRINT', 20000)
+        self.assertLess(g.index('CANCEL_PRINT_BASE'),
+                        g.index('_BED_MESH_RESTORE_ACCEL'))
+        self.assertLess(g.index('_BED_MESH_RESTORE_ACCEL'),
+                        g.index('PRINT_END'))
+        # the restore itself: puts the saved accel back, then 0; and with
+        # no cap active (saved 0) it is a no-op, so a second one is harmless
+        r = run('_BED_MESH_RESTORE_ACCEL', 20000)
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=20000.0', r)
+        self.assertEqual(run('_BED_MESH_RESTORE_ACCEL', 0), [])
 
     def test_the_stow_position_is_140(self):
         for b in BOARDS:

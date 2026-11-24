@@ -68,7 +68,8 @@ class Machine:
                 self.z += dz
                 self.real += dz
             elif w[0] == 'PROBE':
-                self.probe('PROBE_SPEED=15.000' in line)
+                # the fast approach names its speed; the confirm does not
+                self.probe('PROBE_SPEED=' in line)
             elif w[0] == '_HOME_Z_FROM_LAST_PROBE':
                 self.z -= self.last_probe_z
             elif w[0] == 'RESTORE_GCODE_STATE':
@@ -139,6 +140,13 @@ class FakeConfig:
     def getboolean(self, k, d, **kw):
         return self.opts.get(k, d)
 
+    def get(self, k, d=None):
+        return self.opts.get(k, d)
+
+    def deprecate(self, option, value=None):
+        if option in self.opts:
+            self.deprecated = getattr(self, 'deprecated', []) + [option]
+
 
 class FakeGcmd:
     error = CommandError
@@ -146,6 +154,8 @@ class FakeGcmd:
         self.params = params
         self.info = []
     def get_float(self, k, d, **kw):
+        return self.params.get(k, d)
+    def get_int(self, k, d, **kw):
         return self.params.get(k, d)
     def respond_info(self, msg):
         self.info.append(msg)
@@ -321,10 +331,29 @@ class Test(unittest.TestCase):
         cmd(FakeGcmd(SAMPLES_TOLERANCE=1.))
         self.assertIn('PROBE SAMPLES_TOLERANCE=1.000', m.log)
 
+    def test_trigger_counts_reaches_both_taps(self):
+        # A TRIGGER_COUNTS= on the home reaches the fast approach and the
+        # confirming tap both.
+        m = Machine()
+        obj, cmd = make(m)
+        cmd(FakeGcmd(TRIGGER_COUNTS=150000, SAMPLES_TOLERANCE=1.))
+        self.check_homed(m)
+        probes = [l for l in m.log if l.startswith('PROBE')]
+        self.assertEqual(len(probes), 2)
+        self.assertTrue(probes[0].endswith('SAMPLES=1 TRIGGER_COUNTS=150000'))
+        self.assertEqual(probes[1],
+                         'PROBE TRIGGER_COUNTS=150000 SAMPLES_TOLERANCE=1.000')
 
-class KnownZ(unittest.TestCase):
-    # KAN-4682: a home from a Z the contact guard vouches for keeps its
-    # frame and descends from where it is, with FAST_ABOVE
+    def test_no_trigger_counts_leaves_the_probe_default(self):
+        m = Machine()
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertFalse(any('TRIGGER_COUNTS' in l for l in m.log))
+
+
+class OneDescent(unittest.TestCase):
+    # 2026-11-24: the KAN-4682 fast approach was removed with the Z legs.
+    # Every home soft-homes at the top and makes one descent at fast_speed.
     def soft_homes(self, m):
         return sum(1 for l in m.log
                    if l.startswith('SET_KINEMATIC_POSITION Z=160'))
@@ -332,137 +361,42 @@ class KnownZ(unittest.TestCase):
     def probes(self, m):
         return [l for l in m.log if l.startswith('PROBE')]
 
-    def test_a_known_z_is_not_soft_homed(self):
+    def test_a_known_z_is_soft_homed_like_any_other(self):
         m = Machine(real_start=140., known=True)
         obj, cmd = make(m)
         cmd(FakeGcmd())
-        self.assertAlmostEqual(m.off(), 0., places=6)
         self.assertAlmostEqual(m.real, 10.)
-        self.assertEqual(self.soft_homes(m), 0)
-        fast = self.probes(m)[0]
-        self.assertIn('PROBE_SPEED=15.000', fast)
-        self.assertIn('FAST_ABOVE=12.000', fast)
-        self.assertNotIn('FAST_ABOVE', self.probes(m)[1])   # the confirm
-        self.assertEqual(obj.fast_homes, 1)
-        self.assertEqual(obj.last_fast, 'known')
-
-    def test_the_margin_is_a_config_value(self):
-        m = Machine(real_start=140., known=True)
-        obj, cmd = make(m, fast_margin=10.)
-        cmd(FakeGcmd())
-        self.assertIn('FAST_ABOVE=10.000', self.probes(m)[0])
-
-    def legacy(self, m, obj, why):
-        self.assertEqual(self.soft_homes(m), 1, why)
-        self.assertNotIn('FAST_ABOVE', ' '.join(self.probes(m)), why)
-        self.assertEqual(obj.fast_homes, 0, why)
-
-    def test_what_is_not_known_is_homed_as_before(self):
-        for why, kw in (('guard says no', dict(guard=FakeGuard(False))),
-                        ('no guard', dict(guard=None)),
-                        ('fast_approach off', dict(fast_approach=False))):
-            m = Machine(real_start=140., known=True)
-            obj, cmd = make(m, **kw)
-            cmd(FakeGcmd())
-            self.legacy(m, obj, why)
-            self.assertAlmostEqual(m.off(), 0., places=6)
-        # Z not homed at all (the guard may still say anything)
-        m = Machine(real_start=150.)
-        obj, cmd = make(m, guard=FakeGuard(True))
-        cmd(FakeGcmd())
-        self.legacy(m, obj, 'Z not homed')
-        self.assertEqual(obj.last_fast, 'Z not homed')
-
-    def test_a_head_already_in_the_margin_is_homed_as_before(self):
-        m = Machine(real_start=13., known=True)
-        obj, cmd = make(m)
-        cmd(FakeGcmd())
-        self.legacy(m, obj, 'inside the margin')
-        self.assertEqual(obj.last_fast, 'already within the margin')
-
-    def test_no_contact_where_it_was_known_is_an_error_not_a_blind_retry(self):
-        # the plate is 30 mm lower than believed: the head reaches Z-4
-        # without a trigger
-        m = Machine(real_start=140., known=True)
-        m.real = 140. + 30.
-        obj, cmd = make(m)
-        with self.assertRaises(CommandError) as cm:
-            cmd(FakeGcmd())
-        self.assertIn('not where it was believed', str(cm.exception))
-        self.assertEqual(self.soft_homes(m), 0)
-        self.assertEqual(obj.last_attempts, 1)
-        self.assertFalse(m.relative)   # gcode state restored on error
-
-    def test_guard_errors_on_the_fast_approach_are_raised_as_they_are(self):
-        for msg in KnownZ_GUARD_ERRORS:
-            m = Machine(real_start=140., known=True)
-            obj, cmd = make(m)
-
-            def probe(fast, msg=msg):
-                raise CommandError(msg)
-            m.probe = probe
-            with self.assertRaises(CommandError) as cm:
-                cmd(FakeGcmd())
-            self.assertEqual(str(cm.exception), msg)
-            self.assertEqual(obj.last_attempts, 1)
-
-    def test_a_false_touch_on_the_known_path_repeats_from_the_top(self):
-        # a stop 80 mm up: the confirm finds nothing, the repeat is the
-        # blind one (soft-homed at the top, whole travel), and it homes
-        m = Machine(real_start=140., known=True, touches=[80.])
-        obj, cmd = make(m)
-        g = FakeGcmd()
-        cmd(g)
-        self.assertAlmostEqual(m.off(), 0., places=6)
-        self.assertAlmostEqual(m.real, 10.)
-        self.assertEqual(obj.false_touches, 1)
-        self.assertEqual(obj.last_attempts, 2)
         self.assertEqual(self.soft_homes(m), 1)
-        fasts = [p for p in self.probes(m) if 'FAST_ABOVE' in p]
-        self.assertEqual(len(fasts), 1)     # only the first attempt
+        fast = self.probes(m)[0]
+        self.assertIn('PROBE_SPEED=10.000', fast)
+        self.assertNotIn('FAST_ABOVE', ' '.join(self.probes(m)))
 
-    def heaters(self, *pairs):
-        class H:
-            def __init__(self, t, g):
-                self.t, self.g = t, g
-            def get_status(self, et):
-                return {'temperature': self.t, 'target': self.g}
+    def test_fast_speed_default_is_10(self):
+        obj, cmd = make(Machine())
+        self.assertEqual(obj.fast_speed, 10.)
 
-        class Hs:
-            heaters = {'h%d' % i: H(t, g) for i, (t, g) in enumerate(pairs)}
-        return Hs()
-
-    def run_with_heaters(self, *pairs):
+    def test_removed_options_load_and_are_ignored(self):
+        # a dev-mode config written before the removal still loads
         m = Machine(real_start=140., known=True)
         p = FakePrinter(m)
-        p.objs['heaters'] = self.heaters(*pairs)
-        obj = load_cell_home_z.load_config(FakeConfig(p))
+        cfg = FakeConfig(p, fast_approach=True, fast_margin=12.,
+                         fast_heater_settle=3.)
+        load_cell_home_z.load_config(cfg)
+        self.assertEqual(sorted(cfg.deprecated),
+                         ['fast_approach', 'fast_heater_settle',
+                          'fast_margin'])
         p.objs['gcode'].cmds['LOAD_CELL_HOME_Z'](FakeGcmd())
-        return m, obj
+        self.assertAlmostEqual(m.real, 10.)
+        self.assertNotIn('FAST_ABOVE',
+                         ' '.join(l for l in m.log if l.startswith('PROBE')))
 
-    def test_a_heater_still_settling_takes_the_old_path(self):
-        # print start: the hot end is heating; its drift rises inside a leg
-        for pairs in (((120., 215.),), ((215., 215.), (30., 60.))):
-            m, obj = self.run_with_heaters(*pairs)
-            self.legacy(m, obj, pairs)
-            self.assertEqual(obj.last_fast, 'heater settling')
-
-    def test_heaters_at_target_or_off_do_not_stop_it(self):
-        for pairs in (((214., 215.), (60., 60.)), ((25., 0.),), ()):
-            m, obj = self.run_with_heaters(*pairs)
-            self.assertEqual(obj.fast_homes, 1, pairs)
-            self.assertEqual(self.soft_homes(m), 0, pairs)
-
-    def test_the_status_says_what_the_last_home_did(self):
-        m = Machine(real_start=140., known=True)
-        obj, cmd = make(m)
+    def test_the_status_has_no_fast_keys(self):
+        obj, cmd = make(Machine())
         cmd(FakeGcmd())
-        st = obj.get_status(0.)
-        self.assertEqual(st['fast_homes'], 1)
-        self.assertEqual(st['last_fast'], 'known')
+        self.assertEqual(sorted(obj.get_status(0.)),
+                         ['false_touches', 'last_attempts'])
 
 
-KnownZ_GUARD_ERRORS = Test.GUARD_ERRORS
 
 
 if __name__ == '__main__':

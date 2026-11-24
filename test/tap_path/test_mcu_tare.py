@@ -126,7 +126,7 @@ def make_config_helper(mod):
     ch._reference_max_load_counts = REF_MAX
     ch._max_load_safety_margin_counts_param = Param(0)
     ch._max_load_safety_margin_percent_param = Param(5.0)
-    ch._trigger_counts_param = Param(0)
+    ch._trigger_counts = 0
     ch._trigger_percent_param = Param(10)
     return ch
 

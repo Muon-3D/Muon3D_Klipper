@@ -213,10 +213,16 @@ class MuonADS1220:
                                              minval=0.100, maxval=0.250)
         settle_convs = config.getint('temperature_settle_conversions', 2,
                                      minval=1, maxval=4)
-        max_pause = config.getfloat('max_temperature_pause', 4.0,
-                                    minval=0.5, maxval=6.0)
-        # KAN-4682: the Z legs of load_cell_probe stay under this (less a
-        # margin) so a temperature read never lands inside an armed leg
+        # How long an armed probe may hold off the hotend temperature read.
+        # A read takes the shared ADC away from the load cell, and a probe
+        # armed across it can fire in mid-air ("blind").  The Z home is one
+        # descent of up to 164 mm at 10 mm/s plus its tare, about 17 s, so
+        # 20 covers it; the hotend heater is held off for the whole tap
+        # (hold_for_tap), so nothing heats unwatched.  It was 4 (max 6)
+        # while load_cell_probe split the descent into legs (removed
+        # 2026-11-24).
+        max_pause = config.getfloat('max_temperature_pause', 20.0,
+                                    minval=0.5, maxval=30.0)
         self.max_temperature_pause = max_pause
         stall_convs = config.getint('stall_conversions', 64, minval=8,
                                     maxval=10000)
