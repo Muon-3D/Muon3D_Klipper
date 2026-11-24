@@ -120,6 +120,14 @@ class FakeConfig(object):
     def getchoice(self, name, choices, default=None):
         return choices[self._get(name, default)]
 
+    def get(self, name, default=None):
+        return self._get(name, default)
+
+    # configfile.ConfigWrapper.deprecate: only an option that is set
+    def deprecate(self, option, value=None):
+        if option in self.values:
+            self.deprecated = getattr(self, 'deprecated', []) + [option]
+
 
 class FakeMcu(object):
     def estimated_print_time(self, t):

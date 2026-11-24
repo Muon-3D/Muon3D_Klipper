@@ -6013,11 +6013,13 @@ high_side_pin:
 #   Conversions to wait after switching the multiplexer to the hotend
 #   sensor before reading. The first conversion after a register write
 #   is already fully settled; the second adds margin for the inputs.
-#max_temperature_pause: 4.0
-#   How long temperature reads may pause for an armed probe. Past this
-#   the mcu takes a temperature read anyway (logged as a warning). The
-#   heater is held off for the whole tap, so this only bounds how stale
-#   the reported temperature can get.
+#max_temperature_pause: 20.0
+#   How long temperature reads may pause for an armed probe (0.5 to 30
+#   seconds). Past this the mcu takes a temperature read anyway (logged as
+#   a warning), and a probe still armed is blind for that read. The heater
+#   is held off for the whole tap, so this only bounds how stale the
+#   reported temperature can get. The default, 20, covers the M1's Z home:
+#   one descent of up to 164 mm at 10 mm/s.
 #stall_conversions: 64
 #   An unsaturated load cell reading that repeats for this many
 #   conversions means the chip stopped converting; an armed probe then
@@ -6056,7 +6058,10 @@ sensor_type:
 #trigger_counts:
 #   Optional raw ADC count delta used for triggering, measured from the
 #   per-probe tare value. If set, this overrides both trigger_percent and
-#   trigger_force.
+#   trigger_force. The M1 uses 120000: with a preloaded hot end a touch
+#   unloads the cell to lift-off within about 1 ms, so a fixed trigger
+#   between the motion noise and the lift-off reading holds whatever the
+#   preload does with heat. See docs/Load_Cell.md.
 #trigger_percent:
 #   Optional trigger threshold as a percentage of the span from the per-probe
 #   tare value to reference_max_load_counts. If set, this overrides
@@ -6109,74 +6114,11 @@ sensor_type:
 #z_move_abort_confirm_time: 0.020
 #   How long (in seconds) a limit must hold, in consecutive samples,
 #   before the move is ended. 0.002 to 0.2. The default is 0.020.
-#z_move_leg_time: 1.0
-#   A probing move runs in legs of at most this many seconds. Each leg
-#   stops, tares again at rest and arms the trigger and the limits above
-#   on that fixed tare, so a hot load cell's drift (millions of counts
-#   over a heat-up) never adds up within one leg. A tap that touches in
-#   its first leg is one tare, as before. 0 makes every move one descent.
-#   The default is 1.0.
-#z_move_leg_rate_counts: 50000
-#   Between legs, a tare that moved toward the press by more than this
-#   many counts a second (plus 0.1 x the trigger delta) is not taken: the
-#   previous tare is kept, so light contact at the end of a leg is not
-#   zeroed away. Two such legs in a row end the move ("load on the nozzle
-#   between Z legs"). The default is 50000.
-#z_move_drift_total_factor: 4.0
-#   The most the tare may move the wrong way (away from the press) over
-#   all the legs of one move, in trigger deltas of the first leg; past it
-#   the move ends as a wrong-way move. The default is 4.0.
-#z_move_press_total_factor: 1.0
-#   The most the tare may move toward the press over all the legs of one
-#   move, in trigger deltas of the first leg; past it the move ends ("load
-#   on the nozzle between Z legs"). This stops a soft object being taken
-#   into the tare a little at a time; a cell drifting toward the press
-#   (cooling) by more than this over one move stops it too. The default is
-#   1.0.
-#z_move_drift_rate_counts: 0
-#   Within one move, judge the wrong side against the tare plus the drift
-#   seen so far, followed at up to this many counts a second and never
-#   more than 0.5 x the trigger delta. 0 (the default) follows nothing.
-#z_move_fast_leg_max: 4.0
-#   KAN-4682: a probing move that is given FAST_ABOVE=<Z> (the M1's Z home
-#   passes it when the contact guard knows the plate height; the plate is
-#   below that Z) may run the legs that start above it longer than
-#   z_move_leg_time, up to this many seconds. Never shorter, and never
-#   across FAST_ABOVE, so the last legs are z_move_leg_time as before.
-#   0 turns it off. The default is 4.0.
-#z_move_fast_leg_growth: 3.0
-#   A leg may run at most this many times the leg before it. The default
-#   is 3.0.
-#z_move_fast_drift_factor: 0.5
-#   A long leg may absorb at most this share of the trigger delta as drift
-#   at the planned rate: the next leg runs for at most
-#   z_move_fast_drift_factor x delta / (z_move_fast_rate_safety x rate)
-#   seconds, rate being (the tare change since leg 1 +
-#   z_move_fast_noise_counts) divided by the seconds since leg 1. Above 0
-#   up to 0.75. The default is 0.5.
-#z_move_fast_rate_safety: 2.0
-#   The measured rate is multiplied by this: the drift may speed up while
-#   the leg runs. At least 1. The default is 2.0.
-#z_move_fast_noise_counts: 11000
-#   The spread of one tare (Sloe's idle wander is -4000 to +7000 counts),
-#   added to the tare change before it is divided by the elapsed time. The
-#   default is 11000.
-#z_move_fast_rest_time: 0
-#   Seconds the nozzle holds still before a fast descent (PROBE FAST_ABOVE=)
-#   while the drift is measured, so leg 1 is planned from a measured rate.
-#   The noise term is measured over the same window: twice the scatter of
-#   its tare-sized blocks about a smooth curve, at most
-#   z_move_fast_noise_counts and at least a quarter of it. A drift that
-#   speeds up during the rest, or a press-side step, gives no growth for the
-#   whole descent. 0 turns the rest off (legs as before). The default is 0 (off) until
-#   the rest has been benched; 0.5 is the designed value.
-#z_move_fast_temp_margin: 0.5
-#   No armed leg of a fast descent runs longer than the load cell's
-#   max_temperature_pause (muon_ads1220) less this many seconds: past it the
-#   chip reads the hot end's temperature and the load cell is blind. No cap
-#   when the load cell is not a muon_ads1220. The default is 0.5 (the
-#   armed window is about 0.1 s longer than the move, plus stop and
-#   disarm latency).
+#   Every probing move is one descent armed on the tare taken at rest
+#   just before it. The z_move_leg_*, z_move_fast_* and z_move_drift_*
+#   options of the Z legs (KAN-4364/4682) were removed on 2026-11-24.
+#   A config that still sets one loads with a deprecation warning and
+#   the option is ignored.
 #max_load_safety_margin_counts: 0
 #   Optional fixed margin in raw ADC counts to keep away from
 #   reference_max_load_counts when safety_model=preloaded_max. If greater than

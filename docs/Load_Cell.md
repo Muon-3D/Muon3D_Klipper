@@ -175,8 +175,10 @@ If set, this overrides both `trigger_percent` and `trigger_force`.
 #### `trigger_percent`
 Optional trigger threshold as a percentage of the span from the per-probe tare
 value to `reference_max_load_counts`. This is intended for
-`safety_model=preloaded_max` and automatically scales as tare drifts. If set,
-this overrides `trigger_force`.
+`safety_model=preloaded_max` and scales as the tare moves. If set, this
+overrides `trigger_force`. The M1 does not use it any more: a tare that moves
+because the preload changed (heat, or something touching the hot end) moves
+the trigger with it. See [The M1 Z probe](#the-m1-z-probe-preloaded-hot-end).
 
 #### `reference_tare_counts`
 This is the baseline tare value that is set by `LOAD_CELL_CALIBRATE`.
@@ -224,6 +226,72 @@ max-load position to capture this value. Optional
 anchor before a safety trip occurs, as a percentage of the span from tare to
 `reference_max_load_counts`. `max_load_safety_margin_counts` can be used as
 an explicit raw-count override.
+
+#### The M1 Z probe (preloaded hot end)
+This describes the Muon3D M1 (B1 hardware) as set in `core/M1/core.cfg`. It
+was measured on the B1 unit otter on 23-24 Nov 2026, over 60+ homes, cold and
+at 135 C, with the load cell recorded at 1926 samples a second.
+
+**How the sensor sees a touch.** The hot end sits on the load cell with a
+preload from the anchor board flexure. Pressing the nozzle up unloads the
+cell. The "max-load" point (`reference_max_load_counts`,
+`LOAD_CELL_CALIBRATE_MAX`) is the reading with the hot end lifted fully off
+the cell. On a touch at 10 mm/s the reading goes from the tare to that
+lift-off level in 1-2 samples (about 1 ms) and sits flat there (within about
+1000 counts) for 5-60 ms. A touch is a step, not a ramp.
+
+**The settings and why.**
+
+| Setting | Value | Why |
+|---|---|---|
+| `trigger_counts` | 120000 | Must sit above the Z-motion noise on the press side (at most 61000 at 10 mm/s) and below the last reading before lift-off (as low as 255000; past it the raw range fires and the home fails with RAW_RANGE). 120000 leaves 2x on both sides. |
+| `[load_cell_home_z] fast_speed` | 10 | The Z motor's vibration reaches the cell (149/298 Hz at 10 mm/s, 224/447 Hz at 15). At 15 mm/s the noise peak reached 136000, too close to the trigger. |
+| Trigger filters | none | Any filter delays the trigger. Against a 1 ms step the raw range wins that race: a 100 Hz low-pass failed its first home with RAW_RANGE. A 0.8 Hz drift filter made no difference. |
+| One descent | always | The probing move is one move on one tare taken at rest. The 1 s "legs" (KAN-4364/4682) were removed; see below. |
+| `[muon_ads1220] max_temperature_pause` | 20 | A hot end temperature read borrows the load cell's ADC. It waits until the descent (up to about 17 s) is done. The heater is held off for the tap. |
+
+**What used to go wrong, and why it is fixed in hardware.** Before
+2026-11-24 the trigger was `trigger_percent: 10` and long descents ran in 1 s
+legs, because a hot load cell's zero was seen to move by 1.7-2.7M counts over
+a heat-up. On otter that movement was mechanical: something pressing on the
+hot end as it heated, which changes the preload.
+
+| Hot end condition (otter) | Zero, cold to 135 C | Drift during a descent just after heating | Home straight after heating |
+|---|---|---|---|
+| Foam under the hot end (Airtable #297) | about +2.7M | up to 35000 counts/s | false touches, aborts |
+| Silicone sock rubbing the toolhead block cutout (#296) | +2.7M to +3.0M | 16000 counts/s | stopped: "the load cell moved the wrong way" |
+| Nothing touching (foam out, sock trimmed) | +0.1M to +0.27M | under 1000 counts/s | clean |
+
+Anchor-board screw heads touching the heatsink (#293) restrain the hot end
+the same way, and can overload and crack the cell. With nothing touching the
+hot end, one tare holds for the whole descent and the legs bought nothing.
+The sock also damps the hot end ring: with a sock that does not rub, the
+motion noise peak fell from about 50000 to about 30000 counts.
+
+**Pass test for a built toolhead.** Heat to 135 C and run `G28` at once. In
+the console, "Load cell tare value" should be within about 300000 counts of
+its cold value, and the home should complete with no "first touch was not
+the bed" retry. A unit that fails this has something touching the hot end:
+check the sock against the block cutout, the anchor screw heads against the
+heatsink, and that nothing sits under the hot end. Do not change the
+trigger or speed to make such a unit pass.
+
+**Errors and what they mean on the M1.**
+
+- "the load cell moved the wrong way during the Z move": the zero rose by
+  more than 120000 during the descent. Almost always something pressing on
+  a hot end that is still warming up. See the pass test above.
+- "the load on the nozzle exceeded the safety ceiling": more than 300000
+  toward the press without the MCU trigger firing. A wrong tare or a
+  broken trigger. Treat it as a fault.
+- RAW_RANGE (the raw range, from `reference_max_load_counts`): the reading
+  went past the lift-off level plus 5% before the trigger fired. With no
+  filter this happens only if `reference_max_load_counts` is stale (re-run
+  `LOAD_CELL_CALIBRATE_MAX`) or the trigger was raised too high.
+- "first touch was not the bed (attempt N of 5)": the descent triggered in
+  the air and the confirming tap found nothing. The home retries on its
+  own. One in many homes is noise; repeats mean a slip or a knock on the
+  toolhead (see the pass test).
 
 #### Load Cell Endstop Watchdog Task
 When homing the load_cell_endstop starts a task on the MCU to trac
