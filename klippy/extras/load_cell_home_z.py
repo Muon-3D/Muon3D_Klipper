@@ -11,11 +11,21 @@
 # nozzle wipe, a knock on the frame -- it finds nothing, and the home used to
 # fail and take PRINT_START with it.
 #
-# "No trigger" on the confirm proves the first touch was false: the bed is
-# further down. So the axis is soft-homed at the top again and the whole home
-# repeats straight away (retry_settle, default 0: the first attempt has no
-# pause either, and false touches came with the hotend cold and still).
-# A fast approach that finds nothing over the full travel is still an error.
+# "No trigger" on the confirm says the first touch was false: the bed is
+# further down. The home then repeats straight away (retry_settle, default
+# 0: the first attempt has no pause either, and false touches came with the
+# hotend cold and still), but a repeat is BOUNDED: it lifts at most
+# retry_lift mm (never above where the failed attempt started), re-tares and
+# searches down at most retry_lift + retry_reach mm, so it can reach only
+# retry_reach mm below where the confirm ended.  A repeat that finds nothing
+# there is an error and the home stops: the bed is not where any touch said.
+# Until 2026-11-25 every repeat soft-homed at the top again and searched the
+# whole travel (164 mm) from wherever the head was: on sloe a repeat with no
+# contact drove the carriage into its bottom stop and kept going until the
+# power was cut.  A fast approach that finds nothing over the full travel is
+# still an error.  MAX_TRAVEL=<mm> bounds the first attempt the same way (it
+# searches only that far down from where the head is): the bench check that
+# a search with no contact stops where it should.
 #
 # Every home is the same: soft-home at the top, one descent at fast_speed
 # with one tare (see ZLoadBackstop in load_cell_probe.py), then the
@@ -46,6 +56,13 @@ class LoadCellHomeZ:
                                                above=0.)
         self.confirm_lift = config.getfloat('confirm_lift', 1., above=0.)
         self.final_lift = config.getfloat('final_lift', 10., minval=0.)
+        # A repeat after a false touch: lift this far (less if the attempt
+        # had not come down that far), then search this much further down
+        # than the confirm reached.  See the top.
+        self.retry_lift = config.getfloat('retry_lift', 10., minval=0.,
+                                          maxval=20.)
+        self.retry_reach = config.getfloat('retry_reach', 10., above=0.,
+                                           maxval=20.)
         # removed with the fast approach (see the top): accepted, ignored
         for option in ('fast_approach', 'fast_margin', 'fast_heater_settle'):
             if hasattr(config, 'deprecate'):
@@ -53,6 +70,7 @@ class LoadCellHomeZ:
             config.get(option, None)
         self.false_touches = 0
         self.last_attempts = 0
+        self.last_retry_travel = 0.
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
             'LOAD_CELL_HOME_Z', self.cmd_LOAD_CELL_HOME_Z,
@@ -67,6 +85,7 @@ class LoadCellHomeZ:
 
     def cmd_LOAD_CELL_HOME_Z(self, gcmd):
         tol = gcmd.get_float('SAMPLES_TOLERANCE', 0., minval=0.)
+        max_travel = gcmd.get_float('MAX_TRAVEL', 0., minval=0.)
         trig = gcmd.get_int('TRIGGER_COUNTS', 0, minval=0)
         trig_arg = " TRIGGER_COUNTS=%d" % (trig,) if trig else ""
         confirm = "PROBE" + trig_arg
@@ -84,14 +103,23 @@ class LoadCellHomeZ:
                     # tare, which reads the samples arriving now.
                     self._run("G4 P%d\nM400"
                               % (int(self.retry_settle * 1000.),))
-                # Soft-home at the top so the axis can move down. After a
-                # false touch the head is above the bed by an unknown amount,
-                # and the full travel from here covers it.
-                self._run("SET_KINEMATIC_POSITION Z=%.3f" % (z_top,))
+                if attempt > 1:
+                    # A repeat: bounded, from here (see the top)
+                    start = self._retry_frame(start)
+                elif max_travel:
+                    start = self._bounded_frame(max_travel)
+                else:
+                    # Soft-home at the top so the axis can move down
+                    self._run("SET_KINEMATIC_POSITION Z=%.3f" % (z_top,))
+                    start = z_top
                 self._run("LOAD_CELL_TARE")
-                self._run("PROBE PROBE_SPEED=%.3f LIFT_SPEED=%.3f SAMPLES=1%s"
-                          % (self.fast_speed, self.fast_lift_speed, trig_arg))
-                self._home_from_last_probe()
+                probe = ("PROBE PROBE_SPEED=%.3f LIFT_SPEED=%.3f SAMPLES=1%s"
+                         % (self.fast_speed, self.fast_lift_speed, trig_arg))
+                if attempt > 1 or max_travel:
+                    self._run_bounded_probe(gcmd, probe, attempt)
+                else:
+                    self._run(probe)
+                start = self._home_from_touch(toolhead, start)
                 self._run("G91\nG1 Z%.3f F600" % (self.confirm_lift,))
                 try:
                     self._run(confirm)
@@ -110,8 +138,10 @@ class LoadCellHomeZ:
                             "%s. Z home gave up: check that nothing is"
                             " touching the nozzle and that the fan has"
                             " stopped." % (msg,))
-                    gcmd.respond_info("%s. Homing Z again from the top."
-                                      % (msg,))
+                    gcmd.respond_info(
+                        "%s. Homing Z again, lifting at most %.0f mm and"
+                        " searching at most %.0f mm below here."
+                        % (msg, self.retry_lift, self.retry_reach))
                     continue
                 self._home_from_last_probe()
                 if self.final_lift > 0.:
@@ -120,13 +150,68 @@ class LoadCellHomeZ:
         finally:
             self._run("RESTORE_GCODE_STATE NAME=_LOAD_CELL_HOME_Z_STATE")
 
+    def _z(self, toolhead):
+        eventtime = self.printer.get_reactor().monotonic()
+        return toolhead.get_status(eventtime)['position'][2]
+
+    # _HOME_Z_FROM_LAST_PROBE re-frames Z at the touch.  Returns `start` (the
+    # Z this attempt began at, the highest the head has been in it) moved
+    # into the new frame, so a repeat can tell how far it may lift.
+    def _home_from_touch(self, toolhead, start):
+        before = self._z(toolhead)
+        self._home_from_last_probe()
+        return start + (self._z(toolhead) - before)
+
+    # A repeat after a false touch.  Lift min(retry_lift, how far this
+    # attempt came down), so the head never goes above where the attempt
+    # began (it may have begun against the top stop), then declare Z so that
+    # the probe's floor, position_min, is retry_lift + retry_reach below:
+    # the probe cannot travel further than that.  Returns the new start.
+    def _retry_frame(self, start):
+        toolhead = self.printer.lookup_object('toolhead')
+        eventtime = self.printer.get_reactor().monotonic()
+        lift = max(0., min(self.retry_lift, start - self._z(toolhead)))
+        if lift > 0.:
+            self._run("G91\nG1 Z%.3f F600" % (lift,))
+        return self._bounded_frame(lift + self.retry_reach)
+
+    # Declare Z so that position_min, the probe's floor, is `travel` mm
+    # below the head.  Returns the declared Z.
+    def _bounded_frame(self, travel):
+        eventtime = self.printer.get_reactor().monotonic()
+        z = self._z_min(eventtime) + travel
+        self._run("SET_KINEMATIC_POSITION Z=%.3f" % (z,))
+        self.last_retry_travel = travel
+        return z
+
+    # A bounded fast probe (a repeat, or MAX_TRAVEL=).  No trigger within it
+    # means the bed is not where it can be: stop here with an error.
+    def _run_bounded_probe(self, gcmd, probe, attempt):
+        try:
+            self._run(probe)
+        except self.gcode.error as e:
+            if "No trigger" not in str(e):
+                raise
+            if attempt == 1:
+                raise gcmd.error(
+                    "LOAD_CELL_HOME_Z: no contact within MAX_TRAVEL %.1f mm,"
+                    " so Z stopped there." % (self.last_retry_travel,))
+            raise gcmd.error(
+                "LOAD_CELL_HOME_Z: repeat %d of %d found no contact within"
+                " %.1f mm (%.0f mm below where the confirming tap ended), so"
+                " Z stopped there. Check the plate is fitted and nothing"
+                " touches the nozzle, then home again."
+                % (attempt, self.attempts, self.last_retry_travel,
+                   self.retry_reach))
+
     def _z_min(self, eventtime):
         toolhead = self.printer.lookup_object('toolhead')
         return toolhead.get_status(eventtime)['axis_minimum'][2]
 
     def get_status(self, eventtime):
         return {'false_touches': self.false_touches,
-                'last_attempts': self.last_attempts}
+                'last_attempts': self.last_attempts,
+                'last_retry_travel': self.last_retry_travel}
 
 def load_config(config):
     return LoadCellHomeZ(config)
