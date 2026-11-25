@@ -1,6 +1,6 @@
 # Offline tests for klippy/extras/load_cell_home_z.py: a false first touch
 # (the confirming tap finds no bed) is retried from the top, not fatal.
-import os, sys, unittest
+import os, re, sys, types, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..',
                                 'klippy'))
@@ -94,9 +94,20 @@ class Machine:
 
 class FakeGcode:
     error = CommandError
+    args_r = re.compile('([A-Z_]+|[A-Z*])')
     def __init__(self, m):
         self.m = m
         self.cmds = {}
+        self.quiet = []
+        self.gcode_handlers = {'PROBE': self._probe}
+    def _probe(self, gcmd):
+        self.quiet.append(gcmd.commandline)
+        self.m.run(gcmd.commandline)
+    def create_gcode_command(self, cmd, commandline, params):
+        return types.SimpleNamespace(command=cmd, commandline=commandline,
+                                     params=params)
+    def check_abort(self):
+        pass
     def register_command(self, name, fn, desc=None):
         self.cmds[name] = fn
     def run_script_from_command(self, script):
@@ -145,6 +156,9 @@ class FakePrinter:
             guard = FakeGuard(m.known)
         if guard is not None:
             self.objs['contact_guard'] = guard
+        self.events = []
+    def send_event(self, name):
+        self.events.append(name)
     def lookup_object(self, name, *default):
         if name in self.objs:
             return self.objs[name]
@@ -770,6 +784,56 @@ class WrongWay(unittest.TestCase):
         st = obj.get_status(0.)
         self.assertEqual(st['last_wrong_way_retries'], 1)
         self.assertEqual(st['wrong_way_soft_retries'], 1)
+
+    def test_a_retried_stop_is_not_reported_as_an_error(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {0})
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        g = obj.printer.lookup_object('gcode')
+        # every PROBE ran without the dispatcher's '!!' line, and the
+        # stopped one still ended its probe session
+        self.assertEqual(len(g.quiet), len(m.probes))
+        self.assertEqual(obj.printer.events, ['gcode:command_error'])
+
+    def test_the_plate_pulled_in_the_pause_ends_the_home(self):
+        m = Machine(real_start=150.)
+        bed = types.SimpleNamespace(bed_removed=False)
+        self.drift(m, {0})
+        stopped = m._probe
+        def first(fast):
+            bed.bed_removed = True
+            stopped(fast)
+        m._probe = first
+        obj, cmd = make(m)
+        obj.printer.objs['bed_removal_detector'] = bed
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('the bed was removed', str(cm.exception))
+        self.assertEqual(len(m.probes), 1)
+        self.assertTrue(m.cleared)
+
+
+class MaxTravelLimit(unittest.TestCase):
+    def test_max_travel_may_not_go_below_z_min(self):
+        m = Machine(real_start=60.)
+        m.known = True
+        m.z = 60.
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd(MAX_TRAVEL=80.))
+        self.assertIn('would go below Z min', str(cm.exception))
+        self.assertEqual(m.probes, [])
+        self.assertNotIn('SET_KINEMATIC_POSITION', ' '.join(m.log))
+
+    def test_unhomed_max_travel_is_capped_by_the_z_travel(self):
+        m = Machine(real_start=60.)
+        m.known = False
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd(MAX_TRAVEL=Z_TOP - Z_MIN + 1.))
+        self.assertEqual(m.probes, [])
+
 
 if __name__ == '__main__':
     unittest.main()
