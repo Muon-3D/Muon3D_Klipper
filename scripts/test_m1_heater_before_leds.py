@@ -154,7 +154,7 @@ class M1:
         self.toolhead = {
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
-            'axis_minimum': {'x': 0., 'y': -0.1, 'z': -4., 'e': 0.},
+            'axis_minimum': {'x': 0., 'y': -0.3, 'z': -4., 'e': 0.},
             'homed_axes': 'xyz', 'estimated_print_time': 0.}
         printer.add_object('toolhead', Status(self.toolhead))
         self.extruder = {'can_extrude': True, 'target': 215.,
@@ -1738,7 +1738,7 @@ class RefusedCutStillParks(_M1TestCase):
         names = m.names()
         # The refusal came from the cut: the tap ran, the cut did not
         self.assertIn('AXIS_PROTECTED_MOVE AXIS=Y DIR=MIN DIST=20.0 '
-                      'SPEED=60.0 BEYOND=3.9', t)
+                      'SPEED=60.0 BEYOND=3.7', t)
         self.assertIsNone(m.macro_vars('CUT_FILAMENT')['last_stop_y'])
         self.assertNotIn('SET_TMC_CURRENT', names)
         self.assertNotIn('PARK_PRINTER', names)
