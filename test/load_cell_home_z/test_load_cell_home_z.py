@@ -270,15 +270,14 @@ class Test(unittest.TestCase):
         self.assertIn('samples_tolerance', str(cm.exception))
         self.assertEqual(obj.false_touches, 0)
 
-    # KAN-3370: the safety stops are errors the home must not swallow.
+    # KAN-3370: the safety stops are errors the home must not swallow
+    # (a wrong-way stop is retried a bounded number of times: WrongWay).
     # Only "No trigger" on the confirming tap means a false first touch.
     GUARD_ERRORS = [
         "Homing aborted: the bed was removed",
         "Homing aborted: the toolhead disconnected",
         "Homing aborted: the load on the nozzle exceeded the safety ceiling"
         " during the Z move",
-        "Homing aborted: the load cell moved the wrong way during the Z"
-        " move",
         "The nozzle is already under load: check nothing is touching it"
         " (tare -3244819, max-load reference -3010747, headroom -7.8%,"
         " need 20.0%)",
@@ -426,7 +425,8 @@ class OneDescent(unittest.TestCase):
         cmd(FakeGcmd())
         self.assertEqual(sorted(obj.get_status(0.)),
                          ['false_touches', 'last_attempts',
-                          'last_retry_travel'])
+                          'last_retry_travel', 'last_wrong_way_retries',
+                          'wrong_way_soft_retries'])
 
 
 
@@ -619,6 +619,157 @@ class BoundedRetry(unittest.TestCase):
         self.assertEqual(str(cm.exception),
                          "Homing aborted: the bed was removed")
 
+
+
+WRONG_WAY = ("Homing aborted: the load cell moved the wrong way during the Z"
+             " move")
+
+
+class WrongWay(unittest.TestCase):
+    """2026-11-25, smew: every PRINT_START's first descent was stopped for a
+    wrong-way load about 3 s in.  The probe is re-tared and run again in the
+    same frame, so it ends at the same floor, at most wrong_way_retries
+    times per home."""
+
+    def drift(self, m, which, travel=30.):
+        # the probes numbered in `which` (0 = the first PROBE) go down
+        # `travel` (never past their floor) and are stopped wrong-way
+        real = m._probe
+        n = [0]
+
+        def probe(fast):
+            i = n[0]
+            n[0] += 1
+            if i in which:
+                floor = max(0., m.real - (m.z - Z_MIN))
+                d = min(travel, m.real - floor)
+                m.z -= d
+                m.real -= d
+                raise CommandError(WRONG_WAY)
+            real(fast)
+        m._probe = probe
+
+    def floors(self, m):
+        return [l for l in m.log if l.startswith('SET_KINEMATIC_POSITION Z=')]
+
+    def test_a_wrong_way_stop_is_retried_and_homes(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {0})
+        obj, cmd = make(m)
+        g = FakeGcmd()
+        cmd(g)
+        self.assertAlmostEqual(m.off(), 0., places=6)
+        self.assertAlmostEqual(m.real, 10.)
+        self.assertFalse(m.cleared)
+        self.assertEqual(obj.last_wrong_way_retries, 1)
+        self.assertEqual(obj.wrong_way_soft_retries, 1)
+        self.assertEqual(obj.last_attempts, 1)
+        self.assertEqual(obj.false_touches, 0)
+        # one info line, no error; settled then re-tared before the retry
+        self.assertEqual(len([i for i in g.info if 'wrong way' in i]), 1)
+        self.assertFalse(any(i.startswith('!!') for i in g.info))
+        i = m.log.index('G4 P500')
+        self.assertEqual(m.log[i + 1:i + 3], ['M400', 'LOAD_CELL_TARE'])
+        # the same frame: Z declared once, at the top, and the retry went
+        # on from where the stopped probe ended
+        self.assertEqual(self.floors(m), ['SET_KINEMATIC_POSITION Z=160.000'])
+        self.assertEqual([p[1:] for p in m.probes[:2]],
+                         [(150., 120.), (120., 0.)])
+
+    def test_past_the_limit_the_home_stops_with_an_error(self):
+        m = Machine(real_start=150.)
+        self.drift(m, set(range(10)), travel=5.)
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('moved the wrong way 4 times in this home',
+                      str(cm.exception))
+        self.assertEqual(len(m.probes), 4)       # the first and 3 retries
+        self.assertEqual(obj.last_wrong_way_retries, 3)
+        self.assertTrue(m.cleared)
+        self.assertFalse(m.relative)
+
+    def test_zero_retries_stops_at_once(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {0})
+        obj, cmd = make(m, wrong_way_retries=0)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('moved the wrong way 1 times', str(cm.exception))
+        self.assertEqual(len(m.probes), 1)
+        self.assertTrue(m.cleared)
+
+    def test_the_retries_stay_within_max_travel(self):
+        # no plate: 4 probes stopped wrong-way after 4 mm each, then no
+        # contact.  Together they go 20 mm, MAX_TRAVEL, and no further
+        m = Machine(real_start=60.)
+        self.drift(m, {0, 1, 2}, travel=4.)
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertIn('no contact within MAX_TRAVEL 20.0 mm',
+                      str(cm.exception))
+        self.assertAlmostEqual(min(p[2] for p in m.probes), 40.)
+        self.assertEqual(len(self.floors(m)), 1)
+        self.assertTrue(m.cleared)
+
+    def test_the_retries_stay_within_a_repeats_floor(self):
+        # a false touch at 148 (its confirm ends at 144), then the bounded
+        # repeat (back up to 150, floor 134) is stopped wrong-way twice and
+        # finds no bed: it ends at 134
+        m = Machine(real_start=150., touches=[148.])
+        self.drift(m, {2, 3}, travel=6.)
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('repeat 2 of 5 found no contact', str(cm.exception))
+        self.assertAlmostEqual(min(p[2] for p in m.probes), 134.)
+        self.assertEqual(obj.last_wrong_way_retries, 2)
+        self.assertLessEqual(m.max_real, 150. + 1e-9)
+
+    def test_a_wrong_way_confirm_is_retried(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {1}, travel=0.5)
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertAlmostEqual(m.off(), 0., places=6)
+        self.assertEqual(obj.last_wrong_way_retries, 1)
+        self.assertEqual(obj.false_touches, 0)
+
+    def test_one_limit_per_home_and_reset_on_the_next(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {0, 3})
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertEqual(obj.last_wrong_way_retries, 1)
+        m.real = 150.
+        cmd(FakeGcmd())
+        self.assertAlmostEqual(m.off(), 0., places=6)
+        self.assertEqual(obj.last_wrong_way_retries, 1)
+        self.assertEqual(obj.wrong_way_soft_retries, 2)
+
+    def test_other_guard_stops_still_end_the_home(self):
+        m = Machine(real_start=150.)
+        def probe(fast):
+            raise CommandError("Homing aborted: the load on the nozzle"
+                               " exceeded the safety ceiling during the Z"
+                               " move")
+        m._probe = probe
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('safety ceiling', str(cm.exception))
+        self.assertEqual(len(m.probes), 1)
+        self.assertEqual(obj.last_wrong_way_retries, 0)
+
+    def test_status_reports_the_retries(self):
+        m = Machine(real_start=150.)
+        self.drift(m, {0})
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        st = obj.get_status(0.)
+        self.assertEqual(st['last_wrong_way_retries'], 1)
+        self.assertEqual(st['wrong_way_soft_retries'], 1)
 
 if __name__ == '__main__':
     unittest.main()

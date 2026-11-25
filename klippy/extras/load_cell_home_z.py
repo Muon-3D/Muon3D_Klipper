@@ -39,6 +39,15 @@
 # TRIGGER_COUNTS=, when given, is passed to both taps; without it they use
 # [load_cell_probe] trigger_counts, which is what the M1's G28 does.
 #
+# A probe that ZLoadBackstop stops because the load cell moved the wrong
+# way (2026-11-25, smew: every PRINT_START, about 3 s into the first
+# descent, with the hotend heating; Harry: the cell drifts a little, not a
+# fault) is not the end of the home either: wait wrong_way_settle, re-tare
+# and run the same probe again, at most wrong_way_retries times per home.
+# The retry keeps the frame, so it ends at the same floor the stopped probe
+# had: the retries together travel no further than that one probe could
+# have.  Past the limit the home stops with an error.
+#
 # On sloe (2026-11-11) false touches also came on plain G28s, after 1.4-2.5 mm
 # of the fast approach, three in a row after a restart and then about one in
 # ten; 15 fast probes from Z40 had none. The cause is not known yet. Each
@@ -63,6 +72,12 @@ class LoadCellHomeZ:
                                           maxval=20.)
         self.retry_reach = config.getfloat('retry_reach', 10., above=0.,
                                            maxval=20.)
+        # A probe stopped for a wrong-way load: settle, re-tare and run it
+        # again, at most this many times per home.  See the top.
+        self.wrong_way_retries = config.getint('wrong_way_retries', 3,
+                                               minval=0, maxval=10)
+        self.wrong_way_settle = config.getfloat('wrong_way_settle', 0.5,
+                                                minval=0., maxval=5.)
         # removed with the fast approach (see the top): accepted, ignored
         for option in ('fast_approach', 'fast_margin', 'fast_heater_settle'):
             if hasattr(config, 'deprecate'):
@@ -71,6 +86,8 @@ class LoadCellHomeZ:
         self.false_touches = 0
         self.last_attempts = 0
         self.last_retry_travel = 0.
+        self.wrong_way_soft_retries = 0
+        self.last_wrong_way_retries = 0
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
             'LOAD_CELL_HOME_Z', self.cmd_LOAD_CELL_HOME_Z,
@@ -94,6 +111,7 @@ class LoadCellHomeZ:
         toolhead = self.printer.lookup_object('toolhead')
         eventtime = self.printer.get_reactor().monotonic()
         z_top = toolhead.get_status(eventtime)['axis_maximum'][2]
+        self.last_wrong_way_retries = 0
         self._run("SAVE_GCODE_STATE NAME=_LOAD_CELL_HOME_Z_STATE")
         try:
             for attempt in range(1, self.attempts + 1):
@@ -119,7 +137,7 @@ class LoadCellHomeZ:
                 if attempt > 1 or max_travel:
                     self._run_bounded_probe(gcmd, probe, attempt)
                 else:
-                    self._run(probe)
+                    self._run_probe(gcmd, probe)
                 start = self._home_from_touch(
                     toolhead, start, attempt > 1 or bool(max_travel))
                 # never above where the attempt began (a repeat may begin
@@ -128,7 +146,7 @@ class LoadCellHomeZ:
                 if lift > 0.:
                     self._run("G91\nG1 Z%.3f F600" % (lift,))
                 try:
-                    self._run(confirm)
+                    self._run_probe(gcmd, confirm)
                 except self.gcode.error as e:
                     if "No trigger" not in str(e):
                         raise
@@ -222,7 +240,7 @@ class LoadCellHomeZ:
     # means the bed is not where it can be: stop here with an error.
     def _run_bounded_probe(self, gcmd, probe, attempt):
         try:
-            self._run(probe)
+            self._run_probe(gcmd, probe)
         except self.gcode.error as e:
             if "No trigger" not in str(e):
                 raise
@@ -238,6 +256,42 @@ class LoadCellHomeZ:
                 % (attempt, self.attempts, self.last_retry_travel,
                    self.retry_reach))
 
+    # A probe, run again in the same frame after a wrong-way stop (see the
+    # top).  Any other error, or one past the limit, is raised.
+    WRONG_WAY = "the load cell moved the wrong way"
+
+    def _run_probe(self, gcmd, probe):
+        while True:
+            try:
+                self._run(probe)
+                return
+            except self.gcode.error as e:
+                shutdown = getattr(self.printer, 'is_shutdown', None)
+                if (self.WRONG_WAY not in str(e)
+                        or (shutdown is not None and shutdown())):
+                    raise
+                if self.last_wrong_way_retries >= self.wrong_way_retries:
+                    raise gcmd.error(
+                        "LOAD_CELL_HOME_Z: the load cell moved the wrong way"
+                        " %d times in this home (%d re-tares), so Z stopped"
+                        " there. Check nothing presses on or pulls the hot"
+                        " end, then home again."
+                        % (self.last_wrong_way_retries + 1,
+                           self.last_wrong_way_retries))
+                self.last_wrong_way_retries += 1
+                self.wrong_way_soft_retries += 1
+                msg = ("LOAD_CELL_HOME_Z: the load cell drifted the wrong way"
+                       " during the Z move; settling %.1f s, re-taring and"
+                       " moving on to the same floor (retry %d of %d)"
+                       % (self.wrong_way_settle, self.last_wrong_way_retries,
+                          self.wrong_way_retries))
+                logging.info(msg)
+                gcmd.respond_info(msg)
+                if self.wrong_way_settle > 0.:
+                    self._run("G4 P%d\nM400"
+                              % (int(self.wrong_way_settle * 1000.),))
+                self._run("LOAD_CELL_TARE")
+
     def _z_min(self, eventtime):
         toolhead = self.printer.lookup_object('toolhead')
         return toolhead.get_status(eventtime)['axis_minimum'][2]
@@ -245,7 +299,9 @@ class LoadCellHomeZ:
     def get_status(self, eventtime):
         return {'false_touches': self.false_touches,
                 'last_attempts': self.last_attempts,
-                'last_retry_travel': self.last_retry_travel}
+                'last_retry_travel': self.last_retry_travel,
+                'wrong_way_soft_retries': self.wrong_way_soft_retries,
+                'last_wrong_way_retries': self.last_wrong_way_retries}
 
 def load_config(config):
     return LoadCellHomeZ(config)
