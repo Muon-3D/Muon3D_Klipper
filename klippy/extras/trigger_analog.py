@@ -120,6 +120,11 @@ class MCU_SosFilter:
         self._mcu.register_config_callback(self._build_config)
 
     def _build_config(self):
+        # MUON: a non-critical MCU (the M1 toolhead) that reconnects runs
+        # this again against a freshly reset sos_filter, so nothing sent
+        # before the reconnect is on the MCU any more: resend it all.
+        self._last_sent_coeffs = [None] * self._max_sections
+        self._last_sent_offset_scale = None
         self._set_section_cmd = self._mcu.lookup_command(
             "sos_filter_set_section oid=%c section_idx=%c"
             " sos0=%i sos1=%i sos2=%i sos3=%i sos4=%i", cq=self._cmd_queue)
@@ -267,6 +272,12 @@ class MCU_trigger_analog:
         self._sos_filter = sos_filter
 
     def _build_config(self):
+        # MUON: also run on a non-critical reconnect, when the MCU's
+        # trigger_analog is new (raw range 0..0, trigger abs_ge 0, which
+        # fires on the first sample).  The caches below would otherwise keep
+        # an unchanged trigger (a fixed trigger_counts) from being resent.
+        self._last_range_args = None
+        self._last_trigger_args = None
         self._sensor.setup_trigger_analog(self._oid)
         cmd_queue = self._dispatch.get_command_queue()
         if self._sos_filter is None:
