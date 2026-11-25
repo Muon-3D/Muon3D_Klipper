@@ -103,6 +103,8 @@ class LoadCellHomeZ:
     def cmd_LOAD_CELL_HOME_Z(self, gcmd):
         tol = gcmd.get_float('SAMPLES_TOLERANCE', 0., minval=0.)
         max_travel = gcmd.get_float('MAX_TRAVEL', 0., minval=0.)
+        if max_travel:
+            self._check_max_travel(gcmd, max_travel)
         trig = gcmd.get_int('TRIGGER_COUNTS', 0, minval=0)
         trig_arg = " TRIGGER_COUNTS=%d" % (trig,) if trig else ""
         confirm = "PROBE" + trig_arg
@@ -256,14 +258,50 @@ class LoadCellHomeZ:
                 % (attempt, self.attempts, self.last_retry_travel,
                    self.retry_reach))
 
+    # MAX_TRAVEL may not search below position_min: from a homed Z, no
+    # further than Z is above it; otherwise no further than the Z travel.
+    def _check_max_travel(self, gcmd, max_travel):
+        st = self.printer.lookup_object('toolhead').get_status(
+            self.printer.get_reactor().monotonic())
+        room = st['axis_maximum'][2] - st['axis_minimum'][2]
+        if 'z' in st['homed_axes']:
+            room = min(room, st['position'][2] - st['axis_minimum'][2])
+        if max_travel > room + 1e-6:
+            raise gcmd.error(
+                "LOAD_CELL_HOME_Z: MAX_TRAVEL %.1f mm would go below Z min;"
+                " at most %.1f mm from here." % (max_travel, max(room, 0.)))
+
     # A probe, run again in the same frame after a wrong-way stop (see the
     # top).  Any other error, or one past the limit, is raised.
     WRONG_WAY = "the load cell moved the wrong way"
 
+    # Runs a PROBE as the gcode dispatcher does, gcode:command_error
+    # included (it ends the probe session), but without the dispatcher's
+    # '!!' line: a wrong-way stop that is retried is not an error.  Any
+    # error is raised, and LOAD_CELL_HOME_Z reports one it does not retry.
+    def _run_quiet(self, script):
+        gcode = self.gcode
+        parts = gcode.args_r.split(script.upper())
+        cmd = ''.join(parts[:3]).strip()
+        params = {parts[i]: parts[i + 1].strip()
+                  for i in range(1, len(parts), 2)}
+        try:
+            gcode.check_abort()
+            gcode.gcode_handlers[cmd](
+                gcode.create_gcode_command(cmd, script, params))
+        except Exception:
+            self.printer.send_event("gcode:command_error")
+            raise
+
+    def _check_bed(self):
+        bed = self.printer.lookup_object('bed_removal_detector', None)
+        if bed is not None and getattr(bed, 'bed_removed', False):
+            raise self.gcode.error("Homing aborted: the bed was removed")
+
     def _run_probe(self, gcmd, probe):
         while True:
             try:
-                self._run(probe)
+                self._run_quiet(probe)
                 return
             except self.gcode.error as e:
                 shutdown = getattr(self.printer, 'is_shutdown', None)
@@ -291,6 +329,8 @@ class LoadCellHomeZ:
                     self._run("G4 P%d\nM400"
                               % (int(self.wrong_way_settle * 1000.),))
                 self._run("LOAD_CELL_TARE")
+                # the plate pulled during the pause: no move stopped for it
+                self._check_bed()
 
     def _z_min(self, eventtime):
         toolhead = self.printer.lookup_object('toolhead')
