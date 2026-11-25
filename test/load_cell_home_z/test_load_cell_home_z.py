@@ -29,11 +29,23 @@ class Machine:
         self.last_probe_z = None
         self.log = []
         self.dwells = []
+        # (fast, real height at the start, at the end) of every PROBE, and
+        # the highest real height the head reached
+        self.probes = []
+        self.max_real = real_start
+        self.cleared = False
 
     def off(self):
         return self.z - self.real
 
     def probe(self, fast):
+        start = self.real
+        try:
+            self._probe(fast)
+        finally:
+            self.probes.append((fast, start, self.real))
+
+    def _probe(self, fast):
         floor = self.real - (self.z - Z_MIN)   # lowest real height reachable
         if fast and self.touches:
             t = self.touches.pop(0)
@@ -57,7 +69,10 @@ class Machine:
             if not w:
                 continue
             if w[0] == 'SET_KINEMATIC_POSITION':
-                self.z = float(w[1].split('=')[1])
+                if w[1] == 'CLEAR_HOMED=Z':
+                    self.cleared = True
+                else:
+                    self.z = float(w[1].split('=')[1])
             elif w[0] == 'G4':
                 self.dwells.append(float(w[1][1:]) / 1000.)
             elif w[0] == 'G91':
@@ -67,6 +82,7 @@ class Machine:
                 assert self.relative
                 self.z += dz
                 self.real += dz
+                self.max_real = max(self.max_real, self.real)
             elif w[0] == 'PROBE':
                 self.probe('PROBE_SPEED=15.000' in line)
             elif w[0] == '_HOME_Z_FROM_LAST_PROBE':
@@ -174,8 +190,9 @@ class Test(unittest.TestCase):
         self.assertEqual(g.info, [])
 
     def test_false_touch_is_retried(self):
-        # The sloe case: a touch ~159 mm up, the bed far below.
-        m = Machine(real_start=159.5, touches=[159.])
+        # A false touch 12 mm over the bed: the confirm ends 7 mm over it,
+        # and the bounded repeat (10 mm up, 20 mm down) reaches it.
+        m = Machine(real_start=30., touches=[12.])
         obj, cmd = make(m)
         g = FakeGcmd()
         cmd(g)
@@ -184,9 +201,10 @@ class Test(unittest.TestCase):
         self.assertEqual(obj.last_attempts, 2)
         self.assertEqual(m.dwells, [])   # retries at once by default
         self.assertIn('first touch was not the bed', g.info[0])
+        # only the first attempt soft-homes at the top
         self.assertEqual(sum(1 for l in m.log
                              if l.startswith('SET_KINEMATIC_POSITION Z=160')),
-                         2)
+                         1)
 
     def test_false_touch_near_the_bed_needs_no_retry(self):
         # A false touch within the confirm's reach: the confirm finds the
@@ -198,7 +216,8 @@ class Test(unittest.TestCase):
         self.assertEqual(obj.false_touches, 0)
 
     def test_gives_up_after_attempts(self):
-        m = Machine(touches=[100., 90., 80., 70., 60.])
+        # every repeat false-touches again inside its bounded search
+        m = Machine(real_start=60., touches=[50., 44., 38., 32., 26.])
         obj, cmd = make(m)
         with self.assertRaises(CommandError) as cm:
             cmd(FakeGcmd())
@@ -268,7 +287,8 @@ class Test(unittest.TestCase):
             self.assertEqual(obj.last_attempts, 1, msg)
             self.assertEqual(
                 sum(1 for l in m.log
-                    if l.startswith('SET_KINEMATIC_POSITION')), 1, msg)
+                    if l.startswith('SET_KINEMATIC_POSITION Z=')), 1, msg)
+            self.assertTrue(m.cleared, msg)   # failed: Z not left homed
             self.assertFalse(m.relative)   # gcode state restored
 
     def test_guard_errors_on_the_fast_approach_are_not_retried(self):
@@ -290,7 +310,7 @@ class Test(unittest.TestCase):
     def test_no_trigger_still_retries_next_to_a_guard_error(self):
         # the retry still works, and a guard error on the retry's
         # confirming tap ends the home there
-        m = Machine(real_start=159.5, touches=[159.])
+        m = Machine(real_start=30., touches=[12.])
         obj, cmd = make(m)
         real_probe = m.probe
         confirms = []
@@ -309,7 +329,7 @@ class Test(unittest.TestCase):
         self.assertEqual(obj.last_attempts, 2)
 
     def test_retry_settle_dwells_before_the_retry(self):
-        m = Machine(real_start=159.5, touches=[159.])
+        m = Machine(real_start=30., touches=[12.])
         obj, cmd = make(m, retry_settle=1.5)
         cmd(FakeGcmd())
         self.check_homed(m)
@@ -406,20 +426,31 @@ class KnownZ(unittest.TestCase):
             self.assertEqual(str(cm.exception), msg)
             self.assertEqual(obj.last_attempts, 1)
 
-    def test_a_false_touch_on_the_known_path_repeats_from_the_top(self):
-        # a stop 80 mm up: the confirm finds nothing, the repeat is the
-        # blind one (soft-homed at the top, whole travel), and it homes
+    def test_a_false_touch_on_the_known_path_repeats_bounded(self):
+        # a stop 80 mm up on the known path: the confirm finds nothing, and
+        # the repeat is the bounded one (not soft-homed at the top, as it was
+        # until 2026-11-25): with the bed 76 mm under the confirm's end it
+        # finds nothing within 20 mm and stops with an error
         m = Machine(real_start=140., known=True, touches=[80.])
         obj, cmd = make(m)
-        g = FakeGcmd()
-        cmd(g)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('repeat 2 of 5 found no contact', str(cm.exception))
+        self.assertEqual(obj.false_touches, 1)
+        self.assertEqual(obj.last_attempts, 2)
+        self.assertEqual(self.soft_homes(m), 0)
+        self.assertAlmostEqual(m.real, 66.)
+        fasts = [p for p in self.probes(m) if 'FAST_ABOVE' in p]
+        self.assertEqual(len(fasts), 1)     # only the first attempt
+
+    def test_a_false_touch_on_the_known_path_near_the_bed_homes(self):
+        m = Machine(real_start=140., known=True, touches=[14.])
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
         self.assertAlmostEqual(m.off(), 0., places=6)
         self.assertAlmostEqual(m.real, 10.)
         self.assertEqual(obj.false_touches, 1)
-        self.assertEqual(obj.last_attempts, 2)
-        self.assertEqual(self.soft_homes(m), 1)
-        fasts = [p for p in self.probes(m) if 'FAST_ABOVE' in p]
-        self.assertEqual(len(fasts), 1)     # only the first attempt
+        self.assertEqual(self.soft_homes(m), 0)
 
     def heaters(self, *pairs):
         class H:
@@ -463,6 +494,183 @@ class KnownZ(unittest.TestCase):
 
 
 KnownZ_GUARD_ERRORS = Test.GUARD_ERRORS
+
+
+class BoundedRetry(unittest.TestCase):
+    """2026-11-25, sloe: a repeat after a false touch soft-homed at the top
+    and searched 164 mm from wherever the head was; with no contact it drove
+    the carriage into the bottom stop.  A repeat now searches at most
+    retry_lift + retry_reach (20 mm) and stops with an error."""
+
+    def repeats(self, m):
+        return [p for p in m.probes if p[0]][1:]
+
+    def test_max_travel_bounds_the_first_attempt(self):
+        # the bench check: 60 mm over the plate (or no plate), a 20 mm
+        # search stops 40 mm over it with an error
+        m = Machine(real_start=60.)
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertIn('no contact within MAX_TRAVEL 20.0 mm', str(cm.exception))
+        self.assertEqual([p[1:] for p in m.probes], [(60., 40.)])
+        self.assertEqual(obj.last_attempts, 1)
+        self.assertFalse(m.relative)
+        self.assertTrue(m.cleared)     # Z is not left homed in that frame
+
+    def test_max_travel_does_not_repeat_after_a_false_touch(self):
+        m = Machine(real_start=60., touches=[45.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertIn('gave up', str(cm.exception))
+        self.assertEqual(len([p for p in m.probes if p[0]]), 1)
+        self.assertTrue(m.cleared)
+
+    def test_a_confirm_never_goes_below_max_travel(self):
+        # a false touch 19 mm into a 20 mm search: the confirm stops at the
+        # search's floor (40), not 4 mm under the touch (37)
+        m = Machine(real_start=60., touches=[41.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertAlmostEqual(min(p[2] for p in m.probes), 40.)
+        self.assertTrue(m.cleared)
+
+    def test_a_confirm_never_goes_below_a_repeats_floor(self):
+        # repeat 2 searches 150 -> 134 and false-touches at 135: its confirm
+        # stops at 134, not at 131
+        m = Machine(real_start=150., touches=[148., 135.])
+        obj, cmd = make(m, attempts=2)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top, 150.)
+        self.assertAlmostEqual(m.probes[-1][2], 134.)
+
+    def test_the_plate_near_the_floor_still_homes(self):
+        # the plate 2 mm over the floor: the kept frame still homes on it
+        m = Machine(real_start=15.)
+        obj, cmd = make(m)
+        cmd(FakeGcmd(MAX_TRAVEL=17.))
+        self.assertAlmostEqual(m.off(), 0., places=6)
+        self.assertAlmostEqual(m.real, 10.)
+        self.assertFalse(m.cleared)
+
+    def test_a_confirm_lift_never_passes_the_start(self):
+        # the repeat lifts back to 150, where the home began, and touches at
+        # 149.5: its confirm lifts 0.5 mm, not 1, so not above 150
+        m = Machine(real_start=150., touches=[148., 149.5])
+        obj, cmd = make(m, attempts=2)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top, 150.)
+        self.assertLessEqual(m.max_real, 150. + 1e-9)
+
+    def test_a_good_home_leaves_z_homed(self):
+        m = Machine(real_start=30., touches=[12.])
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertFalse(m.cleared)
+
+    def test_max_travel_that_reaches_the_plate_homes(self):
+        m = Machine(real_start=15.)
+        obj, cmd = make(m)
+        cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertAlmostEqual(m.real, 10.)
+
+
+    def test_the_sloe_case_stops_within_the_bound(self):
+        # a false touch ~159 mm over the bed, the bed far below: the repeat
+        # finds nothing and must stop, not search the whole travel
+        m = Machine(real_start=159.5, touches=[159.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        msg = str(cm.exception)
+        self.assertIn('repeat 2 of 5 found no contact', msg)
+        self.assertIn('Z stopped there', msg)
+        self.assertEqual(obj.last_attempts, 2)
+        (fast, top, bottom), = self.repeats(m)
+        # the repeat lifts only as far as the attempt had come down (to
+        # 159.5, where it began), then searches 14.5 mm
+        self.assertAlmostEqual(top, 159.5)
+        self.assertAlmostEqual(bottom, 145.)
+        self.assertAlmostEqual(obj.last_retry_travel, 14.5)
+        self.assertTrue(m.cleared)     # Z is not left homed
+        # the head never went above where it started, not even for the
+        # confirm's lift after the touch 0.5 mm down
+        self.assertLessEqual(m.max_real, 159.5 + 1e-9)
+        self.assertFalse(m.relative)   # gcode state restored on error
+
+    def test_no_contact_retry_from_mid_travel(self):
+        # plate missing under a false touch at 80 mm: the confirm ends at
+        # 76, the repeat lifts to 86, searches 20 mm and stops at 66
+        m = Machine(real_start=120., touches=[80.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('within 20.0 mm', str(cm.exception))
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top, 86.)
+        self.assertAlmostEqual(bottom, 66.)
+        # net, the head ends 14 mm under the first touch: the confirm's 4
+        # plus the repeat's 10 of reach
+        self.assertAlmostEqual(80. - m.real, 14.)
+
+    def test_every_repeat_is_bounded(self):
+        for real_start, touches in ((159.5, [159.]), (60., [55., 50.]),
+                                    (30., [12.]), (20., [18.6, 11.1, 3.6]),
+                                    (60., [50., 44., 38., 32., 26.])):
+            m = Machine(real_start=real_start, touches=touches)
+            obj, cmd = make(m)
+            try:
+                cmd(FakeGcmd())
+            except CommandError:
+                pass
+            for fast, top, bottom in self.repeats(m):
+                self.assertLessEqual(top - bottom, 20. + 1e-9,
+                                     (real_start, touches))
+            # never above the start, except the confirm's own 1 mm lift
+            self.assertLessEqual(m.max_real,
+                                 max(real_start, touches[0] + 1.) + 1e-9)
+
+    def test_bound_is_configurable(self):
+        m = Machine(real_start=120., touches=[80.])
+        obj, cmd = make(m, retry_lift=2., retry_reach=3.)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertIn('within 5.0 mm', str(cm.exception))
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top - bottom, 5.)
+
+    def test_a_repeat_never_soft_homes_at_the_top(self):
+        m = Machine(real_start=60., touches=[50., 44., 38., 32., 26.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        frames = [l for l in m.log if l.startswith('SET_KINEMATIC_POSITION')]
+        self.assertEqual(frames[0], 'SET_KINEMATIC_POSITION Z=160.000')
+        self.assertEqual(sum(1 for l in frames if 'Z=160' in l), 1)
+
+    def test_guard_errors_on_a_repeat_are_raised_as_they_are(self):
+        m = Machine(real_start=30., touches=[12.])
+        obj, cmd = make(m)
+        real_probe = m.probe
+        fasts = []
+
+        def probe(fast):
+            if fast:
+                fasts.append(1)
+                if len(fasts) == 2:
+                    raise CommandError("Homing aborted: the bed was removed")
+            real_probe(fast)
+        m.probe = probe
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd())
+        self.assertEqual(str(cm.exception),
+                         "Homing aborted: the bed was removed")
 
 
 if __name__ == '__main__':

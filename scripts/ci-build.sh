@@ -225,6 +225,7 @@ $PYTHON test/landing/test_abort_mid_print_start.py
 # unless klippy was started with -i, which no printer does.
 $PYTHON test/landing/test_sim_stall_seam.py
 $PYTHON test/load_cell_home_z/test_load_cell_home_z.py
+$PYTHON test/trigger_analog/test_reconnect_resend.py
 finish_test probe_guards "Test load cell probe and homing guards"
 
 # MUON: tests the M1 print-start stack added but never ran in CI.
