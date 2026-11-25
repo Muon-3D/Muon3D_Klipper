@@ -46,11 +46,6 @@
 # 5 mm confirm), so a head far above the bed can need several.
 import logging
 
-# A repeat stops this far under where its attempt began: a probe that trips
-# before moving lifts early_trigger_lift (0.5 mm) up to 3 times, capped only
-# at the axis maximum, which a repeat's frame puts far above the head.
-RETRY_TOP_MARGIN = 2.
-
 class LoadCellHomeZ:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -117,6 +112,7 @@ class LoadCellHomeZ:
                     # Soft-home at the top so the axis can move down
                     self._run("SET_KINEMATIC_POSITION Z=%.3f" % (z_top,))
                     start = z_top
+                self._set_lift_ceiling(start)
                 self._run("LOAD_CELL_TARE")
                 probe = ("PROBE PROBE_SPEED=%.3f LIFT_SPEED=%.3f SAMPLES=1%s"
                          % (self.fast_speed, self.fast_lift_speed, trig_arg))
@@ -124,7 +120,8 @@ class LoadCellHomeZ:
                     self._run_bounded_probe(gcmd, probe, attempt)
                 else:
                     self._run(probe)
-                start = self._home_from_touch(toolhead, start)
+                start = self._home_from_touch(
+                    toolhead, start, attempt > 1 or bool(max_travel))
                 self._run("G91\nG1 Z%.3f F600" % (self.confirm_lift,))
                 try:
                     self._run(confirm)
@@ -164,7 +161,15 @@ class LoadCellHomeZ:
                 logging.exception("LOAD_CELL_HOME_Z: could not clear Z homed")
             raise
         finally:
+            self._set_lift_ceiling(None)
             self._run("RESTORE_GCODE_STATE NAME=_LOAD_CELL_HOME_Z_STATE")
+
+    # The probe's early-trigger lift is capped at the axis maximum, which a
+    # bounded frame puts far above the head: cap it at the attempt's start.
+    def _set_lift_ceiling(self, z):
+        probe = self.printer.lookup_object('probe', None)
+        if hasattr(probe, 'set_lift_ceiling'):
+            probe.set_lift_ceiling(z)
 
     def _z(self, toolhead):
         eventtime = self.printer.get_reactor().monotonic()
@@ -172,11 +177,19 @@ class LoadCellHomeZ:
 
     # _HOME_Z_FROM_LAST_PROBE re-frames Z at the touch.  Returns `start` (the
     # Z this attempt began at, the highest the head has been in it) moved
-    # into the new frame, so a repeat can tell how far it may lift.
-    def _home_from_touch(self, toolhead, start):
+    # into the new frame, so a repeat can tell how far it may lift.  In a
+    # bounded search (keep_floor) a touch within position_min of its floor
+    # keeps the old frame, so the confirm cannot go below that floor either.
+    def _home_from_touch(self, toolhead, start, keep_floor=False):
         before = self._z(toolhead)
         self._home_from_last_probe()
-        return start + (self._z(toolhead) - before)
+        shift = self._z(toolhead) - before
+        if keep_floor and shift > 0.:
+            self._run("SET_KINEMATIC_POSITION Z=%.3f" % (before,))
+            shift = 0.
+        start += shift
+        self._set_lift_ceiling(start)
+        return start
 
     # A repeat after a false touch.  Lift min(retry_lift, how far this
     # attempt came down), so the head never goes above where the attempt
@@ -187,7 +200,7 @@ class LoadCellHomeZ:
         toolhead = self.printer.lookup_object('toolhead')
         eventtime = self.printer.get_reactor().monotonic()
         lift = max(0., min(self.retry_lift,
-                           start - RETRY_TOP_MARGIN - self._z(toolhead)))
+                           start - self._z(toolhead)))
         if lift > 0.:
             self._run("G91\nG1 Z%.3f F600" % (lift,))
         return self._bounded_frame(lift + self.retry_reach)

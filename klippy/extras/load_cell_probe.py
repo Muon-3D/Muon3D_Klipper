@@ -999,6 +999,7 @@ class LoadCellProbingMove:
     _z_watch = None
     _early_trigger_retries = 0
     _early_trigger_lift = 0.5
+    lift_ceiling = None
     _early_triggers = 0
     _approx_tare_t = None
     _mcutare_max_zero_age = 5.
@@ -1267,13 +1268,19 @@ class LoadCellProbingMove:
 
     # Up and clear before the retry's tare, so the new zero is not taken
     # with the nozzle on the plate.  Never above the axis maximum: the Z
-    # home starts soft-homed at the top.
+    # home starts soft-homed at the top.  Nor above lift_ceiling, where
+    # LOAD_CELL_HOME_Z's attempt began, in a frame it declared lower.
+    def set_lift_ceiling(self, z):
+        self.lift_ceiling = z
+
     def _lift_for_retry(self):
         toolhead = self._printer.lookup_object('toolhead')
         if self._early_trigger_lift > 0.:
             pos = toolhead.get_position()
             eventtime = self._printer.get_reactor().monotonic()
             z_max = toolhead.get_status(eventtime)['axis_maximum'][2]
+            if self.lift_ceiling is not None:
+                z_max = min(z_max, self.lift_ceiling)
             z = min(pos[2] + self._early_trigger_lift, z_max)
             if z > pos[2]:
                 speed = self._param_helper.get_probe_params()['lift_speed']
@@ -1600,6 +1607,7 @@ class LoadCellPrinterProbe:
                               config_helper)
         probe.ProbeVirtualEndstopDeprecation(config)
         self._printer.add_object('probe', self)
+        self.set_lift_ceiling = load_cell_probing_move.set_lift_ceiling
         self._printer.register_event_handler("klippy:connect",
                                              self._log_guard_settings)
 

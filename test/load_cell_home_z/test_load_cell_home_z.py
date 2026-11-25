@@ -127,9 +127,20 @@ class FakeGuard:
         return {'z_known': self.known}
 
 
+class FakeProbe:
+    def __init__(self, m):
+        self.m = m
+        self.ceilings = []
+    def set_lift_ceiling(self, z):
+        # (the ceiling, the real height it stands for)
+        self.ceilings.append(
+            None if z is None else (z, z - self.m.off()))
+
+
 class FakePrinter:
     def __init__(self, m, guard='from machine'):
-        self.objs = {'gcode': FakeGcode(m), 'toolhead': FakeToolhead(m)}
+        self.objs = {'gcode': FakeGcode(m), 'toolhead': FakeToolhead(m),
+                     'probe': FakeProbe(m)}
         if guard == 'from machine':
             guard = FakeGuard(m.known)
         if guard is not None:
@@ -451,6 +462,48 @@ class BoundedRetry(unittest.TestCase):
         self.assertEqual(len([p for p in m.probes if p[0]]), 1)
         self.assertTrue(m.cleared)
 
+    def test_a_confirm_never_goes_below_max_travel(self):
+        # a false touch 19 mm into a 20 mm search: the confirm stops at the
+        # search's floor (40), not 4 mm under the touch (37)
+        m = Machine(real_start=60., touches=[41.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertAlmostEqual(min(p[2] for p in m.probes), 40.)
+        self.assertTrue(m.cleared)
+
+    def test_a_confirm_never_goes_below_a_repeats_floor(self):
+        # repeat 2 searches 150 -> 134 and false-touches at 135: its confirm
+        # stops at 134, not at 131
+        m = Machine(real_start=150., touches=[148., 135.])
+        obj, cmd = make(m, attempts=2)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top, 150.)
+        self.assertAlmostEqual(m.probes[-1][2], 134.)
+
+    def test_the_plate_near_the_floor_still_homes(self):
+        # the plate 2 mm over the floor: the kept frame still homes on it
+        m = Machine(real_start=15.)
+        obj, cmd = make(m)
+        cmd(FakeGcmd(MAX_TRAVEL=17.))
+        self.assertAlmostEqual(m.off(), 0., places=6)
+        self.assertAlmostEqual(m.real, 10.)
+        self.assertFalse(m.cleared)
+
+    def test_early_trigger_lifts_are_capped_at_the_attempts_start(self):
+        # sloe: every attempt's ceiling is where it began (159.5 real), and
+        # the probe is left uncapped afterwards
+        m = Machine(real_start=159.5, touches=[159.])
+        obj, cmd = make(m)
+        p = obj.printer.lookup_object('probe')
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        self.assertIsNone(p.ceilings[-1])
+        for z, real in p.ceilings[:-1]:
+            self.assertAlmostEqual(real, 159.5)
+
     def test_a_good_home_leaves_z_homed(self):
         m = Machine(real_start=30., touches=[12.])
         obj, cmd = make(m)
@@ -476,12 +529,11 @@ class BoundedRetry(unittest.TestCase):
         self.assertIn('Z stopped there', msg)
         self.assertEqual(obj.last_attempts, 2)
         (fast, top, bottom), = self.repeats(m)
-        # the repeat lifts only as far as the attempt had come down, less
-        # RETRY_TOP_MARGIN (to 157.5, 2 mm under where it began), then
-        # searches 12.5 mm
-        self.assertAlmostEqual(top, 157.5)
+        # the repeat lifts only as far as the attempt had come down (to
+        # 159.5, where it began), then searches 14.5 mm
+        self.assertAlmostEqual(top, 159.5)
         self.assertAlmostEqual(bottom, 145.)
-        self.assertAlmostEqual(obj.last_retry_travel, 12.5)
+        self.assertAlmostEqual(obj.last_retry_travel, 14.5)
         self.assertTrue(m.cleared)     # Z is not left homed
         # the repeat never lifted the head above where it started (the
         # confirm's 1 mm lift after a touch 0.5 mm down is the old path)
