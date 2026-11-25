@@ -436,7 +436,7 @@ def test_cut_filament_fakes_z_zero_after_the_lift():
 
 def test_park_printer_fakes_z_fifty_after_a_z_park():
     # PARK_PRINTER with Z unhomed: Z_PARK's AXIS_HOME_MOVE lifts to the top,
-    # then SET_KINEMATIC_POSITION SET_HOMED=Z Z=50 and G0 X135 Y63
+    # then SET_KINEMATIC_POSITION SET_HOMED=Z Z=50 and G0 X135 Y69
     r = Rig(z=20., homed=False)
     r.homing_move('z', -60.)
     th = r.printer.toolhead

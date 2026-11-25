@@ -14,6 +14,9 @@ TRINAMIC_DRIVERS = [
 ]
 AXIS_INDEX = {'x': 0, 'y': 1, 'z': 2}
 AXES = tuple(AXIS_INDEX.keys())
+# AXIS_PROTECTED_MOVE BEYOND: how far past an axis limit a stop-finding
+# move may go, at most
+MAX_BEYOND = 10.
 ENDSTOP_SOURCES = ('tmc_virtual', 'configured')
 ENDSTOP_SOURCE_ALIASES = {
     'tmc': 'tmc_virtual',
@@ -339,7 +342,7 @@ class AxisAdvancedHomingMovement:
         "Stops when endstop triggers or DIST is reached. "
         "Does not set axis homed.\n"
         "Params: AXIS=<X|Y|Z> DIR=MAX|MIN DIST=<mm> SPEED=<mm/s> "
-        "BACKOFF=<mm> BACKOFF_SPEED=<mm/s>"
+        "BACKOFF=<mm> BACKOFF_SPEED=<mm/s> BEYOND=<mm>"
     )
 
     def _cmd_axis_park(self, gcmd, default_axis):
@@ -496,6 +499,12 @@ class AxisAdvancedHomingMovement:
         speed = gcmd.get_float('SPEED', self.speed_default, above=0.)
         backoff = gcmd.get_float('BACKOFF', 0.0, minval=0.)
         backoff_speed = gcmd.get_float('BACKOFF_SPEED', speed, above=0.)
+        # BEYOND=<mm>: the move may go up to this far past the axis limits,
+        # to find a stop that sits behind them (CUT_FILAMENT's Y back stop
+        # is behind position_min, which keeps prints off it). The limits are
+        # left as they are: the move runs in a coordinate frame shifted by
+        # the overshoot, and the real coordinate is put back after.
+        beyond = gcmd.get_float('BEYOND', 0., minval=0., maxval=MAX_BEYOND)
 
         toolhead = self.printer.lookup_object('toolhead')
         kin = toolhead.get_kinematics()
@@ -516,28 +525,49 @@ class AxisAdvancedHomingMovement:
             # was refused as out of range). The coordinate is put back after.
             # A negative DIST moves against DIR.
             _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
-            if abs(dist) > axis_max - axis_min:
+            if abs(dist) > axis_max - axis_min + beyond + 1e-6:
                 raise gcmd.error(
                     "AXIS_PROTECTED_MOVE: DIST=%.3f exceeds the %s axis span"
-                    " %.3f" % (dist, axis.upper(), axis_max - axis_min))
+                    " %.3f" % (dist, axis.upper(),
+                               axis_max - axis_min + beyond))
             cur[axis_i] = axis_max if sign * dist < 0. else axis_min
         target_axis = cur[axis_i] + sign * dist
+        _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
         if was_homed:
-            # Stop at the axis limit rather than be refused past it. The
-            # caller's DIST is in G-code terms, and a coordinate transform
-            # (skew) can put the toolhead a little off them.
-            _, _, axis_min, axis_max = self._axis_bounds(kin, axis)
-            target_axis = self._clamp_axis_target(target_axis, axis_min,
-                                                  axis_max)
-        toolhead.set_position(list(cur), homing_axes=axis)
+            # Stop at the axis limit (or BEYOND it) rather than be refused
+            # past it. The caller's DIST is in G-code terms, and a coordinate
+            # transform (skew) can put the toolhead a little off them.
+            target_axis = self._clamp_axis_target(
+                target_axis, axis_min - beyond, axis_max + beyond)
+        # The part of the move past a limit (BEYOND): shift the frame so the
+        # move ends on the limit. Moves are only checked where they end.
+        # The end is the limit itself, not target + shift: that sum can land
+        # a rounding error outside it, and the move is refused there.
+        shift = 0.
+        end_axis = target_axis
+        if target_axis < axis_min:
+            shift = axis_min - target_axis
+            end_axis = axis_min
+        elif target_axis > axis_max:
+            shift = axis_max - target_axis
+            end_axis = axis_max
+        start = list(cur)
+        start[axis_i] += shift
+        toolhead.set_position(start, homing_axes=axis)
 
         try:
-            endpos = list(cur)
-            endpos[axis_i] = target_axis
+            endpos = list(start)
+            endpos[axis_i] = end_axis
             endstops = [(ctx['mcu_endstop'], "%s_protected" % (axis,))]
-            self._run_homing_move(
-                toolhead, endstops, endpos, speed,
-                triggered=True, check_triggered=False, probe_pos=True)
+            try:
+                self._run_homing_move(
+                    toolhead, endstops, endpos, speed,
+                    triggered=True, check_triggered=False, probe_pos=True)
+            finally:
+                if shift:
+                    real = list(toolhead.get_position())
+                    real[axis_i] -= shift
+                    toolhead.set_position(real, homing_axes=axis)
 
             pos_after = toolhead.get_position()
             stalled = abs(pos_after[axis_i] - target_axis) > 0.001
