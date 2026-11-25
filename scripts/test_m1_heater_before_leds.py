@@ -1707,9 +1707,9 @@ class CancelParkTests(_M1TestCase):
 
 class RefusedCutStillParks(_M1TestCase):
     """KAN-3813: sloe, 17 Nov. The cut's Y tap stopped at 3.22, outside
-    the -9.5 to -5.0 window (-3.5 to 1 since the Y frame moved +6), so the cut was refused, and PRINT_END then
-    skipped the park too: the head was left over the print at Z50. A
-    refused cut must still park, then say so."""
+    the -9.5 to -5.0 window (-3.5 to 1 since the Y frame moved +6), so the
+    cut was refused, and PRINT_END then skipped the park too: the head was
+    left over the print at Z50. A refused cut must still park, then say so."""
 
     CUT_ERROR = ('CUT_FILAMENT: the Y back stop is at 3.22, outside -3.5 to '
                  '1.0, so the cut won\'t line up with the nub.')
