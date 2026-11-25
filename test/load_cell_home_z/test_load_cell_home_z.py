@@ -106,8 +106,6 @@ class FakeGcode:
     def create_gcode_command(self, cmd, commandline, params):
         return types.SimpleNamespace(command=cmd, commandline=commandline,
                                      params=params)
-    def check_abort(self):
-        pass
     def register_command(self, name, fn, desc=None):
         self.cmds[name] = fn
     def run_script_from_command(self, script):
