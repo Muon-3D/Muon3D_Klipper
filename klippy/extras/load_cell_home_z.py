@@ -48,6 +48,11 @@
 # 5 mm confirm), so a head far above the bed can need several.
 import logging
 
+# A repeat stops this far under where its attempt began: a probe that trips
+# before moving lifts early_trigger_lift (0.5 mm) up to 3 times, capped only
+# at the axis maximum, which a repeat's frame puts far above the head.
+RETRY_TOP_MARGIN = 2.
+
 class LoadCellHomeZ:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -200,7 +205,9 @@ class LoadCellHomeZ:
                            % (self.confirm_lift - self._z_min(eventtime),
                               attempt, self.attempts))
                     logging.info(msg)
-                    if attempt >= self.attempts:
+                    if attempt >= self.attempts or max_travel:
+                        # MAX_TRAVEL is a check of one bounded search: no
+                        # repeat, which would search further
                         raise gcmd.error(
                             "%s. Z home gave up: check that nothing is"
                             " touching the nozzle and that the fan has"
@@ -214,6 +221,15 @@ class LoadCellHomeZ:
                 if self.final_lift > 0.:
                     self._run("G91\nG1 Z%.3f F600" % (self.final_lift,))
                 return
+        except Exception:
+            # Z was declared, not found: a failed home must not leave it
+            # homed in that frame (G28's homing_scope clears it too, but
+            # LOAD_CELL_HOME_Z may be run on its own, e.g. MAX_TRAVEL)
+            try:
+                self._run("SET_KINEMATIC_POSITION CLEAR_HOMED=Z")
+            except Exception:
+                logging.exception("LOAD_CELL_HOME_Z: could not clear Z homed")
+            raise
         finally:
             self._run("RESTORE_GCODE_STATE NAME=_LOAD_CELL_HOME_Z_STATE")
 
@@ -237,7 +253,8 @@ class LoadCellHomeZ:
     def _retry_frame(self, start):
         toolhead = self.printer.lookup_object('toolhead')
         eventtime = self.printer.get_reactor().monotonic()
-        lift = max(0., min(self.retry_lift, start - self._z(toolhead)))
+        lift = max(0., min(self.retry_lift,
+                           start - RETRY_TOP_MARGIN - self._z(toolhead)))
         if lift > 0.:
             self._run("G91\nG1 Z%.3f F600" % (lift,))
         return self._bounded_frame(lift + self.retry_reach)

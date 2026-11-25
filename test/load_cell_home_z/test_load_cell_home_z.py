@@ -33,6 +33,7 @@ class Machine:
         # the highest real height the head reached
         self.probes = []
         self.max_real = real_start
+        self.cleared = False
 
     def off(self):
         return self.z - self.real
@@ -68,7 +69,10 @@ class Machine:
             if not w:
                 continue
             if w[0] == 'SET_KINEMATIC_POSITION':
-                self.z = float(w[1].split('=')[1])
+                if w[1] == 'CLEAR_HOMED=Z':
+                    self.cleared = True
+                else:
+                    self.z = float(w[1].split('=')[1])
             elif w[0] == 'G4':
                 self.dwells.append(float(w[1][1:]) / 1000.)
             elif w[0] == 'G91':
@@ -283,7 +287,8 @@ class Test(unittest.TestCase):
             self.assertEqual(obj.last_attempts, 1, msg)
             self.assertEqual(
                 sum(1 for l in m.log
-                    if l.startswith('SET_KINEMATIC_POSITION')), 1, msg)
+                    if l.startswith('SET_KINEMATIC_POSITION Z=')), 1, msg)
+            self.assertTrue(m.cleared, msg)   # failed: Z not left homed
             self.assertFalse(m.relative)   # gcode state restored
 
     def test_guard_errors_on_the_fast_approach_are_not_retried(self):
@@ -511,6 +516,22 @@ class BoundedRetry(unittest.TestCase):
         self.assertEqual([p[1:] for p in m.probes], [(60., 40.)])
         self.assertEqual(obj.last_attempts, 1)
         self.assertFalse(m.relative)
+        self.assertTrue(m.cleared)     # Z is not left homed in that frame
+
+    def test_max_travel_does_not_repeat_after_a_false_touch(self):
+        m = Machine(real_start=60., touches=[45.])
+        obj, cmd = make(m)
+        with self.assertRaises(CommandError) as cm:
+            cmd(FakeGcmd(MAX_TRAVEL=20.))
+        self.assertIn('gave up', str(cm.exception))
+        self.assertEqual(len([p for p in m.probes if p[0]]), 1)
+        self.assertTrue(m.cleared)
+
+    def test_a_good_home_leaves_z_homed(self):
+        m = Machine(real_start=30., touches=[12.])
+        obj, cmd = make(m)
+        cmd(FakeGcmd())
+        self.assertFalse(m.cleared)
 
     def test_max_travel_that_reaches_the_plate_homes(self):
         m = Machine(real_start=15.)
@@ -531,11 +552,13 @@ class BoundedRetry(unittest.TestCase):
         self.assertIn('Z stopped there', msg)
         self.assertEqual(obj.last_attempts, 2)
         (fast, top, bottom), = self.repeats(m)
-        # the repeat lifts only as far as the attempt had come down (to
-        # 159.5, where it began, not 10 mm), then searches 14.5 mm
-        self.assertAlmostEqual(top, 159.5)
+        # the repeat lifts only as far as the attempt had come down, less
+        # RETRY_TOP_MARGIN (to 157.5, 2 mm under where it began), then
+        # searches 12.5 mm
+        self.assertAlmostEqual(top, 157.5)
         self.assertAlmostEqual(bottom, 145.)
-        self.assertAlmostEqual(obj.last_retry_travel, 14.5)
+        self.assertAlmostEqual(obj.last_retry_travel, 12.5)
+        self.assertTrue(m.cleared)     # Z is not left homed
         # the repeat never lifted the head above where it started (the
         # confirm's 1 mm lift after a touch 0.5 mm down is the old path)
         self.assertLessEqual(m.max_real, 160. + 1e-9)
