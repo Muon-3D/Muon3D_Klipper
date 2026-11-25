@@ -431,6 +431,34 @@ def test_8_early_trigger_is_retried_with_a_host_tare(mod):
           'tare; with retries 0 the error stands')
 
 
+def test_9_lift_never_passes_the_ceiling(mod):
+    # LOAD_CELL_HOME_Z's bounded repeat declares Z low, so the axis maximum
+    # is no cap there: lift_ceiling, where its attempt began, is.
+    w = World(tare0=180000, real=10.)
+    m, ph = make(mod, w, trigger=M1, ref=OTTER_REF, speed=4.)
+    m._early_trigger_lift = 0.5
+    lifts = []
+    th = m._printer.objects['toolhead']
+    th.manual_move = lambda pos, speed: lifts.append(pos[2])
+    th.wait_moves = lambda: None
+    th.get_position = lambda: [100., 60., 13.8, 0.]
+    th.get_status = lambda et: {'axis_maximum': [200., 174., 160.]}
+    m._param_helper.get_probe_params = lambda gcmd=None: {
+        'probe_speed': 4., 'lift_speed': 10.}
+    m._printer.get_reactor = lambda: type('R', (), {
+        'monotonic': lambda self: 0.})()
+    m._lift_for_retry()
+    assert lifts == [14.3], lifts
+    m.set_lift_ceiling(14.)
+    m._lift_for_retry()
+    assert lifts == [14.3, 14.], lifts
+    m.set_lift_ceiling(13.8)
+    m._lift_for_retry()
+    assert lifts == [14.3, 14.], lifts
+    m.set_lift_ceiling(None)
+    print('ok  9 an early-trigger lift stops at lift_ceiling')
+
+
 def main():
     mod = tg.load_module(tg._paths.patched(
         'klippy/extras/load_cell_probe.py'))
@@ -441,7 +469,8 @@ def main():
              test_5_removed_options_load_and_change_nothing,
              test_6_dead_mcu_trigger_is_stopped_by_the_ceiling,
              test_7_no_bed_is_no_trigger,
-             test_8_early_trigger_is_retried_with_a_host_tare]
+             test_8_early_trigger_is_retried_with_a_host_tare,
+             test_9_lift_never_passes_the_ceiling]
     failed = []
     for t in tests:
         try:
