@@ -1,13 +1,13 @@
 """KAN-3813: a refused cut still parks the head, and the guard is back.
 
 On sloe (17 Nov 2026) the cut's tap towards Y min stopped at 3.22, outside
-the -9.5 to -5.0 window; the cut was refused and PRINT_END's park was
+the -3.5 to 1.0 window; the cut was refused and PRINT_END's park was
 skipped with it, leaving the head over the print. Batch mode exits with an
 error on any command error, even a caught one (see
 test_cut_filament_error.py), so this reads the log instead: the same
 simulation (test/klippy/cut_filament.cfg) with the tap told to find the stop
 at 3.22, then PRINT_END. In the log, in order: the refusal, the report
-(after the park), and at PRINT_END's M84 the head at X135 Y63 Z140 with
+(after the park), and at PRINT_END's M84 the head at X135 Y69 Z140 with
 X, Y and Z still homed, PARK_PRINTER never run, and the guard enabled.
 
     python3 test/contact_guard/test_cut_filament_bad_stop.py <dictdir>
@@ -27,7 +27,7 @@ CONTACT_GUARD_SIMULATE LOAD=0 DURATION=0.5
 _CUT_TEST STOP_AT=3.22
 PRINT_END
 """
-REFUSED = 'the Y back stop is at 3.22, outside -9.5 to -5.0'
+REFUSED = 'the Y back stop is at 3.22, outside -3.5 to 1.0'
 
 
 def run(dictdir):
@@ -73,14 +73,14 @@ def main():
         sys.exit("FAIL: the report does not say why: %s" % (lines[report],))
     for line in (lines[report], lines[end], lines[m84]):
         print(line)
-    expected = ('cut-test: park-end pos=135.000,63.000,140.000 homed=xyz'
+    expected = ('cut-test: park-end pos=135.000,69.000,140.000 homed=xyz'
                 ' parks=0')
     if lines[end] != expected:
         sys.exit("FAIL: expected %r, got %r" % (expected, lines[end]))
     if lines[m84] != 'cut-test: at M84 enabled=1 active=1':
         sys.exit("FAIL: the guard is not enabled and active after the"
                  " refused cut: %s" % (lines[m84],))
-    print("OK: a refused cut still parks (Z, then X135 Y63), reports it,"
+    print("OK: a refused cut still parks (Z, then X135 Y69), reports it,"
           " and leaves the guard enabled")
 
 

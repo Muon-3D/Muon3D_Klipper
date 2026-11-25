@@ -103,7 +103,7 @@ class FailingLedEffect:
 
 class M1:
     def __init__(self, variables_file, restore_startup=True, latched=False,
-                 real_cut=False, stop_at=-6.8, guard=False,
+                 real_cut=False, stop_at=-0.8, guard=False,
                  real_currents=False):
         self.reactor = FakeReactor()
         self.printer = printer = FakePrinter(self.reactor)
@@ -154,7 +154,7 @@ class M1:
         self.toolhead = {
             'position': {'x': 100., 'y': 90., 'z': 40., 'e': 0.},
             'axis_maximum': {'x': 200., 'y': 180., 'z': 180., 'e': 0.},
-            'axis_minimum': {'x': 0., 'y': -10., 'z': -4., 'e': 0.},
+            'axis_minimum': {'x': 0., 'y': -0.3, 'z': -4., 'e': 0.},
             'homed_axes': 'xyz', 'estimated_print_time': 0.}
         printer.add_object('toolhead', Status(self.toolhead))
         self.extruder = {'can_extrude': True, 'target': 215.,
@@ -1681,7 +1681,7 @@ class CancelParkTests(_M1TestCase):
         m = self.m1
         unlock = m.macro_vars('TOOLHEAD_UMBILICAL_UNLOCK_BUTTON_PRESSED')
         unlock.update(e_was_enabled=1, changed_hotend_target=1)
-        m.raising_lines.add('G0 X195 Y10')
+        m.raising_lines.add('G0 X195 Y16')
         m.run('CANCEL_PRINT')
         names = m.names()
         self.assertEqual(m.print_stats['state'], 'cancelled')
@@ -1707,12 +1707,12 @@ class CancelParkTests(_M1TestCase):
 
 class RefusedCutStillParks(_M1TestCase):
     """KAN-3813: sloe, 17 Nov. The cut's Y tap stopped at 3.22, outside
-    the -9.5 to -5.0 window, so the cut was refused, and PRINT_END then
-    skipped the park too: the head was left over the print at Z50. A
-    refused cut must still park, then say so."""
+    the -9.5 to -5.0 window (-3.5 to 1 since the Y frame moved +6), so the
+    cut was refused, and PRINT_END then skipped the park too: the head was
+    left over the print at Z50. A refused cut must still park, then say so."""
 
-    CUT_ERROR = ('CUT_FILAMENT: the Y back stop is at 3.22, outside -9.5 to '
-                 '-5.0, so the cut won\'t line up with the nub.')
+    CUT_ERROR = ('CUT_FILAMENT: the Y back stop is at 3.22, outside -3.5 to '
+                 '1.0, so the cut won\'t line up with the nub.')
 
     def make(self, stop_at, **kw):
         kw.setdefault('guard', True)
@@ -1738,7 +1738,7 @@ class RefusedCutStillParks(_M1TestCase):
         names = m.names()
         # The refusal came from the cut: the tap ran, the cut did not
         self.assertIn('AXIS_PROTECTED_MOVE AXIS=Y DIR=MIN DIST=20.0 '
-                      'SPEED=60.0', t)
+                      'SPEED=60.0 BEYOND=3.7', t)
         self.assertIsNone(m.macro_vars('CUT_FILAMENT')['last_stop_y'])
         self.assertNotIn('SET_TMC_CURRENT', names)
         self.assertNotIn('PARK_PRINTER', names)
@@ -1751,7 +1751,7 @@ class RefusedCutStillParks(_M1TestCase):
         tap = names.index('AXIS_PROTECTED_MOVE')
         safe = t.index('_HOMING_CURRENT RESTORE=1', tap + 2)
         zpark = t.index('Z_PARK')
-        xy = t.index('G0 X135 Y63 F4800')
+        xy = t.index('G0 X135 Y69 F4800')
         err = [i for i, line in enumerate(t) if 'stopped early' in line]
         self.assertEqual(len(err), 1, t)
         m84 = names.index('M84')
@@ -1778,8 +1778,8 @@ class RefusedCutStillParks(_M1TestCase):
         m.run('PRINT_END')
         t = m.timeline
         # Out in +Y before X moves, as the cut does
-        out = t.index('G1 Y10 F4800')
-        self.assertLess(out, t.index('G0 X135 Y63 F4800'))
+        out = t.index('G1 Y16 F4800')
+        self.assertLess(out, t.index('G0 X135 Y69 F4800'))
         self.assertLess(t.index('Z_PARK'), out)
         self.drop_errors()
 
@@ -1796,9 +1796,9 @@ class RefusedCutStillParks(_M1TestCase):
         self.assertIn('SET_CONTACT_GUARD ENABLE=0 TIMEOUT=60', t[:tap])
         on = t.index('SET_CONTACT_GUARD ENABLE=1', tap)
         zpark = t.index('Z_PARK')
-        out = t.index('G1 Y10 F4800')
+        out = t.index('G1 Y16 F4800')
         zero = t.index('SET_CONTACT_GUARD REZERO=1 TRY=1')
-        xy = t.index('G0 X135 Y63 F4800')
+        xy = t.index('G0 X135 Y69 F4800')
         self.assertTrue(on < zpark < out < zero < xy, t)
         self.assertTrue(m.guard['enabled'])
         self.drop_errors()
@@ -1807,12 +1807,12 @@ class RefusedCutStillParks(_M1TestCase):
         m = self.make(3.22)
         m.run('PRINT_END')
         t = m.timeline
-        self.assertNotIn('G1 Y10 F4800', t)
+        self.assertNotIn('G1 Y16 F4800', t)
         tap = m.names().index('AXIS_PROTECTED_MOVE')
         on = t.index('SET_CONTACT_GUARD ENABLE=1', tap)
         zero = t.index('SET_CONTACT_GUARD REZERO=1 TRY=1')
         self.assertTrue(on < t.index('Z_PARK') < zero
-                        < t.index('G0 X135 Y63 F4800'), t)
+                        < t.index('G0 X135 Y69 F4800'), t)
         self.assertTrue(m.guard['enabled'])
         self.drop_errors()
 
@@ -1820,7 +1820,7 @@ class RefusedCutStillParks(_M1TestCase):
         # KAN-3813: the tap's Y current is CUT_FILAMENT's tap_current_y, its
         # own; a Y home (_HOMING_CURRENT with no Y=) is at current_y,
         # 0.6 too.
-        m = self.make(-6.8, real_currents=True)
+        m = self.make(-0.8, real_currents=True)
         m.run('PRINT_END')
         cur = m.currents()
         # tap, restore, the cut's burst, restore
@@ -1837,7 +1837,7 @@ class RefusedCutStillParks(_M1TestCase):
         # burst lasts until a lower SET_TMC_CURRENT (tmc2241.py), or until
         # burst_time. A press that raises never reaches the macro's own
         # restore: the safe park's _HOMING_CURRENT RESTORE=1 must end it.
-        m = self.make(-6.8, real_currents=True)
+        m = self.make(-0.8, real_currents=True)
         m.raising_lines.add('G1 X130.5')
         m.run('PRINT_END')
         cur = m.currents()
@@ -1845,7 +1845,7 @@ class RefusedCutStillParks(_M1TestCase):
             self.assertEqual(cur[axis], [0.6, 0.8, 2.0, 0.8], axis)
         t = m.timeline
         burst = t.index('SET_TMC_CURRENT STEPPER=stepper_y CURRENT=2.0')
-        self.assertLess(burst, t.index('G1 X130.5 Y-5.8 F600'))
+        self.assertLess(burst, t.index('G1 X130.5 Y0.2 F600'))
         self.assertTrue(m.printer.lookup_object('print_end_park')
                         .get_status(0)['failed'])
         self.assertTrue(m.guard['enabled'])
@@ -1857,7 +1857,7 @@ class RefusedCutStillParks(_M1TestCase):
         m.run('PRINT_END')
         t = m.timeline
         self.assertIn('Z_PARK', t)
-        self.assertNotIn('G0 X135 Y63 F4800', t)
+        self.assertNotIn('G0 X135 Y69 F4800', t)
         # The guard is back, and zeroed after the lift
         self.assertLess(t.index('SET_CONTACT_GUARD ENABLE=1'),
                         t.index('Z_PARK'))
@@ -1877,7 +1877,7 @@ class RefusedCutStillParks(_M1TestCase):
         m.run('PRINT_END')
         t = m.timeline
         self.assertNotIn('Z_PARK', t)
-        self.assertNotIn('G0 X135 Y63 F4800', t)
+        self.assertNotIn('G0 X135 Y69 F4800', t)
         self.assertIn('M84', t)
         self.assertEqual(len(self.errors()), 1)
         # Nothing moves, but the guard that stood aside for the tap is
@@ -1885,7 +1885,7 @@ class RefusedCutStillParks(_M1TestCase):
         tap = m.names().index('AXIS_PROTECTED_MOVE')
         self.assertIn('SET_CONTACT_GUARD ENABLE=1', t[tap:])
         self.assertNotIn('SET_CONTACT_GUARD REZERO=1 TRY=1', t)
-        self.assertNotIn('G1 Y10 F4800', t)
+        self.assertNotIn('G1 Y16 F4800', t)
         self.assertTrue(m.guard['enabled'])
         self.drop_errors()
 
@@ -1902,13 +1902,13 @@ class RefusedCutStillParks(_M1TestCase):
         self.drop_errors()
 
     def test_a_stop_in_the_window_cuts_and_parks_as_before(self):
-        m = self.make(-6.8)
+        m = self.make(-0.8)
         m.run('PRINT_END')
         names = m.names()
         # The cut ran: its stroke at the cutter current, then its own park
         self.assertEqual(names.count('SET_TMC_CURRENT'), 4)
         self.assertIn('PARK_PRINTER', names)
-        self.assertEqual(m.macro_vars('CUT_FILAMENT')['last_stop_y'], -6.8)
+        self.assertEqual(m.macro_vars('CUT_FILAMENT')['last_stop_y'], -0.8)
         # Nothing for the safe park to do: no second park, no report
         self.assertNotIn('Z_PARK', names)
         self.assertEqual(self.errors(), [])
@@ -1947,7 +1947,7 @@ class RefusedCutStillParks(_M1TestCase):
         m.responses.clear()
 
     def test_print_start_is_quiet_after_a_cut_that_finished(self):
-        m = self.make(-6.8)
+        m = self.make(-0.8)
         m.run('PRINT_END')
         m.print_stats['state'] = 'printing'
         self.assertEqual(self.start(m), [])
@@ -1963,7 +1963,7 @@ class RefusedCutStillParks(_M1TestCase):
         self.drop_errors()
         park = m.printer.lookup_object('print_end_park')
         self.assertTrue(park.get_status(0)['failed'])
-        m.stop_at = -6.8
+        m.stop_at = -0.8
         m.amove['last']['position'] = None
         m.run('PRINT_END')
         self.assertFalse(park.get_status(0)['failed'])
