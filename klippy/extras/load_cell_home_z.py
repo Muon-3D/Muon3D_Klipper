@@ -54,6 +54,7 @@
 # false-touch attempt walks the head down ~6 mm (the short fast stop plus the
 # 5 mm confirm), so a head far above the bed can need several.
 import logging
+import greenlet
 
 class LoadCellHomeZ:
     def __init__(self, config):
@@ -275,23 +276,29 @@ class LoadCellHomeZ:
     # top).  Any other error, or one past the limit, is raised.
     WRONG_WAY = "the load cell moved the wrong way"
 
-    # Runs a PROBE as the gcode dispatcher does, gcode:command_error
-    # included (it ends the probe session), but without the dispatcher's
-    # '!!' line: a wrong-way stop that is retried is not an error.  Any
-    # error is raised, and LOAD_CELL_HOME_Z reports one it does not retry.
+    # Runs a PROBE as run_script_from_command does (held non-abortable, and
+    # gcode:command_error on an error, which ends the probe session), but
+    # without the dispatcher's '!!' line: a wrong-way stop that is retried
+    # is not an error.  Any error is raised, and LOAD_CELL_HOME_Z reports
+    # one it does not retry.
     def _run_quiet(self, script):
         gcode = self.gcode
         parts = gcode.args_r.split(script.upper())
         cmd = ''.join(parts[:3]).strip()
         params = {parts[i]: parts[i + 1].strip()
                   for i in range(1, len(parts), 2)}
+        hold = greenlet.getcurrent() is getattr(gcode, '_abort_owner', None)
+        if hold:
+            gcode._abort_hold += 1
         try:
-            gcode.check_abort()
             gcode.gcode_handlers[cmd](
                 gcode.create_gcode_command(cmd, script, params))
         except Exception:
             self.printer.send_event("gcode:command_error")
             raise
+        finally:
+            if hold:
+                gcode._abort_hold -= 1
 
     def _check_bed(self):
         bed = self.printer.lookup_object('bed_removal_detector', None)
