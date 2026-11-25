@@ -557,6 +557,17 @@ class BoundedRetry(unittest.TestCase):
         self.assertAlmostEqual(m.real, 10.)
         self.assertFalse(m.cleared)
 
+    def test_a_confirm_lift_never_passes_the_start(self):
+        # the repeat lifts back to 150, where the home began, and touches at
+        # 149.5: its confirm lifts 0.5 mm, not 1, so not above 150
+        m = Machine(real_start=150., touches=[148., 149.5])
+        obj, cmd = make(m, attempts=2)
+        with self.assertRaises(CommandError):
+            cmd(FakeGcmd())
+        (fast, top, bottom), = self.repeats(m)
+        self.assertAlmostEqual(top, 150.)
+        self.assertLessEqual(m.max_real, 150. + 1e-9)
+
     def test_a_good_home_leaves_z_homed(self):
         m = Machine(real_start=30., touches=[12.])
         obj, cmd = make(m)
@@ -588,9 +599,9 @@ class BoundedRetry(unittest.TestCase):
         self.assertAlmostEqual(bottom, 145.)
         self.assertAlmostEqual(obj.last_retry_travel, 14.5)
         self.assertTrue(m.cleared)     # Z is not left homed
-        # the repeat never lifted the head above where it started (the
-        # confirm's 1 mm lift after a touch 0.5 mm down is the old path)
-        self.assertLessEqual(m.max_real, 160. + 1e-9)
+        # the head never went above where it started, not even for the
+        # confirm's lift after the touch 0.5 mm down
+        self.assertLessEqual(m.max_real, 159.5 + 1e-9)
         self.assertFalse(m.relative)   # gcode state restored on error
 
     def test_no_contact_retry_from_mid_travel(self):

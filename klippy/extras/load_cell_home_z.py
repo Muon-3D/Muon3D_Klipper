@@ -188,7 +188,11 @@ class LoadCellHomeZ:
                     self._run(probe)
                 start = self._home_from_touch(
                     toolhead, start, attempt > 1 or bool(max_travel))
-                self._run("G91\nG1 Z%.3f F600" % (self.confirm_lift,))
+                # never above where the attempt began (a repeat may begin
+                # back there, against the top stop)
+                lift = min(self.confirm_lift, start - self._z(toolhead))
+                if lift > 0.:
+                    self._run("G91\nG1 Z%.3f F600" % (lift,))
                 try:
                     self._run(confirm)
                 except self.gcode.error as e:
