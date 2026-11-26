@@ -24,6 +24,7 @@ from extras import temperature_fan  # noqa: E402
 M1 = os.path.join(ROOT, 'core', 'M1')
 PRINT_CFG = os.path.join(M1, 'macros', 'print.cfg')
 CORE_CFG = os.path.join(M1, 'core.cfg')
+BED_CFG = os.path.join(M1, 'macros', 'bed.cfg')
 
 
 class FakeFan:
@@ -87,10 +88,10 @@ class SpeedFloor(unittest.TestCase):
         self.assertEqual(tf.fan.speeds, [0.2])
 
 
-def macro_gcode(section):
-    with open(PRINT_CFG) as f:
+def macro_gcode(section, path=PRINT_CFG, header='[gcode_macro %s]'):
+    with open(path) as f:
         lines = f.read().splitlines()
-    start = lines.index('[gcode_macro %s]' % (section,)) + 1
+    start = lines.index(header % (section,)) + 1
     out, in_gcode = [], False
     for line in lines[start:]:
         if line.startswith('['):
@@ -125,6 +126,16 @@ class Macros(unittest.TestCase):
             'SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=toolhead_heatsink'
             ' MIN_SPEED=0.25 MAX_SPEED=1.0'])
 
+    def test_target_is_kept(self):
+        # Left out, TARGET resets to the configured target_temp, which
+        # would undo a fan parked with TARGET=0.
+        name = 'temperature_fan toolhead_heatsink'
+        for target, on in ((65., '1'), (0., '1'), (0., '0')):
+            p = self.printer()
+            p[name] = {'target': target}
+            line = self.render({'ON': on}, p)[0]
+            self.assertTrue(line.endswith(' TARGET=%s' % (target,)), line)
+
     def test_no_fan_no_command(self):
         self.assertEqual(self.render({'ON': '1'}, {}), [])
 
@@ -137,6 +148,18 @@ class Macros(unittest.TestCase):
         for section in ('PRINT_END', 'CANCEL_PRINT', '_ON_PRINT_ERROR'):
             self.assertIn('_HEATSINK_FAN_PRINT ON=0', macro_gcode(section),
                           section)
+
+    def test_z_column_removed_cancel_restores(self):
+        g = macro_gcode('_Z_COLUMN_CHANGED', BED_CFG)
+        self.assertLess(g.index('TURN_OFF_HEATERS'),
+                        g.index('_HEATSINK_FAN_PRINT ON=0'))
+
+    def test_idle_timeout_restores_when_not_paused(self):
+        # The catch-all for a stop that runs no exit macro
+        # (SDCARD_RESET_FILE). A pause keeps the fan at 100%.
+        g = macro_gcode('idle_timeout', CORE_CFG, '[%s]')
+        self.assertLess(g.index('{% else %}'),
+                        g.index('_HEATSINK_FAN_PRINT ON=0'))
 
     def test_print_end_restores_after_heaters_off(self):
         g = macro_gcode('PRINT_END')
