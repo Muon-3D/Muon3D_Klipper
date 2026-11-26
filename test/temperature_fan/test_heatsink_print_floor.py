@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """KAN-7031: the toolhead heatsink fan runs at 100% while printing.
 
-PRINT_START raises the fan's min_speed to 1.0 (_HEATSINK_FAN_PRINT ON=1) and
-PRINT_END, CANCEL_PRINT and _ON_PRINT_ERROR put the configured value back.
+PRINT_START raises the fan's min_speed to 1.0 (_HEATSINK_FAN_PRINT ON=1) once
+its probing is done, and PRINT_END, CANCEL_PRINT and _ON_PRINT_ERROR put the
+configured value back.
 temperature_fan must hold that raised floor even where the curve says 0 (a
 thermistor reading low), and keep upstream's meaning for the configured one.
 Also checks the M1 [load_cell_home_z] wrong-way defaults stay inside the cap.
@@ -150,10 +151,19 @@ class Macros(unittest.TestCase):
     def test_no_fan_no_command(self):
         self.assertEqual(self.render({'ON': '1'}, {}), [])
 
-    def test_print_start_raises_after_guard(self):
+    def test_print_start_raises_after_probing(self):
+        # Homing, the taps and the mesh run with the fan as before; the
+        # floor goes up before the hot end leaves OOZE_TEMP (the dock).
         g = macro_gcode('PRINT_START')
         self.assertEqual(g[0], '_HOTEND_FAN_GUARD WHAT=Print')
-        self.assertEqual(g[1], '_HEATSINK_FAN_PRINT ON=1')
+        self.assertEqual(g.count('_HEATSINK_FAN_PRINT ON=1'), 1)
+        on = g.index('_HEATSINK_FAN_PRINT ON=1')
+        probing = [i for i, l in enumerate(g)
+                   if l.startswith(('G28', '_PRINT_START_MESH',
+                                    'NOZZLE_WIPE_SMART'))]
+        self.assertTrue(probing)
+        self.assertGreater(on, max(probing))
+        self.assertLess(on, g.index('ANTI_OOZE_NOZZLE_DOCK'))
 
     def test_exit_paths_restore(self):
         for section in ('PRINT_END', 'CANCEL_PRINT', '_ON_PRINT_ERROR'):
