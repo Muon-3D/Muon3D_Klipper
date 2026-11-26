@@ -126,15 +126,26 @@ class Macros(unittest.TestCase):
             'SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=toolhead_heatsink'
             ' MIN_SPEED=0.25 MAX_SPEED=1.0'])
 
+    def _line(self, on, target):
+        p = self.printer()
+        p['temperature_fan toolhead_heatsink'] = {'target': target}
+        return self.render({'ON': on}, p)[0]
+
     def test_target_is_kept(self):
-        # Left out, TARGET resets to the configured target_temp, which
-        # would undo a fan parked with TARGET=0.
-        name = 'temperature_fan toolhead_heatsink'
-        for target, on in ((65., '1'), (0., '1'), (0., '0')):
-            p = self.printer()
-            p[name] = {'target': target}
-            line = self.render({'ON': on}, p)[0]
-            self.assertTrue(line.endswith(' TARGET=%s' % (target,)), line)
+        # Left out, TARGET resets to the configured target_temp.
+        for target, on in ((65., '1'), (50., '1'), (50., '0'), (0., '0')):
+            line = self._line(on, target)
+            self.assertTrue(line.endswith(' MAX_SPEED=1.0 TARGET=%s'
+                                          % (target,)), line)
+
+    def test_print_start_unparks_a_parked_fan(self):
+        # TARGET=0 holds the fan off whatever MIN_SPEED says, so ON=1
+        # leaves TARGET out and the fan goes back to target_temp.
+        for target in (0., -1.):
+            line = self._line('1', target)
+            self.assertNotIn('TARGET=', line.split('TEMPERATURE_FAN=')[1])
+            self.assertTrue(line.endswith(' MIN_SPEED=1.0 MAX_SPEED=1.0'),
+                            line)
 
     def test_no_fan_no_command(self):
         self.assertEqual(self.render({'ON': '1'}, {}), [])
