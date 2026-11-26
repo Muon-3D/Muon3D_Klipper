@@ -51,6 +51,13 @@ class TemperatureFan:
         value = float(value)
         if value <= 0.:
             value = 0.
+            # MUON (KAN-7031): a MIN_SPEED raised above the configured one
+            # (PRINT_START's toolhead heatsink floor) holds even when the
+            # control asks for off. The heatsink curve is 0 below 38 C and its
+            # thermistor can read low. The configured min_speed keeps
+            # upstream's meaning: a floor only while the fan is on.
+            if self.min_speed > self.min_speed_conf:
+                value = self.min_speed
         elif value < self.min_speed:
             value = self.min_speed
         if self.target_temp <= 0.:

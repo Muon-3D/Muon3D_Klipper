@@ -321,6 +321,11 @@ $PYTHON scripts/test_real_config.py --selftest -d ${DICTDIR} core/M1 core/M1-B0
 $PYTHON scripts/test_real_config.py -d ${DICTDIR} core/M1 core/M1-B0
 finish_test real_config "Test klippy starts on the shipped M1 configs"
 
+# MUON (KAN-7031): heatsink fan at 100% while printing, restored after.
+start_test heatsink_print_floor "Test heatsink fan print floor"
+$PYTHON test/temperature_fan/test_heatsink_print_floor.py
+finish_test heatsink_print_floor "Test heatsink fan print floor"
+
 # MUON: cancelling a print while PRINT_START runs. Real reactor, gcode and
 # virtual_sdcard, no MCU: the batch-mode .test files above cannot send a
 # webhook from a second greenlet, which is the whole of the case.
